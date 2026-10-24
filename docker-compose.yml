@@ -1,0 +1,14 @@
+# 可视化模型训练平台（GPU 版）
+# 前置条件：宿主机已安装 NVIDIA 驱动 + nvidia-container-toolkit（Linux）
+#          或 Docker Desktop（Windows WSL2）已启用 GPU。
+# GPU 未就绪前可先使用: docker compose -f docker-compose.cpu.yml up
+services:
+  trainer:
+    build: ./backend
+    container_name: model-trainer
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    gpus: all
+    restart: unless-stopped

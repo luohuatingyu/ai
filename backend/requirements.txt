@@ -1,0 +1,10 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pandas>=2.2
+numpy>=2.0
+scikit-learn>=1.5
+# Linux 上 PyPI 的 torch 默认是 CUDA 12 构建（自带 cudnn/cublas 等 nvidia-* 依赖）
+# 如需固定 CUDA 版本，在 Dockerfile 中使用官方索引，例如:
+#   --index-url https://download.pytorch.org/whl/cu124
+torch>=2.6,<3
