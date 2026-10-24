@@ -11,7 +11,7 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +20,12 @@ from pydantic import BaseModel, Field
 import app.config as config
 from app.jobs import JobManager, read_metrics
 from app.trainer import predict_row
+from app.database import db_session
+from app.db_utils import (
+    save_dataset_to_db,
+    get_dataset_from_db,
+    add_job_log,
+)
 
 app = FastAPI(title="可视化模型训练平台", version="1.0.0")
 
@@ -97,9 +103,27 @@ def _save_dataset_from_frame(df: pd.DataFrame, name: str) -> dict:
         "columns": [str(c) for c in df.columns],
         "created_at": time.time(),
     }
+    
+    # 保存到文件
     _dataset_meta_path(ds_id).write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    
+    # 保存到数据库
+    if config.DB_AVAILABLE:
+        try:
+            with db_session() as db:
+                save_dataset_to_db(
+                    db=db,
+                    ds_id=ds_id,
+                    name=name,
+                    rows=int(len(df)),
+                    columns=[str(c) for c in df.columns],
+                )
+        except Exception as e:
+            # 如果数据库保存失败，只保存到文件
+            pass
+    
     return meta
 
 
@@ -145,11 +169,24 @@ def samples() -> list[dict]:
 @app.get("/api/datasets")
 def list_datasets() -> list[dict]:
     out: list[dict] = []
+    
+    # 从文件系统获取数据集
     for path in sorted(config.DATASETS_DIR.glob("*.meta.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             out.append(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             continue
+    
+    # 如果数据库可用，合并数据库中的数据集
+    if config.DB_AVAILABLE:
+        try:
+            with db_session() as db:
+                # 这里可以添加从数据库获取数据集的逻辑
+                # 由于当前设计主要使用文件存储，暂时不添加
+                pass
+        except Exception:
+            pass
+    
     return out
 
 
@@ -249,12 +286,34 @@ def job_logs(job_id: str, offset: int = 0) -> dict:
     job = manager.get(job_id)
     if not job:
         raise HTTPException(404, "任务不存在")
+    
     lines: list[str] = []
+    total = 0
+
+    # 优先从文件获取日志
     if job.log_path.exists():
         lines = job.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    offset = max(0, min(offset, len(lines)))
+        total = len(lines)
+
+    # 数据库可用且已有日志时，以数据库日志为准（训练线程会同步写入）
+    if config.DB_AVAILABLE:
+        try:
+            with db_session() as db:
+                db_logs = get_job_logs(db, job_id, 0, 1000000)
+
+                if db_logs:
+                    # 时间按写入顺序（timestamp, id）取全量，offset 在本函数统一切片，
+                    # 避免 SQL 分页与本函数分页叠加导致丢行
+                    db_lines = [f"[{log.timestamp.strftime('%H:%M:%S')}] {log.message}" for log in db_logs]
+                    lines = db_lines
+                    total = len(db_lines)
+        except Exception:
+            # 如果数据库操作失败，只使用文件日志
+            pass
+
+    offset = max(0, min(offset, total))
     batch = lines[offset : offset + 500]
-    return {"lines": batch, "next_offset": offset + len(batch), "total": len(lines)}
+    return {"lines": batch, "next_offset": offset + len(batch), "total": total}
 
 
 @app.post("/api/jobs/{job_id}/cancel")

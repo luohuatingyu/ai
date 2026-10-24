@@ -1,12 +1,30 @@
 # 可视化模型训练平台（CPU 临时版）
 # 与 docker-compose.yml 使用同一个镜像；GPU 环境就绪后请改用 GPU 版获得加速。
 # 本文件仅去掉 gpus 声明，页面与代码无需任何修改。
+
+# 注意：本项目使用已有的MySQL服务器，不创建MySQL容器
+# 请确保MySQL服务器已启动，并通过环境变量配置连接信息
+
 services:
   trainer:
     build: ./backend
-    container_name: model-trainer
+    container_name: model-trainer-cpu
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+    environment:
+      # MySQL连接配置（请根据您的MySQL服务器配置修改）
+      DB_HOST: ${DB_HOST:-localhost}          # MySQL服务器地址
+      DB_PORT: ${DB_PORT:-3306}               # MySQL端口
+      DB_USER: ${DB_USER:-root}              # MySQL用户名
+      DB_PASSWORD: ${DB_PASSWORD:-password}   # MySQL密码
+      DB_NAME: ${DB_NAME:-model_training}    # 数据库名称
+      DB_CHARSET: ${DB_CHARSET:-utf8mb4}      # 字符集
+      DB_COLLATION: ${DB_COLLATION:-utf8mb4_unicode_ci}  # 排序规则
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}       # 连接池大小
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20} # 最大溢出连接数
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30} # 获取连接超时时间
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-3600} # 连接回收时间
+      DB_ECHO: ${DB_ECHO:-false}             # 是否显示SQL语句
     restart: unless-stopped

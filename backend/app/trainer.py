@@ -157,8 +157,13 @@ def _evaluate(
     loader: DataLoader,
     task: str,
     device: torch.device,
+    y_scale: tuple[float, float] | None = None,
 ) -> tuple[dict, np.ndarray, np.ndarray]:
-    """返回 ({val_loss, val_accuracy | val_mse/val_r2/val_mae}, y_pred, y_true)。"""
+    """返回指标字典 + (y_pred, y_true)。
+
+    y_scale=(mean, std) 时为回归任务：网络自己在标准化空间训练，
+    返回的 val_loss/mse/rmse/mae 已反归一化到目标原始量纲。
+    """
     loss_fn = nn.CrossEntropyLoss() if task == "classification" else nn.MSELoss()
     model.eval()
     total, seen = 0.0, 0
@@ -178,13 +183,16 @@ def _evaluate(
 
     y_pred = np.concatenate(preds)
     y_true = np.concatenate(trues)
-    result = {"val_loss": total / max(seen, 1)}
+    k = (y_scale[1] ** 2) if y_scale else 1.0
+    k_mae = y_scale[1] if y_scale else 1.0
+    result = {"val_loss": (total / max(seen, 1)) * k}
     if task == "classification":
         result["val_accuracy"] = float(accuracy_score(y_true, y_pred))
     else:
-        result["val_mse"] = float(mean_squared_error(y_true, y_pred))
+        result["val_mse"] = float(mean_squared_error(y_true, y_pred)) * k
         result["val_rmse"] = float(np.sqrt(result["val_mse"]))
-        result["val_mae"] = float(mean_absolute_error(y_true, y_pred))
+        result["val_mae"] = float(mean_absolute_error(y_true, y_pred)) * k_mae
+        # R² 对线性变换尺度不变，可直接用网络输出计算
         result["val_r2"] = float(r2_score(y_true, y_pred))
     return result, y_pred, y_true
 
@@ -224,6 +232,20 @@ def run_training(
     log_fn: LogFn,
     job_dir: Path,
 ) -> dict:
+    # 添加数据库日志功能
+    def db_log_fn(msg: str):
+        log_fn(msg)
+        # 尝试将日志保存到数据库
+        try:
+            from app.db_utils import add_job_log
+            from app.database import SessionLocal
+            # 从job_dir获取job_id
+            job_id = job_dir.name
+            with SessionLocal() as db:
+                add_job_log(db, job_id, msg)
+        except Exception:
+            # 如果数据库操作失败，忽略错误，继续使用文件日志
+            pass
     t0 = time.time()
     if cancel_event.is_set():
         raise JobCancelled()
@@ -242,10 +264,10 @@ def run_training(
     seed = int(params["seed"])
 
     # ---- 环境 ----
-    device = _pick_device(log_fn)
+    device = _pick_device(db_log_fn)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    log_fn(
+    db_log_fn(
         f"环境: torch {torch.__version__} / 设备 {device} / 显存 "
         f"{torch.cuda.get_device_properties(0).total_memory // 2**20} MiB"
         if device.type == "cuda"
@@ -253,7 +275,7 @@ def run_training(
     )
 
     # ---- 数据 ----
-    log_fn(f"读取数据集 {dataset_path.name} …")
+    db_log_fn(f"读取数据集 {dataset_path.name} …")
     df = pd.read_csv(dataset_path)
     if target not in df.columns:
         raise ValueError(f"目标列 '{target}' 不在数据集中")
@@ -273,12 +295,12 @@ def run_training(
     X_all = X_df.to_numpy(dtype=np.float32)
     y_all = y_enc
     n_features = X_all.shape[1]
-    log_fn(
+    db_log_fn(
         f"样本 {len(X_all)} 条；特征 {n_features} 个"
         f"（数值 {len(feat_meta['num_cols'])}，one-hot 展开 {n_features - len(feat_meta['num_cols'])}）"
     )
     if classes:
-        log_fn(f"分类类别: {classes}")
+        db_log_fn(f"分类类别: {classes}")
 
     stratify = None
     if task == "classification":
@@ -291,13 +313,25 @@ def run_training(
     X_train, X_val, y_train, y_val = train_test_split(
         X_all, y_all, test_size=test_split, random_state=seed, stratify=stratify
     )
-    log_fn(f"划分: 训练 {X_train.shape[0]} 条 / 验证 {X_val.shape[0]} 条")
+    db_log_fn(f"划分: 训练 {X_train.shape[0]} 条 / 验证 {X_val.shape[0]} 条")
 
     mean = np.asarray(X_train.mean(axis=0), dtype=np.float32)
     std = np.asarray(X_train.std(axis=0), dtype=np.float32)
     std[std < 1e-8] = 1.0
     X_train = (X_train - mean) / std
     X_val = (X_val - mean) / std
+
+    # 回归目标标准化（避免大数值目标导致 loss 梯度过小、训练不动）
+    y_scale: tuple[float, float] | None = None
+    if task == "regression":
+        y_mean = float(np.asarray(y_train, dtype=np.float64).mean())
+        y_std = float(np.asarray(y_train, dtype=np.float64).std())
+        if y_std < 1e-8:
+            y_std = 1.0
+        y_scale = (y_mean, y_std)
+        log_fn(f"回归目标标准化: mean={y_mean:.2f}, std={y_std:.2f}（评估与预测时反归一化）")
+        y_train = ((y_train - y_mean) / y_std).astype(np.float32)
+        y_val = ((y_val - y_mean) / y_std).astype(np.float32)
 
     preprocessor = {
         "feature_names": [str(c) for c in X_df.columns],
@@ -310,6 +344,7 @@ def run_training(
         "classes": classes,
         "target": target,
         "task": task,
+        "target_scale": y_scale,
     }
     (job_dir / "preprocessor.json").write_text(
         json.dumps(_py(preprocessor), ensure_ascii=False, indent=2), encoding="utf-8"
@@ -325,7 +360,7 @@ def run_training(
     }
     model = _build_model(n_features, out_dim, hidden_size, hidden_layers, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    log_fn(f"模型: MLP({'+'.join(str(d) for d in [n_features] + [hidden_size] * hidden_layers + [out_dim])})")
+    db_log_fn(f"模型: MLP({'+'.join(str(d) for d in [n_features] + [hidden_size] * hidden_layers + [out_dim])})")
 
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
@@ -362,8 +397,10 @@ def run_training(
             running += loss.item() * len(y_batch)
             seen += len(y_batch)
         train_loss = running / max(seen, 1)
+        if y_scale:  # 反归一化到目标原始量纲，保持 train/val 曲线单位一致
+            train_loss *= y_scale[1] ** 2
 
-        val_result, _, _ = _evaluate(model, val_loader, task, device)
+        val_result, _, _ = _evaluate(model, val_loader, task, device, y_scale=y_scale)
         record: dict[str, Any] = {"epoch": epoch, "train_loss": round(train_loss, 6),
                                   "val_loss": round(val_result["val_loss"], 6)}
         if task == "classification":
@@ -374,13 +411,13 @@ def run_training(
         _append_jsonl(metrics_path, record)
 
         if task == "classification":
-            log_fn(
+            db_log_fn(
                 f"[epoch {epoch}/{epochs}] train_loss={train_loss:.4f} "
                 f"val_loss={val_result['val_loss']:.4f} val_acc={val_result['val_accuracy']:.4f}"
             )
             score = record["val_accuracy"]
         else:
-            log_fn(
+            db_log_fn(
                 f"[epoch {epoch}/{epochs}] train_loss={train_loss:.4f} "
                 f"val_loss={val_result['val_loss']:.4f} val_r2={val_result['val_r2']:.4f}"
             )
@@ -396,7 +433,7 @@ def run_training(
     # ---- 最终报告（用最佳权重）----
     state = torch.load(job_dir / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(state["state_dict"])
-    final_result, y_pred, y_true = _evaluate(model, val_loader, task, device)
+    final_result, y_pred, y_true = _evaluate(model, val_loader, task, device, y_scale=y_scale)
 
     summary: dict[str, Any] = {
         "task": task,
@@ -423,9 +460,9 @@ def run_training(
             zero_division=0,
         )
         summary["report"] = _py(report)
-        log_fn(f"最终验证准确率 {final_result['val_accuracy']:.4f}")
+        db_log_fn(f"最终验证准确率 {final_result['val_accuracy']:.4f}")
     else:
-        log_fn(
+        db_log_fn(
             f"最终验证 MSE={final_result['val_mse']:.4f} RMSE={final_result['val_rmse']:.4f} "
             f"R²={final_result['val_r2']:.4f}"
         )
@@ -433,7 +470,7 @@ def run_training(
     (job_dir / "summary.json").write_text(
         json.dumps(_py(summary), ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    log_fn(f"训练完成，用时 {summary['duration_sec']}s")
+    db_log_fn(f"训练完成，用时 {summary['duration_sec']}s")
     return _py(summary)
 
 
@@ -466,4 +503,8 @@ def predict_row(ckpt_path: Path, row: dict) -> dict:
             "prediction": classes[top],
             "probabilities": {str(c): float(p) for c, p in zip(classes, prob)},
         }
-    return {"task": task, "prediction": float(out[0, 0])}
+    value = float(out[0, 0])
+    scale = pre.get("target_scale")
+    if scale:
+        value = value * float(scale[1]) + float(scale[0])
+    return {"task": task, "prediction": value}

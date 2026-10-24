@@ -4,9 +4,13 @@
 #             torch 的 Linux wheel 内置 CUDA 12 运行时，镜像内无需安装 CUDA Toolkit。
 FROM python:3.12-slim
 
+# 默认走清华 PyPI 镜像（大体积 torch/nvidia wheel 下载更稳）；
+# 海外环境可用 build-arg 覆盖，例如 --build-arg PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_DEFAULT_TIMEOUT=180
+    PIP_DEFAULT_TIMEOUT=180 \
+    PIP_INDEX_URL=${PIP_INDEX_URL}
 
 WORKDIR /app
 
@@ -19,6 +23,11 @@ COPY app ./app
 COPY static ./static
 COPY sample_data ./sample_data
 
+# 启动与数据库初始化脚本
+COPY init_db.sh start.sh ./
+RUN chmod +x init_db.sh start.sh
+
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 启动：等待/初始化 MySQL（失败不阻塞训练服务）后启动 API
+CMD ["./start.sh"]

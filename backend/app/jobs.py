@@ -5,6 +5,11 @@
 - log.txt        追加式日志
 - metrics.jsonl  逐 epoch 指标
 - best.pt/last.pt/preprocessor.json/summary.json 由训练器产出
+
+同时支持MySQL数据库存储：
+- 数据集信息存储在datasets表
+- 任务信息存储在training_jobs表
+- 任务日志存储在job_logs表
 """
 from __future__ import annotations
 
@@ -19,6 +24,14 @@ from pathlib import Path
 from typing import Any
 
 import app.config as config
+from app.db_utils import (
+    save_job_to_db,
+    update_job_status,
+    get_job_from_db,
+    get_all_jobs_from_db,
+    add_job_log,
+    get_job_logs,
+)
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -129,6 +142,7 @@ class JobManager:
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="train")
         self._load_existing()
+        self._db_available = config.DB_AVAILABLE
 
     # ------------------------------------------------------------------
     # 对外 API
@@ -139,6 +153,24 @@ class JobManager:
         job.dir.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._jobs[job.id] = job
+        
+        # 保存到数据库
+        if self._db_available:
+            try:
+                from app.database import SessionLocal
+                with SessionLocal() as db:
+                    save_job_to_db(
+                        db=db,
+                        job_id=job.id,
+                        dataset_id=spec["dataset_id"],
+                        dataset_name=spec.get("dataset_name", spec["dataset_id"]),
+                        target=spec["target"],
+                        task=spec["task"],
+                        params=spec["params"],
+                    )
+            except Exception as e:
+                _append_log(job, f"数据库保存失败: {e}")
+        
         _persist(job)
         self._executor.submit(self._run, job)
         return job
@@ -147,7 +179,40 @@ class JobManager:
         return self._jobs.get(job_id)
 
     def list(self) -> list[Job]:
-        return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+        # 优先从内存获取，如果数据库可用则合并数据库中的任务
+        jobs = list(self._jobs.values())
+        
+        if self._db_available:
+            try:
+                from app.database import SessionLocal
+                with SessionLocal() as db:
+                    db_jobs = get_all_jobs_from_db(db)
+                    # 将数据库中的任务添加到内存中（如果不存在）
+                    for db_job in db_jobs:
+                        if db_job.id not in self._jobs:
+                            # TrainingJob 模型没有 spec 字段，从拆分字段重建
+                            spec = {
+                                "dataset_id": db_job.dataset_id,
+                                "dataset_name": db_job.dataset_name,
+                                "target": db_job.target,
+                                "task": db_job.task,
+                                "params": db_job.params or {},
+                            }
+                            job = Job(spec)
+                            job.id = db_job.id
+                            job.status = db_job.status
+                            job.created_at = db_job.created_at.timestamp() if db_job.created_at else _now()
+                            job.started_at = db_job.started_at.timestamp() if db_job.started_at else None
+                            job.finished_at = db_job.finished_at.timestamp() if db_job.finished_at else None
+                            job.error = db_job.error
+                            job.device = db_job.device
+                            job.summary = db_job.summary
+                            jobs.append(job)
+            except Exception as e:
+                # 如果数据库操作失败，只返回内存中的任务
+                pass
+        
+        return sorted(jobs, key=lambda j: j.created_at, reverse=True)
 
     def cancel(self, job_id: str) -> Job:
         job = self._jobs.get(job_id)
@@ -203,6 +268,16 @@ class JobManager:
         job.status = RUNNING
         job.started_at = _now()
         _append_log(job, "任务开始")
+        
+        # 更新数据库中的任务状态
+        if self._db_available:
+            try:
+                from app.database import SessionLocal
+                with SessionLocal() as db:
+                    update_job_status(db, job.id, "running")
+            except Exception as e:
+                _append_log(job, f"数据库状态更新失败: {e}")
+        
         _persist(job)
 
         spec = job.spec
@@ -218,17 +293,57 @@ class JobManager:
                 log_fn=lambda msg: _append_log(job, msg),
                 job_dir=job.dir,
             )
+            
+            # 更新任务状态和摘要
             job.device = summary.get("device")
             job.summary = summary
             job.status = COMPLETED
+            
+            # 更新数据库
+            if self._db_available:
+                try:
+                    from app.database import SessionLocal
+                    with SessionLocal() as db:
+                        update_job_status(
+                            db, 
+                            job.id, 
+                            "completed", 
+                            device=job.device,
+                            summary=job.summary
+                        )
+                except Exception as e:
+                    _append_log(job, f"数据库状态更新失败: {e}")
         except JobCancelled:
             job.status = CANCELLED
             _append_log(job, "任务已取消")
+            
+            # 更新数据库
+            if self._db_available:
+                try:
+                    from app.database import SessionLocal
+                    with SessionLocal() as db:
+                        update_job_status(db, job.id, "cancelled")
+                except Exception as e:
+                    _append_log(job, f"数据库状态更新失败: {e}")
         except Exception as exc:  # noqa: BLE001
             job.status = FAILED
             job.error = str(exc)
             _append_log(job, f"任务失败: {exc}")
             _append_log(job, traceback.format_exc())
+            
+            # 更新数据库
+            if self._db_available:
+                try:
+                    from app.database import SessionLocal
+                    with SessionLocal() as db:
+                        update_job_status(
+                            db, 
+                            job.id, 
+                            "failed", 
+                            error=job.error
+                        )
+                except Exception as e:
+                    _append_log(job, f"数据库状态更新失败: {e}")
         finally:
             job.finished_at = _now()
             _persist(job)

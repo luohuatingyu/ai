@@ -16,3 +16,14 @@ SAMPLE_DIR = APP_ROOT / "sample_data"
 
 for _d in (DATA_DIR, DATASETS_DIR, JOBS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+# 数据库配置
+USE_DATABASE = os.environ.get("USE_DATABASE", "true").lower() == "true"
+if USE_DATABASE:
+    try:
+        from app.database import DATABASE_URL
+        DB_AVAILABLE = True
+    except ImportError:
+        DB_AVAILABLE = False
+else:
+    DB_AVAILABLE = False
