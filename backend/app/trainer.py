@@ -2,12 +2,18 @@
 
 - 设备自动探测：有 NVIDIA GPU（torch.cuda.is_available()）则用 cuda，否则退回 cpu。
 - 产物：日志(job manager 写)、metrics.jsonl（逐 epoch 指标）、best.pt / last.pt、
-  preprocessor.json、summary.json。
+  preprocessor.json、summary.json、checkpoints/ckpt-e*.pt。
+- **训练上下文与 GPU 解耦**：
+  * save_trainer_state / load_trainer_state 保存"完整可迁移训练状态"——
+    模型权重 + 优化器状态 + 随机数状态 + epoch 进度 + best 追踪 + 预处理器；
+  * 保存时全部 CPU 化（设备无关），任意服务器/任意显卡（甚至 CPU）可接手续训；
+  * run_training 支持 resume_state 断点续训与 pause_event 优雅暂停。
 - 新增训练类型时：在本文件增加 run_* 函数，并在 app/main.py 的 /api/train 中路由。
 """
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from pathlib import Path
@@ -27,11 +33,21 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
+import app.config as config
+
 LogFn = Callable[[str], None]
 
 
 class JobCancelled(Exception):
     """用户请求取消训练（由 app.jobs 捕获并以 cancelled 状态收尾）。"""
+
+
+class JobPaused(Exception):
+    """训练被优雅暂停（租约丢失 / 用户暂停 / 服务器释放前 SIGTERM）。
+
+    由 app.worker 捕获：暂停前训练器已保存完整 trainer-state checkpoint，
+    任务进入 paused 状态，可被任意其它服务器/显卡接手续训。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +68,80 @@ def _py(value: Any) -> Any:
 def _append_jsonl(path: Path, record: dict) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _to_cpu(obj: Any) -> Any:
+    """递归把张量/嵌套结构搬到 CPU：保证 checkpoint 与设备无关（可跨显卡/跨机迁移）。"""
+    if torch.is_tensor(obj):
+        return obj.detach().to("cpu")
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        converted = [_to_cpu(v) for v in obj]
+        return type(obj)(converted) if isinstance(obj, tuple) else converted
+    return obj
+
+
+def _rng_snapshot() -> dict:
+    """打包 torch / numpy / python 三套随机数状态。
+
+    numpy 与 python 的状态转为纯 JSON 类型（列表/数字），保证能通过
+    torch.load(weights_only=True) 的安全加载（跨服务器续训不降级安全性）。
+    """
+    np_state = np.random.get_state()  # ('MT19937', keys, pos, has_gauss, cached)
+    py_state = random.getstate()     # (version, tuple_of_ints, gauss_next)
+    snapshot = {
+        "torch": torch.get_rng_state(),
+        "numpy": {
+            "op": str(np_state[0]),
+            "keys": np.asarray(np_state[1]).tolist(),
+            "pos": int(np_state[2]),
+            "has_gauss": int(np_state[3]),
+            "cached_gaussian": float(np_state[4]),
+        },
+        "python": {"version": int(py_state[0]), "state": list(py_state[1]), "gauss": py_state[2]},
+    }
+    # CUDA 随机数状态一并无损保存（GPU 上 Dropout 等算子使用设备侧 RNG）；
+    # 恢复时设备数不同则跳过（跨卡续训本就不承诺逐位一致）
+    if torch.cuda.is_available():
+        snapshot["cuda"] = torch.cuda.get_rng_state_all()
+    return snapshot
+
+
+def _rng_restore(snapshot: dict, log_fn: LogFn | None = None) -> None:
+    """恢复随机数状态：使续训的数据 shuffle / Dropout 序列与未中断时一致。"""
+    try:
+        torch.set_rng_state(snapshot["torch"].cpu())
+        np_state = snapshot["numpy"]
+        np.random.set_state((
+            np_state["op"], np.asarray(np_state["keys"], dtype=np.int64),
+            int(np_state["pos"]), int(np_state["has_gauss"]),
+            float(np_state["cached_gaussian"]),
+        ))
+        py_state = snapshot["python"]
+        random.setstate((int(py_state["version"]), tuple(py_state["state"]), py_state["gauss"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        if log_fn:
+            log_fn(f"随机数状态恢复失败（不影响续训，仅 shuffle 序列变化）: {exc}")
+    cuda_states = snapshot.get("cuda")
+    if cuda_states and torch.cuda.is_available() and torch.cuda.device_count() >= len(cuda_states):
+        try:
+            torch.cuda.set_rng_state_all([s.cpu() for s in cuda_states])
+        except (RuntimeError, ValueError) as exc:
+            if log_fn:
+                log_fn(f"CUDA 随机数状态恢复跳过: {exc}")
+
+
+def _version_tuple(version: str) -> tuple:
+    """torch 版号转可比较元组（忽略 2.8.0+cu126 之类的后缀）。"""
+    digits = version.split("+")[0].split(".")
+    out = []
+    for d in digits[:3]:
+        try:
+            out.append(int(d))
+        except ValueError:
+            break
+    return tuple(out)
 
 
 def _build_model(
@@ -217,7 +307,8 @@ def _save_checkpoint(
 ) -> None:
     torch.save(
         {
-            "state_dict": model.state_dict(),
+            # 权重 CPU 化：best.pt 可在任意服务器/任意设备上加载推理
+            "state_dict": _to_cpu(model.state_dict()),
             "arch": arch,
             "task": task,
             "kind": kind,
@@ -226,6 +317,91 @@ def _save_checkpoint(
         },
         path,
     )
+
+
+# ---------------------------------------------------------------------------
+# 完整可迁移训练状态（trainer state）
+# ---------------------------------------------------------------------------
+
+def save_trainer_state(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    arch: dict,
+    preprocessor: dict,
+    task: str,
+    params: dict,
+    epoch: int,
+    best_score: float | None,
+    best_epoch: int,
+    best_record: dict | None,
+    device: torch.device,
+) -> dict:
+    """保存"完整训练上下文"——续训所需的全部状态，设备无关。
+
+    包含：模型权重、优化器状态（AdamW 动量）、三套随机数状态、
+    epoch 进度、best 追踪、预处理器、关键超参与版本元信息。
+    张量全部 CPU 化；numpy/python RNG 转 JSON 安全类型，
+    整个文件可通过 torch.load(weights_only=True) 安全加载。
+    """
+    state = {
+        "kind": "trainer_state",
+        "task": task,
+        "arch": arch,
+        "params": params,
+        "epoch": int(epoch),
+        "best_score": best_score,
+        "best_epoch": int(best_epoch),
+        "best_record": best_record or {},
+        "state_dict": _to_cpu(model.state_dict()),
+        "optimizer": _to_cpu(optimizer.state_dict()),
+        "rng": _rng_snapshot(),
+        "preprocessor": preprocessor,
+        "meta": {
+            "torch_version": str(torch.__version__),
+            "saved_device": str(device),
+            "saved_at": time.time(),
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    torch.save(state, tmp)
+    tmp.replace(path)  # 原子落盘：中断不会留下半写的 checkpoint
+    return state
+
+
+def load_trainer_state(path: Path) -> dict:
+    """加载训练上下文；文件缺失/损坏/不兼容时抛出带明确指引的异常。"""
+    if not path.exists():
+        raise FileNotFoundError(f"训练状态文件不存在: {path}")
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {exc}") from exc
+    if not isinstance(state, dict) or state.get("kind") != "trainer_state":
+        raise ValueError(f"不是有效的训练状态文件（kind 不匹配）: {path}")
+    return state
+
+
+def _validate_resume_state(
+    state: dict, arch: dict, task: str, log_fn: LogFn
+) -> None:
+    """续训前校验 checkpoint 与当前任务/超参/环境兼容，失败给出明确原因。"""
+    if state.get("task") != task:
+        raise ValueError(f"checkpoint 任务类型不匹配: {state.get('task')!r} != {task!r}")
+    if state.get("arch") != arch:
+        raise ValueError(
+            f"checkpoint 网络结构与当前超参不一致（arch {state.get('arch')} != {arch}），"
+            "续训要求 hidden_size/hidden_layers/特征数与原训练完全一致"
+        )
+    saved_tv = str(state.get("meta", {}).get("torch_version", ""))
+    if saved_tv and _version_tuple(saved_tv) > _version_tuple(str(torch.__version__)):
+        raise ValueError(
+            f"当前 torch {torch.__version__} 低于 checkpoint 保存版本 {saved_tv}，"
+            "为避免静默出错请升级 torch 后再续训"
+        )
+    log_fn(f"checkpoint 兼容性校验通过（保存于 torch {saved_tv}）")
 
 
 # ---------------------------------------------------------------------------
@@ -240,15 +416,28 @@ def run_training(
     cancel_event: threading.Event,
     log_fn: LogFn,
     job_dir: Path,
+    pause_event: threading.Event | None = None,
+    resume_state: dict | None = None,
+    on_epoch_end: Callable[[dict], None] | None = None,
+    on_checkpoint: Callable[[int], None] | None = None,
 ) -> dict:
-    # 添加数据库日志功能
+    """执行（或续训执行）一次训练，返回 summary。
+
+    参数说明（多机无状态 worker 架构）：
+    - pause_event: 优雅暂停信号；触发时先保存完整 trainer-state 再抛 JobPaused；
+    - resume_state: load_trainer_state 的返回值，跨服务器/跨显卡续训的完整上下文；
+    - on_epoch_end: 每 epoch 结束回调（worker 借此把 metrics/日志同步到状态平面）；
+    - on_checkpoint: trainer-state 存档回调（worker 上传版本化 checkpoint 到对象存储）。
+    """
+    # 添加数据库日志功能（数据库关闭/不可用时不做任何 DB 操作，避免连接阻塞）
     def db_log_fn(msg: str):
         log_fn(msg)
-        # 尝试将日志保存到数据库
+        if not config.DB_AVAILABLE:
+            return
         try:
             from app.db_utils import add_job_log
             from app.database import SessionLocal
-            # 从job_dir获取job_id
+            # 从job_dir获取job_id（worker 的 scratch 目录名即 job_id）
             job_id = job_dir.name
             with SessionLocal() as db:
                 add_job_log(db, job_id, msg)
@@ -258,6 +447,8 @@ def run_training(
     t0 = time.time()
     if cancel_event.is_set():
         raise JobCancelled()
+    if pause_event is None:
+        pause_event = threading.Event()
     if not dataset_path.exists():
         raise ValueError("数据集文件不存在（可能已被删除）")
     if task not in ("classification", "regression"):
@@ -371,6 +562,29 @@ def run_training(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     db_log_fn(f"模型: MLP({'+'.join(str(d) for d in [n_features] + [hidden_size] * hidden_layers + [out_dim])})")
 
+    # ---- 恢复训练上下文（跨服务器/跨显卡续训） ----
+    start_epoch = 0
+    best_record: dict | None = None
+    best_score: float | None = None
+    best_epoch = 0
+    if resume_state is not None:
+        # 校验 checkpoint 与当前任务/超参/环境兼容，不兼容直接拒绝（不静默出错）
+        _validate_resume_state(resume_state, arch, task, db_log_fn)
+        model.load_state_dict(resume_state["state_dict"])
+        # 优化器状态（AdamW 动量）：缺失会导致续训等效于学习率冷启动、loss 跳变
+        optimizer.load_state_dict(resume_state["optimizer"])
+        start_epoch = int(resume_state.get("epoch", 0))
+        best_score = resume_state.get("best_score")
+        best_epoch = int(resume_state.get("best_epoch", 0))
+        best_record = resume_state.get("best_record") or None
+        saved_device = resume_state.get("meta", {}).get("saved_device", "未知")
+        db_log_fn(
+            f"续训恢复: 从第 {start_epoch + 1} 个 epoch 继续（原设备 {saved_device}，"
+            f"本机设备 {device}；优化器/随机数状态已还原）"
+        )
+        # 随机数状态恢复必须在模型构建之后：续训的数据 shuffle 序列与未中断时完全一致
+        _rng_restore(resume_state.get("rng") or {}, db_log_fn)
+
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
         batch_size=batch_size,
@@ -383,19 +597,48 @@ def run_training(
 
     # ---- 训练循环 ----
     metrics_path = job_dir / "metrics.jsonl"
-    best_record: dict | None = None
-    best_score: float | None = None
-    best_epoch = 0
+    # trainer-state 存档间隔（epoch 数）：进度兜底线，暂停/崩溃时可回退到最近存档
+    ckpt_interval = max(int(getattr(config, "WORKER_CHECKPOINT_INTERVAL", 5)), 1)
 
-    for epoch in range(1, epochs + 1):
+    def _persist_state(finished_epoch: int) -> None:
+        """保存完整训练上下文到本地 scratch，并回调 worker 上传到状态平面。"""
+        save_trainer_state(
+            job_dir / "checkpoints" / f"ckpt-e{finished_epoch:04d}.pt",
+            model=model,
+            optimizer=optimizer,
+            arch=arch,
+            preprocessor=preprocessor,
+            task=task,
+            params={
+                "epochs": epochs, "batch_size": batch_size, "lr": lr,
+                "hidden_size": hidden_size, "hidden_layers": hidden_layers,
+                "test_split": test_split, "seed": seed,
+            },
+            epoch=finished_epoch,
+            best_score=best_score,
+            best_epoch=best_epoch,
+            best_record=best_record,
+            device=device,
+        )
+        if on_checkpoint is not None:
+            on_checkpoint(finished_epoch)
+
+    for epoch in range(start_epoch + 1, epochs + 1):
         if cancel_event.is_set():
             raise JobCancelled()
+        if pause_event.is_set():
+            # 优雅暂停：先存档到最近完成的 epoch，再交由 worker 标记 paused
+            _persist_state(epoch - 1)
+            raise JobPaused(f"训练已在第 {epoch - 1} 个 epoch 后暂停")
 
         model.train()
         running, seen = 0.0, 0
         for X_batch, y_batch in train_loader:
             if cancel_event.is_set():
                 raise JobCancelled()
+            if pause_event.is_set():
+                _persist_state(epoch - 1)
+                raise JobPaused(f"训练已在第 {epoch - 1} 个 epoch 后暂停（epoch {epoch} 中途）")
             optimizer.zero_grad()
             out = model(X_batch.to(device))
             pred = out if task == "classification" else out.squeeze(-1)
@@ -439,8 +682,20 @@ def run_training(
         if epoch % 5 == 0 or epoch == epochs:
             _save_checkpoint(job_dir / "last.pt", model, arch, preprocessor, task, "last", record)
 
+        # 周期性保存完整训练上下文（断点续训依据），并同步 metrics/日志到状态平面
+        if epoch % ckpt_interval == 0 or epoch == epochs:
+            _persist_state(epoch)
+        if on_epoch_end is not None:
+            on_epoch_end(record)
+
     # ---- 最终报告（用最佳权重）----
-    state = torch.load(job_dir / "best.pt", map_location=device, weights_only=True)
+    best_path = job_dir / "best.pt"
+    if not best_path.exists():
+        raise ValueError(
+            "缺少 best.pt 权重产物，无法生成最终报告（续训时由接手 worker 从状态平面拉取；"
+            "若任务从未训练过任何 epoch 请检查数据与超参）"
+        )
+    state = torch.load(best_path, map_location=device, weights_only=True)
     model.load_state_dict(state["state_dict"])
     final_result, y_pred, y_true = _evaluate(model, val_loader, task, device, y_scale=y_scale)
 
@@ -452,6 +707,7 @@ def run_training(
         "cuda_version": torch.version.cuda,
         "epochs_total": epochs,
         "epochs_done": epochs,
+        "resumed_from": start_epoch,          # 本次运行起始 epoch（0 表示全新训练）
         "best_epoch": best_epoch,
         "best": best_record,
         "final": _py(final_result),
