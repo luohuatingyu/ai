@@ -14,11 +14,11 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      # MySQL连接配置（请根据您的MySQL服务器配置修改）
+      # MySQL连接配置（明文密码）
       DB_HOST: ${DB_HOST:-localhost}          # MySQL服务器地址
       DB_PORT: ${DB_PORT:-3306}               # MySQL端口
       DB_USER: ${DB_USER:-root}              # MySQL用户名
-      DB_PASSWORD: ${DB_PASSWORD:-password}   # MySQL密码
+      DB_PASSWORD: ${DB_PASSWORD:-password}   # MySQL密码（明文）
       DB_NAME: ${DB_NAME:-model_training}    # 数据库名称
       DB_CHARSET: ${DB_CHARSET:-utf8mb4}      # 字符集
       DB_COLLATION: ${DB_COLLATION:-utf8mb4_unicode_ci}  # 排序规则

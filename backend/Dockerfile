@@ -24,8 +24,8 @@ COPY static ./static
 COPY sample_data ./sample_data
 
 # 启动与数据库初始化脚本
-COPY init_db.sh init_secrets.sh start.sh ./
-RUN chmod +x init_db.sh init_secrets.sh start.sh
+COPY init_db.sh start.sh ./
+RUN chmod +x init_db.sh start.sh
 
 EXPOSE 8000
 

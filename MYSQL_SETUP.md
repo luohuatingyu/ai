@@ -4,38 +4,44 @@
 
 本项目已集成MySQL数据库支持，用于存储数据集信息和训练任务数据。**项目使用已有的MySQL服务器，不会创建新的MySQL容器**。默认情况下，数据仍然保存到文件系统，但可以选择启用MySQL数据库进行持久化存储。
 
-## 前提条件
+## 配置方式
 
-1. 已有一个可用的MySQL服务器
-2. 有足够的权限创建数据库和表
-3. 网络连接正常（容器可以访问MySQL服务器）
+### 1. 明文密码配置
+
+在 `.env` 文件中直接设置明文密码：
+
+```bash
+# .env 文件
+DB_HOST=localhost          # MySQL服务器地址
+DB_PORT=3306              # MySQL端口
+DB_USER=root              # MySQL用户名
+DB_PASSWORD=password      # MySQL密码（明文）
+DB_NAME=model_training    # 数据库名称
+```
+
+### 2. 如果不知道密码，重置MySQL
+
+手动重置MySQL：
+
+```bash
+# 检查MySQL连接
+mysql -u root -p -e "SELECT 1;"
+
+# 删除并重新创建数据库
+mysql -u root -p -e "DROP DATABASE IF EXISTS model_training; CREATE DATABASE model_training CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+# 创建新用户（可选）
+mysql -u root -p -e "CREATE USER IF NOT EXISTS 'appuser'@'%' IDENTIFIED BY 'password'; GRANT ALL PRIVILEGES ON model_training.* TO 'appuser'@'%'; FLUSH PRIVILEGES;"
+```
 
 ## 启动方式
 
-### 1. 配置MySQL连接
-
-```bash
-# 复制环境变量文件
-cp .env.example .env
-
-# 编辑环境变量，设置正确的MySQL连接信息
-nano .env
-```
-
-### 2. 创建数据库（如果需要）
-
-```sql
-CREATE DATABASE model_training CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-```
-
-### 3. 启动应用
-
-#### 使用GPU版本（推荐）
+### 使用GPU版本（推荐）
 ```bash
 docker compose up -d --build
 ```
 
-#### 使用CPU版本
+### 使用CPU版本
 ```bash
 docker compose -f docker-compose.cpu.yml up -d --build
 ```
@@ -48,13 +54,6 @@ docker compose -f docker-compose.cpu.yml up -d --build
 - `DB_USER`: MySQL用户名（默认：root）
 - `DB_PASSWORD`: MySQL密码（默认：password）
 - `DB_NAME`: 数据库名称（默认：model_training）
-- `DB_CHARSET`: 字符集（默认：utf8mb4）
-- `DB_COLLATION`: 排序规则（默认：utf8mb4_unicode_ci）
-- `DB_POOL_SIZE`: 连接池大小（默认：10）
-- `DB_MAX_OVERFLOW`: 最大溢出连接数（默认：20）
-- `DB_POOL_TIMEOUT`: 获取连接超时时间（默认：30）
-- `DB_POOL_RECYCLE`: 连接回收时间（默认：3600）
-- `DB_ECHO`: 是否显示SQL语句（默认：false）
 
 ## 数据库表结构
 
@@ -91,12 +90,6 @@ docker compose -f docker-compose.cpu.yml up -d --build
 - timestamp: 日志时间戳
 - message: 日志消息
 
-## 数据持久化
-
-项目采用双重存储策略：
-1. **文件系统**：用于存储模型文件（.pt）、预处理配置等
-2. **MySQL数据库**：用于存储元数据、任务状态和日志
-
 ## 数据库初始化
 
 项目启动时会自动执行数据库初始化：
@@ -124,70 +117,21 @@ docker exec -it model-trainer bash
 python app/db_init.py
 ```
 
-### 禁用数据库支持
-如果不想使用数据库，可以通过环境变量禁用：
+### 忘记密码
+如果忘记密码，可以手动重置MySQL：
 ```bash
-export USE_DATABASE=false
-docker compose up -d --build
+# 删除并重新创建数据库
+mysql -u root -p -e "DROP DATABASE IF EXISTS model_training; CREATE DATABASE model_training CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 ```
 
-## 性能考虑
 
-1. 数据库操作可能会影响性能，特别是在高并发场景下
-2. 日志数据量较大，建议定期清理或使用日志轮转
-3. 可以根据需要调整数据库连接池大小
-4. 考虑使用读写分离来提高性能
-
-## 备份与恢复
-
-### 数据库备份
-```bash
-# 备份数据库
-mysqldump -u root -p model_training > backup.sql
-
-# 恢复数据库
-mysql -u root -p model_training < backup.sql
-```
-
-### 文件系统备份
-```bash
-# 备份整个data目录
-tar -czf data_backup.tar.gz data/
-```
-
-## 监控与维护
-
-### 查看数据库状态
-```sql
--- 查看数据库状态
-SHOW STATUS;
-
--- 查看慢查询
-SHOW VARIABLES LIKE '%slow_query%';
-
--- 查看连接数
-SHOW STATUS LIKE 'Threads_connected';
-```
-
-### 定期维护
-```sql
--- 优化表
-OPTIMIZE TABLE datasets, training_jobs, job_logs;
-
--- 分析表
-ANALYZE TABLE datasets, training_jobs, job_logs;
-
--- 清理过期数据
-DELETE FROM job_logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY);
-```
 
 ## 安全建议
 
 1. 使用强密码
 2. 限制访问权限
-3. 使用SSL连接
-4. 定期更新密码
-5. 定期备份数据
+3. 定期更新密码
+4. 定期备份数据
 
 ## 详细配置说明
 

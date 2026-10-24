@@ -334,9 +334,9 @@ class DatasetManager:
             
             # 计算统计信息
             stats = {
-                "total_rows": len(df),
-                "total_columns": len(df.columns),
-                "memory_usage_mb": df.memory_usage(deep=True).sum() / 1024 / 1024,
+                "total_rows": int(len(df)),
+                "total_columns": int(len(df.columns)),
+                "memory_usage_mb": float(df.memory_usage(deep=True).sum() / 1024 / 1024),
                 "column_stats": {}
             }
             
@@ -348,18 +348,18 @@ class DatasetManager:
                 if col_type in ['int64', 'float64']:
                     stats["column_stats"][col] = {
                         "type": col_type,
-                        "min": col_data.min(),
-                        "max": col_data.max(),
-                        "mean": col_data.mean(),
-                        "std": col_data.std(),
-                        "null_count": col_data.isnull().sum()
+                        "min": float(col_data.min()),
+                        "max": float(col_data.max()),
+                        "mean": float(col_data.mean()),
+                        "std": float(col_data.std()),
+                        "null_count": int(col_data.isnull().sum())
                     }
                 else:
                     stats["column_stats"][col] = {
                         "type": col_type,
-                        "unique_count": col_data.nunique(),
-                        "top_values": col_data.value_counts().head(5).to_dict(),
-                        "null_count": col_data.isnull().sum()
+                        "unique_count": int(col_data.nunique()),
+                        "top_values": {str(k): int(v) for k, v in col_data.value_counts().head(5).items()},
+                        "null_count": int(col_data.isnull().sum())
                     }
             
             return stats
