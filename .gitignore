@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 可视化训练平台运行时数据（数据集/任务/模型产物）
+data/
+backend/.venv/
