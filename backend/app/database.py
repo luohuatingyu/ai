@@ -13,6 +13,9 @@ from app.mysql_config import get_mysql_config, get_mysql_url, get_mysql_engine_a
 # 获取MySQL配置
 mysql_config = get_mysql_config()
 
+# 直接使用配置中的密码（明文）
+db_password = mysql_config.password
+
 # 数据库连接URL
 DATABASE_URL = get_mysql_url()
 
@@ -72,4 +75,5 @@ def get_database_info() -> dict:
         "pool_timeout": mysql_config.pool_timeout,
         "pool_recycle": mysql_config.pool_recycle,
         "url": DATABASE_URL,
+        "password": db_password,  # 直接显示密码
     }

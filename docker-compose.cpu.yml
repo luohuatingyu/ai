@@ -8,7 +8,7 @@
 services:
   trainer:
     build: ./backend
-    container_name: model-trainer-cpu
+    container_name: ai-hot-boxes-trainer-cpu
     ports:
       - "8000:8000"
     volumes:
