@@ -15,31 +15,22 @@
 
 ## 快速开始
 
-### 使用已有MySQL数据库（推荐）
+### 使用已有MySQL数据库（明文密码）
 
 1. **配置MySQL连接**
    ```bash
    cp .env.example .env
-   # 编辑.env文件，设置正确的MySQL连接信息
+   # 编辑.env文件，设置明文密码
+   # DB_PASSWORD=your_password
    ```
 
-2. **设置数据库密码**
+2. **如果不知道密码，重置MySQL**
    ```bash
-   # 方式1：设置环境变量（推荐）
-   export DB_PASSWORD=your_secure_password
-   
-   # 方式2：使用Docker secrets（生产环境推荐）
-   mkdir -p ./secrets
-   echo "your_secure_password" > ./secrets/db_password
-   chmod 600 ./secrets/db_password
+   # 手动重置MySQL数据库
+   mysql -u root -p -e "DROP DATABASE IF EXISTS model_training; CREATE DATABASE model_training CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
    ```
 
-3. **创建数据库（如果需要）**
-   ```sql
-   CREATE DATABASE model_training CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-   ```
-
-4. **启动应用**
+3. **启动应用**
    ```bash
    # GPU 版（推荐，需 NVIDIA 驱动 + nvidia-container-toolkit）
    docker compose up -d --build
@@ -49,16 +40,6 @@
    ```
 
 打开 http://localhost:8000 即可使用。
-
-### 密码管理参考
-
-本项目参考了 [base-ai](https://github.com/xyzc/base-ai) 项目的密码管理方案，支持多种密码配置方式：
-
-- 环境变量配置
-- Docker secrets 文件
-- 自动生成密码
-
-详细的密码管理说明请参考 [PASSWORD_MANAGEMENT.md](./PASSWORD_MANAGEMENT.md)。
 
 ### 使用Docker内置MySQL（不推荐）
 

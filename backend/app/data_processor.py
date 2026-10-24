@@ -231,28 +231,46 @@ class DataProcessor:
     
     def get_data_profile(self, df: pd.DataFrame) -> Dict[str, Any]:
         """获取数据概览"""
+        # 转换numpy类型为Python原生类型，以便JSON序列化
+        def convert_types(obj):
+            if isinstance(obj, dict):
+                return {k: convert_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_types(v) for v in obj]
+            elif isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+        
         profile = {
             "shape": df.shape,
             "columns": df.columns.tolist(),
-            "dtypes": df.dtypes.to_dict(),
-            "memory_usage": df.memory_usage(deep=True).sum(),
-            "missing_values": df.isnull().sum().to_dict(),
-            "duplicates": df.duplicated().sum(),
+            "dtypes": {str(col): str(dtype) for col, dtype in df.dtypes.items()},
+            "memory_usage": int(df.memory_usage(deep=True).sum()),
+            "missing_values": {str(col): int(count) for col, count in df.isnull().sum().items()},
+            "duplicates": int(df.duplicated().sum()),
         }
         
         # 数值列统计
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         if len(numeric_cols) > 0:
-            profile["numeric_stats"] = df[numeric_cols].describe().to_dict()
+            describe_stats = df[numeric_cols].describe()
+            profile["numeric_stats"] = convert_types(describe_stats.to_dict())
         
         # 分类列统计
         categorical_cols = df.select_dtypes(include=['object']).columns
         if len(categorical_cols) > 0:
             profile["categorical_stats"] = {}
             for col in categorical_cols:
-                profile["categorical_stats"][col] = {
-                    "unique_count": df[col].nunique(),
-                    "top_values": df[col].value_counts().head(5).to_dict()
+                profile["categorical_stats"][str(col)] = {
+                    "unique_count": int(df[col].nunique()),
+                    "top_values": {str(k): int(v) for k, v in df[col].value_counts().head(5).items()}
                 }
         
         return profile
