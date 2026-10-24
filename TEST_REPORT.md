@@ -2,10 +2,10 @@
 
 ## Git基准点
 
-- **Commit Hash**: 633bbcb
-- **提交信息**: Fix dataset storage format compatibility between DatasetManager and legacy paths
+- **Commit Hash**: 3bb4a96
+- **提交信息**: Merge emdash/hot-boxes-clean-y9u6p: dataset compatibility fixes and AGENTS.md improvements
 - **测试日期**: 2026-10-24
-- **分支**: emdash/hot-boxes-clean-y9u6p
+- **分支**: master（自 emdash/hot-boxes-clean-y9u6p 合并，该分支本地功能测试 32/32；容器化验证基于本合并提交）
 
 ## 本次变更测试结果（2026-10-24）
 
@@ -47,6 +47,19 @@
 cd backend && python3 test_comprehensive.py   # 32/32 通过
 ```
 
+## 容器化部署验证（2026-10-24）
+
+**验证环境**：master 合并提交 `3bb4a96`；Apple Silicon 宿主机（无 NVIDIA GPU）→ 按 README 规范使用 `docker-compose.cpu.yml`（镜像相同，仅去掉 gpus 声明）；Docker Hub 网络已恢复。
+
+**验证结果**：
+- ✅ 镜像构建成功：`docker compose -f docker-compose.cpu.yml up --build -d`（含 torch CUDA wheel 安装，容器内 Python 3.12 + torch 2.14.1+cu130，宿主有 GPU 时自动启用）
+- ✅ 容器启动正常：MySQL 不可达时按设计等待后跳过初始化，文件存储为主数据源
+- ✅ 核心链路端到端通过：示例导入 → 详情预览 → 训练（2 epochs，completed，准确率 0.75）→ 单条预测（返回预测 + 概率）
+- ✅ **数据持久化挂载验证**：容器内写入的数据集元数据与任务产物（best.pt / job.json / metrics.jsonl 等）正确落盘宿主机 `./data/`，证明 `config.py` 容器路径修复（633bbcb）在容器环境行为正确
+- ✅ 验证后清理：测试数据集/任务已通过 API 删除，容器已停止
+
+**已知噪音**：容器日志中 `/health` 404 来自外部监控探测（compose 与 Dockerfile 均未配置 healthcheck；应用路由为 `/api/health`），对功能无影响。
+
 ## 测试覆盖范围
 
 - ✅ 正常场景：健康检查、系统信息、示例导入全链路、训练监控、预测、模型下载
@@ -58,10 +71,11 @@ cd backend && python3 test_comprehensive.py   # 32/32 通过
 
 ## 已知问题与限制
 
-1. **Docker 镜像构建失败（环境网络受限）**：`docker compose up --build -d` 因无法连接 Docker Hub（`auth.docker.io` i/o timeout）失败，本次修复未在容器内运行验证。已通过本地 uvicorn（相同代码）验证全部功能；`config.py` 的容器路径逻辑（检测 `/app` 目录）建议网络恢复后以 `docker compose up --build -d` 复验
+1. **Docker 验证已完成（2026-10-24）**：早前因无法连接 Docker Hub 构建失败；网络恢复后已完成容器化验证，全链路通过且数据挂载正确（见"容器化部署验证"章节）。GPU 探测路径（CUDA 分支）因本机无 NVIDIA GPU 未验证，需在 GPU 宿主机复验
 2. **`/api/datasets/{id}/process` 与 `/api/datasets/{id}/profile` 端点仍仅支持新格式数据集**（读取 `raw/`、`processed/` 固定路径），对旧扁平格式数据集返回 500；核心链路（导入/列表/详情/训练/预测）已双格式兼容
 3. **MySQL 数据库路径未测试**：本地无可用数据库连接（`USE_DATABASE=false` 运行），DB 镜像逻辑仅做代码走查
-4. **远端分支 `origin/hot-boxes-temp` 仍含历史临时测试脚本提交**：本地分支已通过 rebase 剔除并清理，但 AGENTS.md 禁止 `git push`，无法清理远端；如需清理请明确授权后执行 push
+4. **远端仓库待同步（需 push 授权）**：`origin/hot-boxes-temp` 仍含历史临时测试脚本提交（本地已剔除并删除分支）；`origin/master` 落后于本地 master。AGENTS.md 禁止 `git push`，如需同步请明确授权
+5. **分支 `emdash/hot-boxes-clean-y9u6p` 存在并行开发中的新模块**（`fd40a1e`：storage 抽象 + coordination 平面，尚未接线到 main/jobs）：未纳入 master 合并范围，待其功能完成并测试后再合并
 
 ## 重测触发条件
 
@@ -73,9 +87,10 @@ cd backend && python3 test_comprehensive.py   # 32/32 通过
 
 ## 下次测试建议
 
-1. 网络恢复后执行 `docker compose up --build -d` 完成容器化部署验证（含 GPU 探测）
+1. 在 NVIDIA GPU 宿主机上验证 GPU 版 compose（`gpus` 声明与 CUDA 自动启用路径）
 2. 补齐 `/api/datasets/{id}/process`、`/profile` 端点的旧格式兼容（或明确限制新格式使用）
 3. 配置可用 MySQL 后测试数据库镜像路径（datasets/training_jobs/job_logs 三表双写）
 4. 补充前端页面交互测试（Chart.js 曲线、日志增量拉取、进度条）
 5. 将临时功能测试固化为正式测试套件（建议 pytest + httpx，纳入 requirements-dev）
 6. 上传接口实测 multipart 上传流程（本次因无现成 CSV 上传样例，通过示例导入覆盖等价路径）
+7. `fd40a1e` 的 storage/coordination 新模块接线后，补充多机架构（嵌入式模式/Redis/MinIO）功能测试
