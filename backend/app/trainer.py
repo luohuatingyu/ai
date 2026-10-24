@@ -67,12 +67,21 @@ def _build_model(
 
 
 def _pick_device(log_fn: LogFn) -> torch.device:
-    if torch.cuda.is_available():
-        name = torch.cuda.get_device_name(0)
-        log_fn(f"使用 GPU: {name} (CUDA {torch.version.cuda})")
-        return torch.device("cuda")
-    log_fn("未检测到 GPU，使用 CPU 训练（速度较慢，可补充 GPU 环境后复用本镜像）")
-    return torch.device("cpu")
+    # 首先尝试初始化GPU
+    try:
+        if torch.cuda.is_available():
+            # 尝试获取GPU设备名称，如果失败则抛出异常
+            name = torch.cuda.get_device_name(0)
+            # 尝试创建一个张量来测试GPU是否真正可用
+            test_tensor = torch.tensor([1.0], device='cuda')
+            log_fn(f"成功启动 GPU: {name} (CUDA {torch.version.cuda})")
+            return torch.device("cuda")
+        else:
+            raise RuntimeError("CUDA 不可用")
+    except Exception as e:
+        # GPU初始化失败，回退到CPU
+        log_fn(f"GPU 初始化失败: {str(e)}，回退到 CPU 训练（速度较慢，可检查 GPU 驱动和 CUDA 版本）")
+        return torch.device("cpu")
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 
 # 容器内默认 /app/data，通过 docker-compose 挂载到宿主机 ./data 以持久化
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+# 本地开发使用相对路径
+DATA_DIR = Path(os.environ.get("DATA_DIR", "../data"))
 DATASETS_DIR = DATA_DIR / "datasets"
 JOBS_DIR = DATA_DIR / "jobs"
 

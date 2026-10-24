@@ -15,17 +15,19 @@
 
 ## 快速开始
 
-### 使用已有MySQL数据库（推荐）
+### 使用已有MySQL数据库（明文密码）
 
 1. **配置MySQL连接**
    ```bash
    cp .env.example .env
-   # 编辑.env文件，设置正确的MySQL连接信息
+   # 编辑.env文件，设置明文密码
+   # DB_PASSWORD=your_password
    ```
 
-2. **创建数据库（如果需要）**
-   ```sql
-   CREATE DATABASE model_training CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+2. **如果不知道密码，重置MySQL**
+   ```bash
+   # 手动重置MySQL数据库
+   mysql -u root -p -e "DROP DATABASE IF EXISTS model_training; CREATE DATABASE model_training CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
    ```
 
 3. **启动应用**
