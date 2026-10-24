@@ -9,20 +9,52 @@
 - 🏆 训练完成自动给出分类报告 / 回归指标（MSE、RMSE、MAE、R²）
 - 🔮 加载 best.pt 在线单条预测，模型权重可下载
 - 🔧 预留 GPU 接入：镜像内置 CUDA 12 构建 torch，宿主机装好驱动即自动启用 GPU
+- 💾 支持MySQL数据库存储，使用已有MySQL服务器
 
 无需任何登录/权限逻辑，开放访问。
 
 ## 快速开始
 
-```bash
-# GPU 版（推荐，需 NVIDIA 驱动 + nvidia-container-toolkit）
-docker compose up -d --build
+### 使用已有MySQL数据库（推荐）
 
-# GPU 尚未就绪时，先用 CPU 版把页面跑起来（镜像相同，仅去掉 gpus 声明）
-docker compose -f docker-compose.cpu.yml up -d --build
-```
+1. **配置MySQL连接**
+   ```bash
+   cp .env.example .env
+   # 编辑.env文件，设置正确的MySQL连接信息
+   ```
+
+2. **创建数据库（如果需要）**
+   ```sql
+   CREATE DATABASE model_training CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+   ```
+
+3. **启动应用**
+   ```bash
+   # GPU 版（推荐，需 NVIDIA 驱动 + nvidia-container-toolkit）
+   docker compose up -d --build
+
+   # GPU 尚未就绪时，先用 CPU 版把页面跑起来（镜像相同，仅去掉 gpus 声明）
+   docker compose -f docker-compose.cpu.yml up -d --build
+   ```
 
 打开 http://localhost:8000 即可使用。
+
+### 使用Docker内置MySQL（不推荐）
+
+如果您想快速测试，可以使用Docker内置的MySQL：
+
+```bash
+# 1. 先启动MySQL
+docker run -d --name mysql-temp -e MYSQL_ROOT_PASSWORD=password -e MYSQL_DATABASE=model_training -e MYSQL_USER=appuser -e MYSQL_PASSWORD=apppass -p 33061:3306 mysql:8.0
+
+# 2. 启动应用
+export DB_HOST=localhost
+export DB_PORT=33061
+export DB_USER=root
+export DB_PASSWORD=password
+export DB_NAME=model_training
+docker compose up -d --build
+```
 
 建议流程：在左侧先点「＋ classification_demo」「＋ regression_demo」导入任意一个内置示例数据集（客户流失二分类 / 房价回归），点「开始训练」，右侧实时观看曲线与日志。
 
@@ -38,6 +70,15 @@ docker compose -f docker-compose.cpu.yml up -d --build
 
 CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch.cuda.is_available()`，无 GPU 时仅打印提示并回退 CPU。
 
+## 数据库（MySQL，可选镜像存储）
+
+采用**文件为主、数据库镜像**的双写设计：`./data/` 下的 job.json / log.txt / metrics.jsonl 始终是第一数据源，MySQL 仅镜像 `datasets` / `training_jobs` / `job_logs` 三张表；**数据库不可用时训练、上传、页面完全不受影响**（启动脚本等待最多 90 秒后跳过初始化）。
+
+- 首次启动自动建表（`backend/app/db_init.py`）
+- `USE_DATABASE=false` 可彻底关闭数据库路径（仅文件存储）
+- 页面图表依赖 Chart.js CDN（浏览器需可访问公网），训练与数据存储全程本地完成
+- 详细说明见根目录 `MYSQL_SETUP.md`、`USING_EXISTING_MYSQL.md`
+
 ## 目录结构
 
 ```
@@ -50,6 +91,7 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 │   │   ├── main.py           # FastAPI 路由 + 静态页托管
 │   │   ├── jobs.py           # 任务管理：线程池、状态机、持久化、日志
 │   │   ├── trainer.py        # CSV 分类/回归训练器（PyTorch）+ 在线预测
+│   │   ├── database.py / models.py / db_utils.py / db_init.py  # MySQL 可选镜像
 │   │   └── config.py
 │   ├── static/index.html     # 可视化单页（无 Node 构建）
 │   ├── sample_data/          # 内置示例数据集
