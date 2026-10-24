@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>数据集管理</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        header {
+            background-color: #fff;
+            padding: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+        
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+        }
+        
+        .upload-section {
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+        
+        .upload-area {
+            border: 2px dashed #3498db;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        
+        .upload-area:hover {
+            background-color: #f8f9fa;
+            border-color: #2980b9;
+        }
+        
+        .upload-area.drag-over {
+            background-color: #e3f2fd;
+            border-color: #1976d2;
+        }
+        
+        .upload-icon {
+            font-size: 48px;
+            color: #3498db;
+            margin-bottom: 10px;
+        }
+        
+        .upload-text {
+            font-size: 16px;
+            color: #555;
+            margin-bottom: 10px;
+        }
+        
+        .file-input {
+            display: none;
+        }
+        
+        .btn {
+            display: inline-block;
+            padding: 10px 20px;
+            background-color: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s ease;
+        }
+        
+        .btn:hover {
+            background-color: #2980b9;
+        }
+        
+        .btn-secondary {
+            background-color: #95a5a6;
+        }
+        
+        .btn-secondary:hover {
+            background-color: #7f8c8d;
+        }
+        
+        .btn-danger {
+            background-color: #e74c3c;
+        }
+        
+        .btn-danger:hover {
+            background-color: #c0392b;
+        }
+        
+        .dataset-section {
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .filter-bar {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .search-input {
+            flex: 1;
+            min-width: 200px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        
+        .tag-filter {
+            display: flex;
+            gap: 5px;
+            flex-wrap: wrap;
+        }
+        
+        .tag {
+            background-color: #e3f2fd;
+            color: #1976d2;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .tag:hover {
+            background-color: #bbdefb;
+        }
+        
+        .tag.active {
+            background-color: #1976d2;
+            color: white;
+        }
+        
+        .dataset-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .dataset-card {
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 20px;
+            transition: all 0.3s ease;
+        }
+        
+        .dataset-card:hover {
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            transform: translateY(-2px);
+        }
+        
+        .dataset-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .dataset-title {
+            font-size: 18px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        
+        .dataset-actions {
+            display: flex;
+            gap: 5px;
+        }
+        
+        .dataset-info {
+            margin-bottom: 15px;
+        }
+        
+        .dataset-meta {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        
+        .dataset-tags {
+            display: flex;
+            gap: 5px;
+            flex-wrap: wrap;
+        }
+        
+        .preview-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        
+        .preview-table th,
+        .preview-table td {
+            padding: 5px;
+            border: 1px solid #ddd;
+            text-align: left;
+        }
+        
+        .preview-table th {
+            background-color: #f8f9fa;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            z-index: 1000;
+        }
+        
+        .modal-content {
+            background-color: white;
+            margin: 50px auto;
+            padding: 30px;
+            width: 80%;
+            max-width: 600px;
+            border-radius: 8px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .modal-title {
+            font-size: 24px;
+            font-weight: bold;
+        }
+        
+        .close-btn {
+            font-size: 28px;
+            cursor: pointer;
+            color: #aaa;
+        }
+        
+        .close-btn:hover {
+            color: #000;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        
+        .form-input,
+        .form-textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        
+        .form-textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+        
+        .processing-operations {
+            margin-top: 20px;
+        }
+        
+        .operation-item {
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 10px;
+        }
+        
+        .operation-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .operation-title {
+            font-weight: bold;
+        }
+        
+        .operation-params {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 10px;
+        }
+        
+        .param-group {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .param-label {
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+        
+        .param-input {
+            padding: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px 20px;
+            border-radius: 4px;
+            color: white;
+            font-weight: bold;
+            z-index: 2000;
+            animation: slideIn 0.3s ease;
+        }
+        
+        .notification.success {
+            background-color: #27ae60;
+        }
+        
+        .notification.error {
+            background-color: #e74c3c;
+        }
+        
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>数据集管理</h1>
+        </div>
+    </header>
+    
+    <div class="container">
+        <!-- 上传区域 -->
+        <section class="upload-section">
+            <h2>上传数据集</h2>
+            <div class="upload-area" id="uploadArea">
+                <div class="upload-icon">📁</div>
+                <div class="upload-text">拖拽文件到此处或点击选择文件</div>
+                <div class="upload-text">支持 CSV、Excel、JSON 及压缩文件</div>
+                <input type="file" id="fileInput" class="file-input" multiple accept=".csv,.xlsx,.xls,.json,.zip,.tar,.tar.gz,.tgz">
+                <button class="btn" onclick="document.getElementById('fileInput').click()">选择文件</button>
+            </div>
+            <div id="uploadProgress" style="margin-top: 20px; display: none;">
+                <div class="loading"></div>
+                <span id="uploadStatus">上传中...</span>
+            </div>
+        </section>
+        
+        <!-- 数据集列表 -->
+        <section class="dataset-section">
+            <h2>数据集列表</h2>
+            
+            <!-- 筛选栏 -->
+            <div class="filter-bar">
+                <input type="text" class="search-input" id="searchInput" placeholder="搜索数据集...">
+                <div class="tag-filter" id="tagFilter">
+                    <!-- 标签将动态加载 -->
+                </div>
+            </div>
+            
+            <!-- 数据集网格 -->
+            <div class="dataset-grid" id="datasetGrid">
+                <!-- 数据集卡片将动态加载 -->
+            </div>
+        </section>
+    </div>
+    
+    <!-- 数据集详情模态框 -->
+    <div class="modal" id="datasetModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title" id="modalTitle">数据集详情</h3>
+                <span class="close-btn" onclick="closeModal()">&times;</span>
+            </div>
+            <div id="modalBody">
+                <!-- 模态框内容将动态加载 -->
+            </div>
+        </div>
+    </div>
+    
+    <!-- 数据处理模态框 -->
+    <div class="modal" id="processingModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">数据处理</h3>
+                <span class="close-btn" onclick="closeProcessingModal()">&times;</span>
+            </div>
+            <div id="processingBody">
+                <!-- 处理选项将动态加载 -->
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // API 基础URL
+        const API_BASE = '/api';
+        
+        // 全局变量
+        let datasets = [];
+        let allTags = [];
+        let selectedTags = [];
+        
+        // 初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeUpload();
+            loadDatasets();
+            loadTags();
+        });
+        
+        // 初始化上传功能
+        function initializeUpload() {
+            const uploadArea = document.getElementById('uploadArea');
+            const fileInput = document.getElementById('fileInput');
+            
+            // 拖拽事件
+            uploadArea.addEventListener('dragover', function(e) {
+                e.preventDefault();
+                uploadArea.classList.add('drag-over');
+            });
+            
+            uploadArea.addEventListener('dragleave', function(e) {
+                e.preventDefault();
+                uploadArea.classList.remove('drag-over');
+            });
+            
+            uploadArea.addEventListener('drop', function(e) {
+                e.preventDefault();
+                uploadArea.classList.remove('drag-over');
+                
+                const files = e.dataTransfer.files;
+                handleFiles(files);
+            });
+            
+            // 文件选择事件
+            fileInput.addEventListener('change', function(e) {
+                handleFiles(e.target.files);
+            });
+        }
+        
+        // 处理文件上传
+        async function handleFiles(files) {
+            const uploadProgress = document.getElementById('uploadProgress');
+            const uploadStatus = document.getElementById('uploadStatus');
+            
+            uploadProgress.style.display = 'block';
+            uploadStatus.textContent = `正在上传 ${files.length} 个文件...`;
+            
+            const results = [];
+            const totalFiles = files.length;
+            
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                uploadStatus.textContent = `正在上传 ${i + 1}/${totalFiles}: ${file.name}`;
+                
+                try {
+                    const result = await uploadFile(file);
+                    results.push({
+                        file: file.name,
+                        success: true,
+                        data: result
+                    });
+                } catch (error) {
+                    results.push({
+                        file: file.name,
+                        success: false,
+                        error: error.message
+                    });
+                }
+            }
+            
+            uploadProgress.style.display = 'none';
+            
+            // 显示结果
+            let successCount = results.filter(r => r.success).length;
+            let message = `上传完成: ${successCount}/${totalFiles} 成功`;
+            
+            if (successCount < totalFiles) {
+                message += '\n失败文件:\n';
+                results.filter(r => !r.success).forEach(r => {
+                    message += `- ${r.file}: ${r.error}\n`;
+                });
+            }
+            
+            showNotification(message, successCount === totalFiles ? 'success' : 'error');
+            
+            // 刷新数据集列表
+            loadDatasets();
+        }
+        
+        // 上传单个文件
+        async function uploadFile(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            const response = await fetch(`${API_BASE}/datasets`, {
+                method: 'POST',
+                body: formData
+            });
+            
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || '上传失败');
+            }
+            
+            return await response.json();
+        }
+        
+        // 加载数据集列表
+        async function loadDatasets() {
+            try {
+                const response = await fetch(`${API_BASE}/datasets`);
+                if (!response.ok) throw new Error('加载数据集失败');
+                
+                const data = await response.json();
+                datasets = data.datasets;
+                
+                renderDatasets(datasets);
+            } catch (error) {
+                showNotification(error.message, 'error');
+            }
+        }
+        
+        // 渲染数据集列表
+        function renderDatasets(datasetsToRender) {
+            const grid = document.getElementById('datasetGrid');
+            grid.innerHTML = '';
+            
+            if (datasetsToRender.length === 0) {
+                grid.innerHTML = '<p style="text-align: center; color: #666;">暂无数据集</p>';
+                return;
+            }
+            
+            datasetsToRender.forEach(dataset => {
+                const card = createDatasetCard(dataset);
+                grid.appendChild(card);
+            });
+        }
+        
+        // 创建数据集卡片
+        function createDatasetCard(dataset) {
+            const card = document.createElement('div');
+            card.className = 'dataset-card';
+            
+            const tagsHtml = dataset.tags.map(tag => `<span class="tag">${tag}</span>`).join('');
+            
+            card.innerHTML = `
+                <div class="dataset-header">
+                    <h3 class="dataset-title">${dataset.name}</h3>
+                    <div class="dataset-actions">
+                        <button class="btn" onclick="showDatasetDetail('${dataset.id}')">详情</button>
+                        <button class="btn btn-secondary" onclick="processDataset('${dataset.id}')">处理</button>
+                        <button class="btn btn-danger" onclick="deleteDataset('${dataset.id}')">删除</button>
+                    </div>
+                </div>
+                <div class="dataset-info">
+                    <div class="dataset-meta">行数: ${dataset.rows}</div>
+                    <div class="dataset-meta">列数: ${dataset.columns.length}</div>
+                    <div class="dataset-meta">创建时间: ${new Date(dataset.created_at * 1000).toLocaleString()}</div>
+                    <div class="dataset-tags">${tagsHtml}</div>
+                </div>
+                <div class="preview-table">
+                    <table>
+                        <thead>
+                            <tr>
+                                ${dataset.columns.slice(0, 3).map(col => `<th>${col}</th>`).join('')}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${dataset.preview ? dataset.preview.slice(0, 3).map(row => 
+                                `<tr>${dataset.columns.slice(0, 3).map(col => `<td>${row[col] || ''}</td>`).join('')}</tr>`
+                            ).join('') : ''}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            
+            return card;
+        }
+        
+        // 显示数据集详情
+        async function showDatasetDetail(datasetId) {
+            try {
+                const response = await fetch(`${API_BASE}/datasets/${datasetId}`);
+                if (!response.ok) throw new Error('获取数据集详情失败');
+                
+                const dataset = await response.json();
+                
+                const modal = document.getElementById('datasetModal');
+                const modalTitle = document.getElementById('modalTitle');
+                const modalBody = document.getElementById('modalBody');
+                
+                modalTitle.textContent = dataset.name;
+                
+                const statsHtml = `
+                    <div class="dataset-info">
+                        <div class="dataset-meta">ID: ${dataset.id}</div>
+                        <div class="dataset-meta">行数: ${dataset.rows}</div>
+                        <div class="dataset-meta">列数: ${dataset.columns.length}</div>
+                        <div class="dataset-meta">文件大小: ${formatBytes(dataset.file_size)}</div>
+                        <div class="dataset-meta">创建时间: ${new Date(dataset.created_at * 1000).toLocaleString()}</div>
+                        <div class="dataset-meta">更新时间: ${new Date(dataset.updated_at * 1000).toLocaleString()}</div>
+                    </div>
+                    <h4>列信息</h4>
+                    <table class="preview-table">
+                        <thead>
+                            <tr>
+                                <th>列名</th>
+                                <th>数据类型</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${dataset.columns.map(col => 
+                                `<tr><td>${col}</td><td>${dataset.column_types[col]}</td></tr>`
+                            ).join('')}
+                        </tbody>
+                    </table>
+                    ${dataset.description ? `<h4>描述</h4><p>${dataset.description}</p>` : ''}
+                    ${dataset.tags.length > 0 ? `
+                        <h4>标签</h4>
+                        <div class="dataset-tags">
+                            ${dataset.tags.map(tag => `<span class="tag">${tag}</span>`).join('')}
+                        </div>
+                    ` : ''}
+                `;
+                
+                modalBody.innerHTML = statsHtml;
+                modal.style.display = 'block';
+            } catch (error) {
+                showNotification(error.message, 'error');
+            }
+        }
+        
+        // 处理数据集
+        async function processDataset(datasetId) {
+            try {
+                const response = await fetch(`${API_BASE}/processing/operations`);
+                if (!response.ok) throw new Error('获取处理操作失败');
+                
+                const operations = await response.json();
+                
+                const modal = document.getElementById('processingModal');
+                const modalBody = document.getElementById('processingBody');
+                
+                let operationsHtml = '<div class="processing-operations">';
+                
+                operations.operations.forEach(op => {
+                    operationsHtml += `
+                        <div class="operation-item">
+                            <div class="operation-header">
+                                <div class="operation-title">${op.name}</div>
+                                <button class="btn" onclick="addOperation('${op.type}')">添加</button>
+                            </div>
+                            <div class="operation-description">${op.description}</div>
+                            <div class="operation-params">
+                                ${Object.entries(op.params).map(([key, param]) => `
+                                    <div class="param-group">
+                                        <label class="param-label">${param.description}</label>
+                                        <input type="text" class="param-input" id="${op.type}_${key}" placeholder="${param.type}">
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                operationsHtml += '</div>';
+                
+                modalBody.innerHTML = operationsHtml;
+                modal.style.display = 'block';
+            } catch (error) {
+                showNotification(error.message, 'error');
+            }
+        }
+        
+        // 删除数据集
+        async function deleteDataset(datasetId) {
+            if (!confirm('确定要删除这个数据集吗？')) return;
+            
+            try {
+                const response = await fetch(`${API_BASE}/datasets/${datasetId}`, {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) throw new Error('删除数据集失败');
+                
+                showNotification('数据集已删除', 'success');
+                loadDatasets();
+            } catch (error) {
+                showNotification(error.message, 'error');
+            }
+        }
+        
+        // 加载标签
+        async function loadTags() {
+            try {
+                const response = await fetch(`${API_BASE}/datasets/tags`);
+                if (!response.ok) throw new Error('加载标签失败');
+                
+                const data = await response.json();
+                allTags = data.tags;
+                
+                renderTags();
+            } catch (error) {
+                console.error('加载标签失败:', error);
+            }
+        }
+        
+        // 渲染标签
+        function renderTags() {
+            const tagFilter = document.getElementById('tagFilter');
+            tagFilter.innerHTML = '';
+            
+            allTags.forEach(tag => {
+                const tagElement = document.createElement('span');
+                tagElement.className = 'tag';
+                tagElement.textContent = tag;
+                tagElement.onclick = () => toggleTag(tag);
+                tagFilter.appendChild(tagElement);
+            });
+        }
+        
+        // 切换标签
+        function toggleTag(tag) {
+            const index = selectedTags.indexOf(tag);
+            if (index > -1) {
+                selectedTags.splice(index, 1);
+            } else {
+                selectedTags.push(tag);
+            }
+            
+            // 更新标签样式
+            const tagElements = document.querySelectorAll('.tag');
+            tagElements.forEach(element => {
+                if (element.textContent === tag) {
+                    element.classList.toggle('active');
+                }
+            });
+            
+            // 筛选数据集
+            filterDatasets();
+        }
+        
+        // 筛选数据集
+        function filterDatasets() {
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            
+            let filtered = datasets;
+            
+            // 搜索筛选
+            if (searchTerm) {
+                filtered = filtered.filter(dataset => {
+                    return dataset.name.toLowerCase().includes(searchTerm) ||
+                           dataset.description.toLowerCase().includes(searchTerm) ||
+                           dataset.columns.some(col => col.toLowerCase().includes(searchTerm));
+                });
+            }
+            
+            // 标签筛选
+            if (selectedTags.length > 0) {
+                filtered = filtered.filter(dataset => {
+                    return selectedTags.some(tag => dataset.tags.includes(tag));
+                });
+            }
+            
+            renderDatasets(filtered);
+        }
+        
+        // 搜索事件监听
+        document.getElementById('searchInput').addEventListener('input', filterDatasets);
+        
+        // 关闭模态框
+        function closeModal() {
+            document.getElementById('datasetModal').style.display = 'none';
+        }
+        
+        function closeProcessingModal() {
+            document.getElementById('processingModal').style.display = 'none';
+        }
+        
+        // 显示通知
+        function showNotification(message, type = 'success') {
+            const notification = document.createElement('div');
+            notification.className = `notification ${type}`;
+            notification.textContent = message;
+            
+            document.body.appendChild(notification);
+            
+            setTimeout(() => {
+                notification.remove();
+            }, 3000);
+        }
+        
+        // 格式化字节数
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+        
+        // 添加操作（示例）
+        function addOperation(operationType) {
+            showNotification(`已添加操作: ${operationType}`, 'success');
+        }
+    </script>
+</body>
+</html>
