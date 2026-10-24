@@ -2,10 +2,47 @@
 
 ## Git基准点
 
-- **Commit Hash**: 308da1b
-- **提交信息**: Add AGENTS.md with testing and development guidelines
+- **Commit Hash**: a785599
+- **提交信息**: merge: Merge emdash/hot-boxes-clean-y9u6p branch into master
 - **测试日期**: 2026-10-24
-- **分支**: main
+- **分支**: master
+
+## 本次变更测试结果（2026-10-24）
+
+**变更范围**：将 `emdash/hot-boxes-clean-y9u6p` 功能分支合并进 master（合并提交 `a785599`），涉及：
+- 新增数据集管理模块（`dataset_manager.py`、`data_processor.py`、`dataset_importer.py`、`migrate_datasets.py`、`utils.py`、`dataset-manager.html`）
+- 修改数据库连接为明文密码 MySQL 配置（`database.py`），删除 `mysql_config.py`/`mysql_example.py`
+- 修改 `trainer.py` GPU 初始化逻辑（失败自动回退 CPU）
+- 修改 `main.py`（数据集上传/导入历史等 API）
+- 修改 `config.py`（DATA_DIR 默认值）与 docker-compose 配置
+- 新增 `AGENTS.md`、`TEST_REPORT.md`；删除过时文档（`MYSQL_SETUP.md`、`MYSQL_CONFIG.md`、`USING_EXISTING_MYSQL.md`）
+
+**测试执行结果**：
+- 总测试用例：0 个（执行被环境阻断）
+- 通过：0 个
+- 失败：0 个
+- 错误：0 个
+- 跳过：全部（原因见下）
+
+**受阻原因**：
+1. `docker compose up --build -d` 构建失败：访问 Docker Hub（`auth.docker.io`）i/o 超时（DNS 解析异常），基础镜像 `python:3.12-slim` 无法拉取，本地亦无缓存镜像
+2. 宿主机仅有系统 Python 3.9.6，无 AGENTS.md 要求的 Python 3.12，且未安装 fastapi/torch/pandas 等依赖，无法在本地启动后端进行 API 测试
+
+**关键模块测试**（均未执行）：
+- 数据层：未执行（构建受阻）
+- 服务层：未执行（构建受阻）
+- 训练器层：未执行（构建受阻）
+- API层：未执行（构建受阻）
+
+**未验证内容与建议验证方式**：
+- 未验证：服务启动、数据集上传/管理 API、训练任务启动与监控、GPU 初始化回退逻辑、数据持久化
+- 建议验证：网络恢复后执行 `docker compose up --build -d`，再依次执行 `curl http://localhost:8000/api/health`、`curl http://localhost:8000/api/system`、`curl http://localhost:8000/api/datasets`，并通过页面或 curl 上传 CSV 验证数据集完整流程
+
+**新发现的问题**：
+1. `config.py` 的 `DATA_DIR` 默认值已改为 `../data`（提交 `ea3d5b0`）。容器内 `WORKDIR /app` 下会解析为 `/data`，与 docker-compose 挂载的 `/app/data` 不一致，导致容器内数据不会持久化到宿主机 `./data`；且 docker-compose 未设置 `DATA_DIR` 环境变量。修复方案待用户确认（compose 增加 `DATA_DIR: /app/data` 环境变量，或恢复 `config.py` 默认值）
+2. 当前网络环境无法访问 Docker Hub，构建与运行时验证受阻
+
+**Git基准点**：a785599
 
 ## 测试执行结果
 
@@ -75,6 +112,8 @@
 1. 项目目前没有完整的测试套件
 2. 缺少自动化测试脚本
 3. 没有持续集成/持续部署(CI/CD)流程
+4. `config.py` 的 `DATA_DIR` 默认值 `../data` 与容器挂载路径 `/app/data` 不一致，容器内数据持久化失效（修复方案待用户确认）
+5. 当前网络环境无法访问 Docker Hub（`auth.docker.io` 超时），`docker compose up --build -d` 构建受阻，本次合并的运行时验证未执行
 
 ## 下次测试建议
 
