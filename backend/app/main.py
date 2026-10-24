@@ -3,27 +3,26 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import time
-import uuid
 from typing import Any, Literal
 
-import numpy as np
 import pandas as pd
 import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile, Depends
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import app.config as config
+from app.utils import safe_filename
 from app.jobs import JobManager, read_metrics
 from app.trainer import predict_row
 from app.database import db_session
 from app.db_utils import (
     save_dataset_to_db,
     get_dataset_from_db,
+    get_job_logs,
     add_job_log,
 )
 from app.dataset_manager import DatasetManager
@@ -80,54 +79,54 @@ def system() -> dict:
 # 数据集
 # ---------------------------------------------------------------------------
 
-def _dataset_csv(ds_id: str) -> Any:
-    return config.DATASETS_DIR / f"{ds_id}.csv"
-
-
 def _dataset_meta_path(ds_id: str) -> Any:
+    """旧扁平格式的数据集元信息路径：{ds_id}.meta.json"""
     return config.DATASETS_DIR / f"{ds_id}.meta.json"
 
 
 def _load_meta_or_404(ds_id: str) -> dict:
+    """加载数据集元信息，兼容旧扁平格式与新结构；两种格式均不存在时返回 404"""
     _check_id(ds_id, "数据集")
+    # 优先读取旧扁平格式：{ds_id}.meta.json
     path = _dataset_meta_path(ds_id)
-    if not path.exists():
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(500, f"数据集元信息损坏: {exc}") from exc
+    # 回退读取新结构：metadata/{ds_id}.json（由 DatasetManager 统一管理）
+    meta = dataset_manager.get_dataset(ds_id)
+    if meta is None:
         raise HTTPException(404, "数据集不存在")
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(500, f"数据集元信息损坏: {exc}") from exc
+    return meta
 
 
 def _save_dataset_from_frame(df: pd.DataFrame, name: str) -> dict:
-    ds_id = f"ds-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-    df.to_csv(_dataset_csv(ds_id), index=False)
-    meta = {
-        "id": ds_id,
-        "name": name,
+    """将 DataFrame 保存为新数据集（统一走 DatasetManager 新存储结构，保证列表/预览/训练全链路兼容）"""
+    # 构造 DatasetManager 所需的元信息
+    metadata = {
+        "original_filename": name,
         "rows": int(len(df)),
         "columns": [str(c) for c in df.columns],
+        "column_types": {str(c): str(t) for c, t in df.dtypes.items()},
         "created_at": time.time(),
     }
     
-    # 保存到文件
-    _dataset_meta_path(ds_id).write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # 通过 DatasetManager 保存（写入 raw/processed/metadata 及数据集目录）
+    meta = dataset_manager.save_dataset(df, metadata, description="内置示例数据集")
     
-    # 保存到数据库
+    # 镜像保存到数据库（数据库不可用时仅保存文件，不影响主流程）
     if config.DB_AVAILABLE:
         try:
             with db_session() as db:
                 save_dataset_to_db(
                     db=db,
-                    ds_id=ds_id,
-                    name=name,
+                    ds_id=meta["id"],
+                    name=meta["name"],
                     rows=int(len(df)),
                     columns=[str(c) for c in df.columns],
                 )
-        except Exception as e:
-            # 如果数据库保存失败，只保存到文件
+        except Exception:
             pass
     
     return meta

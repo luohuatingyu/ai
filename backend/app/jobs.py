@@ -78,6 +78,26 @@ def _append_log(job: "Job", msg: str) -> None:
         pass
 
 
+def _resolve_dataset_csv(ds_id: str) -> Path:
+    """查找数据集 CSV 文件路径，兼容新旧两种存储布局。
+
+    布局一（旧扁平格式）：{DATA_DIR}/datasets/{ds_id}.csv
+    布局二（新结构）：{DATA_DIR}/datasets/processed/{ds_id}.csv（优先）
+                     或 raw/、数据集目录副本
+    找不到时返回旧扁平格式路径（由训练器抛出明确的文件不存在错误）。
+    """
+    candidates = [
+        config.DATASETS_DIR / f"{ds_id}.csv",               # 旧扁平格式
+        config.DATASETS_DIR / "processed" / f"{ds_id}.csv", # 新结构：processed 目录
+        config.DATASETS_DIR / "raw" / f"{ds_id}.csv",       # 新结构：raw 目录
+        config.DATASETS_DIR / ds_id / f"{ds_id}.csv",       # 新结构：数据集目录副本
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
 def read_metrics(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -285,7 +305,7 @@ class JobManager:
             from app.trainer import JobCancelled, run_training
 
             summary = run_training(
-                dataset_path=config.DATASETS_DIR / f"{spec['dataset_id']}.csv",
+                dataset_path=_resolve_dataset_csv(spec["dataset_id"]),
                 target=spec["target"],
                 task=spec["task"],
                 params=spec["params"],
