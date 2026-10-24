@@ -168,8 +168,8 @@ class DatasetManager:
     
     def get_dataset(self, ds_id: str) -> Optional[Dict[str, Any]]:
         """
-        获取数据集信息
-        
+        获取数据集信息（兼容新旧两种存储格式）
+
         Args:
             ds_id: 数据集ID
             
@@ -177,16 +177,41 @@ class DatasetManager:
             Dict: 数据集信息，如果不存在返回None
         """
         metadata_path = self.metadata_dir / f"{ds_id}.json"
-        if not metadata_path.exists():
-            return None
         
         try:
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-            return metadata
+            # 优先读取新格式：metadata/{ds_id}.json
+            if metadata_path.exists():
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            
+            # 回退读取旧扁平格式：{ds_id}.meta.json
+            flat_path = self.datasets_dir / f"{ds_id}.meta.json"
+            if flat_path.exists():
+                with open(flat_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            
+            return None
         except Exception as e:
             logger.error(f"读取数据集 {ds_id} 元数据失败: {e}")
             return None
+
+    def _resolve_csv(self, ds_id: str) -> Optional[Path]:
+        """
+        按新旧两种存储布局查找数据集 CSV 文件
+
+        Args:
+            ds_id: 数据集ID
+
+        Returns:
+            Path: 找到的 CSV 文件路径；两种格式都不存在时返回 None
+        """
+        candidates = [
+            self.processed_dir / f"{ds_id}.csv",      # 新结构：processed 目录
+            self.raw_dir / f"{ds_id}.csv",            # 新结构：raw 目录
+            self.datasets_dir / ds_id / f"{ds_id}.csv",  # 新结构：数据集目录副本
+            self.datasets_dir / f"{ds_id}.csv",      # 旧扁平格式
+        ]
+        return next((p for p in candidates if p.exists()), None)
     
     def list_datasets(self, limit: int = 100, offset: int = 0, 
                      tags: List[str] = None, search: str = None) -> Tuple[List[Dict[str, Any]], int]:
@@ -203,15 +228,22 @@ class DatasetManager:
             Tuple[datasets, total]: 数据集列表和总数
         """
         datasets = []
+        seen_ids = set()
         
-        # 获取所有元数据文件
-        metadata_files = list(self.metadata_dir.glob("*.json"))
+        # 元数据来源：新结构 metadata/*.json 优先，随后补充旧扁平格式 *.meta.json（按 id 去重）
+        sources = list(self.metadata_dir.glob("*.json")) + list(self.datasets_dir.glob("*.meta.json"))
         
         # 读取并过滤数据集
-        for metadata_file in metadata_files:
+        for metadata_file in sources:
             try:
                 with open(metadata_file, 'r', encoding='utf-8') as f:
                     metadata = json.load(f)
+                
+                # 按 id 去重：同一数据集在新旧两种格式同时存在时，仅保留新格式的记录
+                ds_id = metadata.get("id") or metadata_file.name.replace(".meta.json", "").replace(".json", "")
+                if ds_id in seen_ids:
+                    continue
+                seen_ids.add(ds_id)
                 
                 # 标签过滤
                 if tags:
@@ -257,13 +289,15 @@ class DatasetManager:
             return False
         
         try:
-            # 删除文件
+            # 删除文件（同时覆盖新旧两种存储格式的文件，避免残留）
             files_to_delete = [
                 self.raw_dir / f"{ds_id}.csv",
                 self.processed_dir / f"{ds_id}.csv",
                 self.metadata_dir / f"{ds_id}.json",
                 self.datasets_dir / ds_id / f"{ds_id}.csv",
-                self.datasets_dir / ds_id / f"{ds_id}.meta.json"
+                self.datasets_dir / ds_id / f"{ds_id}.meta.json",
+                self.datasets_dir / f"{ds_id}.csv",        # 旧扁平格式
+                self.datasets_dir / f"{ds_id}.meta.json",  # 旧扁平格式
             ]
             
             for file_path in files_to_delete:
@@ -297,7 +331,11 @@ class DatasetManager:
             raise HTTPException(404, "数据集不存在")
         
         try:
-            df = pd.read_csv(self.processed_dir / f"{ds_id}.csv", nrows=max(1, min(rows, 50)))
+            # 兼容新旧格式查找 CSV 文件
+            csv_path = self._resolve_csv(ds_id)
+            if csv_path is None:
+                raise HTTPException(404, f"数据集文件不存在: {ds_id}.csv")
+            df = pd.read_csv(csv_path, nrows=max(1, min(rows, 50)))
             preview = df.astype(object).where(pd.notnull(df), None).to_dict(orient="records")
             
             return {
@@ -330,7 +368,11 @@ class DatasetManager:
             raise HTTPException(404, "数据集不存在")
         
         try:
-            df = pd.read_csv(self.processed_dir / f"{ds_id}.csv")
+            # 兼容新旧格式查找 CSV 文件
+            csv_path = self._resolve_csv(ds_id)
+            if csv_path is None:
+                raise HTTPException(404, f"数据集文件不存在: {ds_id}.csv")
+            df = pd.read_csv(csv_path)
             
             # 计算统计信息
             stats = {
