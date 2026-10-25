@@ -25,19 +25,24 @@ SAMPLE_DIR = APP_ROOT / "sample_data"
 # - 计算平面：无状态 GPU Worker，随时可释放/替换，凭 checkpoint 接手续训
 # ---------------------------------------------------------------------------
 
-# 存储后端：local=本地文件系统（单机零依赖）；minio=S3 兼容对象存储（多机共享状态）
+# 存储后端：local=本地文件系统（单机零依赖）；s3=S3 兼容对象存储（多机共享状态）
 STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local").strip().lower() or "local"
 
 # Redis 连接地址：留空时启用“嵌入式模式”（API 进程内置 worker 线程，无需任何外部组件）
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "").strip()
 
-# MinIO / S3 兼容对象存储配置（STORAGE_BACKEND=minio 时生效）
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "localhost:9000").strip()
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin").strip()
-MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin").strip()
-MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "mtp-artifacts").strip()
-MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").strip().lower() == "true"
+# S3 兼容对象存储配置（STORAGE_BACKEND=s3 时生效）。
+# 适用于任意 S3 协议服务：SeaweedFS / 阿里云 OSS(S3 网关) / 腾讯云 COS / AWS S3 等，
+# 例如：
+#   SeaweedFS: S3_ENDPOINT=localhost:9000
+#   阿里云 OSS: S3_ENDPOINT=s3.oss-cn-hangzhou.aliyuncs.com  S3_SECURE=true
+#   腾讯云 COS: S3_ENDPOINT=cos.ap-guangzhou.myqcloud.com    S3_SECURE=true
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "localhost:9000").strip()
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "minioadmin").strip()
+S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "minioadmin").strip()
+S3_BUCKET = os.environ.get("S3_BUCKET", "mtp-artifacts").strip()
+S3_SECURE = os.environ.get("S3_SECURE", "false").strip().lower() == "true"
 
 # Worker（计算单元）配置
 WORKER_ID = os.environ.get("WORKER_ID", "").strip()  # 独立 worker 身份标识（空则自动生成）

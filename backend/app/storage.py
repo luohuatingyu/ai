@@ -5,7 +5,7 @@
   key 访问，key 形如 "jobs/{job_id}/best.pt"、"datasets/{ds_id}.csv"；
 - 两个实现：
   * LocalArtifactStore  —— 本地文件系统（单机模式，与旧版 data/ 目录布局完全一致）；
-  * MinioArtifactStore  —— S3 兼容对象存储（多机共享状态平面，MinIO/S3/OSS 均可）；
+  * S3ArtifactStore     —— S3 兼容对象存储（多机共享状态平面，SeaweedFS/OSS/COS/S3 均可）；
 - GPU/服务器只是"临时租客"：谁持有任务租约谁写入，其余节点随时可释放。
 """
 from __future__ import annotations
@@ -33,10 +33,10 @@ def validate_key(key: str) -> str:
 
 
 class ArtifactStore:
-    """产物仓储接口：Local 与 MinIO 两个后端实现同一套语义。
+    """产物仓储接口：Local 与 S3 两个后端实现同一套语义。
 
     写入语义统一为"原子写"：读者永远看不到写了一半的文件——
-    Local 用 tmp + os.replace，MinIO 依赖 S3 单次 PUT 的原子性。
+    Local 用 tmp + os.replace，S3 依赖单次 PUT 的原子性。
     """
 
     # ---------------- 字节/文本 ----------------
@@ -178,10 +178,11 @@ class LocalArtifactStore(ArtifactStore):
         return keys
 
 
-class MinioArtifactStore(ArtifactStore):
-    """S3 兼容对象存储实现（MinIO / AWS S3 / 阿里 OSS S3 网关等）。
+class S3ArtifactStore(ArtifactStore):
+    """S3 兼容对象存储实现（SeaweedFS / 阿里云 OSS S3 网关 / 腾讯云 COS / AWS S3 等）。
 
     依赖 minio SDK（惰性导入：未安装/未启用时本地模式不受影响）。
+    minio 客户端是通用 S3 协议客户端，可与任意 S3 兼容服务互通。
     单次 put_object 即原子覆盖，读方永远看不到半写状态。
     """
 
@@ -197,12 +198,12 @@ class MinioArtifactStore(ArtifactStore):
         from minio import Minio  # noqa: WPS433
 
         self._client = Minio(
-            endpoint or config.MINIO_ENDPOINT,
-            access_key=access_key or config.MINIO_ACCESS_KEY,
-            secret_key=secret_key or config.MINIO_SECRET_KEY,
-            secure=config.MINIO_SECURE if secure is None else secure,
+            endpoint or config.S3_ENDPOINT,
+            access_key=access_key or config.S3_ACCESS_KEY,
+            secret_key=secret_key or config.S3_SECRET_KEY,
+            secure=config.S3_SECURE if secure is None else secure,
         )
-        self.bucket = bucket or config.MINIO_BUCKET
+        self.bucket = bucket or config.S3_BUCKET
         self._ensure_bucket()
 
     def _ensure_bucket(self) -> None:
@@ -260,11 +261,11 @@ _store_instance: Optional[ArtifactStore] = None
 
 
 def get_store() -> ArtifactStore:
-    """按配置返回仓储单例：STORAGE_BACKEND=minio 用对象存储，否则本地文件。"""
+    """按配置返回仓储单例：STORAGE_BACKEND=s3 用对象存储，否则本地文件。"""
     global _store_instance
     if _store_instance is None:
-        if config.STORAGE_BACKEND == "minio":
-            _store_instance = MinioArtifactStore()
+        if config.STORAGE_BACKEND == "s3":
+            _store_instance = S3ArtifactStore()
         else:
             _store_instance = LocalArtifactStore(config.DATA_DIR)
     return _store_instance

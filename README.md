@@ -69,7 +69,8 @@ docker compose up -d --build
 ```
 控制平面  trainer (FastAPI)      提交/暂停/恢复/取消任务，任务面板，watchdog
 协调平面  redis                  任务队列 + 租约(SET NX+TTL) + worker 心跳注册
-状态平面  minio (S3)             数据集 / checkpoint / 产物；job.json 权威，MySQL 仅镜像
+状态平面  seaweedfs (S3)         数据集 / checkpoint / 产物；job.json 权威，MySQL 仅镜像
+          （可替换为阿里云 OSS / 腾讯云 COS / AWS S3 等任意 S3 兼容服务）
 计算平面  worker (一卡一进程)    supervisor 按 GPU 数拉起子进程并守护恢复
 ```
 
@@ -81,11 +82,11 @@ docker compose up -d --build
 - **失败分类**：数据集缺失/超参非法等业务性错误直接 FAILED；CUDA/OOM/网络瞬断等环境性错误自动重试（上限 `JOB_MAX_AUTO_RETRY`，默认 5，.env 可配），每次重试都从最近 checkpoint 续训。
 - **两种部署形态**：
   - **单机零依赖**（默认）：`STORAGE_BACKEND=local`、`REDIS_URL` 留空 —— API 进程内嵌 worker 线程，协调面为进程内实现，行为与多机模式一致；
-  - **多机多卡**：所有节点连同一 Redis + MinIO，任意服务器加卡即自动入列领取任务。
+  - **多机多卡**：所有节点连同一 Redis + S3 对象存储（SeaweedFS / 阿里云 OSS / 腾讯云 COS 等），任意服务器加卡即自动入列领取任务。
 
 ## 多机多卡部署
 
-### 1. 主节点（API + Redis + MinIO + worker）
+### 1. 主节点（API + Redis + SeaweedFS + worker）
 
 ```bash
 docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cpu.yml
@@ -97,11 +98,12 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
 # 在新服务器上克隆同一仓库，配置指向主节点：
 cat > .env <<'EOF'
 REDIS_URL=redis://主节点IP:6379/0
-STORAGE_BACKEND=minio
-MINIO_ENDPOINT=主节点IP:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-MINIO_BUCKET=mtp-artifacts
+STORAGE_BACKEND=s3
+S3_ENDPOINT=主节点IP:9000
+S3_ACCESS_KEY=minioadmin
+S3_SECRET_KEY=minioadmin
+S3_BUCKET=mtp-artifacts
+S3_SECURE=false
 EOF
 docker compose up -d --build worker
 ```
@@ -112,7 +114,8 @@ docker compose up -d --build worker
 
 ```bash
 cd backend
-STORAGE_BACKEND=minio MINIO_ENDPOINT=主节点IP:9000 python scripts/migrate_to_object_storage.py
+STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:9000 S3_ACCESS_KEY=... S3_SECRET_KEY=... \
+    python scripts/migrate_to_object_storage.py
 ```
 
 把本地遗留数据集与任务产物（含版本化 checkpoint）幂等迁入对象存储，老任务即可跨机续训。
@@ -121,7 +124,7 @@ STORAGE_BACKEND=minio MINIO_ENDPOINT=主节点IP:9000 python scripts/migrate_to_
 
 ```bash
 cd backend
-REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=minio MINIO_ENDPOINT=主节点IP:9000 python -m app.worker
+REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:9000 python -m app.worker
 # supervisor：探测可见 GPU 数 N → N 个"一卡一子进程"+WORKER_CPU_SLOTS 个 CPU 槽，掉卡自动探测恢复
 python -m app.worker --slot A-gpu0   # 单卡子进程（CUDA_VISIBLE_DEVICES 由 supervisor 注入）
 python -m app.worker --probe-gpu     # 一次性卡健康探测（退出码 0=健康）
@@ -151,7 +154,7 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 ## 目录结构
 
 ```
-├── docker-compose.yml        # 多机架构 GPU 版（trainer + redis + minio + worker）
+├── docker-compose.yml        # 多机架构 GPU 版（trainer + redis + seaweedfs + worker）
 ├── docker-compose.cpu.yml    # 多机架构 CPU 版（无 gpus 声明，worker 走 CPU 槽）
 ├── backend/
 │   ├── Dockerfile            # python:3.12-slim + CUDA 构建 torch
@@ -162,7 +165,7 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 │   │   ├── jobstore.py       # job.json CRUD / metrics 回滚 / 日志（权威记录层）
 │   │   ├── worker.py         # 无状态 TrainingWorker + 一卡一进程 WorkerSupervisor
 │   │   ├── coordination.py   # 队列/租约/worker 注册（Redis 与嵌入式双实现）
-│   │   ├── storage.py        # ArtifactStore（local / MinIO）+ checkpoint 版本化
+│   │   ├── storage.py        # ArtifactStore（local / S3 兼容对象存储）+ checkpoint 版本化
 │   │   ├── trainer.py        # 可续训训练器（PyTorch）+ 在线预测
 │   │   ├── database.py / models.py / db_utils.py / db_init.py  # MySQL 可选镜像
 │   │   └── config.py
@@ -204,7 +207,7 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 
 ## 注意事项
 
-- 数据与模型产物保存在宿主机 `./data/` 目录（本地模式）或 MinIO 卷（多机模式），容器重建不丢失。
+- 数据与模型产物保存在宿主机 `./data/` 目录（本地模式）或 S3 对象存储（多机模式：SeaweedFS 卷 / 阿里云 OSS / 腾讯云 COS），容器重建不丢失。
 - 单机模式任务由 API 进程内嵌 worker 线程执行；多机模式由各服务器的 worker 服务（一卡一进程）领取，可混合部署。
 - 页面图表依赖 Chart.js CDN，浏览器需可访问公网；日志与训练数据全程本地/内网运行。
 - 镜像构建首次约 2~4 GB 下载（torch CUDA wheel），后续走 Docker 缓存。

@@ -2,12 +2,14 @@
 """把本地遗留数据迁移到对象存储状态平面（多机模式一次性升级工具）。
 
 背景：旧版本所有数据都在 {DATA_DIR}/ 下（数据集 CSV + 任务产物）。
-多机模式下状态平面切换为 MinIO/S3（STORAGE_BACKEND=minio），worker 从
-对象存储拉数据集与 checkpoint——历史数据需要先迁移过去，否则任务
-记录/断点/模型在 worker 侧不可见（本机继续可读，但无法续训/交付）。
+多机模式下状态平面切换为 S3 兼容对象存储（STORAGE_BACKEND=s3，
+SeaweedFS / 阿里云 OSS / 腾讯云 COS 等均可），worker 从对象存储拉
+数据集与 checkpoint——历史数据需要先迁移过去，否则任务记录/断点/
+模型在 worker 侧不可见（本机继续可读，但无法续训/交付）。
 
 用法（在 backend 目录）：
-    STORAGE_BACKEND=minio MINIO_ENDPOINT=... python scripts/migrate_to_object_storage.py [--dry-run]
+    STORAGE_BACKEND=s3 S3_ENDPOINT=... S3_ACCESS_KEY=... S3_SECRET_KEY=... \
+        python scripts/migrate_to_object_storage.py [--dry-run]
 
 - 幂等：已存在于状态平面的 key 自动跳过，可重复执行；
 - local 后端无需迁移：本地文件本身就是权威状态平面，直接退出；
@@ -77,12 +79,12 @@ def main() -> int:
     local_backend = type(store).__name__ == "LocalArtifactStore"
     if local_backend:
         print("[migrate] STORAGE_BACKEND=local：本地文件即权威状态平面，无需迁移。")
-        print("[migrate] 多机部署时请先配置 STORAGE_BACKEND=minio 与 MINIO_* 再运行本脚本。")
+        print("[migrate] 多机部署时请先配置 STORAGE_BACKEND=s3 与 S3_* 再运行本脚本。")
         return 0
 
     print(f"[migrate] 状态平面: {type(store).__name__} "
-          f"endpoint={os.environ.get('MINIO_ENDPOINT', config.MINIO_ENDPOINT)} "
-          f"bucket={config.MINIO_BUCKET}")
+          f"endpoint={os.environ.get('S3_ENDPOINT', config.S3_ENDPOINT)} "
+          f"bucket={config.S3_BUCKET}")
 
     created = skipped = failed = 0
 

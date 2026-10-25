@@ -2,17 +2,20 @@
 # 与 docker-compose.yml 同一镜像与同一套服务编排，仅不声明 GPU；
 # 计算平面 worker 以 CPU 执行槽运行（require_gpu 的任务会等待 GPU 节点加入）。
 # GPU 环境就绪后请改用 GPU 版获得加速。
+#
+# 状态平面为 SeaweedFS（S3 兼容对象存储），亦可换成阿里云 OSS / 腾讯云 COS 等
+# S3 服务（修改 S3_* 环境变量即可）。
 
 # 注意：本项目使用可配置的已有 MySQL 服务器，不创建 MySQL 容器。
 
 x-backend-env: &backend-env
   REDIS_URL: redis://redis:6379/0
-  STORAGE_BACKEND: minio
-  MINIO_ENDPOINT: minio:9000
-  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
-  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
-  MINIO_BUCKET: ${MINIO_BUCKET:-mtp-artifacts}
-  MINIO_SECURE: "false"
+  STORAGE_BACKEND: s3
+  S3_ENDPOINT: seaweedfs:8333
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+  S3_BUCKET: ${S3_BUCKET:-mtp-artifacts}
+  S3_SECURE: "false"
   DATA_DIR: /app/data
   JOB_MAX_AUTO_RETRY: ${JOB_MAX_AUTO_RETRY:-5}
   JOB_RETRY_BACKOFF: ${JOB_RETRY_BACKOFF:-2}
@@ -38,21 +41,18 @@ services:
       retries: 10
     restart: unless-stopped
 
-  minio:
-    # 镜像源可通过 .env 的 MINIO_IMAGE 切换（国内网络可用国内镜像源）
-    image: ${MINIO_IMAGE:-quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z}
-    container_name: mtp-minio-cpu
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+  seaweedfs:
+    # 镜像源可通过 .env 的 SEAWEEDFS_IMAGE 切换（国内网络可用国内镜像源）
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:latest}
+    container_name: mtp-seaweedfs-cpu
+    command: server -s3 -filer -dir=/data
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:8333"   # S3 API（宿主 9000 端口保持与旧版体验一致）
+      - "9001:8888"   # 控制台（filer Web UI）
     volumes:
-      - minio-data-cpu:/data
+      - seaweedfs-data-cpu:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8333/"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -84,7 +84,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      minio:
+      seaweedfs:
         condition: service_healthy
     restart: unless-stopped
 
@@ -99,10 +99,10 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      minio:
+      seaweedfs:
         condition: service_healthy
     restart: unless-stopped
 
 volumes:
   redis-data-cpu:
-  minio-data-cpu:
+  seaweedfs-data-cpu:

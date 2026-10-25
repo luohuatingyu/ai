@@ -1,9 +1,10 @@
 # 可视化模型训练平台（多机多卡 / 无状态训练版）
 #
-# 架构（三平面分离）：
+# 架构（四平面分离）：
 # - 控制平面：trainer（FastAPI API + 前端）
 # - 协调平面：redis（任务队列 + 租约/心跳 + worker 注册，watchdog 依赖）
-# - 状态平面：minio（数据集 + checkpoint + 产物；job.json 权威，MySQL 仅镜像）
+# - 状态平面：seaweedfs（S3 兼容对象存储：数据集 + checkpoint + 产物；
+#   job.json 权威，MySQL 仅镜像；也可换成阿里云 OSS / 腾讯云 COS 等 S3 服务）
 # - 计算平面：worker（supervisor 一卡一子进程，GPU 只是可随时释放的计算单元；
 #   任意 worker 崩溃/掉卡，任务由其它卡/机器从 checkpoint 接续）
 #
@@ -11,7 +12,7 @@
 #          或 Docker Desktop（Windows WSL2）已启用 GPU。
 # 纯 CPU 环境使用: docker compose -f docker-compose.cpu.yml up
 #
-# 本地单机开发（不依赖 Redis/MinIO，也可不用本文件）：API 进程内嵌 worker，
+# 本地单机开发（不依赖 Redis/SeaweedFS，也可不用本文件）：API 进程内嵌 worker，
 # 状态平面回落到 ./data 本地文件（STORAGE_BACKEND=local）。
 #
 # 注意：本项目使用可配置的已有 MySQL 服务器，不创建 MySQL 容器；
@@ -20,13 +21,13 @@
 x-backend-env: &backend-env
   # ---- 协调平面 ----
   REDIS_URL: redis://redis:6379/0
-  # ---- 状态平面 ----
-  STORAGE_BACKEND: minio
-  MINIO_ENDPOINT: minio:9000
-  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
-  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
-  MINIO_BUCKET: ${MINIO_BUCKET:-mtp-artifacts}
-  MINIO_SECURE: "false"
+  # ---- 状态平面（S3 兼容：SeaweedFS / OSS / COS / S3 均可）----
+  STORAGE_BACKEND: s3
+  S3_ENDPOINT: seaweedfs:8333
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+  S3_BUCKET: ${S3_BUCKET:-mtp-artifacts}
+  S3_SECURE: "false"
   # ---- 数据目录（数据集缓存 / worker scratch）----
   DATA_DIR: /app/data
   # ---- 任务重试 / watchdog ----
@@ -55,24 +56,20 @@ services:
       retries: 10
     restart: unless-stopped
 
-  minio:
-    # MinIO 自 2025 年起已从 Docker Hub 迁移到 quay.io（AIStor）。
-    # 固定稳定版本（:latest 多架构清单在部分网络下拉取易挂起）。
-    # 国内网络拉取困难时，可在 .env 中把 MINIO_IMAGE 换成国内镜像源，
-    # 例如：MINIO_IMAGE=docker.m.daocloud.io/minio/minio:latest
-    image: ${MINIO_IMAGE:-quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z}
-    container_name: mtp-minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+  seaweedfs:
+    # S3 兼容对象存储（状态平面）。国内网络拉取失败时可在 .env 中把
+    # SEAWEEDFS_IMAGE 换成国内镜像源，例如：
+    #   SEAWEEDFS_IMAGE=docker.m.daocloud.io/chrislusf/seaweedfs:latest
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:latest}
+    container_name: mtp-seaweedfs
+    command: server -s3 -filer -dir=/data
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # 控制台
+      - "9000:8333"   # S3 API（宿主 9000 端口保持与旧版体验一致）
+      - "9001:8888"   # 控制台（filer Web UI）
     volumes:
-      - minio-data:/data
+      - seaweedfs-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8333/"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -106,7 +103,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      minio:
+      seaweedfs:
         condition: service_healthy
     restart: unless-stopped
 
@@ -114,7 +111,7 @@ services:
     build: ./backend
     container_name: mtp-worker
     volumes:
-      - ./data:/app/data   # 本地 scratch 与数据集缓存（权威数据在 MinIO）
+      - ./data:/app/data   # 本地 scratch 与数据集缓存（权威数据在 S3 状态平面）
     environment:
       <<: *backend-env
       USE_DATABASE: ${USE_DATABASE:-false}
@@ -122,11 +119,11 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      minio:
+      seaweedfs:
         condition: service_healthy
     restart: unless-stopped
     # 运行 supervisor：探测可见 GPU 数 N → N 个“一卡一子进程”+WORKER_CPU_SLOTS 个 CPU 槽
 
 volumes:
   redis-data:
-  minio-data:
+  seaweedfs-data:

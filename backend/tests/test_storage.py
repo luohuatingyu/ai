@@ -203,3 +203,31 @@ def test_job_log_helpers(store):
     jobstore.append_job_log(store, "jc4", "第二步")
     text = jobstore.read_job_log(store, "jc4")
     assert "第一步" in text and "第二步" in text
+
+
+# ---------------------------------------------------------------------------
+# S3 后端集成（需 MTP_TEST_S3 指向 S3 兼容端点，如 SeaweedFS；默认跳过）
+# ---------------------------------------------------------------------------
+
+def test_s3_backend_roundtrip():
+    """S3 兼容对象存储：写/读/存在性/列表/删除往返（SeaweedFS / OSS / COS 通用）。"""
+    import os
+
+    endpoint = os.environ.get("MTP_TEST_S3")
+    if not endpoint:
+        pytest.skip("未配置 MTP_TEST_S3（S3 兼容端点），跳过 S3 后端集成测试")
+    from app.storage import S3ArtifactStore
+
+    st = S3ArtifactStore(endpoint=endpoint, access_key="minioadmin",
+                         secret_key="minioadmin", bucket="mtp-pytest-s3", secure=False)
+    key = "jobs/it-s3/test.txt"
+    try:
+        st.write_bytes(key, "s3-roundtrip".encode("utf-8"))
+        assert st.read_text(key) == "s3-roundtrip"
+        assert st.exists(key)
+        assert key in st.list_keys("jobs/it-s3/")
+        st.delete(key)
+        assert not st.exists(key)
+    finally:
+        for k in st.list_keys("jobs/it-s3/"):
+            st.delete(k)  # 清理测试遗留对象
