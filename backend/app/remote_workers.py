@@ -42,6 +42,10 @@ def remote_configuration_errors() -> List[str]:
         errors.append("远程服务器管理尚未启用")
     if len(config.WORKER_REMOTE_TOKEN) < 32:
         errors.append("WORKER_REMOTE_TOKEN 至少需要 32 个字符")
+    if not config.REDIS_URL:
+        errors.append("平台必须配置共享 REDIS_URL，远程 worker 才能加入同一任务队列")
+    if config.STORAGE_BACKEND != "s3":
+        errors.append("平台必须使用共享 S3 存储，远程 worker 才能读取数据集和写入产物")
     if not shutil.which("ssh"):
         errors.append("平台后端容器未安装 OpenSSH 客户端")
     key_path = Path(config.WORKER_SSH_KEY_PATH)

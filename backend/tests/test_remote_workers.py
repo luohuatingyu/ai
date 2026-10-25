@@ -25,6 +25,8 @@ def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/ml/worker:unit")
     monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "rediss://redis.example.net:6380/0")
     monkeypatch.setattr(config, "WORKER_REMOTE_S3_ENDPOINT", "storage.example.net:9000")
+    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(config, "STORAGE_BACKEND", "s3")
     monkeypatch.setattr(config, "S3_ACCESS_KEY", "access-test")
     monkeypatch.setattr(config, "S3_SECRET_KEY", "secret-test")
     monkeypatch.setattr(config, "S3_BUCKET", "models-test")
@@ -62,6 +64,17 @@ def test_remote_configuration_requires_key_permissions_and_registry(tmp_path, mo
     assert any("镜像仓库引用" in item for item in remote_workers.remote_configuration_errors())
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", False)
     assert any("尚未启用" in item for item in remote_workers.remote_configuration_errors())
+
+
+def test_remote_configuration_requires_shared_queue_and_object_storage(tmp_path, monkeypatch):
+    """平台未启用共享 Redis 或 S3 时不允许部署无法协同的远程 worker。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(config, "REDIS_URL", "")
+    monkeypatch.setattr(config, "STORAGE_BACKEND", "local")
+    errors = remote_workers.remote_configuration_errors()
+    assert any("共享 REDIS_URL" in item for item in errors)
+    assert any("共享 S3 存储" in item for item in errors)
 
 
 def test_render_remote_script_quotes_values_and_does_not_transfer_repository(tmp_path, monkeypatch):

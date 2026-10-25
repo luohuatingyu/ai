@@ -113,7 +113,7 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
    WORKER_SSH_KEY_HOST_PATH=/宿主机路径/worker_ssh_key
    WORKER_SSH_KNOWN_HOSTS_HOST_PATH=/宿主机路径/worker_known_hosts
    ```
-   `WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 必须从目标机网络可达，并分别对应当前平台使用的 Redis 和 S3 存储。`WORKER_REMOTE_TOKEN` 用于保护页面的远程管理 API。
+   平台本身需设置 `REDIS_URL` 并使用 `STORAGE_BACKEND=s3`；`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 必须从目标机网络可达，并分别连接到当前平台使用的 Redis 和同一 S3 存储。配置不完整时，页面会阻止远程部署。`WORKER_REMOTE_TOKEN` 用于保护页面的远程管理 API。
 3. 登录镜像仓库，构建并推送 worker 镜像。GPU 平台使用默认 Compose 文件；纯 CPU 平台使用 CPU 文件：
    ```bash
    docker login registry.example.com
