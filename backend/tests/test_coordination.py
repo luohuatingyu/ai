@@ -146,6 +146,18 @@ def test_build_coordination_embedded():
 # Redis 实现语义一致性（有 Redis 时执行；CI 无 Redis 自动跳过）
 # ---------------------------------------------------------------------------
 
+def test_unjsonable_legacy_repr_fallback():
+    """兼容性：旧版 jsonable 的 Python repr 序列化（单引号 dict）可还原。"""
+    from app.coordination import unjsonable
+
+    assert unjsonable("{'available': False, 'name': None, 'count': 0, 'vram_mb': 0}") == {
+        "available": False, "name": None, "count": 0, "vram_mb": 0}
+    assert unjsonable("somehost") == "somehost"      # 普通字符串原样返回
+    assert unjsonable("'a:b'") == "'a:b'"            # 引号包裹的字符串保守保留原值（避免歧义）
+    assert unjsonable("[1, 2]") == [1, 2]            # JSON 优先路径
+    assert unjsonable(3) == 3                        # 非字符串原样
+
+
 def test_redis_semantics_match_embedded():
     """同一脚本在 Redis 实现上复跑全部租约/信号断言（需 MTP_TEST_REDIS）。"""
     import os

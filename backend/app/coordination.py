@@ -11,6 +11,7 @@ REDIS_URL 为空时自动切换 Embedded 实现（进程内队列/锁，单机�
 """
 from __future__ import annotations
 
+import ast
 import json
 import threading
 import time
@@ -422,12 +423,22 @@ def jsonable(value: object) -> str:
 
 
 def unjsonable(value: object) -> object:
-    """把 Redis 读回的字符串还原为原始类型（嵌套结构 JSON 解码）。"""
+    """把 Redis 读回的字符串还原为原始类型（嵌套结构 JSON 解码）。
+
+    兼容旧版 jsonable 的 Python repr 序列化（单引号 dict 等）。
+    """
     if not isinstance(value, str):
         return value
     try:
         parsed = json.loads(value)
     except (json.JSONDecodeError, TypeError):
+        parsed = value
+    if isinstance(parsed, (dict, list, bool, int, float)):
+        return parsed
+    # 旧格式回退：ast.literal_eval 解析 Python repr（普通字符串原样返回）
+    try:
+        parsed = ast.literal_eval(value)
+    except (ValueError, SyntaxError, MemoryError):
         return value
     if isinstance(parsed, (dict, list, bool, int, float)):
         return parsed
