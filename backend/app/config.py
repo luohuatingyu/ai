@@ -67,13 +67,22 @@ WATCHDOG_INTERVAL = float(os.environ.get("WATCHDOG_INTERVAL", "5"))       # watc
 for _d in (DATA_DIR, DATASETS_DIR, JOBS_DIR, WORKER_SCRATCH_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-# 数据库配置
+# ---------------------------------------------------------------------------
+# 数据库（MySQL 可选镜像）配置：全项目唯一的 DB 配置来源
+# ---------------------------------------------------------------------------
 USE_DATABASE = os.environ.get("USE_DATABASE", "true").lower() == "true"
-if USE_DATABASE:
-    try:
-        from app.database import DATABASE_URL
-        DB_AVAILABLE = True
-    except ImportError:
-        DB_AVAILABLE = False
-else:
-    DB_AVAILABLE = False
+DB_HOST = os.environ.get("DB_HOST", "localhost").strip()
+DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+DB_USER = os.environ.get("DB_USER", "root").strip()
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "password")
+DB_NAME = os.environ.get("DB_NAME", "model_training").strip()
+DB_CHARSET = os.environ.get("DB_CHARSET", "utf8mb4").strip()
+DB_COLLATION = os.environ.get("DB_COLLATION", "utf8mb4_unicode_ci").strip()
+DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "10"))
+DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "20"))
+DB_POOL_TIMEOUT = int(os.environ.get("DB_POOL_TIMEOUT", "30"))
+DB_POOL_RECYCLE = int(os.environ.get("DB_POOL_RECYCLE", "3600"))
+DB_ECHO = os.environ.get("DB_ECHO", "false").strip().lower() == "true"
+
+# 数据库路径是否启用（镜像写失败一律静默，文件权威源不受影响）
+DB_AVAILABLE = USE_DATABASE
