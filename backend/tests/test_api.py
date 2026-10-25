@@ -247,6 +247,39 @@ def test_import_json_dataset(client, store):
     assert detail["preview"][1]["feature"] == 2
 
 
+@pytest.mark.parametrize(
+    "filename,content",
+    [("broken.json", b"{"), ("table.parquet", b"not-a-supported-format")],
+)
+def test_import_rejects_invalid_or_unsupported_files(client, store, filename, content):
+    """异常场景：格式错误或不支持的文件返回 400，且不创建数据集。"""
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": (filename, content, "application/octet-stream")},
+    )
+
+    assert response.status_code == 400
+    assert client.get("/api/datasets").json()["total"] == 0
+
+
+def test_import_rolls_back_when_object_store_sync_fails(client, store, monkeypatch):
+    """异常场景：远端同步失败时回滚本地数据集和导入历史。"""
+    content = b'[{"feature": 1, "target": "a"}]'
+
+    def fail_sync(_dataset_id):
+        raise OSError("对象存储不可用")
+
+    monkeypatch.setattr("app.routers.datasets._sync_dataset_csv_to_store", fail_sync)
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("records.json", content, "application/json")},
+    )
+
+    assert response.status_code == 503
+    assert client.get("/api/datasets").json()["total"] == 0
+    assert client.get("/api/datasets/import-history").json()["total"] == 0
+
+
 @pytest.mark.parametrize("archive_name,archive_kind", [("rows.zip", "zip"), ("rows.tar.gz", "tar.gz")])
 def test_import_archive_dataset(client, store, archive_name, archive_kind):
     """正常场景：ZIP 与 TAR.GZ 解包后导入 CSV，且返回可访问的数据集。"""
