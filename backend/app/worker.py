@@ -338,13 +338,23 @@ class TrainingWorker:
             return
         spec = record.get("spec") or {}
         hint = spec.get("resource_hint") or {}
-        if hint.get("require_gpu") and not self.gpu_available:
-            # 资源提示不匹配（本机无 GPU）：放回队列，由 GPU worker 领取；
-            # 提示日志按任务去重，避免刷屏
+        gpu = self.caps.get("gpu") or {}
+        min_vram = int(hint.get("min_vram_mb") or 0)
+        # 资源提示匹配（到卡级）：require_gpu 要求是 GPU 卡；min_vram_mb 要求显存下限。
+        # 不匹配则放回队列等待合适的卡（提示日志防刷屏），不影响队列中其它任务。
+        if (hint.get("require_gpu") or min_vram > 0) and not gpu.get("available"):
             self.queue.push(job_id)
             last_id, last_ts = self._last_skip
             if last_id != job_id or time.time() - last_ts > 30.0:
-                self._log(f"[{job_id}] 需要 GPU 训练，本机无 GPU，已放回队列等待 GPU worker")
+                self._log(f"[{job_id}] 资源提示需要 GPU，本槽无可用 GPU，已放回队列等待 GPU worker")
+                self._last_skip = (job_id, time.time())
+            time.sleep(min(2.0, self._idle_poll))
+            return
+        if min_vram > 0 and int(gpu.get("vram_mb") or 0) < min_vram:
+            self.queue.push(job_id)
+            last_id, last_ts = self._last_skip
+            if last_id != job_id or time.time() - last_ts > 30.0:
+                self._log(f"[{job_id}] 显存不足（需 ≥ {min_vram} MiB，本卡 {gpu.get('vram_mb')} MiB），已放回队列")
                 self._last_skip = (job_id, time.time())
             time.sleep(min(2.0, self._idle_poll))
             return
@@ -487,14 +497,25 @@ class TrainingWorker:
                     "worker 心跳丢失（任务已被重派），本节点停止写入"
                     if controller.lease_lost.is_set() else str(exc)
                 )
+                # 断点产物同步：best/last/preprocessor 一并上传状态平面——
+                # 恢复后即使验证指标不再提升，接手 worker 也有 best.pt 可交付/预测
+                for name in ("best.pt", "last.pt", "preprocessor.json"):
+                    artifact = scratch / name
+                    if artifact.exists():
+                        store.write_file(job_key(job_id, name), artifact)
                 jobstore.update_job(store, job_id, status=jobstore.PAUSED,
                                    worker_id=self.worker_id)
                 joblog(
-                    f"训练暂停: {reason}；断点已保存，可由任意节点接手"
+                    f"训练暂停: {reason}；断点与产物已同步，可由任意节点接手"
                     f"（POST /api/jobs/{job_id}/resume）",
                 )
                 return
             except JobCancelled:
+                # 取消（可在任意 eopch）：同步已完成部分的最佳产物供交付/预测
+                for name in ("best.pt", "last.pt", "preprocessor.json"):
+                    artifact = scratch / name
+                    if artifact.exists():
+                        store.write_file(job_key(job_id, name), artifact)
                 jobstore.update_job(store, job_id, status=jobstore.CANCELLED,
                                    finished_at=time.time())
                 joblog("任务已取消")
@@ -618,9 +639,13 @@ class TrainingWorker:
             self._set_failed(job_id, f"{exc}\n{traceback.format_exc(limit=8)}", scratch)
 
     def _flush_final(self, scratch: Path, job_id: str) -> None:
-        """收尾兜底：尽力把本地 metrics/日志的最后状态同步到状态平面（幂等）。"""
+        """收尾兜底：把本地最后的 metrics/日志/最佳产物同步到状态平面（幂等）。
+
+        best.pt/last.pt/preprocessor.json 也纳入兜底：失败路径下本地训练进度
+        产生的最佳权重不应丢失（重试/预测/交付都要能取到）。
+        """
         try:
-            for name in ("metrics.jsonl", "log.txt"):
+            for name in ("metrics.jsonl", "log.txt", "best.pt", "last.pt", "preprocessor.json"):
                 artifact = scratch / name
                 if artifact.exists():
                     self.store.write_file(job_key(job_id, name), artifact)

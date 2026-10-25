@@ -16,7 +16,9 @@ from pydantic import BaseModel, Field
 
 import app.config as config
 from app.utils import safe_filename
-from app.jobs import JobManager, read_metrics
+from app import jobstore
+from app.jobs import JobManager, api_view
+from app.storage import get_store, job_key
 from app.trainer import predict_row
 from app.database import db_session
 from app.db_utils import (
@@ -266,6 +268,9 @@ class TrainRequest(BaseModel):
     hidden_size: int = Field(64, ge=1, le=2048)
     test_split: float = Field(0.2, ge=0.05, le=0.5)
     seed: int = 42
+    # 资源提示（任务分发匹配到卡级）：要求在 GPU 卡上训练 / 显存下限
+    require_gpu: bool = False
+    min_vram_mb: int = Field(0, ge=0, le=1024 * 1024)
 
 
 class PredictRequest(BaseModel):
@@ -282,6 +287,10 @@ def start_training(req: TrainRequest) -> dict:
     dataset_id = params.pop("dataset_id")
     target = params.pop("target")
     task = params.pop("task")
+    resource_hint = {
+        "require_gpu": bool(params.pop("require_gpu")),
+        "min_vram_mb": int(params.pop("min_vram_mb") or 0),
+    }
 
     job = manager.submit(
         {
@@ -290,33 +299,37 @@ def start_training(req: TrainRequest) -> dict:
             "target": target,
             "task": task,
             "params": params,
+            "resource_hint": resource_hint,
         }
     )
-    return {"job_id": job.id}
+    return {"job_id": job["id"]}
 
 
 @app.get("/api/jobs")
 def list_jobs() -> list[dict]:
-    return [j.api_view(include_metrics=True) for j in manager.list()]
+    return [
+        api_view(record, include_metrics=True, store=manager.store)
+        for record in manager.list()
+    ]
 
 
 @app.get("/api/jobs/{job_id}")
 def job_detail(job_id: str) -> dict:
     _check_id(job_id, "任务")
-    job = manager.get(job_id)
-    if not job:
+    record = manager.get(job_id)
+    if not record:
         raise HTTPException(404, "任务不存在")
 
-    data = job.api_view(include_metrics=True, include_summary=True)
+    data = api_view(record, include_metrics=True, include_summary=True, store=manager.store)
     metrics = data.get("metrics") or []
-    epochs_total = job.spec.get("params", {}).get("epochs", 0)
+    epochs_total = (record.get("spec") or {}).get("params", {}).get("epochs", 0)
     current_epoch = metrics[-1]["epoch"] if metrics else 0
     data["progress"] = {
         "epoch": current_epoch,
         "epochs_total": epochs_total,
-        "percent": 100.0 if job.status == "completed" else (100.0 * current_epoch / epochs_total if epochs_total else 0.0),
+        "percent": 100.0 if record.get("status") == "completed" else (100.0 * current_epoch / epochs_total if epochs_total else 0.0),
     }
-    if job.status in ("queued", "running") and epochs_total and metrics:
+    if record.get("status") in ("queued", "running") and epochs_total and metrics:
         data["progress"]["percent"] = max(data["progress"]["percent"] - 0.5, 0.0)
     return data
 
@@ -324,32 +337,27 @@ def job_detail(job_id: str) -> dict:
 @app.get("/api/jobs/{job_id}/logs")
 def job_logs(job_id: str, offset: int = 0) -> dict:
     _check_id(job_id, "任务")
-    job = manager.get(job_id)
-    if not job:
+    if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")
-    
-    lines: list[str] = []
-    total = 0
 
-    # 优先从文件获取日志
-    if job.log_path.exists():
-        lines = job.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    total = 0
+    lines: list[str] = []
+    # 状态平面日志文件为权威源（续训时各登录点自然衔接）
+    text = jobstore.read_job_log(manager.store, job_id)
+    if text:
+        lines = text.splitlines()
         total = len(lines)
 
-    # 数据库可用且已有日志时，以数据库日志为准（训练线程会同步写入）
+    # 数据库可用且已有日志时，与文件日志合并优先取数据库（训练线程镜像）
     if config.DB_AVAILABLE:
         try:
             with db_session() as db:
                 db_logs = get_job_logs(db, job_id, 0, 1000000)
-
                 if db_logs:
-                    # 时间按写入顺序（timestamp, id）取全量，offset 在本函数统一切片，
-                    # 避免 SQL 分页与本函数分页叠加导致丢行
                     db_lines = [f"[{log.timestamp.strftime('%H:%M:%S')}] {log.message}" for log in db_logs]
                     lines = db_lines
                     total = len(db_lines)
         except Exception:
-            # 如果数据库操作失败，只使用文件日志
             pass
 
     offset = max(0, min(offset, total))
@@ -361,12 +369,38 @@ def job_logs(job_id: str, offset: int = 0) -> dict:
 def cancel_job(job_id: str) -> dict:
     _check_id(job_id, "任务")
     try:
-        job = manager.cancel(job_id)
+        record = manager.cancel(job_id)
     except KeyError as exc:
         raise HTTPException(404, "任务不存在") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"ok": True, "status": job.status}
+    return {"ok": True, "status": record["status"]}
+
+
+@app.post("/api/jobs/{job_id}/pause")
+def pause_job(job_id: str) -> dict:
+    """暂停任务：训练中的任务保存断点后进入 paused（可跨机/卡恢复）。"""
+    _check_id(job_id, "任务")
+    try:
+        record = manager.pause(job_id)
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "status": record["status"]}
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def resume_job(job_id: str) -> dict:
+    """恢复暂停的任务：重新排队，任意可用卡/机器从 checkpoint 接续训练。"""
+    _check_id(job_id, "任务")
+    try:
+        record = manager.resume(job_id)
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "status": record["status"]}
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -381,12 +415,53 @@ def delete_job(job_id: str) -> dict:
     return {"ok": True}
 
 
+@app.get("/api/workers")
+def list_workers() -> dict:
+    """列出全部在线计算槽（多机多卡，卡片级）：型号/显存/状态/当前任务。"""
+    import time as _time
+
+    workers: list[dict] = []
+    for item in manager.lease.list_workers():
+        info = dict(item)
+        info["machine_id"] = info.get("machine_id") or str(info.get("worker_id", "")).rsplit("-", 1)[0] or None
+        gpu = info.get("gpu") or {}
+        info["device_label"] = (
+            f"GPU: {gpu.get('name')}" if gpu.get("available") else "CPU"
+        )
+        state = "idle"
+        current_job = None
+        epoch = None
+        if not info.get("active"):
+            state = "offline"
+        else:
+            state = str(info.get("state") or "idle")
+            current_job = info.get("current_job") or None
+            epoch = info.get("epoch") if info.get("epoch") is not None else None
+        info["state"] = state
+        info["current_job"] = current_job
+        info["epoch"] = epoch
+        info["heartbeat_age_sec"] = (
+            round(_time.time() - float(info.get("last_seen", _time.time())), 1)
+            if info.get("last_seen") else None
+        )
+        workers.append(info)
+    workers.sort(key=lambda x: (str(x.get("machine_id")), str(x.get("worker_id"))))
+    return {
+        "workers": workers,
+        "queue_depth": manager.queue.size(),
+        "ts": time.time(),
+    }
+
+
 @app.get("/api/jobs/{job_id}/model")
 def download_model(job_id: str) -> FileResponse:
     _check_id(job_id, "任务")
-    path = config.JOBS_DIR / job_id / "best.pt"
-    if not path.exists():
+    if not manager.get(job_id):
+        raise HTTPException(404, "任务不存在")
+    key = job_key(job_id, "best.pt")
+    if not manager.store.exists(key):
         raise HTTPException(404, "模型文件尚未生成（任务可能仍在训练）")
+    path = manager.store.read_file(key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best.pt")
     return FileResponse(path, media_type="application/octet-stream", filename=f"{job_id}-best.pt")
 
 
@@ -395,11 +470,14 @@ def predict(job_id: str, body: PredictRequest) -> dict:
     _check_id(job_id, "任务")
     if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")
-    ckpt = config.JOBS_DIR / job_id / "best.pt"
-    if not ckpt.exists():
+    key = job_key(job_id, "best.pt")
+    if not manager.store.exists(key):
         raise HTTPException(400, "模型文件尚未生成（任务可能仍在训练）")
+    local_ckpt = manager.store.read_file(
+        key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best.pt"
+    )
     try:
-        return predict_row(ckpt, body.row)
+        return predict_row(local_ckpt, body.row)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"预测失败: {exc}") from exc
 

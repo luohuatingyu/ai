@@ -70,6 +70,10 @@ class JobQueue:
         """当前排队任务数。"""
         raise NotImplementedError
 
+    def snapshot(self) -> List[str]:
+        """当前在队的任务 id 列表（watchdog 防丢失重派用，尽力而为）。"""
+        raise NotImplementedError
+
 
 class EmbeddedJobQueue(JobQueue):
     """进程内队列（单机嵌入式模式）：deque + 条件变量实现阻塞 pop。"""
@@ -109,6 +113,10 @@ class EmbeddedJobQueue(JobQueue):
         with self._cond:
             return len(self._items)
 
+    def snapshot(self) -> List[str]:
+        with self._cond:
+            return list(self._items)
+
 
 class RedisJobQueue(JobQueue):
     """Redis List 实现的任务队列（多机模式）。"""
@@ -140,6 +148,9 @@ class RedisJobQueue(JobQueue):
 
     def size(self) -> int:
         return int(self._redis.llen(_QUEUE_KEY))
+
+    def snapshot(self) -> List[str]:
+        return [str(item) for item in self._redis.lrange(_QUEUE_KEY, 0, -1)]
 
 
 class LeaseStore:
