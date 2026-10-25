@@ -290,13 +290,15 @@
   <!-- 左栏：数据集 + 参数 -->
   <aside class="panel">
     <h2>① 数据集</h2>
-    <div class="row">
-      <select id="datasetSelect"></select>
-      <button id="btnUpload">上传 CSV</button>
+    <div id="datasetLocalPanel">
+      <div class="row">
+        <select id="datasetSelect"></select>
+        <button id="btnUpload">上传数据</button>
+      </div>
+      <input type="file" id="fileInput" accept=".csv,.json,.jsonl,.ndjson" hidden>
+      <div id="previewWrap"><div class="empty">选择或上传数据集后在此预览</div></div>
+      <div id="previewMeta" class="hint" style="margin-top:6px;"></div>
     </div>
-    <input type="file" id="fileInput" accept=".csv" hidden>
-    <div id="previewWrap"><div class="empty">选择或上传数据集后在此预览</div></div>
-    <div id="previewMeta" class="hint" style="margin-top:6px;"></div>
 
     <h2>② 训练配置</h2>
     <form id="trainForm" class="stack" onsubmit="return false;">
@@ -312,6 +314,10 @@
             <option value="regression">回归</option>
             <option value="clustering">KMeans 聚类</option>
             <option value="time_series_forecasting">时间序列预测</option>
+            <option value="llm_pretraining">LLM 从零预训练</option>
+            <option value="llm_sft">LLM 全参数 SFT</option>
+            <option value="llm_dpo">LLM DPO</option>
+            <option value="llm_ppo">LLM PPO / RLHF</option>
           </select>
         </div>
         <div class="field" id="timeColumnField" hidden>
@@ -326,6 +332,53 @@
         </div>
         <div class="field" id="forecastHorizonField" hidden>
           <label>预测步数</label><input id="p_forecast_horizon" type="number" value="1" min="1" max="64">
+        </div>
+        <div class="field wide" id="llmFields" hidden>
+          <div class="formgrid">
+            <div class="field">
+              <label>数据来源</label>
+              <select id="p_dataset_source"><option value="local">本地数据集</option><option value="hub">Hugging Face Hub</option></select>
+            </div>
+            <div class="field" id="hubDatasetField" hidden>
+              <label>Hub 数据集 ID</label><input id="p_hub_dataset" maxlength="193" placeholder="例如: org/dataset">
+            </div>
+            <div class="field" id="hubConfigField" hidden>
+              <label>数据集配置（可选）</label><input id="p_hub_config" maxlength="128" placeholder="默认配置留空">
+            </div>
+            <div class="field" id="hubSplitField" hidden>
+              <label>数据 split</label><input id="p_hub_split" value="train" maxlength="128">
+            </div>
+            <div class="field" id="baseModelField" hidden>
+              <label>基座模型 Hub ID</label><input id="p_base_model" maxlength="256" placeholder="例如: org/model-name">
+            </div>
+            <div class="field" id="rewardModelField" hidden>
+              <label>PPO 奖励模型 Hub ID（num_labels=1）</label><input id="p_reward_model" maxlength="256" placeholder="例如: org/reward-model">
+            </div>
+            <div class="field" id="textColumnField">
+              <label>文本列</label><input id="p_text_column" value="text" maxlength="128">
+            </div>
+            <div class="field" id="promptColumnField" hidden>
+              <label>Prompt 列</label><input id="p_prompt_column" value="prompt" maxlength="128">
+            </div>
+            <div class="field" id="completionColumnField" hidden>
+              <label>Completion 列（可选）</label><input id="p_completion_column" maxlength="128">
+            </div>
+            <div class="field" id="chosenColumnField" hidden>
+              <label>DPO chosen 列</label><input id="p_chosen_column" value="chosen" maxlength="128">
+            </div>
+            <div class="field" id="rejectedColumnField" hidden>
+              <label>DPO rejected 列</label><input id="p_rejected_column" value="rejected" maxlength="128">
+            </div>
+            <div class="field"><label>最大样本数</label><input id="p_max_samples" type="number" value="5000" min="1" max="1000000"></div>
+            <div class="field"><label>最大序列长度</label><input id="p_max_seq_len" type="number" value="256" min="2" max="8192"></div>
+            <div class="field" id="vocabSizeField" hidden><label>Tokenizer 词表大小</label><input id="p_vocab_size" type="number" value="8000" min="32" max="250000"></div>
+            <div class="field" id="modelHiddenSizeField" hidden><label>模型隐藏维度</label><input id="p_model_hidden_size" type="number" value="256" min="16" max="8192"></div>
+            <div class="field" id="modelLayersField" hidden><label>模型层数</label><input id="p_model_layers" type="number" value="4" min="1" max="96"></div>
+            <div class="field" id="modelHeadsField" hidden><label>注意力头数</label><input id="p_model_heads" type="number" value="4" min="1" max="128"></div>
+            <div class="field" id="ppoUpdatesField" hidden><label>PPO 更新次数</label><input id="p_ppo_updates" type="number" value="4" min="1" max="16"></div>
+            <div class="field" id="llmLearningRateField" hidden><label>微调学习率</label><input id="p_llm_lr" type="number" value="0.00002" step="0.00001" min="0.000001" max="1"></div>
+          </div>
+          <div class="hint">Hub 模型和数据集均按公共仓库加载，禁用自定义远程代码。LLM 任务要求单张 GPU，模型与序列长度需适配该卡显存。</div>
         </div>
         <div class="field"><label id="epochLabel">轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"></div>
         <div class="field" id="batchSizeField"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"></div>
@@ -525,6 +578,8 @@ const fmtLoss = (v) => (v === null || v === undefined) ? "-" : Number(v).toFixed
 const taskName = (task) => ({
   classification: "分类", regression: "回归", clustering: "KMeans 聚类",
   time_series_forecasting: "时间序列预测",
+  llm_pretraining: "LLM 从零预训练", llm_sft: "LLM 全参数 SFT",
+  llm_dpo: "LLM DPO", llm_ppo: "LLM PPO / RLHF",
 }[task] || task || "未知任务");
 
 /* ---------- 设备徽章 ---------- */
@@ -626,11 +681,17 @@ async function loadPreview() {
 
 function updateStart() {
   const task = taskSelect.value;
+  const isLLM = task.startsWith("llm_");
+  const source = isLLM ? $("p_dataset_source").value : "local";
+  const datasetReady = isLLM && source === "hub" ? Boolean($("p_hub_dataset").value.trim()) : Boolean(state.datasetId);
   const hasTarget = Boolean($("targetSelect").value);
   const hasTimeColumn = Boolean($("timeColumnSelect").value)
     && $("timeColumnSelect").value !== $("targetSelect").value;
-  const ready = state.datasetId && (task === "clustering"
-    || (hasTarget && (task !== "time_series_forecasting" || hasTimeColumn)));
+  const hasBaseModel = !isLLM || task === "llm_pretraining" || Boolean($("p_base_model").value.trim());
+  const hasRewardModel = !isLLM || task !== "llm_ppo" || Boolean($("p_reward_model").value.trim());
+  const ready = datasetReady && hasBaseModel && hasRewardModel && (isLLM || (task === "clustering"
+    || (hasTarget && (task !== "time_series_forecasting" || hasTimeColumn))));
+
   $("btnStart").disabled = !ready;
 }
 
@@ -638,13 +699,39 @@ function updateTaskFields() {
   const task = taskSelect.value;
   const isClustering = task === "clustering";
   const isForecasting = task === "time_series_forecasting";
-  $("targetField").hidden = isClustering;
+  const isLLM = task.startsWith("llm_");
+  const isPretraining = task === "llm_pretraining";
+  const isDpo = task === "llm_dpo";
+  const isPpo = task === "llm_ppo";
+  $("targetField").hidden = isClustering || isLLM;
   $("timeColumnField").hidden = !isForecasting;
   $("nClustersField").hidden = !isClustering;
   $("lookbackField").hidden = !isForecasting;
   $("forecastHorizonField").hidden = !isForecasting;
-  ["batchSizeField", "learningRateField", "hiddenLayersField", "hiddenSizeField", "testSplitField", "resourceHintField"]
-    .forEach((id) => { $(id).hidden = isClustering; });
+  $("llmFields").hidden = !isLLM;
+  $("datasetLocalPanel").hidden = isLLM && $("p_dataset_source").value === "hub";
+  $("hubDatasetField").hidden = !isLLM || $("p_dataset_source").value !== "hub";
+  $("hubConfigField").hidden = !isLLM || $("p_dataset_source").value !== "hub";
+  $("hubSplitField").hidden = !isLLM || $("p_dataset_source").value !== "hub";
+  $("baseModelField").hidden = !isLLM || isPretraining;
+  $("rewardModelField").hidden = !isPpo;
+  $("textColumnField").hidden = !isPretraining && task !== "llm_sft";
+  $("promptColumnField").hidden = !isDpo && !isPpo && !(task === "llm_sft" && $("p_completion_column").value.trim());
+  $("completionColumnField").hidden = !isLLM || task !== "llm_sft";
+  $("chosenColumnField").hidden = !isDpo;
+  $("rejectedColumnField").hidden = !isDpo;
+  $("vocabSizeField").hidden = !isPretraining;
+  ["modelHiddenSizeField", "modelLayersField", "modelHeadsField"].forEach((id) => { $(id).hidden = !isPretraining; });
+  $("ppoUpdatesField").hidden = !isPpo;
+  ["batchSizeField", "testSplitField"].forEach((id) => { $(id).hidden = isClustering; });
+  $("learningRateField").hidden = isClustering || (isLLM && !isPretraining);
+  $("llmLearningRateField").hidden = !isLLM || isPretraining;
+  ["hiddenLayersField", "hiddenSizeField"].forEach((id) => { $(id).hidden = isClustering || isLLM; });
+  $("resourceHintField").hidden = isClustering || isLLM;
+  $("p_require_gpu").disabled = isLLM;
+  $("p_require_gpu").checked = isLLM || $("p_require_gpu").checked;
+  $("minVramField").hidden = isLLM ? false : (isClustering || !$("p_require_gpu").checked);
+  $("btnPredict").textContent = isLLM ? "生成文本" : "预测";
   if (isClustering) {
     $("p_require_gpu").checked = false;
     $("minVramField").hidden = true;
@@ -654,7 +741,15 @@ function updateTaskFields() {
     ? "KMeans 根据所有特征自动分组，不需要目标列，当前使用 CPU。"
     : isForecasting
       ? "按时间列排序目标值；使用最近窗口预测指定步数后的数值。"
-      : "分类适用于离散标签，回归适用于连续数值目标。";
+      : isLLM
+        ? isPretraining
+          ? "从随机初始化 tokenizer 和 decoder-only GPT-2 模型，使用文本列做因果语言建模。"
+          : isDpo
+            ? "基于 prompt、chosen、rejected 偏好对执行 DPO，全参数更新基座模型。"
+            : isPpo
+              ? "基于奖励模型执行 PPO 式 RLHF；需要标量奖励模型和单张 GPU。"
+              : "对 Hugging Face CausalLM 执行全参数监督微调（SFT）。"
+        : "分类适用于离散标签，回归适用于连续数值目标。";
   updateStart();
 }
 
@@ -679,14 +774,21 @@ $("datasetSelect").onchange = (e) => { state.datasetId = e.target.value; loadPre
 /* ---------- 训练任务 ---------- */
 const taskSelect = $("taskSelect");
 taskSelect.addEventListener("change", updateTaskFields);
+$("p_dataset_source").addEventListener("change", updateTaskFields);
+[
+  "p_hub_dataset", "p_base_model", "p_reward_model", "p_completion_column",
+].forEach((id) => $(id).addEventListener("input", () => { updateTaskFields(); updateStart(); }));
 $("p_require_gpu").onchange = () => { $("minVramField").hidden = !$("p_require_gpu").checked; };
 
 $("btnStart").onclick = async () => {
   const task = taskSelect.value;
-  if (!state.datasetId || (task !== "clustering" && !$("targetSelect").value)) return;
+  const isLLM = task.startsWith("llm_");
+  const datasetSource = isLLM ? $("p_dataset_source").value : "local";
+  const datasetId = isLLM && datasetSource === "hub" ? $("p_hub_dataset").value.trim() : state.datasetId;
+  if (!datasetId || (!isLLM && task !== "clustering" && !$("targetSelect").value)) return;
   const payload = {
-    dataset_id: state.datasetId,
-    target: task === "clustering" ? null : $("targetSelect").value,
+    dataset_id: datasetId,
+    target: task === "clustering" || isLLM ? null : $("targetSelect").value,
     task,
     epochs: Number($("p_epochs").value),
     batch_size: Number($("p_batch_size").value),
@@ -703,6 +805,30 @@ $("btnStart").onclick = async () => {
     payload.time_column = $("timeColumnSelect").value;
     payload.lookback = Number($("p_lookback").value);
     payload.forecast_horizon = Number($("p_forecast_horizon").value);
+  }
+  if (isLLM) {
+    Object.assign(payload, {
+      dataset_source: datasetSource,
+      dataset_config: $("p_hub_config").value.trim() || null,
+      dataset_split: $("p_hub_split").value.trim() || "train",
+      base_model: $("p_base_model").value.trim() || null,
+      reward_model: $("p_reward_model").value.trim() || null,
+      text_column: $("p_text_column").value.trim() || "text",
+      prompt_column: $("p_prompt_column").value.trim() || "prompt",
+      completion_column: $("p_completion_column").value.trim() || null,
+      chosen_column: $("p_chosen_column").value.trim() || "chosen",
+      rejected_column: $("p_rejected_column").value.trim() || "rejected",
+      max_samples: Number($("p_max_samples").value),
+      max_seq_len: Number($("p_max_seq_len").value),
+      vocab_size: Number($("p_vocab_size").value),
+      model_hidden_size: Number($("p_model_hidden_size").value),
+      model_layers: Number($("p_model_layers").value),
+      model_heads: Number($("p_model_heads").value),
+      ppo_updates: Number($("p_ppo_updates").value),
+      llm_lr: Number($("p_llm_lr").value),
+      require_gpu: true,
+      min_vram_mb: Math.max(Number($("p_min_vram").value) || 0, 0),
+    });
   }
   $("btnStart").disabled = true;
   try {
@@ -875,6 +1001,10 @@ function renderCharts(j) {
     loss.data.datasets[0].label = "平均惯性";
     loss.data.datasets[1].label = "惯性";
     $("lossChart").previousElementSibling.textContent = "KMeans 惯性（越低越好）";
+  } else if (j.spec.task.startsWith("llm_")) {
+    loss.data.datasets[0].label = "train_loss";
+    loss.data.datasets[1].label = "val_loss";
+    $("lossChart").previousElementSibling.textContent = "LLM 训练 / 验证 Loss";
   } else {
     loss.data.datasets[0].label = "train_loss";
     loss.data.datasets[1].label = "val_loss";
@@ -885,6 +1015,9 @@ function renderCharts(j) {
   const metric = state.charts.metric;
   let key, title;
   if (j.spec.task === "clustering") { key = "val_silhouette"; title = "轮廓系数 Silhouette（越高越好）"; }
+  else if (j.spec.task === "llm_dpo") { key = "preference_accuracy"; title = "DPO 偏好准确率"; }
+  else if (j.spec.task === "llm_ppo") { key = "reward"; title = "PPO 奖励分数"; }
+  else if (j.spec.task.startsWith("llm_")) { key = "perplexity"; title = "验证 Perplexity（越低越好）"; }
   else if (j.spec.task === "regression" || j.spec.task === "time_series_forecasting") {
     key = "val_r2"; title = "验证 R²（越高越好）";
   } else { key = "val_accuracy"; title = "验证准确率 accuracy"; }
@@ -939,6 +1072,24 @@ function renderResult(j) {
     box.innerHTML = html;
     return;
   }
+  if (j.spec.task.startsWith("llm_")) {
+    html += stat("最佳 epoch", `${s.best_epoch} / ${s.epochs_total}`);
+    html += stat("训练 loss", fmtLoss(s.final.train_loss));
+    if (s.final.val_loss !== undefined) {
+      html += stat("验证 loss", fmtLoss(s.final.val_loss));
+      html += stat("Perplexity", fmtLoss(s.final.perplexity));
+    }
+    if (s.final.preference_accuracy !== undefined) html += stat("偏好准确率", `${(s.final.preference_accuracy * 100).toFixed(1)}%`);
+    if (s.final.reward !== undefined) html += stat("PPO reward", fmtLoss(s.final.reward));
+    if (s.final.kl !== undefined) html += stat("KL", fmtLoss(s.final.kl));
+    html += stat("样本", `${s.rows.train} / ${s.rows.val}`);
+    html += stat("设备", s.device === "cuda" ? "GPU" : "CPU");
+    html += stat("用时", `${s.duration_sec}s`);
+    html += `</div><div class="hint" style="margin-top:8px;">模型 tokenizer 与权重已保存为 best_model.zip。可下载模型包，或切到「预测」页输入 prompt 生成文本。</div>`;
+    box.className = "";
+    box.innerHTML = html;
+    return;
+  }
   html += stat("最佳 epoch", s.best_epoch + " / " + s.epochs_total);
   if (j.spec.task === "regression" || j.spec.task === "time_series_forecasting") {
     html += stat("验证 R²", fmtLoss(s.final.val_r2));
@@ -974,6 +1125,14 @@ function renderResult(j) {
 async function fillPredictTemplate() {
   const j = state.jobs.find((x) => x.id === state.jobId);
   if (!j) return;
+  if (j.spec.task.startsWith("llm_")) {
+    $("predictInput").value = "";
+    $("predictInput").placeholder = "输入 prompt，例如：用三句话介绍机器学习。";
+    $("tab-predict").querySelector(".hint").textContent = "输入一段 prompt，平台使用已训练的 decoder-only LLM 生成续写内容。";
+    $("btnPredict").textContent = "生成文本";
+    return;
+  }
+  $("btnPredict").textContent = "预测";
   if (j.spec.task === "time_series_forecasting") {
     $("predictInput").value = "[]";
     $("predictInput").placeholder = `输入最近 ${j.spec.params.lookback} 个目标值，例如 [1.2, 1.4, 1.3, ...]`;
@@ -999,17 +1158,23 @@ $("btnPredict").onclick = async () => {
   const out = $("predictOut");
   const job = state.jobs.find((item) => item.id === state.jobId);
   let body;
+  const isLLM = Boolean(job && job.spec.task.startsWith("llm_"));
   try {
-    const input = JSON.parse($("predictInput").value);
-    body = job && job.spec.task === "time_series_forecasting" ? { history: input } : { row: input };
+    if (isLLM) body = { prompt: $("predictInput").value, max_new_tokens: 64, temperature: 0.0, top_p: 0.9 };
+    else {
+      const input = JSON.parse($("predictInput").value);
+      body = job && job.spec.task === "time_series_forecasting" ? { history: input } : { row: input };
+    }
   }
   catch (e) { toast("预测输入不是合法 JSON: " + e.message, "err"); return; }
   try {
-    const r = await apiJson(`/api/jobs/${state.jobId}/predict`, {
+    const r = await apiJson(`/api/jobs/${state.jobId}/${isLLM ? "generate" : "predict"}`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     out.hidden = false;
-    let txt = job && job.spec.task === "clustering"
+    let txt = isLLM
+      ? r.generated_text
+      : job && job.spec.task === "clustering"
       ? `所属簇：${r.prediction}（中心距离 ${Number(r.distance).toFixed(4)}）`
       : "预测结果: " + (typeof r.prediction === "number" ? r.prediction.toFixed(4) : r.prediction);
     if (r.probabilities) txt += "\n各类别概率:\n" + Object.entries(r.probabilities).map(([k, v]) => `  ${k}: ${(v * 100).toFixed(2)}%`).join("\n");
@@ -1450,6 +1615,7 @@ $("btnDownload").onclick = () => { if (state.jobId) location.href = `/api/jobs/$
 
 /* ---------- 启动 ---------- */
 (async function init() {
+  updateTaskFields();
   loadSystem();
   setInterval(loadSystem, 15000);
   refreshWorkers();

@@ -20,6 +20,7 @@ from app.storage import job_key
 from app.trainer import predict_row
 from app.routers.common import _check_id, _load_meta_or_404
 from app.routers.schemas import (
+    GenerateRequest,
     PredictRequest,
     RemoteServerRequest,
     TrainRequest,
@@ -35,9 +36,10 @@ router = APIRouter(prefix="/api", tags=["jobs"])
 
 @router.post("/train")
 def start_training(req: TrainRequest) -> dict:
-    meta = _load_meta_or_404(req.dataset_id)
-    target = "" if req.task == "clustering" else (req.target or "")
-    columns = meta["columns"]
+    llm_task = req.task.startswith("llm_")
+    meta = _load_meta_or_404(req.dataset_id) if req.dataset_source == "local" else None
+    target = "" if req.task == "clustering" or llm_task else (req.target or "")
+    columns = (meta or {}).get("columns", [])
     if req.task in {"classification", "regression", "time_series_forecasting"}:
         if target not in columns:
             raise HTTPException(400, f"目标列 '{target}' 不在数据集列中")
@@ -58,15 +60,28 @@ def start_training(req: TrainRequest) -> dict:
         params["time_column"] = time_column
         params["lookback"] = lookback
         params["forecast_horizon"] = forecast_horizon
+    if llm_task:
+        llm_lr = float(params.pop("llm_lr"))
+        if task != "llm_pretraining":
+            params["lr"] = llm_lr
+    if not llm_task:
+        for name in (
+            "dataset_source", "dataset_config", "dataset_split", "base_model", "reward_model",
+            "text_column", "prompt_column", "completion_column", "chosen_column", "rejected_column",
+            "max_samples", "max_seq_len", "vocab_size", "model_hidden_size", "model_layers",
+            "model_heads", "ppo_updates", "generation_tokens", "llm_lr",
+        ):
+            params.pop(name, None)
+    requested_gpu = bool(params.pop("require_gpu"))
     resource_hint = {
-        "require_gpu": bool(params.pop("require_gpu")),
+        "require_gpu": llm_task or requested_gpu,
         "min_vram_mb": int(params.pop("min_vram_mb") or 0),
     }
 
     job = manager.submit(
         {
             "dataset_id": dataset_id,
-            "dataset_name": meta.get("name", dataset_id),
+            "dataset_name": (meta or {}).get("name", dataset_id),
             "target": target,
             "task": task,
             "params": params,
@@ -437,11 +452,15 @@ def download_model(job_id: str) -> FileResponse:
     _check_id(job_id, "任务")
     if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")
-    key = job_key(job_id, "best.pt")
+    record = manager.get(job_id)
+    is_llm = str((record.get("spec") or {}).get("task", "")).startswith("llm_")
+    artifact_name = "best_model.zip" if is_llm else "best.pt"
+    key = job_key(job_id, artifact_name)
     if not manager.store.exists(key):
         raise HTTPException(404, "模型文件尚未生成（任务可能仍在训练）")
-    path = manager.store.read_file(key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best.pt")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"{job_id}-best.pt")
+    path = manager.store.read_file(key, config.WORKER_SCRATCH_DIR / "serve" / job_id / artifact_name)
+    filename = f"{job_id}-model.zip" if is_llm else f"{job_id}-best.pt"
+    return FileResponse(path, media_type="application/octet-stream", filename=filename)
 
 
 @router.post("/jobs/{job_id}/predict")
@@ -449,6 +468,9 @@ def predict(job_id: str, body: PredictRequest) -> dict:
     _check_id(job_id, "任务")
     if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")
+    task = str(((manager.get(job_id) or {}).get("spec") or {}).get("task", ""))
+    if task.startswith("llm_"):
+        raise HTTPException(400, "LLM 任务请使用文本生成接口")
     key = job_key(job_id, "best.pt")
     if not manager.store.exists(key):
         raise HTTPException(400, "模型文件尚未生成（任务可能仍在训练）")
@@ -459,3 +481,34 @@ def predict(job_id: str, body: PredictRequest) -> dict:
         return predict_row(local_ckpt, body.row, history=body.history)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"预测失败: {exc}") from exc
+
+
+@router.post("/jobs/{job_id}/generate")
+def generate(job_id: str, body: GenerateRequest) -> dict:
+    """从已训练的 LLM 模型包生成文本，不执行任何远程代码。"""
+    _check_id(job_id, "任务")
+    record = manager.get(job_id)
+    if not record:
+        raise HTTPException(404, "任务不存在")
+    task = str((record.get("spec") or {}).get("task", ""))
+    if not task.startswith("llm_"):
+        raise HTTPException(400, "该任务不是 LLM 任务")
+    key = job_key(job_id, "best_model.zip")
+    if not manager.store.exists(key):
+        raise HTTPException(400, "LLM 模型文件尚未生成（任务可能仍在训练）")
+    local_bundle = manager.store.read_file(
+        key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best_model.zip"
+    )
+    try:
+        from app.llm_trainer import generate_text
+
+        generated = generate_text(
+            local_bundle,
+            body.prompt,
+            max_new_tokens=body.max_new_tokens,
+            temperature=body.temperature,
+            top_p=body.top_p,
+        )
+        return {"prompt": body.prompt, "generated_text": generated}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"文本生成失败: {exc}") from exc

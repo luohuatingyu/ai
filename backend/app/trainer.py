@@ -435,7 +435,7 @@ def load_trainer_state(path: Path) -> dict:
         state = torch.load(path, map_location="cpu", weights_only=True)
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {exc}") from exc
-    if not isinstance(state, dict) or state.get("kind") != "trainer_state":
+    if not isinstance(state, dict) or state.get("kind") not in {"trainer_state", "llm_trainer_state"}:
         raise ValueError(f"不是有效的训练状态文件（kind 不匹配）: {path}")
     return state
 
@@ -754,7 +754,7 @@ def _run_kmeans_training(
 # ---------------------------------------------------------------------------
 
 def run_training(
-    dataset_path: Path,
+    dataset_path: Path | None,
     target: str,
     task: str,
     params: dict,
@@ -794,7 +794,22 @@ def run_training(
         raise JobCancelled()
     if pause_event is None:
         pause_event = threading.Event()
-    if not dataset_path.exists():
+    if task in {"llm_pretraining", "llm_sft", "llm_dpo", "llm_ppo"}:
+        from app.llm_trainer import run_llm_training
+
+        return run_llm_training(
+            task=task,
+            dataset_path=dataset_path,
+            params={**params, "dataset_id": params.get("dataset_id")},
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            log_fn=db_log_fn,
+            job_dir=job_dir,
+            resume_state=resume_state,
+            on_epoch_end=on_epoch_end,
+            on_checkpoint=on_checkpoint,
+        )
+    if dataset_path is None or not dataset_path.exists():
         raise ValueError("数据集文件不存在（可能已被删除）")
     if task not in ("classification", "regression", "clustering", "time_series_forecasting"):
         raise ValueError(f"未知任务类型: {task}")

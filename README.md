@@ -7,8 +7,8 @@
 - 📈 实时 Loss 曲线、验证指标曲线（Chart.js）、进度条
 - 📜 实时训练日志，任务可排队、暂停（保存断点）、恢复（跨卡/跨机接续）、取消、删除
 - 🖥 计算资源管理：平台通过 SSH 远程执行单文件部署脚本、自动检测 CPU/GPU、手动选择计算槽加入资源池，并可远程启动/停止/重启 worker
-- 🏆 支持分类、回归、KMeans 聚类和单序列时间序列预测；训练完成后展示对应评估指标
-- 🔮 加载 best.pt 在线单条预测，模型权重可下载
+- 🏆 支持分类、回归、KMeans 聚类、单序列预测、LLM 从零预训练、全参数 SFT、DPO 与 PPO/RLHF
+- 🔮 表格模型在线单条预测；LLM 可输入 prompt 生成文本，模型包可下载
 - ♻️ 环境性故障（CUDA/OOM/网络瞬断）自动从断点续训（`JOB_MAX_AUTO_RETRY` 次内），单卡故障不影响整体任务完成
 - 🔧 预留 GPU 接入：镜像内置 CUDA 12 构建 torch，宿主机装好驱动即自动启用 GPU
 - 💾 支持MySQL数据库存储（可选镜像），使用已有MySQL服务器
@@ -63,6 +63,12 @@ docker compose up -d --build
 建议流程：在左侧先点「＋ classification_demo」「＋ regression_demo」导入任意一个内置示例数据集（客户流失二分类 / 房价回归），选择分类或回归后点「开始训练」，右侧实时观看曲线与日志。
 
 训练任务类型：分类和回归需要选择目标列；KMeans 聚类不需要目标列，可设置簇数；单序列时间序列预测需要选择时间列、数值目标列、历史窗口长度和预测步数，按时间顺序留出验证数据。
+
+### LLM 训练
+
+训练配置中可选择本地数据集或 Hugging Face Hub 数据集，设置配置名、split、文本/偏好列和最大样本数。支持从随机初始化 tokenizer 与 decoder-only GPT-2 开始预训练、对 Hub CausalLM 做全参数 SFT、使用 `prompt/chosen/rejected` 偏好对做 DPO，以及配置标量奖励模型执行 PPO 式 RLHF。LLM 模型加载和数据集加载都关闭 `trust_remote_code`；Hub 模型与数据集需为可公开访问的仓库。
+
+LLM 任务要求单张 GPU，并将 tokenizer 与模型权重保存为 `best_model.zip`；完成后可在「预测」页输入 prompt 生成文本。PPO 需要 `num_labels=1` 的奖励模型。首版仅支持 decoder-only CausalLM，不做单任务多卡并行；请按 GPU 显存选择模型、批大小与序列长度。可上传 CSV、JSON 或 JSONL/NDJSON 文本与偏好数据。
 
 ## 架构（四平面 + 无状态计算单元）
 

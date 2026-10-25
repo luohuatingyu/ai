@@ -465,7 +465,7 @@ class TrainingWorker:
                     pass
 
             # 拉取历史产物到 scratch：日志/指标延续既有内容，best.pt 供最终报告加载
-            for name in ("log.txt", "metrics.jsonl", "best.pt"):
+            for name in ("log.txt", "metrics.jsonl", "best.pt", "best_model.zip"):
                 key = job_key(job_id, name)
                 if store.exists(key):
                     store.read_file(key, scratch / name)
@@ -512,7 +512,11 @@ class TrainingWorker:
             controller.start()
             self._controller = controller
 
-            dataset_path = resolve_dataset_for_worker(str(spec["dataset_id"]), scratch)
+            dataset_path = None
+            if str(params.get("dataset_source", "local")) != "hub":
+                dataset_path = resolve_dataset_for_worker(str(spec["dataset_id"]), scratch)
+            training_params = dict(params)
+            training_params.setdefault("dataset_id", str(spec["dataset_id"]))
 
             def scratch_log(msg: str) -> None:
                 """训练器日志：写本地 scratch，随 on_epoch_end 整文件幂等同步到状态平面。"""
@@ -548,7 +552,7 @@ class TrainingWorker:
                     dataset_path=dataset_path,
                     target=str(spec["target"]),
                     task=str(spec["task"]),
-                    params=params,
+                    params=training_params,
                     cancel_event=controller.cancel_event,
                     log_fn=scratch_log,
                     job_dir=scratch,
@@ -566,7 +570,7 @@ class TrainingWorker:
                 )
                 # 断点产物同步：best/last/preprocessor 一并上传状态平面——
                 # 恢复后即使验证指标不再提升，接手 worker 也有 best.pt 可交付/预测
-                for name in ("best.pt", "last.pt", "preprocessor.json"):
+                for name in ("best.pt", "last.pt", "preprocessor.json", "best_model.zip"):
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
@@ -590,7 +594,7 @@ class TrainingWorker:
                 return
             except JobCancelled:
                 # 取消（可在任意 eopch）：同步已完成部分的最佳产物供交付/预测
-                for name in ("best.pt", "last.pt", "preprocessor.json"):
+                for name in ("best.pt", "last.pt", "preprocessor.json", "best_model.zip"):
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
@@ -601,7 +605,7 @@ class TrainingWorker:
 
             # ---- 成功：上传最终产物 + 记录训练分段（UI 分段设备标注数据源） ----
             for name in ("metrics.jsonl", "log.txt", "best.pt", "last.pt",
-                         "preprocessor.json", "summary.json"):
+                         "preprocessor.json", "summary.json", "best_model.zip"):
                 artifact = scratch / name
                 if artifact.exists():
                     store.write_file(job_key(job_id, name), artifact)
@@ -723,7 +727,10 @@ class TrainingWorker:
         产生的最佳权重不应丢失（重试/预测/交付都要能取到）。
         """
         try:
-            for name in ("metrics.jsonl", "log.txt", "best.pt", "last.pt", "preprocessor.json"):
+            for name in (
+                "metrics.jsonl", "log.txt", "best.pt", "last.pt",
+                "preprocessor.json", "best_model.zip",
+            ):
                 artifact = scratch / name
                 if artifact.exists():
                     self.store.write_file(job_key(job_id, name), artifact)

@@ -121,7 +121,9 @@ class JobManager:
         for required in ("dataset_id", "task"):
             if not spec.get(required):
                 raise ValueError(f"缺少必填字段: {required}")
-        if spec.get("task") != "clustering" and not spec.get("target"):
+        if spec.get("task") not in {
+            "clustering", "llm_pretraining", "llm_sft", "llm_dpo", "llm_ppo"
+        } and not spec.get("target"):
             raise ValueError("缺少必填字段: target")
         job_id = f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         spec = dict(spec)

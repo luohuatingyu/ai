@@ -24,3 +24,7 @@ httpx2>=2.0
 # Excel 数据集导入（.xlsx / .xls）
 openpyxl>=3.1
 xlrd>=2.0
+
+# Hugging Face Hub 数据加载与 decoder-only LLM 训练
+transformers>=4.46,<5
+datasets>=3.3,<5

@@ -22,7 +22,7 @@ class DatasetImporter:
     
     def __init__(self, datasets_dir: Path):
         self.datasets_dir = datasets_dir
-        self.supported_formats = ['.csv', '.xlsx', '.xls', '.json', '.zip', '.tar', '.tar.gz', '.tgz']
+        self.supported_formats = ['.csv', '.xlsx', '.xls', '.json', '.jsonl', '.ndjson', '.zip', '.tar', '.tar.gz', '.tgz']
         self.temp_dir = datasets_dir / "temp" / "import"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
     
@@ -139,7 +139,7 @@ class DatasetImporter:
             self._extract_archive_safely(archive_path, extraction_dir)
             
             # 查找数据文件
-            supported_data = {".csv", ".xlsx", ".xls", ".json"}
+            supported_data = {".csv", ".xlsx", ".xls", ".json", ".jsonl", ".ndjson"}
             for file_path in sorted(extraction_dir.rglob("*")):
                 if file_path.is_file() and self._file_extension(file_path.name) in supported_data:
                     extracted_files.append(file_path)
@@ -188,6 +188,9 @@ class DatasetImporter:
                 df = pd.read_csv(file_path)
             elif file_ext == ".json":
                 df = pd.read_json(file_path)
+            elif file_ext in {".jsonl", ".ndjson"}:
+                # LLM 常见的 JSON Lines 语料逐行解析，导入后由 DatasetManager 统一存储。
+                df = pd.read_json(file_path, lines=True)
             elif file_ext in {".xlsx", ".xls"}:
                 df = pd.read_excel(file_path)
             else:

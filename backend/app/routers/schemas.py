@@ -1,6 +1,7 @@
 """API 请求模型（pydantic），从 main.py 抽出以拆分路由。"""
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, StrictBool, model_validator
@@ -9,7 +10,29 @@ from pydantic import BaseModel, Field, StrictBool, model_validator
 class TrainRequest(BaseModel):
     dataset_id: str
     target: str | None = None
-    task: Literal["classification", "regression", "clustering", "time_series_forecasting"] = "classification"
+    task: Literal[
+        "classification", "regression", "clustering", "time_series_forecasting",
+        "llm_pretraining", "llm_sft", "llm_dpo", "llm_ppo",
+    ] = "classification"
+    dataset_source: Literal["local", "hub"] = "local"
+    dataset_config: str | None = Field(default=None, max_length=128)
+    dataset_split: str = Field(default="train", min_length=1, max_length=128)
+    base_model: str | None = Field(default=None, max_length=256)
+    reward_model: str | None = Field(default=None, max_length=256)
+    text_column: str = Field(default="text", min_length=1, max_length=128)
+    prompt_column: str = Field(default="prompt", min_length=1, max_length=128)
+    completion_column: str | None = Field(default=None, max_length=128)
+    chosen_column: str = Field(default="chosen", min_length=1, max_length=128)
+    rejected_column: str = Field(default="rejected", min_length=1, max_length=128)
+    max_samples: int = Field(default=5000, ge=1, le=1_000_000)
+    max_seq_len: int = Field(default=512, ge=2, le=8192)
+    vocab_size: int = Field(default=8000, ge=32, le=250_000)
+    model_hidden_size: int = Field(default=256, ge=16, le=8192)
+    model_layers: int = Field(default=4, ge=1, le=96)
+    model_heads: int = Field(default=4, ge=1, le=128)
+    ppo_updates: int = Field(default=4, ge=1, le=16)
+    generation_tokens: int = Field(default=32, ge=1, le=512)
+    llm_lr: float = Field(default=2e-5, gt=0, le=1.0)
     time_column: str | None = None
     n_clusters: int = Field(4, ge=2, le=64)
     lookback: int = Field(12, ge=2, le=512)
@@ -27,7 +50,30 @@ class TrainRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_task_fields(self) -> "TrainRequest":
-        """按任务类型校验目标列、时间列和资源参数。"""
+        """按任务类型校验数据源、模型标识、目标列和资源参数。"""
+        llm_tasks = {"llm_pretraining", "llm_sft", "llm_dpo", "llm_ppo"}
+        repo_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?$")
+
+        def validate_repo_id(value: str | None, label: str, required: bool = False) -> None:
+            """只接受 Hugging Face 仓库 ID，拒绝 URL、路径和参数注入。"""
+            if required and not value:
+                raise ValueError(f"{label}不能为空")
+            if value and (not repo_pattern.fullmatch(value) or value in {".", ".."}):
+                raise ValueError(f"{label}必须是有效的 Hugging Face 仓库 ID")
+
+        if self.task in llm_tasks:
+            if self.dataset_source == "hub":
+                validate_repo_id(self.dataset_id, "数据集 ID", required=True)
+            if self.task in {"llm_sft", "llm_dpo", "llm_ppo"}:
+                validate_repo_id(self.base_model, "基座模型", required=True)
+            if self.task == "llm_ppo":
+                validate_repo_id(self.reward_model, "奖励模型", required=True)
+            if self.model_hidden_size % self.model_heads:
+                raise ValueError("模型隐藏维度必须能被注意力头数整除")
+            if self.task == "llm_pretraining" and self.vocab_size < 32:
+                raise ValueError("从零预训练的词表大小至少为 32")
+        elif self.dataset_source != "local":
+            raise ValueError("Hub 数据源仅支持 LLM 任务")
         if self.task in {"classification", "regression", "time_series_forecasting"} and not self.target:
             raise ValueError("该任务类型必须指定目标列")
         if self.task == "time_series_forecasting":
@@ -50,6 +96,15 @@ class PredictRequest(BaseModel):
         if (self.row is None) == (self.history is None):
             raise ValueError("预测请求必须且只能提供 row 或 history")
         return self
+
+
+class GenerateRequest(BaseModel):
+    """LLM 文本生成请求，并限制单次推理的资源消耗。"""
+
+    prompt: str = Field(min_length=1, max_length=32768)
+    max_new_tokens: int = Field(default=32, ge=1, le=512)
+    temperature: float = Field(default=0.0, ge=0, le=2.0)
+    top_p: float = Field(default=0.9, gt=0, le=1.0)
 
 
 class ProcessRequest(BaseModel):
