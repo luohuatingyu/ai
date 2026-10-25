@@ -1,30 +1,107 @@
-# 可视化模型训练平台（CPU 临时版）
-# 与 docker-compose.yml 使用同一个镜像；GPU 环境就绪后请改用 GPU 版获得加速。
-# 本文件仅去掉 gpus 声明，页面与代码无需任何修改。
+# 可视化模型训练平台（多机架构 · 纯 CPU 环境版）
+# 与 docker-compose.yml 同一镜像与同一套服务编排，仅不声明 GPU；
+# 计算平面 worker 以 CPU 执行槽运行（require_gpu 的任务会等待 GPU 节点加入）。
+# GPU 环境就绪后请改用 GPU 版获得加速。
 
-# 注意：本项目使用已有的MySQL服务器，不创建MySQL容器
-# 请确保MySQL服务器已启动，并通过环境变量配置连接信息
+# 注意：本项目使用可配置的已有 MySQL 服务器，不创建 MySQL 容器。
+
+x-backend-env: &backend-env
+  REDIS_URL: redis://redis:6379/0
+  STORAGE_BACKEND: minio
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+  MINIO_BUCKET: ${MINIO_BUCKET:-mtp-artifacts}
+  MINIO_SECURE: "false"
+  DATA_DIR: /app/data
+  JOB_MAX_AUTO_RETRY: ${JOB_MAX_AUTO_RETRY:-5}
+  JOB_RETRY_BACKOFF: ${JOB_RETRY_BACKOFF:-2}
+  WATCHDOG_INTERVAL: ${WATCHDOG_INTERVAL:-5}
+  WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-10}
+  WORKER_LEASE_TTL: ${WORKER_LEASE_TTL:-30}
+  WORKER_SUPERVISOR_PROBE_INTERVAL: ${WORKER_SUPERVISOR_PROBE_INTERVAL:-15}
+  WORKER_CPU_SLOTS: ${WORKER_CPU_SLOTS:-2}
+  WORKER_CHECKPOINT_INTERVAL: ${WORKER_CHECKPOINT_INTERVAL:-5}
+  WORKER_CHECKPOINT_KEEP: ${WORKER_CHECKPOINT_KEEP:-3}
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: mtp-redis-cpu
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data-cpu:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: mtp-minio-cpu
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data-cpu:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   trainer:
     build: ./backend
-    container_name: ai-hot-boxes-trainer-cpu
+    container_name: mtp-trainer-cpu
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
     environment:
-      # MySQL连接配置（明文密码）
-      DB_HOST: ${DB_HOST:-localhost}          # MySQL服务器地址
-      DB_PORT: ${DB_PORT:-3306}               # MySQL端口
-      DB_USER: ${DB_USER:-root}              # MySQL用户名
-      DB_PASSWORD: ${DB_PASSWORD:-password}   # MySQL密码（明文）
-      DB_NAME: ${DB_NAME:-model_training}    # 数据库名称
-      DB_CHARSET: ${DB_CHARSET:-utf8mb4}      # 字符集
-      DB_COLLATION: ${DB_COLLATION:-utf8mb4_unicode_ci}  # 排序规则
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}       # 连接池大小
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20} # 最大溢出连接数
-      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30} # 获取连接超时时间
-      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-3600} # 连接回收时间
-      DB_ECHO: ${DB_ECHO:-false}             # 是否显示SQL语句
+      <<: *backend-env
+      USE_DATABASE: ${USE_DATABASE:-false}
+      DB_HOST: ${DB_HOST:-localhost}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-password}
+      DB_NAME: ${DB_NAME:-model_training}
+      DB_CHARSET: ${DB_CHARSET:-utf8mb4}
+      DB_COLLATION: ${DB_COLLATION:-utf8mb4_unicode_ci}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-3600}
+      DB_ECHO: ${DB_ECHO:-false}
+      EMBEDDED_WORKERS: ${EMBEDDED_WORKERS:-0}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     restart: unless-stopped
+
+  worker:
+    build: ./backend
+    container_name: mtp-worker-cpu
+    volumes:
+      - ./data:/app/data
+    environment:
+      <<: *backend-env
+      USE_DATABASE: ${USE_DATABASE:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data-cpu:
+  minio-data-cpu:
