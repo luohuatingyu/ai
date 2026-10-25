@@ -2,10 +2,42 @@
 
 ## Git基准点
 
-- **Commit Hash**: e1f5d1e（分离本机与远程 worker 镜像默认值）
-- **提交信息**: Separate remote and local worker image defaults
-- **测试日期**: 2026-10-25
+- **Commit Hash**: 8493fac（SSH 流式传输本机 worker 镜像）
+- **提交信息**: Stream worker images over SSH
+- **测试日期**: 2026-10-26
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：经 SSH 流式传输本机 worker 镜像（2026-10-26）
+
+**变更范围**：远程安装不再要求目标机访问镜像仓库。trainer 通过挂载的 Docker socket 查询本机镜像平台并导出归档，以流式方式经 SSH stdin 传给目标机 `docker load`；部署脚本确认镜像已加载后再启动 worker。服务器覆盖值和平台 `WORKER_IMAGE` 都指向平台 Docker 中的本地标签。安装前会对比本机镜像与目标 Docker 的系统/架构，名称别名会规范化，平台不一致时在传输镜像前拒绝并提示。
+
+**测试环境**：Docker Compose；测试镜像 Python 3.12.15。远程管理覆盖配置将 `/var/run/docker.sock` 挂载给 trainer。工作区还保留已有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 改动；它们未纳入本次功能提交，但参与了完整测试。
+
+**测试执行结果**：
+- 定向远程 worker 与 API 测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py tests/test_api.py -q -p no:cacheprovider`：90 通过、0 失败（19.44 秒）。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：211 通过、6 跳过、0 失败、0 错误（55.27 秒）。6 项跳过为 3 项 Redis 集成、2 项 S3 集成和 1 项 Supervisor 子进程集成，受外部服务或环境门控。
+- 全量测试有一次 `test_cancel_running_via_signal` 未及时观察到取消日志；该用例单独复跑 1 通过，之后完整套件重跑通过。此用例与远程镜像变更无关，记录为一次时序波动。
+- `docker compose up --build -d` 与 `docker compose -f docker-compose.yml -f docker-compose.remote.yml up --build -d`：均通过。GPU 与 CPU 远程覆盖配置的 `docker compose ... config -q` 检查均通过；trainer 在 Python 3.12.15 下启动，容器内确认 Docker socket 已挂载。
+- 通过运行中的 trainer 访问真实 Docker Engine API：版本接口返回 HTTP 200 / API 1.56；`mtp-worker:local` 平台为 `linux/arm64`；镜像导出接口成功读取 512 字节 tar 归档头。
+- Shell 脚本语法、前端内联 JavaScript 语法、页面 HTTP 提示内容与 `git diff --check`：均通过。
+- 保留 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 可以从平台 Docker 按标签导出镜像归档，不将完整镜像写入临时文件 | Docker API：`test_local_docker_image_archive_uses_engine_api_version_and_tag_path`、`test_local_docker_image_platform_reads_engine_image_metadata`；流传输：`test_worker_image_archive_streams_over_ssh_without_saving_it` | 按 Engine API 版本查询镜像归档与平台信息；模拟归档经 SSH stdin 到达接收端且内容一致，无临时 tar 文件 | 正常、路径编码、资源与 I/O |
+| 安装先检查目标 Docker，并通过 SSH `docker load` 传输；目标脚本不再 pull 镜像或同步源码 | SSH 与脚本：`test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv`、`test_render_remote_script_quotes_values_and_does_not_transfer_repository`、`test_remote_bootstrap_script_installs_cpu_and_gpu_workers` | 本地标签默认值经流传输，远程动作运行已加载镜像；脚本没有 `docker pull` 或 `git clone` | 正常、兼容、CPU/GPU 部署回归 |
+| 本机与远端平台不兼容时不发送大镜像；平台别名可识别 | 架构：`test_run_remote_action_rejects_mismatched_image_architecture_before_transfer`、`test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv` | arm64 镜像对 amd64 目标明确失败且传输函数不调用；本机 `amd64` 与远端 `x86_64` 可匹配 | 兼容性、边界、失败路径 |
+| 平台检查错误不得泄露 SSH 凭证；归档失败错误同样脱敏 | `test_remote_docker_platform_rejects_errors_and_redacts_credentials`、`test_worker_image_transfer_failure_is_reported_and_redacted` | Docker 检查失败或返回非法平台时拒绝并隐藏密码；远端 load 错误隐藏敏感值 | 异常、权限与安全、恶意输出 |
+| GPU/CPU Compose 均挂载 Docker socket，并保留平台/服务器本地标签默认与覆盖 | `test_compose_separates_local_worker_image_from_remote_default`；GPU/CPU `config -q`；真实 trainer socket 冒烟 | 两类 Compose 可解析并挂载 socket；Docker Engine API 可访问 | 配置兼容、部署回归 |
+| 既有 API、训练、数据和存储回归通过 | 完整 `backend/tests/` | 211 通过、6 环境门控跳过，无最终失败 | 兼容、回归 |
+
+**已知问题与限制**：未连接真实远程 SSH 服务器做端到端完整镜像传输和 worker 启动。目标 Docker 的操作系统和 CPU 架构必须与平台本地镜像一致；当前构建出的本机 worker 镜像为 `linux/arm64`，部署到 amd64 服务器前需在平台 Docker 中准备 amd64 worker 镜像。Docker socket 控制宿主 Docker，权限接近宿主 root；远程管理 API 应限制网络访问。
+
+**重测触发条件**：修改 Docker Engine API 导出、镜像 SSH 流、平台匹配、远程 worker 安装脚本或远程 Compose socket 挂载时，运行远程 worker/API 定向测试、GPU/CPU Compose 检查和完整 `backend/tests/`，并重新检查实际 socket 访问。
+
+**Git基准点**：`8493fac`（Stream worker images over SSH）；本报告作为单独提交更新。
 
 ## 本次变更测试结果：分离本机与远程 worker 镜像默认值（2026-10-25）
 
