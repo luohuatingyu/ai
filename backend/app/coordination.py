@@ -151,6 +151,10 @@ class LeaseStore:
     - release: 仅当 token 匹配才删除 —— 不误伤新持有者。
     """
 
+    def healthy(self) -> bool:
+        """协调平面连通性自检（worker 启动/看门狗周期探测用）。"""
+        raise NotImplementedError
+
     # ---------------- 租约 ----------------
 
     def acquire(self, job_id: str, token: str, ttl: float) -> bool:
@@ -211,6 +215,9 @@ class EmbeddedLeaseStore(LeaseStore):
         self._signals: Dict[str, Set[str]] = {}   # job_id -> 活跃信号集合
         self._workers: Dict[str, Dict[str, object]] = {}  # worker_id -> info(含 last_seen)
 
+    def healthy(self) -> bool:
+        return True
+
     # ---------------- 租约 ----------------
 
     def acquire(self, job_id: str, token: str, ttl: float) -> bool:
@@ -226,7 +233,8 @@ class EmbeddedLeaseStore(LeaseStore):
     def renew(self, job_id: str, token: str, ttl: float) -> bool:
         with self._lock:
             holder = self._leases.get(job_id)
-            if holder is None or holder[0] != token:
+            # 与 Redis 语义对齐：过期后 key 已不存在，同 token 也无法续租
+            if holder is None or holder[0] != token or holder[1] <= time.time():
                 return False
             holder[1] = time.time() + ttl
             return True
@@ -301,6 +309,12 @@ class RedisLeaseStore(LeaseStore):
 
     def __init__(self, redis_client) -> None:
         self._redis = redis_client
+
+    def healthy(self) -> bool:
+        try:
+            return bool(self._redis.ping())
+        except Exception:
+            return False
 
     # ---------------- 租约 ----------------
 

@@ -18,20 +18,6 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = APP_ROOT / "static"
 SAMPLE_DIR = APP_ROOT / "sample_data"
 
-for _d in (DATA_DIR, DATASETS_DIR, JOBS_DIR, WORKER_SCRATCH_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
-
-# 数据库配置
-USE_DATABASE = os.environ.get("USE_DATABASE", "true").lower() == "true"
-if USE_DATABASE:
-    try:
-        from app.database import DATABASE_URL
-        DB_AVAILABLE = True
-    except ImportError:
-        DB_AVAILABLE = False
-else:
-    DB_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
 # 多机训练架构：控制/状态/计算三平面分离
 # - 控制平面（API）：只负责接收请求、入队、查询状态，本身不训练
@@ -54,9 +40,25 @@ MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "training-platform").strip()
 MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").strip().lower() == "true"
 
 # Worker（计算单元）配置
+WORKER_ID = os.environ.get("WORKER_ID", "").strip()  # 独立 worker 身份标识（空则自动生成）
 WORKER_SCRATCH_DIR = DATA_DIR / "worker-scratch"       # 本地临时缓存（scratch），可随时清空
 WORKER_HEARTBEAT_INTERVAL = float(os.environ.get("WORKER_HEARTBEAT_INTERVAL", "10"))   # 心跳周期（秒）
 WORKER_LEASE_TTL = float(os.environ.get("WORKER_LEASE_TTL", "30"))                     # 租约有效期（秒）
 EMBEDDED_WORKERS = int(os.environ.get("EMBEDDED_WORKERS", "2"))                         # 嵌入式模式 worker 线程数
 WORKER_CHECKPOINT_INTERVAL = int(os.environ.get("WORKER_CHECKPOINT_INTERVAL", "5"))     # 每训练 N 个 epoch 存一次 checkpoint
 WORKER_CHECKPOINT_KEEP = int(os.environ.get("WORKER_CHECKPOINT_KEEP", "3"))             # 版本化 checkpoint 保留个数（可回退）
+
+# 运行期目录统一创建（幂等）
+for _d in (DATA_DIR, DATASETS_DIR, JOBS_DIR, WORKER_SCRATCH_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+# 数据库配置
+USE_DATABASE = os.environ.get("USE_DATABASE", "true").lower() == "true"
+if USE_DATABASE:
+    try:
+        from app.database import DATABASE_URL
+        DB_AVAILABLE = True
+    except ImportError:
+        DB_AVAILABLE = False
+else:
+    DB_AVAILABLE = False
