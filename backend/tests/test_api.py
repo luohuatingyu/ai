@@ -1159,3 +1159,18 @@ def test_training_page_resource_retry_and_chart_style_contract():
     assert ".training-page #llmFields > .formgrid" in css
     assert "repeat(auto-fit, minmax(min(100%, 210px), 1fr))" in css
     assert 'href="/app.css?v=20261025-2"' in html
+
+
+def test_remote_server_feedback_toasts_render_above_add_modal():
+    """远程添加表单打开时，错误提示仍应显示在弹窗上方。"""
+    backend_dir = Path(__file__).resolve().parents[1]
+    static_dir = backend_dir / "static"
+    if not static_dir.is_dir():
+        static_dir = backend_dir.parent / "static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    modal_css = html.split(".server-modal {", 1)[1].split("}", 1)[0]
+    toast_css = html.split("#toastWrap {", 1)[1].split("}", 1)[0]
+    modal_z_index = int(modal_css.split("z-index:", 1)[1].split(";", 1)[0])
+    toast_z_index = int(toast_css.split("z-index:", 1)[1].split(";", 1)[0])
+
+    assert toast_z_index > modal_z_index
