@@ -2,38 +2,38 @@
 
 ## Git基准点
 
-- **Commit Hash**: 8403540（本次测试覆盖代码的提交）
-- **提交信息**: Add external compute server onboarding
+- **Commit Hash**: f8839c5（本次测试覆盖代码的提交）
+- **提交信息**: Require shared backends for remote workers
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
-## 本次变更测试结果：外部计算服务器接入（2026-10-25）
+## 本次变更测试结果：平台 SSH 远程计算服务器管理（2026-10-25）
 
-**变更范围**：用一次引导脚本把外部服务器接入计算集群；检测 CPU/GPU 槽位；在页面按槽位手动加入或停止接单；外部 worker 支持本机 start/stop/restart/status 操作。
+**变更范围**：由平台在页面登记目标 SSH 主机，后端通过固定主机密钥校验远程执行单文件 Bash 脚本并拉取 worker 镜像，不向目标机同步项目源码；检测到的 CPU/GPU 槽由用户手动加入资源池；页面可远程重新部署、启动、停止和重启 worker。远程服务器及异步操作状态保存于 Redis；远程管理 API 使用独立令牌保护。
 
-**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；本机无 NVIDIA GPU。
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；本机无可用 NVIDIA GPU；未配置真实远程服务器、SSH 私钥或镜像仓库凭据。
 
 **测试执行结果**：
-- `docker compose up --build -d`：通过；trainer、worker、frontend 已重建并运行，SeaweedFS healthy。
-- 定向测试：80 项收集，77 通过、3 跳过、0 失败、0 错误（45.61 秒）。
-- 完整测试：133 项收集，127 通过、6 跳过、0 失败、0 错误（53.92 秒）。
-- pytest 通过只读挂载当前 `backend/tests/` 和 `scripts/` 执行；工作区原有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 也参与全量测试，但不属于 `8403540` 提交。
-- 跳过项：3 个 Redis 协调集成、1 个 Redis Supervisor 集成、2 个 S3 集成；需要 `MTP_TEST_REDIS` / `MTP_TEST_S3` 配置。
+- `docker compose up --build -d`：通过；trainer、worker、frontend 均重建并启动，SeaweedFS 健康。
+- 定向测试：65 项收集，62 通过、3 跳过、0 失败、0 错误（16.20 秒）。
+- 完整测试：153 项收集，147 通过、6 跳过、0 失败、0 错误（41.20 秒）。
+- pytest 在 Python 3.12.15 容器中只读挂载 `backend/tests/` 和 `scripts/` 执行；工作区原有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 也参与全量测试，但没有纳入 `f8839c5` 提交。
+- 跳过项：3 个 Redis 协调集成、1 个 Redis Supervisor 集成、2 个 S3 集成；分别需要 `MTP_TEST_REDIS` / `MTP_TEST_S3` 配置。
 - 两条非失败警告：SQLAlchemy `declarative_base()` 弃用提示；Pandas 对 xlrd 引擎的未来弃用提示。
-- 静态检查通过：worker 脚本 `bash -n`、前端内嵌 JavaScript `node --check`、两份 Compose 配置解析、`git diff --check`。
-- 运行时 API 检查：`/api/workers` 返回在线 CPU 槽、CPU 线程/内存、稳定槽位标识及 `current_job: null`。
-- Safari 手动交互：添加服务器向导正常打开；GPU 默认命令正确；切换 CPU 后显示 `WORKER_COMPOSE_FILE=docker-compose.cpu.yml ./scripts/worker-node.sh add`；Escape 关闭向导并把焦点交回添加按钮。
+- 静态检查通过：`bash -n backend/app/remote_worker.sh`、Node 解析内嵌 JavaScript、GPU/CPU 主 Compose 与远程覆盖 Compose 解析、`git diff --check`。
+- Safari 手动检查：远程添加表单显示 SSH 主机/账号/端口、资源类型、令牌说明；GPU/CPU 选项布局正常，CPU 模式显示 CPU 槽数量；页面明确显示不会同步项目源码。
+- `/api/workers` 页面运行时检查：本机在线 CPU 槽、CPU 线程/内存、稳定槽位标识和当前任务状态正常。
 
 **定向和完整测试命令**：
 ```bash
 docker compose run --rm --no-deps \
-  -v /Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p/backend/tests:/app/backend/tests:ro \
-  -v /Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p/scripts:/app/scripts:ro \
-  trainer python -m pytest backend/tests/test_worker.py backend/tests/test_coordination.py backend/tests/test_api.py backend/tests/test_worker_node_script.py -v
+  -v "$PWD/backend/tests:/app/backend/tests:ro" \
+  -v "$PWD/scripts:/app/scripts:ro" \
+  trainer python -m pytest backend/tests/test_remote_workers.py backend/tests/test_coordination.py backend/tests/test_api.py -v
 
 docker compose run --rm --no-deps \
-  -v /Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p/backend/tests:/app/backend/tests:ro \
-  -v /Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p/scripts:/app/scripts:ro \
+  -v "$PWD/backend/tests:/app/backend/tests:ro" \
+  -v "$PWD/scripts:/app/scripts:ro" \
   trainer python -m pytest backend/tests/ -v
 ```
 
@@ -41,20 +41,18 @@ docker compose run --rm --no-deps \
 
 | 验收标准 | 测试层级与用例 | 输入与预期 | 场景 |
 |---|---|---|---|
-| 一次脚本接入并安全保存服务器配置 | 脚本：`test_add_writes_private_worker_configuration`、`test_environment_file_is_not_executed_as_shell`、`test_add_rejects_newlines_in_environment_values` | 有效 Redis/S3/服务器标识写入权限 600 的 `.env.worker`；shell 表达式不执行；换行注入在启动前拒绝 | 正常、权限与安全、异常 |
-| 缺少接入配置时不启动 worker | 脚本：`test_add_requires_coordinator_and_storage_settings`、`test_add_requires_interactive_first_run_configuration` | 缺 Redis/S3 或非交互首次运行缺配置时返回错误，Docker 不启动 worker | 边界、异常 |
-| 自动发现 CPU/GPU 能力并保持稳定槽位标识 | Worker：`test_detect_capabilities_reports_cpu_and_stable_server_identity`、`test_probe_visible_gpu_never_raises` | 上报 CPU 核数/内存与稳定机器/槽位 ID；GPU 探测失败不导致 worker 崩溃 | 正常、异常、兼容 |
-| 外接槽默认待选，用户可加入或停止接单 | API/协调：`test_managed_worker_selection_api`、`test_worker_selection_is_saved_independently_of_heartbeat`、`test_redis_semantics_match_embedded` | 默认关闭；有效布尔值可切换且重连后保留；未知槽 404、内置槽 409、非法布尔值 422 | 正常、边界、异常、安全、兼容 |
-| 停止接单不打断正在运行的训练 | Worker：`test_managed_worker_waits_for_manual_selection` | 槽停用后当前任务完成，队列中的下一任务不由该槽领取 | 正常、状态冲突、回归 |
-| 在目标服务器启动、停止、重启及查看状态 | 脚本：`test_start_creates_worker_without_rebuilding`、`test_worker_lifecycle_commands`、`test_add_propagates_compose_failure` | 只操作 worker 服务；停止/重启等待 45 秒；Compose 错误向调用方返回 | 正常、异常、兼容 |
-| 页面按服务器分组，清晰展示资源并提供接入命令 | Safari 手动交互；运行中 `/api/workers` 检查 | 打开向导、切换 CPU/GPU 命令、Escape 关闭；槽卡展示资源状态和空任务值 | 正常、可用性、回归 |
-| 原有训练/API/存储功能不回归 | `docker compose ... pytest backend/tests/ -v` | 完整套件 127 通过、0 失败 | 回归、兼容 |
+| 页面登记服务器后由平台 SSH 执行脚本，目标机不接收项目源码 | API/脚本：`test_remote_server_api_installs_and_manages_with_nonsecret_records`、`test_render_remote_script_quotes_values_and_does_not_transfer_repository`、`test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv`；Safari 表单检查 | 授权请求创建异步安装；脚本经 stdin 发送、镜像由目标机拉取；记录不含令牌/私钥；SSH 严格校验已登记主机密钥 | 正常、权限与安全、兼容 |
+| 缺配置、错误令牌、非法目标或注入输入会拒绝 SSH 操作 | API/执行器：`test_remote_management_requires_an_enabled_admin_token`、`test_remote_server_api_rejects_shell_injection_before_ssh`、`test_render_remote_script_rejects_shell_and_path_injection`、`test_remote_configuration_requires_key_permissions_and_registry`、`test_remote_configuration_requires_shared_queue_and_object_storage` | 远程功能默认关闭；错误令牌 401、关闭时 503、格式非法 422；共享 Redis/S3、私钥权限或镜像引用不满足时配置检查失败 | 边界、异常、权限与安全 |
+| 安装后可启动、停止、重启并重试部署；操作状态可轮询 | API/执行器：`test_remote_server_api_installs_and_manages_with_nonsecret_records`、`test_execute_remote_operation_persists_success_and_failure`、`test_remote_bootstrap_script_lifecycle` | install/start/stop/restart 返回可轮询状态；错误记录失败原因；停止/重启使用 45 秒优雅等待 | 正常、异常、状态冲突、回归 |
+| 目标 worker 自动报告 CPU/GPU，资源槽由用户手动选择 | Shell/worker/API：`test_remote_bootstrap_script_installs_cpu_and_gpu_workers`、`test_detect_capabilities_reports_cpu_and_stable_server_identity`、`test_managed_worker_selection_api`、Safari 表单检查 | CPU/GPU 镜像配置正确；槽位首次默认待选；用户可手动启用 | 正常、边界、兼容；真实 GPU 受硬件限制 |
+| 远程配置可持久读取，既有训练、数据集和存储行为不回归 | `test_remote_server_and_operation_metadata_roundtrip` 与完整 `backend/tests/` | 远程服务器/操作元数据往返通过；完整测试 147 通过、6 跳过、0 失败 | 正常、兼容、回归 |
 
 **未验证内容和限制**：
-- 未在真实外部服务器上运行引导脚本；主节点 Redis/S3 连通与 Docker Compose 部署需在目标环境验收。
+- 未在真实外部服务器上运行 SSH 安装及生命周期操作；目标机的 Docker 权限、主机指纹、镜像拉取、Redis/S3 连通仍需在目标环境验收。
 - 本机无 NVIDIA GPU，未验证真实 GPU 型号、显存与训练执行；CPU 路径已覆盖。
 - Redis/S3 集成按门控跳过，无法在本轮证明外部 Redis 中的选择持久化及对象存储连通。
-- 现有应用没有 API 身份认证；新槽位开关沿用现有 API 访问模式，部署应限制在可信网络或由反向代理保护。
+- 私有镜像仓库需要先让目标机具备镜像拉取凭据；目标机不需要检出源码或手动运行项目脚本。
+- 现有应用没有通用 API 身份认证；本次远程管理路由单独使用令牌，页面与其他 API 仍应部署在可信网络或由反向代理保护。
 
 ## 上一轮补充测试：Excel 与数据集管理（2026-10-25）
 
@@ -198,12 +196,14 @@ MTP_TEST_S3=localhost:9000 python3 -m pytest tests/test_storage.py -q  # 22/22
 - ✅ 边界场景：空队列/空指标、首 epoch 前暂停、checkpoint 保留窗口（最近 3 个）、keep<=0 防御
 - ✅ 异常场景：损坏 checkpoint 回退、数据集缺失、目标列缺失、非法超参续训、坏 metrics 行容忍
 - ✅ 权限与安全：任务 ID 路径穿越拒绝、数据集 ID 非法拒绝、租约 token 校验（不可越权释放/续期）
+- ✅ 远程管理安全：专用管理令牌、SSH known_hosts 严格校验、私钥权限、输入注入拒绝和敏感配置不进入 SSH argv/服务器记录
 - ✅ 兼容性场景：旧扁平/新结构双布局数据集读写训练、旧前端字段契约（api_view）
 - ✅ 回归场景：重复入队幂等、健康租约不误重派、删除保护、同 seed 复跑一致
 - ✅ 故障注入：存储瞬断（环境性）自动重试与耗尽、执行槽 SIGKILL、租约过期重派
 
 ## 已知问题与限制
 
+**新增限制—远程 SSH 目标环境尚未实测**：当前测试使用 fake SSH/Docker；上线前需配置只读挂载且权限为 600 的 SSH 私钥、核验后的 `known_hosts`、可拉取的 worker 镜像，以及从目标机可访问的 Redis/S3 地址。私有镜像需目标机预置 registry 登录凭据。
 1. **真实 GPU 行为未验证**：本机无 NVIDIA GPU（torch 2.8 CPU only，容器内 torch 2.14.1+cu130 亦无 GPU），CUDA_VISIBLE_DEVICES 隔离、驱动崩溃恢复、显存匹配的真实行为需在 GPU 服务器按以下清单复验：
    - GPU 版 compose 的 `gpus: all` 与一卡一子进程隔离
    - `--probe-gpu` 在有卡机器返回 0、掉卡恢复后 supervisor 自动重启槽位
@@ -222,14 +222,16 @@ MTP_TEST_S3=localhost:9000 python3 -m pytest tests/test_storage.py -q  # 22/22
 - ✅ 修改了训练器或任务管理
 - ✅ 修改了 API 路由
 - ✅ 修改了核心配置（影响业务逻辑的配置）
+- ✅ 修改了远程 SSH 执行器或目标机单文件脚本（`backend/app/remote_workers.py`、`backend/app/remote_worker.sh`）
 - ❌ 仅修改前端（`backend/static/`）、文档、数据库脚本、构建配置、测试代码时不强制重测
 
 标准测试命令：`cd backend && python3 -m pytest tests/ -v`；Redis/S3 集成用 `MTP_TEST_REDIS` / `MTP_TEST_S3` 环境变量门控开启。
 
 ## 下次测试建议
 
-1. GPU 服务器人工验证清单（见"已知问题"第 1 条）
-2. 配置真实 MySQL 后回归 DB 镜像路径
-3. 在阿里云 OSS / 腾讯云 COS 端点跑 `MTP_TEST_S3` 集成测试
-4. SeaweedFS 多机集群模式（filer replication）验证
-5. 前端页面交互测试（Chart.js 曲线、计算槽面板轮询、暂停/恢复按钮链路）
+1. 用真实 CPU/GPU 目标机验证 SSH 主机密钥校验、镜像仓库认证、Redis/S3 连接和 worker 心跳/槽位手动启用/生命周期
+2. GPU 服务器人工验证清单（见"已知问题"第 1 条）
+3. 配置真实 MySQL 后回归 DB 镜像路径
+4. 在阿里云 OSS / 腾讯云 COS 端点跑 `MTP_TEST_S3` 集成测试
+5. SeaweedFS 多机集群模式（filer replication）验证
+6. 前端页面交互测试（Chart.js 曲线、计算槽面板轮询、暂停/恢复按钮链路）
