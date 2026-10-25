@@ -101,6 +101,12 @@ def _get_dataset_or_404(ds_id: str) -> dict:
 
 
 def _write_metadata(ds_id: str, dataset: dict) -> None:
-    """把数据集元信息写回新结构 metadata/{ds_id}.json。"""
+    """写入新结构元数据，并同步更新仍存在的旧扁平元数据。"""
     metadata_path = config.DATASETS_DIR / "metadata" / f"{ds_id}.json"
-    metadata_path.write_text(json.dumps(dataset, ensure_ascii=False, indent=2))
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(dataset, ensure_ascii=False, indent=2)
+    metadata_path.write_text(payload, encoding="utf-8")
+
+    legacy_path = _dataset_meta_path(ds_id)
+    if legacy_path.exists():
+        legacy_path.write_text(payload, encoding="utf-8")
