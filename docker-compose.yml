@@ -19,8 +19,8 @@
 #      未配置时 USE_DATABASE=false，主流程仅文件存储不受影响。
 
 x-backend-env: &backend-env
-  # ---- 协调平面 ----
-  REDIS_URL: redis://redis:6379/0
+  # ---- 协调平面 (外部Redis容器，地址来自.env) ----
+  REDIS_URL: ${REDIS_URL:-redis://localhost:6379/0}
   # ---- 状态平面（S3 兼容：SeaweedFS / OSS / COS / S3 均可）----
   STORAGE_BACKEND: s3
   S3_ENDPOINT: seaweedfs:8333
@@ -28,6 +28,19 @@ x-backend-env: &backend-env
   S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
   S3_BUCKET: ${S3_BUCKET:-mtp-artifacts}
   S3_SECURE: "false"
+  # ---- 数据库 (外部MySQL容器，地址来自.env) ----
+  DB_HOST: ${DB_HOST:-localhost}
+  DB_PORT: ${DB_PORT:-3306}
+  DB_USER: ${DB_USER:-root}
+  DB_PASSWORD: ${DB_PASSWORD:-password}
+  DB_NAME: ${DB_NAME:-model_training}
+  DB_CHARSET: ${DB_CHARSET:-utf8mb4}
+  DB_COLLATION: ${DB_COLLATION:-utf8mb4_unicode_ci}
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+  DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+  DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-3600}
+  DB_ECHO: ${DB_ECHO:-false}
   # ---- 数据目录（数据集缓存 / worker scratch）----
   DATA_DIR: /app/data
   # ---- 任务重试 / watchdog ----
@@ -38,24 +51,11 @@ x-backend-env: &backend-env
   WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-10}
   WORKER_LEASE_TTL: ${WORKER_LEASE_TTL:-30}
   WORKER_SUPERVISOR_PROBE_INTERVAL: ${WORKER_SUPERVISOR_PROBE_INTERVAL:-15}
-  WORKER_CPU_SLOTS: ${WORKER_CPU_SLOTS:-1}
+  WORKER_CPU_SLOTS: ${WORKER_CPU_SLOTS:-2}
   WORKER_CHECKPOINT_INTERVAL: ${WORKER_CHECKPOINT_INTERVAL:-5}
   WORKER_CHECKPOINT_KEEP: ${WORKER_CHECKPOINT_KEEP:-3}
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: mtp-redis
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-
   seaweedfs:
     # S3 兼容对象存储（状态平面）。国内网络拉取失败时可在 .env 中把
     # SEAWEEDFS_IMAGE 换成国内镜像源，例如：
@@ -81,6 +81,11 @@ services:
     container_name: mtp-trainer
     ports:
       - "8000:8000"
+    # 外部 mysql/redis 容器发布在宿主机 localhost:3306 / localhost:6379；
+    # 将容器内 localhost 映射到宿主机网关，使 .env 中的 localhost 配置在容器内直接生效
+    extra_hosts:
+      - "localhost:host-gateway"
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
     environment:
@@ -88,22 +93,8 @@ services:
       # 单机零依赖开发：STORAGE_BACKEND=local / REDIS_URL 留空时，
       # API 进程内嵌 worker 线程，协调平面为进程内实现
       USE_DATABASE: ${USE_DATABASE:-false}
-      DB_HOST: ${DB_HOST:-localhost}
-      DB_PORT: ${DB_PORT:-3306}
-      DB_USER: ${DB_USER:-root}
-      DB_PASSWORD: ${DB_PASSWORD:-password}
-      DB_NAME: ${DB_NAME:-model_training}
-      DB_CHARSET: ${DB_CHARSET:-utf8mb4}
-      DB_COLLATION: ${DB_COLLATION:-utf8mb4_unicode_ci}
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
-      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
-      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-3600}
-      DB_ECHO: ${DB_ECHO:-false}
       EMBEDDED_WORKERS: ${EMBEDDED_WORKERS:-0}   # 多机模式下训练交给 worker 服务
     depends_on:
-      redis:
-        condition: service_healthy
       seaweedfs:
         condition: service_healthy
     restart: unless-stopped
@@ -111,21 +102,20 @@ services:
   worker:
     build: ./backend
     container_name: mtp-worker
-    # 计算平面：supervisor 探测可见 GPU 数 N → N 个“一卡一子进程”+WORKER_CPU_SLOTS 个 CPU 槽
+    # 计算平面：supervisor 按 WORKER_CPU_SLOTS 拉起 CPU 执行槽（一卡一进程的 CPU 版）
     command: ["python", "-m", "app.worker"]
+    extra_hosts:
+      - "localhost:host-gateway"
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data   # 本地 scratch 与数据集缓存（权威数据在 S3 状态平面）
     environment:
       <<: *backend-env
       USE_DATABASE: ${USE_DATABASE:-false}
-    gpus: all               # 一卡一进程：supervisor 按 CUDA_VISIBLE_DEVICES 拆分
     depends_on:
-      redis:
-        condition: service_healthy
       seaweedfs:
         condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  redis-data:
   seaweedfs-data:
