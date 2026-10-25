@@ -129,8 +129,13 @@ class RedisJobQueue(JobQueue):
         self._redis.rpush(_QUEUE_KEY, job_id)
 
     def pop(self, timeout: float = 1.0) -> Optional[str]:
-        # BLPOP 是单命令原子出队（队首）：两个 worker 同时领取不会拿到同一个任务
-        result = self._redis.blpop(_QUEUE_KEY, timeout=max(int(timeout), 1))
+        # BLPOP 是单命令原子出队（队首）：两个 worker 同时领取不会拿到同一个任务。
+        # 阻塞窗口与 socket 超时相等的边界竞态下 redis-py 会抛 TimeoutError，
+        # 语义上等价于"窗口内无任务"——捕获并返回 None（worker 退避后重试）。
+        try:
+            result = self._redis.blpop(_QUEUE_KEY, timeout=max(int(timeout), 1))
+        except Exception:
+            return None
         if result is None:
             return None
         _, job_id = result

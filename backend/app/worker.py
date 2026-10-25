@@ -314,7 +314,14 @@ class TrainingWorker:
                     # 掉卡期间不领取新任务；已被其它节点重派的心跳丢失处理照常生效
                     self._shutdown.wait(self._idle_poll)
                     continue
-                job_id = self.queue.pop(timeout=self._idle_poll)
+                try:
+                    job_id = self.queue.pop(timeout=self._idle_poll)
+                except Exception as exc:  # noqa: BLE001
+                    # 协调面瞬断（Redis 网络抖动等）不得杀死 worker 进程：
+                    # 退避后继续循环，任务由租约/watchdog 机制兜底
+                    self._log(f"worker {self.worker_id}: 队列领取异常，稍后重试: {exc}")
+                    self._shutdown.wait(self._idle_poll)
+                    continue
                 if job_id is None:
                     continue
                 self._execute_job(job_id)

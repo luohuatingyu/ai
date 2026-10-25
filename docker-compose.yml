@@ -62,14 +62,15 @@ services:
     #   SEAWEEDFS_IMAGE=docker.m.daocloud.io/chrislusf/seaweedfs:latest
     image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:latest}
     container_name: mtp-seaweedfs
-    command: server -s3 -filer -dir=/data
+    # -ip=0.0.0.0 使 S3/filer 监听全部接口（默认只绑容器网卡 IP，健康检查无法走 localhost）
+    command: server -s3 -filer -dir=/data -ip=0.0.0.0
     ports:
       - "9000:8333"   # S3 API（宿主 9000 端口保持与旧版体验一致）
       - "9001:8888"   # 控制台（filer Web UI）
     volumes:
       - seaweedfs-data:/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8333/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8333/"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -110,6 +111,8 @@ services:
   worker:
     build: ./backend
     container_name: mtp-worker
+    # 计算平面：supervisor 探测可见 GPU 数 N → N 个“一卡一子进程”+WORKER_CPU_SLOTS 个 CPU 槽
+    command: ["python", "-m", "app.worker"]
     volumes:
       - ./data:/app/data   # 本地 scratch 与数据集缓存（权威数据在 S3 状态平面）
     environment:
@@ -122,7 +125,6 @@ services:
       seaweedfs:
         condition: service_healthy
     restart: unless-stopped
-    # 运行 supervisor：探测可见 GPU 数 N → N 个“一卡一子进程”+WORKER_CPU_SLOTS 个 CPU 槽
 
 volumes:
   redis-data:

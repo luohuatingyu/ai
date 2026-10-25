@@ -45,7 +45,8 @@ services:
     # 镜像源可通过 .env 的 SEAWEEDFS_IMAGE 切换（国内网络可用国内镜像源）
     image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:latest}
     container_name: mtp-seaweedfs-cpu
-    command: server -s3 -filer -dir=/data
+    # -ip=0.0.0.0 使 S3/filer 监听全部接口（默认只绑容器网卡 IP，健康检查无法走 localhost）
+    command: server -s3 -filer -dir=/data -ip=0.0.0.0
     ports:
       - "9000:8333"   # S3 API（宿主 9000 端口保持与旧版体验一致）
       - "9001:8888"   # 控制台（filer Web UI）
@@ -91,6 +92,8 @@ services:
   worker:
     build: ./backend
     container_name: mtp-worker-cpu
+    # 计算平面：supervisor 按 WORKER_CPU_SLOTS 拉起 CPU 执行槽（一卡一进程的 CPU 版）
+    command: ["python", "-m", "app.worker"]
     volumes:
       - ./data:/app/data
     environment:
