@@ -2,10 +2,43 @@
 
 ## Git基准点
 
-- **Commit Hash**: a91f265（本次重测基于分支 emdash/hot-boxes-clean-y9u6p 最新提交）
-- **提交信息**: Fix /api/datasets/tags and import-history shadowed by {ds_id} route
+- **Commit Hash**: a65cb73（本次补充测试的代码基准点）
+- **提交信息**: Complete metadata for imported datasets
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次任务补充测试（2026-10-25）
+
+**变更范围**：训练台与数据集管理页共享导航和响应式样式；多格式数据导入与压缩包安全校验；数据处理接口接入、旧/新数据布局兼容、导入元数据完整性和重复处理回归。
+
+**测试环境**：Docker Compose 重建成功；pytest 容器为 Python 3.12.15。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过，trainer、worker、frontend 重建并启动，SeaweedFS healthy。
+- `docker run --rm -e USE_DATABASE=false -v "$PWD/backend:/app" -v "$PWD/scripts:/scripts:ro" -w /app --entrypoint python emdash-hot-boxes-clean-y9u6p-trainer:latest -m pytest tests/ -v`：收集到 97 项时 API 测试模块导入失败；Starlette TestClient 提示缺少 `httpx2`，因此 API pytest 未执行。
+- `docker run --rm -e USE_DATABASE=false -v "$PWD/backend:/app" -v "$PWD/scripts:/scripts:ro" -w /app --entrypoint python emdash-hot-boxes-clean-y9u6p-trainer:latest -m pytest tests/ --ignore=tests/test_api.py -q`：91 通过、6 跳过、0 失败；跳过项依赖可选 Redis/S3 集成环境。
+- 首次排除 API 的命令未挂载仓库 `scripts/`，用户新增的 worker 节点脚本测试有 10 项因 `/scripts/worker-node.sh` 不存在失败；补齐只读挂载后上述最终命令全部通过。
+- Python 3.12 直接调用处理路由：旧扁平数据集依次执行选列和去重后，第二次仍从原始 CSV 读取；通过，结果为 2 行、`feature` 与 `target` 两列。
+- Python 3.12 导入器冒烟：JSON 行列元数据、嵌套 TAR.GZ 导入、ZIP 路径穿越拒绝均通过。
+- 运行中 HTTP API 冒烟：JSON 上传、详情字段/行数、选列处理与元数据更新均通过；测试数据集 `ds-20261025-093340-add432` 已通过 API 删除。
+- Safari 桌面检查：统一导航、数据集卡片和上传空闲状态正常；窄屏断点（720px、480px）已核对 CSS。未执行真实窄屏视口截图验证。
+
+**未验证内容和阻塞**：
+- 当前容器没有 `httpx2`，完整 API pytest 收集被阻断；`backend/requirements.txt` 尚未添加该测试依赖，等待用户确认后重跑完整套件。
+- 当前容器没有 `openpyxl` 和 `xlrd`，因此 `.xlsx/.xls` 导入未验证；等待用户确认是否加入运行依赖。
+- 此次未通过 `MTP_TEST_S3` 执行对象存储集成套件；基础套件中的 2 个 S3 测试按门控跳过。
+- SQLAlchemy 输出 `declarative_base()` 弃用警告，与本次变更无关。
+
+**验收标准—测试映射**：
+
+| 验收标准 | 测试/验证 | 结果 |
+|---|---|---|
+| 页面共享风格、导航与桌面布局 | Safari 桌面页面检查；响应式断点 CSS 检查 | 通过；窄屏实际截图未验证 |
+| 导入后行数、字段和类型元数据完整 | HTTP JSON 上传与详情；直接 JSON 导入器冒烟 | 通过 |
+| JSON、TAR.GZ 可导入且危险压缩包路径拒绝 | Python 3.12 导入器冒烟 | 通过 |
+| 旧扁平布局重复处理始终从原始文件开始 | Python 3.12 直接调用处理路由 | 通过 |
+| 新布局处理与 API UI 流程 | HTTP API 选列处理和元数据检查 | 通过 |
+| 全量 API 回归及 Excel 引擎兼容 | `tests/test_api.py` 与 Excel 导入 | 未执行：缺少待确认依赖 |
 
 ## 本次变更测试结果（2026-10-25）
 
