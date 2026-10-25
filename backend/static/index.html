@@ -184,6 +184,15 @@
   .server-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:15px; }
   .server-form .field { min-width:0; }
   .server-form .field.wide { grid-column:1/-1; }
+  .ssh-credential-settings { grid-column:1/-1; padding:12px; border:1px solid var(--border);
+    border-radius:10px; background:rgba(28,35,51,.45); }
+  .ssh-credential-settings summary { cursor:pointer; color:var(--text); font-weight:600; }
+  .ssh-credential-settings[open] summary { margin-bottom:10px; }
+  .ssh-credential-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+  .ssh-credential-grid .wide { grid-column:1/-1; }
+  .ssh-credential-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  @media (max-width:560px) { .ssh-credential-grid { grid-template-columns:1fr; }
+    .ssh-credential-grid .wide { grid-column:auto; } }
   .server-mode { display:flex; gap:7px; flex-wrap:wrap; }
   .server-mode label { display:flex; align-items:center; gap:7px; padding:8px 11px;
     border:1px solid var(--border); border-radius:9px; cursor:pointer; color:var(--text); }
@@ -441,8 +450,39 @@
       <div class="field wide">
         <label for="remoteAdminToken">远程管理令牌</label>
         <input id="remoteAdminToken" type="password" autocomplete="current-password" required placeholder="平台配置的 WORKER_REMOTE_TOKEN">
-        <div class="hint">只保存在当前浏览器标签页会话中；平台端需预先配置 SSH 认证方式、凭证、known_hosts 和镜像/存储地址。</div>
+        <div class="hint">令牌只保存在当前浏览器标签页会话中。SSH 密钥或密码可在下方设置；known_hosts 和镜像/存储地址仍由平台部署配置提供。</div>
       </div>
+      <details class="ssh-credential-settings" id="remoteSshSettings">
+        <summary>平台 SSH 凭证设置</summary>
+        <div id="remoteSshSettingsStatus" class="hint" aria-live="polite">正在读取凭证状态…</div>
+        <div class="ssh-credential-grid" style="margin-top:10px;">
+          <div class="field wide">
+            <label for="remoteSshAuthMethod">认证方式</label>
+            <select id="remoteSshAuthMethod">
+              <option value="key">SSH 私钥</option>
+              <option value="password">SSH 密码</option>
+            </select>
+          </div>
+          <div class="field wide" id="remoteSshKeyFields">
+            <label for="remoteSshPrivateKey">私钥内容</label>
+            <textarea id="remoteSshPrivateKey" autocomplete="off" spellcheck="false" placeholder="粘贴完整的 OpenSSH / PEM 私钥；支持 OpenSSH 可识别的密钥类型"></textarea>
+            <div class="hint">支持 OpenSSH 可识别的私钥格式；加密私钥可填写口令。保存后私钥不会再次显示。</div>
+          </div>
+          <div class="field wide" id="remoteSshPassphraseField">
+            <label for="remoteSshPassphrase">私钥口令（可选）</label>
+            <input id="remoteSshPassphrase" type="password" autocomplete="new-password">
+          </div>
+          <div class="field wide" id="remoteSshPasswordField" hidden>
+            <label for="remoteSshPassword">SSH 登录密码</label>
+            <input id="remoteSshPassword" type="password" autocomplete="new-password">
+            <div class="hint">此密码用于平台上登记的所有远程服务器账号。</div>
+          </div>
+        </div>
+        <div class="ssh-credential-actions">
+          <button type="button" id="btnSaveRemoteSshSettings" class="primary" disabled>加密保存凭证</button>
+          <button type="button" id="btnResetRemoteSshSettings" disabled>清除页面凭证，恢复 .env 配置</button>
+        </div>
+      </details>
       <div class="server-form-actions">
         <button type="button" id="btnCancelAddServer">取消</button>
         <button type="submit" id="btnSubmitRemoteServer" class="primary">远程添加并检测资源</button>
@@ -1172,12 +1212,115 @@ async function remoteApiJson(url, opt = {}) {
   return apiJson(url, { ...opt, headers });
 }
 
+// 按平台认证方式显示凭证输入项；隐藏的凭证不会被提交。
+function updateRemoteSshCredentialFields(clearHidden = true) {
+  const useKey = $("remoteSshAuthMethod").value === "key";
+  $("remoteSshKeyFields").hidden = !useKey;
+  $("remoteSshPassphraseField").hidden = !useKey;
+  $("remoteSshPasswordField").hidden = useKey;
+  $("remoteSshPrivateKey").required = false;
+  $("remoteSshPassword").required = false;
+  if (clearHidden) {
+    if (useKey) $("remoteSshPassword").value = "";
+    else {
+      $("remoteSshPrivateKey").value = "";
+      $("remoteSshPassphrase").value = "";
+    }
+  }
+}
+
+// 查询平台凭证状态，只展示认证方式与来源，绝不回填凭证明文。
+async function loadRemoteSshSettings() {
+  const status = $("remoteSshSettingsStatus");
+  if (!getRemoteAdminToken()) {
+    status.textContent = "先填写远程管理令牌，再查看或修改平台 SSH 凭证。";
+    $("btnSaveRemoteSshSettings").disabled = true;
+    $("btnResetRemoteSshSettings").disabled = true;
+    return;
+  }
+  status.textContent = "正在读取凭证状态…";
+  try {
+    const settings = await remoteApiJson("/api/remote-ssh-settings");
+    const method = settings.auth_method === "key" ? "SSH 私钥" : settings.auth_method === "password" ? "SSH 密码" : "未配置";
+    const source = settings.source === "page" ? "页面加密配置" : ".env / 私钥挂载";
+    status.textContent = `${source} · ${method} · ${settings.configured ? "凭证已配置" : "凭证未配置"}。页面不会显示已保存的秘密。`;
+    $("remoteSshAuthMethod").value = settings.auth_method || "key";
+    updateRemoteSshCredentialFields();
+    $("btnSaveRemoteSshSettings").disabled = !settings.can_configure;
+    $("btnResetRemoteSshSettings").disabled = settings.source !== "page";
+    if (settings.status_error) status.textContent += ` ${settings.status_error}`;
+    if (!settings.can_configure) status.textContent += " 页面保存需要共享 Redis 和 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY。";
+  } catch (error) {
+    status.textContent = error.message;
+    $("btnSaveRemoteSshSettings").disabled = true;
+    $("btnResetRemoteSshSettings").disabled = true;
+  }
+}
+
+// 保存凭证到令牌保护的接口；提交后清空浏览器输入框。
+async function saveRemoteSshSettings() {
+  const token = $("remoteAdminToken").value.trim();
+  if (!token) { toast("请先填写平台远程管理令牌", "err"); $("remoteAdminToken").focus(); return; }
+  try { sessionStorage.setItem("workerAdminToken", token); }
+  catch { toast("当前浏览器无法保存标签页令牌，请检查隐私模式设置", "err"); return; }
+  const authMethod = $("remoteSshAuthMethod").value;
+  if (authMethod === "key" && !$("remoteSshPrivateKey").value.trim()) {
+    toast("请粘贴完整的 SSH 私钥", "err");
+    $("remoteSshPrivateKey").focus();
+    return;
+  }
+  if (authMethod === "password" && !$("remoteSshPassword").value) {
+    toast("请填写 SSH 登录密码", "err");
+    $("remoteSshPassword").focus();
+    return;
+  }
+  const payload = authMethod === "key"
+    ? { auth_method: authMethod, private_key: $("remoteSshPrivateKey").value, passphrase: $("remoteSshPassphrase").value || null }
+    : { auth_method: authMethod, password: $("remoteSshPassword").value };
+  const button = $("btnSaveRemoteSshSettings");
+  button.disabled = true;
+  try {
+    await remoteApiJson("/api/remote-ssh-settings", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    $("remoteSshPrivateKey").value = "";
+    $("remoteSshPassphrase").value = "";
+    $("remoteSshPassword").value = "";
+    toast("平台 SSH 凭证已加密保存", "ok");
+    await loadRemoteSshSettings();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
+  }
+}
+
+// 删除页面密文后恢复使用既有的 .env 或私钥挂载配置。
+async function resetRemoteSshSettings() {
+  if (!getRemoteAdminToken()) { toast("请先填写平台远程管理令牌", "err"); return; }
+  if (!window.confirm("清除页面保存的 SSH 凭证并恢复使用 .env 配置？")) return;
+  const button = $("btnResetRemoteSshSettings");
+  button.disabled = true;
+  try {
+    await remoteApiJson("/api/remote-ssh-settings", { method: "DELETE" });
+    toast("页面凭证已清除；平台现在使用 .env 配置", "ok");
+    await loadRemoteSshSettings();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
+  }
+}
+
 // 打开远程服务器表单，并恢复会话内令牌。
 function openAddServerModal() {
   const modal = $("addServerModal");
   $("remoteAdminToken").value = getRemoteAdminToken();
+  $("remoteSshPrivateKey").value = "";
+  $("remoteSshPassphrase").value = "";
+  $("remoteSshPassword").value = "";
+  updateRemoteSshCredentialFields(false);
   modal.hidden = false;
   modal.classList.add("open");
+  loadRemoteSshSettings();
   $("remoteMachineId").focus();
 }
 
@@ -1186,6 +1329,9 @@ function closeAddServerModal() {
   const modal = $("addServerModal");
   modal.classList.remove("open");
   modal.hidden = true;
+  $("remoteSshPrivateKey").value = "";
+  $("remoteSshPassphrase").value = "";
+  $("remoteSshPassword").value = "";
   $("btnAddServer").focus();
 }
 
@@ -1260,6 +1406,21 @@ $("btnCloseAddServer").onclick = closeAddServerModal;
 $("btnCancelAddServer").onclick = closeAddServerModal;
 $("btnRefreshWorkers").onclick = refreshWorkers;
 $("remoteServerForm").addEventListener("submit", submitRemoteServer);
+$("remoteSshAuthMethod").addEventListener("change", () => updateRemoteSshCredentialFields());
+$("btnSaveRemoteSshSettings").onclick = saveRemoteSshSettings;
+$("btnResetRemoteSshSettings").onclick = resetRemoteSshSettings;
+$("remoteAdminToken").addEventListener("change", () => {
+  const token = $("remoteAdminToken").value.trim();
+  if (token) {
+    try { sessionStorage.setItem("workerAdminToken", token); } catch { /* 保存配置时提示 */ }
+  }
+  loadRemoteSshSettings();
+});
+["remoteSshPassphrase", "remoteSshPassword"].forEach((id) => {
+  $(id).addEventListener("keydown", (event) => {
+    if (event.key === "Enter") event.preventDefault();
+  });
+});
 document.querySelectorAll("input[name='mode']").forEach((input) => {
   input.addEventListener("change", () => { $("remoteCpuSlotsField").hidden = input.value !== "cpu" || !input.checked; });
 });

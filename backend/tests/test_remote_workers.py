@@ -117,6 +117,8 @@ def test_remote_configuration_rejects_newline_in_platform_password(tmp_path, mon
 )
 def test_openssh_reads_supported_private_key_formats(tmp_path, key_type, key_options):
     """OpenSSH 自行识别常见密钥格式，平台不强制转换或限定密钥算法。"""
+    from app.routers.schemas import RemoteSSHCredentialsRequest
+
     ssh_keygen = shutil.which("ssh-keygen")
     if not ssh_keygen:
         pytest.skip("测试环境没有 ssh-keygen")
@@ -136,6 +138,10 @@ def test_openssh_reads_supported_private_key_formats(tmp_path, key_type, key_opt
         "ecdsa": "ecdsa-sha2-nistp256 ",
         "rsa": "ssh-rsa ",
     }[key_type])
+    configured = RemoteSSHCredentialsRequest(
+        auth_method="key", private_key=key.read_text(encoding="utf-8")
+    )
+    assert configured.auth_method == "key"
 
 
 def test_remote_configuration_requires_shared_queue_and_object_storage(tmp_path, monkeypatch):
@@ -269,6 +275,83 @@ def test_run_remote_action_uses_key_passphrase_without_exposing_it(tmp_path, mon
     assert passphrase not in " ".join(calls["command"])
     assert calls["environment"]["WORKER_SSH_ASKPASS_SECRET"] == passphrase
     assert Path(calls["environment"]["SSH_ASKPASS"]).name == "ssh_askpass.sh"
+
+
+def test_run_remote_action_uses_page_password_and_redacts_it(tmp_path, monkeypatch, request):
+    """页面保存的密码解密后通过 askpass 使用，且 SSH 输出不会泄漏密码。"""
+    from cryptography.fernet import Fernet
+
+    _remote_config(tmp_path, monkeypatch)
+    secret = "page-managed password with $ and spaces"
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", "")
+    monkeypatch.setattr(manager, "distributed", True)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+    remote_workers.store_platform_ssh_credentials(
+        {"auth_method": "password", "password": secret}
+    )
+    calls = {}
+
+    def fake_run(command, **kwargs):
+        calls["command"] = command
+        calls["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 255, stdout="", stderr=f"rejected {secret}")
+
+    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    with pytest.raises(remote_workers.RemoteWorkerError) as exc_info:
+        remote_workers.run_remote_action(_server(), "start")
+
+    assert "-i" not in calls["command"]
+    assert secret not in " ".join(calls["command"])
+    assert calls["environment"]["WORKER_SSH_ASKPASS_SECRET"] == secret
+    assert secret not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
+    manager.lease.delete_remote_ssh_credentials()
+
+
+def test_run_remote_action_materializes_page_private_key_temporarily(tmp_path, monkeypatch, request):
+    """页面密钥作为 600 权限临时文件使用，SSH 完成后立即清理。"""
+    from cryptography.fernet import Fernet
+
+    _remote_config(tmp_path, monkeypatch)
+    ssh_keygen = shutil.which("ssh-keygen")
+    if not ssh_keygen:
+        pytest.skip("测试环境没有 ssh-keygen")
+    key_path = tmp_path / "uploaded_key"
+    subprocess.run(
+        [ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    private_key = key_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(config, "WORKER_SSH_KEY_PATH", str(tmp_path / "missing-mounted-key"))
+    monkeypatch.setattr(manager, "distributed", True)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+    remote_workers.store_platform_ssh_credentials(
+        {"auth_method": "key", "private_key": private_key, "passphrase": ""}
+    )
+    calls = {}
+
+    def fake_run(command, **kwargs):
+        temporary_key = Path(command[command.index("-i") + 1])
+        calls["key_path"] = temporary_key
+        calls["key_text"] = temporary_key.read_text(encoding="utf-8")
+        calls["key_mode"] = stat.S_IMODE(temporary_key.stat().st_mode)
+        return subprocess.CompletedProcess(command, 0, stdout="worker running", stderr="")
+
+    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    remote_workers.run_remote_action(_server(), "start")
+
+    assert calls["key_text"] == private_key
+    assert calls["key_mode"] == 0o600
+    assert not calls["key_path"].exists()
+    manager.lease.delete_remote_ssh_credentials()
 
 
 def test_run_remote_action_brackets_ipv6_ssh_destination(tmp_path, monkeypatch):

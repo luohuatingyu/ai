@@ -1,5 +1,5 @@
-# 远程服务器管理覆盖配置：平台 trainer 使用统一配置的 SSH 凭证和已核验 known_hosts。
-# 密钥认证需配置 WORKER_SSH_KEY_HOST_PATH；密码认证可省略，Compose 会挂载 /dev/null 占位。
+# 远程服务器管理覆盖配置：trainer 使用页面加密凭证或环境变量回退，并严格校验 known_hosts。
+# 只有使用 WORKER_SSH_KEY_HOST_PATH 环境变量回退时才需要提供私钥文件；页面密钥会临时落盘。
 # WORKER_SSH_KNOWN_HOSTS_HOST_PATH 始终需要指向平台宿主机上已核验的只读文件。
 
 services:

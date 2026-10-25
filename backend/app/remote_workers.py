@@ -1,14 +1,18 @@
 """远程 worker 管理：校验接入参数、经 SSH 执行单个部署脚本并保存操作状态。"""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List
+
+from cryptography.fernet import Fernet, InvalidToken
 
 import app.config as config
 from app.state import manager
@@ -36,9 +40,118 @@ _ENVIRONMENT_KEYS = (
 )
 
 
-def remote_configuration_errors() -> List[str]:
+def _credential_fernet() -> Fernet:
+    """构造平台凭证加密器；密钥由运维通过环境变量提供并保持稳定。"""
+    key = config.WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY
+    if not key:
+        raise RemoteWorkerError("页面配置 SSH 凭证前需设置 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY")
+    try:
+        return Fernet(key.encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise RemoteWorkerError("WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY 不是有效的 Fernet 密钥") from exc
+
+
+def _platform_ssh_credentials() -> Dict[str, str]:
+    """读取页面加密凭证；不存在时回退到历史环境变量和私钥挂载。"""
+    encrypted = manager.lease.get_remote_ssh_credentials()
+    if not encrypted:
+        return {
+            "source": "env",
+            "auth_method": config.WORKER_SSH_AUTH_METHOD,
+            "password": config.WORKER_SSH_PASSWORD,
+            "passphrase": config.WORKER_SSH_KEY_PASSPHRASE,
+            "private_key": "",
+        }
+    try:
+        payload = _credential_fernet().decrypt(encrypted.encode("ascii"))
+        credentials = json.loads(payload.decode("utf-8"))
+    except (InvalidToken, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RemoteWorkerError(
+            "页面保存的 SSH 凭证无法解密；请检查平台加密密钥并重新保存凭证"
+        ) from exc
+    if not isinstance(credentials, dict) or credentials.get("auth_method") not in {"key", "password"}:
+        raise RemoteWorkerError("页面保存的 SSH 凭证格式无效，请重新配置")
+    credentials.setdefault("password", "")
+    credentials.setdefault("passphrase", "")
+    credentials.setdefault("private_key", "")
+    credentials["source"] = "page"
+    return {str(key): str(value) for key, value in credentials.items()}
+
+
+def remote_ssh_settings_status() -> Dict[str, object]:
+    """返回页面安全设置所需的状态，不把任何凭证内容返回给浏览器。"""
+    try:
+        credentials = _platform_ssh_credentials()
+    except RemoteWorkerError:
+        if not manager.lease.get_remote_ssh_credentials():
+            raise
+        try:
+            _credential_fernet()
+            encryption_ready = True
+        except RemoteWorkerError:
+            encryption_ready = False
+        return {
+            "source": "page",
+            "auth_method": None,
+            "configured": False,
+            "can_configure": bool(config.REDIS_URL and manager.distributed and encryption_ready),
+            "status_error": "页面凭证无法解密；请恢复原加密密钥，或在设置有效密钥后重新保存/清除凭证。",
+        }
+    method = credentials["auth_method"]
+    if credentials["source"] == "page":
+        configured = bool(
+            credentials.get("private_key") if method == "key" else credentials.get("password")
+        )
+    elif method == "key":
+        key_path = Path(config.WORKER_SSH_KEY_PATH)
+        configured = key_path.is_file() and not (key_path.stat().st_mode & 0o077)
+    else:
+        configured = bool(config.WORKER_SSH_PASSWORD)
+    try:
+        _credential_fernet()
+        encryption_ready = True
+    except RemoteWorkerError:
+        encryption_ready = False
+    return {
+        "source": credentials["source"],
+        "auth_method": method if method in {"key", "password"} else None,
+        "configured": configured,
+        "can_configure": bool(config.REDIS_URL and manager.distributed and encryption_ready),
+    }
+
+
+def store_platform_ssh_credentials(credentials: Dict[str, str]) -> Dict[str, object]:
+    """加密页面凭证后持久化到共享 Redis，并返回不含秘密的状态。"""
+    if not config.REDIS_URL or not manager.distributed:
+        raise RemoteWorkerError("页面保存 SSH 凭证需要启用共享 Redis")
+    fernet = _credential_fernet()
+    serialized = json.dumps(credentials, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encrypted = fernet.encrypt(serialized).decode("ascii")
+    manager.lease.set_remote_ssh_credentials(encrypted)
+    return remote_ssh_settings_status()
+
+
+def clear_platform_ssh_credentials() -> Dict[str, object]:
+    """删除页面保存的凭证，使远程连接回退到原有环境配置。"""
+    manager.lease.delete_remote_ssh_credentials()
+    return remote_ssh_settings_status()
+
+
+def remote_configuration_errors(credentials: Dict[str, str] | None = None) -> List[str]:
     """列出远程执行缺少的配置，不读取或返回平台 SSH 凭证内容。"""
     errors: List[str] = []
+    if credentials is None:
+        try:
+            credentials = _platform_ssh_credentials()
+        except RemoteWorkerError as exc:
+            errors.append(str(exc))
+            credentials = {
+                "source": "env",
+                "auth_method": "",
+                "password": "",
+                "passphrase": "",
+                "private_key": "",
+            }
     if not config.WORKER_REMOTE_ENABLED:
         errors.append("远程服务器管理尚未启用")
     if len(config.WORKER_REMOTE_TOKEN) < 32:
@@ -50,15 +163,19 @@ def remote_configuration_errors() -> List[str]:
     if not shutil.which("ssh"):
         errors.append("平台后端容器未安装 OpenSSH 客户端")
     known_hosts_path = Path(config.WORKER_SSH_KNOWN_HOSTS_PATH)
-    if config.WORKER_SSH_AUTH_METHOD not in {"key", "password"}:
+    auth_method = credentials["auth_method"]
+    if auth_method not in {"key", "password"}:
         errors.append("WORKER_SSH_AUTH_METHOD 只能是 key 或 password")
-    elif config.WORKER_SSH_AUTH_METHOD == "key":
+    elif auth_method == "key" and credentials["source"] == "page":
+        if not credentials.get("private_key"):
+            errors.append("页面未配置 SSH 私钥")
+    elif auth_method == "key":
         key_path = Path(config.WORKER_SSH_KEY_PATH)
         if not key_path.is_file():
             errors.append("平台 SSH 私钥文件不存在")
         elif key_path.stat().st_mode & 0o077:
             errors.append("平台 SSH 私钥权限必须限制为 600 或更严格")
-    elif not config.WORKER_SSH_PASSWORD:
+    elif not credentials.get("password"):
         errors.append("密码认证需要配置 WORKER_SSH_PASSWORD")
     if not known_hosts_path.is_file() or known_hosts_path.stat().st_size == 0:
         errors.append("SSH known_hosts 文件不存在；请先登记并核验目标主机指纹")
@@ -81,11 +198,7 @@ def remote_configuration_errors() -> List[str]:
     )
     if any("\n" in value or "\r" in value for value in values):
         errors.append("远程配置不能包含换行符")
-    ssh_secret = (
-        config.WORKER_SSH_PASSWORD
-        if config.WORKER_SSH_AUTH_METHOD == "password"
-        else config.WORKER_SSH_KEY_PASSPHRASE
-    )
+    ssh_secret = credentials.get("password", "") if auth_method == "password" else credentials.get("passphrase", "")
     if "\n" in ssh_secret or "\r" in ssh_secret:
         errors.append("SSH 凭证不能包含换行符")
     return errors
@@ -154,7 +267,8 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
 
 def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
     """用严格主机校验的 OpenSSH 执行脚本，并过滤输出中的平台 SSH 凭证。"""
-    errors = remote_configuration_errors()
+    credentials = _platform_ssh_credentials()
+    errors = remote_configuration_errors(credentials)
     if errors:
         raise RemoteWorkerError("；".join(errors))
     validate_server_record(server)
@@ -165,13 +279,29 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
     ssh_host = f"[{host}]" if ":" in host else host
     target = f"{server['username']}@{ssh_host}"
     command = [ssh_path]
-    if config.WORKER_SSH_AUTH_METHOD == "key":
-        command.extend(["-i", config.WORKER_SSH_KEY_PATH])
+    temporary_key_path: Path | None = None
+    if credentials["auth_method"] == "key":
+        if credentials["source"] == "page":
+            fd, temporary_key_name = tempfile.mkstemp(prefix="mtp-ssh-key-")
+            temporary_key_path = Path(temporary_key_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as key_file:
+                    key_file.write(credentials["private_key"])
+                    if not credentials["private_key"].endswith("\n"):
+                        key_file.write("\n")
+                os.chmod(temporary_key_path, 0o600)
+            except OSError:
+                temporary_key_path.unlink(missing_ok=True)
+                raise
+            key_path = str(temporary_key_path)
+        else:
+            key_path = config.WORKER_SSH_KEY_PATH
+        command.extend(["-i", key_path])
         command.extend(["-o", "IdentitiesOnly=yes"])
         command.extend(["-o", "PubkeyAuthentication=yes"])
         command.extend(["-o", "PasswordAuthentication=no"])
         command.extend(["-o", "KbdInteractiveAuthentication=no"])
-        ssh_secret = config.WORKER_SSH_KEY_PASSPHRASE
+        ssh_secret = credentials.get("passphrase", "")
         command.extend(["-o", "BatchMode=no" if ssh_secret else "BatchMode=yes"])
     else:
         command.extend(["-o", "PubkeyAuthentication=no"])
@@ -180,7 +310,7 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
         command.extend(["-o", "PreferredAuthentications=password"])
         command.extend(["-o", "NumberOfPasswordPrompts=1"])
         command.extend(["-o", "BatchMode=no"])
-        ssh_secret = config.WORKER_SSH_PASSWORD
+        ssh_secret = credentials.get("password", "")
     command.extend(
         [
             "-p",
@@ -224,7 +354,10 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
         raise RemoteWorkerError("远程 SSH 操作超时") from exc
     except OSError as exc:
         raise RemoteWorkerError("无法启动 SSH 客户端") from exc
-    output = _redact_output(result.stdout, result.stderr)
+    finally:
+        if temporary_key_path is not None:
+            temporary_key_path.unlink(missing_ok=True)
+    output = _redact_output(result.stdout, result.stderr, credentials)
     if result.returncode != 0:
         detail = (output["stderr"] or output["stdout"] or "远程脚本返回错误").strip()
         raise RemoteWorkerError(detail[-2000:])
@@ -268,14 +401,22 @@ def execute_remote_operation(
     manager.lease.set_remote_server(str(server["machine_id"]), server)
 
 
-def _redact_output(stdout: str, stderr: str) -> Dict[str, str]:
+def _redact_output(
+    stdout: str, stderr: str, credentials: Dict[str, str] | None = None
+) -> Dict[str, str]:
     """从 SSH 输出中删除远程配置和平台 SSH 凭证。"""
+    credentials = credentials or {
+        "password": config.WORKER_SSH_PASSWORD,
+        "passphrase": config.WORKER_SSH_KEY_PASSPHRASE,
+        "private_key": "",
+    }
     secrets = (
         config.WORKER_REMOTE_REDIS_URL,
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
-        config.WORKER_SSH_PASSWORD,
-        config.WORKER_SSH_KEY_PASSPHRASE,
+        credentials.get("password", ""),
+        credentials.get("passphrase", ""),
+        credentials.get("private_key", ""),
     )
     for secret in secrets:
         if secret:

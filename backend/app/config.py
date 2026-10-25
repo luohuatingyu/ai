@@ -60,7 +60,7 @@ WORKER_SUPERVISOR_PROBE_INTERVAL = float(os.environ.get("WORKER_SUPERVISOR_PROBE
 WORKER_GPU_PROBE = os.environ.get("WORKER_GPU_PROBE", "true").strip().lower() == "true"  # 心跳周期内是否做 GPU 软探测
 WORKER_CPU_SLOTS = int(os.environ.get("WORKER_CPU_SLOTS", "1"))  # Supervisor 额外提供的 CPU 执行槽数（纯 CPU 训练）
 
-# 远程计算服务器管理：默认关闭；平台统一配置 SSH 密钥或密码，并通过 SSH 执行短脚本。
+# 远程计算服务器管理：默认关闭；SSH 凭证可由页面加密保存，也兼容环境变量回退。
 WORKER_REMOTE_ENABLED = os.environ.get("WORKER_REMOTE_ENABLED", "false").strip().lower() == "true"
 WORKER_REMOTE_TOKEN = os.environ.get("WORKER_REMOTE_TOKEN", "").strip()
 WORKER_REMOTE_IMAGE = os.environ.get("WORKER_IMAGE", "").strip()
@@ -70,6 +70,9 @@ WORKER_SSH_AUTH_METHOD = os.environ.get("WORKER_SSH_AUTH_METHOD", "key").strip()
 WORKER_SSH_PASSWORD = os.environ.get("WORKER_SSH_PASSWORD", "")
 WORKER_SSH_KEY_PATH = os.environ.get("WORKER_SSH_KEY_PATH", "/run/remote-worker/ssh_key").strip()
 WORKER_SSH_KEY_PASSPHRASE = os.environ.get("WORKER_SSH_KEY_PASSPHRASE", "")
+WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY = os.environ.get(
+    "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", ""
+).strip()
 WORKER_SSH_KNOWN_HOSTS_PATH = os.environ.get(
     "WORKER_SSH_KNOWN_HOSTS_PATH", "/run/remote-worker/known_hosts"
 ).strip()

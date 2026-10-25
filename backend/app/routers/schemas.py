@@ -71,3 +71,42 @@ class RemoteServerRequest(BaseModel):
     port: int = Field(default=22, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] = "gpu"
     cpu_slots: int = Field(default=2, ge=0, le=256)
+
+
+class RemoteSSHCredentialsRequest(BaseModel):
+    """页面配置平台统一 SSH 密钥或密码；明文只存在于本次请求内。"""
+
+    auth_method: Literal["key", "password"]
+    private_key: str | None = Field(default=None, max_length=256 * 1024)
+    password: str | None = Field(default=None, max_length=4096)
+    passphrase: str | None = Field(default=None, max_length=4096)
+
+    @model_validator(mode="after")
+    def validate_credentials(self) -> "RemoteSSHCredentialsRequest":
+        """只接受与认证方式对应的必需凭证，并拒绝注入控制字符。"""
+        if self.auth_method == "key":
+            if not self.private_key or "\x00" in self.private_key:
+                raise ValueError("密钥认证需要有效的 SSH 私钥")
+            lines = self.private_key.strip().splitlines()
+            if (
+                len(lines) < 3
+                or not lines[0].startswith("-----BEGIN ")
+                or not lines[0].endswith(" PRIVATE KEY-----")
+                or not lines[-1].startswith("-----END ")
+                or not lines[-1].endswith(" PRIVATE KEY-----")
+            ):
+                raise ValueError("私钥格式无效；请粘贴完整的 OpenSSH / PEM 私钥")
+            if self.password is not None:
+                raise ValueError("密钥认证不能同时提交登录密码")
+        else:
+            if not self.password or "\x00" in self.password:
+                raise ValueError("密码认证需要填写 SSH 登录密码")
+            if "\n" in self.password or "\r" in self.password:
+                raise ValueError("SSH 密码不能包含换行符")
+            if self.private_key is not None or self.passphrase is not None:
+                raise ValueError("密码认证不能同时提交私钥或私钥口令")
+        if self.passphrase is not None and (
+            "\x00" in self.passphrase or "\n" in self.passphrase or "\r" in self.passphrase
+        ):
+            raise ValueError("私钥口令不能包含换行符或空字符")
+        return self

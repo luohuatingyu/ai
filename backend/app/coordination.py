@@ -29,6 +29,7 @@ _WORKER_INFO = "mtp:worker:{worker_id}:info"
 _WORKER_HB = "mtp:worker:{worker_id}:hb"
 _WORKER_ENABLED = "mtp:workers:enabled"
 _REMOTE_SERVERS = "mtp:remote:servers"
+_REMOTE_SSH_CREDENTIALS = "mtp:remote:ssh_credentials"
 _REMOTE_OPERATION = "mtp:remote:operation:{operation_id}"
 _REMOTE_OPERATION_TTL = 7 * 24 * 3600
 
@@ -252,6 +253,18 @@ class LeaseStore:
         """删除一条远程服务器连接记录，不访问目标服务器。"""
         raise NotImplementedError
 
+    def set_remote_ssh_credentials(self, encrypted_credentials: str) -> None:
+        """保存已加密的平台级 SSH 凭证。"""
+        raise NotImplementedError
+
+    def get_remote_ssh_credentials(self) -> Optional[str]:
+        """读取已加密的平台级 SSH 凭证。"""
+        raise NotImplementedError
+
+    def delete_remote_ssh_credentials(self) -> None:
+        """清除页面保存的平台级 SSH 凭证。"""
+        raise NotImplementedError
+
     def set_remote_operation(self, operation_id: str, info: Dict[str, object]) -> None:
         """保存远程 SSH 操作进度。"""
         raise NotImplementedError
@@ -276,6 +289,7 @@ class EmbeddedLeaseStore(LeaseStore):
         self._worker_enabled: Dict[str, bool] = {}  # worker_id -> 是否允许接单
         self._remote_servers: Dict[str, Dict[str, object]] = {}
         self._remote_operations: Dict[str, Dict[str, object]] = {}
+        self._remote_ssh_credentials: Optional[str] = None
 
     def healthy(self) -> bool:
         return True
@@ -391,6 +405,21 @@ class EmbeddedLeaseStore(LeaseStore):
         """删除进程内远程服务器元数据。"""
         with self._lock:
             self._remote_servers.pop(machine_id, None)
+
+    def set_remote_ssh_credentials(self, encrypted_credentials: str) -> None:
+        """在进程内保存 Fernet 密文，供嵌入式模式和测试复用。"""
+        with self._lock:
+            self._remote_ssh_credentials = encrypted_credentials
+
+    def get_remote_ssh_credentials(self) -> Optional[str]:
+        """读取进程内的平台 SSH 凭证密文副本。"""
+        with self._lock:
+            return self._remote_ssh_credentials
+
+    def delete_remote_ssh_credentials(self) -> None:
+        """清除进程内的平台 SSH 凭证密文。"""
+        with self._lock:
+            self._remote_ssh_credentials = None
 
     def set_remote_operation(self, operation_id: str, info: Dict[str, object]) -> None:
         """在进程内保存远程操作状态副本。"""
@@ -562,6 +591,19 @@ class RedisLeaseStore(LeaseStore):
     def delete_remote_server(self, machine_id: str) -> None:
         """从 Redis 删除远程服务器元数据，不访问目标服务器。"""
         self._redis.hdel(_REMOTE_SERVERS, machine_id)
+
+    def set_remote_ssh_credentials(self, encrypted_credentials: str) -> None:
+        """将 Fernet 密文写入独立 Redis key，避免和服务器元数据混存。"""
+        self._redis.set(_REMOTE_SSH_CREDENTIALS, encrypted_credentials)
+
+    def get_remote_ssh_credentials(self) -> Optional[str]:
+        """读取独立 Redis key 中的平台 SSH 凭证密文。"""
+        value = self._redis.get(_REMOTE_SSH_CREDENTIALS)
+        return str(value) if value is not None else None
+
+    def delete_remote_ssh_credentials(self) -> None:
+        """从 Redis 清除页面保存的平台 SSH 凭证密文。"""
+        self._redis.delete(_REMOTE_SSH_CREDENTIALS)
 
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳 key 已消失且注册信息长期未更新的 worker 条目。

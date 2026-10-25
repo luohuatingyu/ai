@@ -325,3 +325,43 @@ def test_cleanup_stale_workers_redis():
     finally:
         ls.deregister_worker("w-dead")
         ls.deregister_worker("w-live")
+
+
+def test_embedded_remote_ssh_credentials_store_opaque_ciphertext():
+    """协调存储的远程凭证接口只接收密文，并支持清除。"""
+    ls = EmbeddedLeaseStore()
+    ciphertext = "gAAAAABtest-encrypted-value"
+
+    assert ls.get_remote_ssh_credentials() is None
+    ls.set_remote_ssh_credentials(ciphertext)
+    assert ls.get_remote_ssh_credentials() == ciphertext
+    ls.delete_remote_ssh_credentials()
+    assert ls.get_remote_ssh_credentials() is None
+
+
+def test_redis_remote_ssh_credentials_use_dedicated_key():
+    """Redis 凭证密文写入独立 key，并可读回和删除。"""
+    from app.coordination import RedisLeaseStore
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def delete(self, key):
+            return self.values.pop(key, None) is not None
+
+    redis = FakeRedis()
+    ls = RedisLeaseStore(redis)
+    ciphertext = "fernet-ciphertext-only"
+
+    ls.set_remote_ssh_credentials(ciphertext)
+    assert redis.values == {"mtp:remote:ssh_credentials": ciphertext}
+    assert ls.get_remote_ssh_credentials() == ciphertext
+    ls.delete_remote_ssh_credentials()
+    assert redis.values == {}

@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Literal, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 
 import app.config as config
@@ -309,6 +309,72 @@ def list_remote_servers(
     _require_remote_admin_token(x_worker_admin_token)
     servers = manager.lease.list_remote_servers()
     return {"servers": servers}
+
+
+@router.get("/remote-ssh-settings")
+def get_remote_ssh_settings(
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """返回 SSH 认证方式与凭证状态，绝不向页面回传凭证明文。"""
+    from app.remote_workers import RemoteWorkerError, remote_ssh_settings_status
+
+    _require_remote_admin_token(x_worker_admin_token)
+    try:
+        return remote_ssh_settings_status()
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, "平台 SSH 凭证状态读取失败；请检查共享 Redis 连接") from exc
+
+
+@router.put("/remote-ssh-settings")
+async def put_remote_ssh_settings(
+    http_request: Request,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """加密并保存平台统一 SSH 凭证；响应只包含认证方式和保存状态。"""
+    from app.remote_workers import RemoteWorkerError, store_platform_ssh_credentials
+    from app.routers.schemas import RemoteSSHCredentialsRequest
+
+    _require_remote_admin_token(x_worker_admin_token)
+    try:
+        request = RemoteSSHCredentialsRequest.model_validate(await http_request.json())
+    except (TypeError, ValueError):
+        # Pydantic 默认错误详情包含输入值；凭证接口统一返回脱敏错误。
+        raise HTTPException(422, "SSH 凭证输入无效；请检查认证方式和凭证内容") from None
+    credentials = {"auth_method": request.auth_method}
+    if request.auth_method == "key":
+        private_key = request.private_key.replace("\r\n", "\n").replace("\r", "\n").strip()
+        credentials.update(
+            {
+                "private_key": private_key + ("\n" if not private_key.endswith("\n") else ""),
+                "passphrase": request.passphrase or "",
+            }
+        )
+    else:
+        credentials["password"] = request.password
+    try:
+        return store_platform_ssh_credentials(credentials)
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, "平台 SSH 凭证保存失败；请检查共享 Redis 连接") from exc
+
+
+@router.delete("/remote-ssh-settings")
+def delete_remote_ssh_settings(
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """清除页面保存的 SSH 凭证，并回退到平台 `.env` 配置。"""
+    from app.remote_workers import RemoteWorkerError, clear_platform_ssh_credentials
+
+    _require_remote_admin_token(x_worker_admin_token)
+    try:
+        return clear_platform_ssh_credentials()
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, "平台 SSH 凭证清除失败；请检查共享 Redis 连接") from exc
 
 
 @router.post("/remote-servers", status_code=202)
