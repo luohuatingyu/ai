@@ -367,6 +367,172 @@ def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatc
     assert response.status_code == 422
 
 
+def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client, monkeypatch, request):
+    """令牌保护的 SSH 设置加密持久化，并且读取/清除接口不回传秘密。"""
+    from cryptography.fernet import Fernet
+
+    from app.remote_workers import _platform_ssh_credentials
+    from app.state import manager
+
+    token = "remote-admin-token-settings-0123456789"
+    headers = {"X-Worker-Admin-Token": token}
+    password = "platform SSH password with spaces and $ chars"
+    encryption_key = Fernet.generate_key().decode("ascii")
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", encryption_key)
+    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(manager, "distributed", True)
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+
+    payload = {"auth_method": "password", "password": password}
+    assert client.get("/api/remote-ssh-settings").status_code == 401
+    assert client.put("/api/remote-ssh-settings", json=payload).status_code == 401
+    assert client.delete("/api/remote-ssh-settings").status_code == 401
+
+    saved = client.put("/api/remote-ssh-settings", json=payload, headers=headers)
+    assert saved.status_code == 200, saved.text
+    ciphertext = manager.lease.get_remote_ssh_credentials()
+    assert ciphertext and password not in ciphertext
+    assert password.encode() not in ciphertext.encode()
+    assert Fernet(encryption_key.encode()).decrypt(ciphertext.encode()).decode().find(password) >= 0
+    assert saved.json() == {
+        "source": "page",
+        "auth_method": "password",
+        "configured": True,
+        "can_configure": True,
+    }
+
+    readback = client.get("/api/remote-ssh-settings", headers=headers)
+    assert readback.status_code == 200
+    assert password not in readback.text
+    assert _platform_ssh_credentials()["password"] == password
+
+    cleared = client.delete("/api/remote-ssh-settings", headers=headers)
+    assert cleared.status_code == 200
+    assert manager.lease.get_remote_ssh_credentials() is None
+    assert cleared.json()["source"] == "env"
+    assert password not in cleared.text
+
+
+def test_remote_ssh_settings_save_private_key_without_echo(client, monkeypatch, request):
+    """页面密钥保存后返回状态而非私钥文本，Redis 中只保留加密内容。"""
+    from cryptography.fernet import Fernet
+
+    from app.state import manager
+
+    token = "remote-admin-token-private-key-0123456789"
+    headers = {"X-Worker-Admin-Token": token}
+    private_key = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "test-key-material-that-must-not-be-echoed\n"
+        "-----END OPENSSH PRIVATE KEY-----"
+    )
+    encryption_key = Fernet.generate_key().decode("ascii")
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", encryption_key)
+    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(manager, "distributed", True)
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+
+    response = client.put(
+        "/api/remote-ssh-settings",
+        headers=headers,
+        json={"auth_method": "key", "private_key": private_key},
+    )
+
+    assert response.status_code == 200, response.text
+    assert private_key not in response.text
+    assert "test-key-material-that-must-not-be-echoed" not in response.text
+    ciphertext = manager.lease.get_remote_ssh_credentials()
+    assert ciphertext and private_key not in ciphertext
+    stored = json.loads(Fernet(encryption_key.encode()).decrypt(ciphertext.encode()).decode())
+    assert stored["private_key"] == private_key + "\n"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"auth_method": "password", "password": ""},
+        {"auth_method": "password", "password": "first\nsecond"},
+        {"auth_method": "key", "private_key": "not a key"},
+        {"auth_method": "key", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc"},
+    ],
+)
+def test_remote_ssh_settings_reject_invalid_credentials(client, monkeypatch, request, payload):
+    """空密码、多行密码及不完整/非法密钥在保存前拒绝。"""
+    from app.state import manager
+
+    token = "remote-admin-token-invalid-settings-012345"
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+
+    response = client.put(
+        "/api/remote-ssh-settings",
+        headers={"X-Worker-Admin-Token": token},
+        json=payload,
+    )
+    assert response.status_code == 422
+    attempted_secret = payload.get("password") or payload.get("private_key") or ""
+    if attempted_secret:
+        assert attempted_secret not in response.text
+    assert manager.lease.get_remote_ssh_credentials() is None
+
+
+def test_remote_ssh_settings_require_redis_and_encryption_key(client, monkeypatch, request):
+    """未启用共享 Redis 或未设置有效加密密钥时页面不能持久化凭证。"""
+    from app.state import manager
+
+    token = "remote-admin-token-storage-settings-012345"
+    headers = {"X-Worker-Admin-Token": token}
+    payload = {"auth_method": "password", "password": "test-password"}
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+
+    monkeypatch.setattr(config, "REDIS_URL", "")
+    monkeypatch.setattr(manager, "distributed", False)
+    no_redis = client.put("/api/remote-ssh-settings", headers=headers, json=payload)
+    assert no_redis.status_code == 503
+    assert "共享 Redis" in no_redis.text
+
+    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(manager, "distributed", True)
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", "")
+    no_key = client.put("/api/remote-ssh-settings", headers=headers, json=payload)
+    assert no_key.status_code == 503
+    assert "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY" in no_key.text
+    manager.lease.delete_remote_ssh_credentials()
+
+
+def test_remote_ssh_settings_redacts_redis_read_failure(client, monkeypatch):
+    """共享 Redis 读取异常以脱敏 503 返回，不泄漏底层错误内容。"""
+    from app.routers import jobs as jobs_router
+
+    token = "remote-admin-token-redis-error-012345678"
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+
+    def fail_status():
+        raise OSError("redis password leaked")
+
+    monkeypatch.setattr(jobs_router, "remote_ssh_settings_status", fail_status)
+    response = client.get(
+        "/api/remote-ssh-settings",
+        headers={"X-Worker-Admin-Token": token},
+    )
+
+    assert response.status_code == 503
+    assert "redis password leaked" not in response.text
+    assert "共享 Redis" in response.text
+
+
 def test_pause_resume_via_http(client, make_dataset):
     """HTTP 链路：running → pause → paused → resume → completed，曲线连续。"""
     ds = make_dataset(n=2000)

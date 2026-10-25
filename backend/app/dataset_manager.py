@@ -108,7 +108,8 @@ class DatasetManager:
             "rows": len(df),
             "columns": list(df.columns),
             "column_types": {col: str(dtype) for col, dtype in df.dtypes.items()},
-            "memory_usage": df.memory_usage(deep=True).sum(),
+            # Pandas 返回 numpy 整数，保存 JSON 前转换为原生 int。
+            "memory_usage": int(df.memory_usage(deep=True).sum()),
             "created_at": time.time(),
             "file_size": file_size,
             "status": "validated"
