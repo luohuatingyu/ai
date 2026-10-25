@@ -2,10 +2,35 @@
 
 ## Git基准点
 
-- **Commit Hash**: 0ac97b6（本次测试覆盖代码与测试用例的提交）
-- **提交信息**: Add training resource tracking and retry controls
+- **Commit Hash**: b37b2bc（本次测试覆盖代码与测试用例的提交）
+- **提交信息**: Fix responsive LLM training form layout
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：LLM 配置表单响应式布局修复（2026-10-25）
+
+**变更范围**：LLM 配置区横跨训练表单整行；内部字段网格按可用宽度自适应，最小列宽 210px，避免窄栏下 Hub/PPO 字段被压缩。
+
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15。容器重建后训练页静态资源由前端和 trainer 镜像提供。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| LLM 配置区跨越训练表单整行，避免与任务类型并排挤占宽度 | 前端静态契约：`test_training_page_resource_retry_and_chart_style_contract`；页面包含 `#llmFields`，样式选择器限定在训练表单中并声明跨列 | LLM PPO/RLHF 显示 Hub、Prompt、样本数和 PPO 字段；LLM 区域占满外层表单网格 | 正常、响应式、回归 |
+| 内部字段随可用宽度自适应，不出现过窄列 | 同一前端静态契约；CSS 检查内部网格 `auto-fit` 与 210px 最小列宽 | 空间允许时并排显示，空间不足时收为单列；输入字段不再落入约百像素窄列 | 窄屏边界、响应式 |
+| 既有训练、数据、LLM、资源调度功能继续工作 | 完整 `backend/tests/` 测试套件 | 202 项收集；196 项通过，6 项环境门控跳过，0 失败、0 错误 | 兼容性、回归 |
+
+**测试执行结果**：
+- 修改前新增的布局契约检查按预期失败，明确复现缺失的 LLM 跨列样式；样式修复后定向测试通过（1 通过）。
+- `docker compose run --rm --no-deps -v "$PWD/backend/tests:/app/backend/tests:ro" -v "$PWD/backend/static:/app/backend/static:ro" -v "$PWD/scripts:/app/scripts:ro" trainer python -m pytest backend/tests/test_api.py::test_training_page_resource_retry_and_chart_style_contract -v`：1 通过。
+- `docker compose up --build -d`：通过；frontend、trainer、worker 镜像重建并启动，SeaweedFS healthy。
+- `docker compose run --rm --no-deps -v "$PWD/backend/tests:/app/backend/tests:ro" -v "$PWD/scripts:/app/scripts:ro" trainer python -m pytest backend/tests/ -v`：202 项收集，196 通过、6 跳过、0 失败、0 错误（58.70 秒）。
+- 6 项跳过：3 项 Redis 集成、2 项 S3 集成、1 项 Supervisor 子进程集成，受外部服务或环境门控。
+- `git diff --check`：通过；保留 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+- 未执行浏览器截图级人工核对；响应式行为由前端样式契约检查和 CSS 规则覆盖。
+
+**Git基准点**：`b37b2bc`（Fix responsive LLM training form layout）；本报告在后续单独提交。
 
 ## 本次变更测试结果：训练资源轨迹与失败任务重试（2026-10-25）
 
