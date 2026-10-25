@@ -553,11 +553,12 @@ def test_render_remote_script_rejects_shell_and_path_injection(invalid_server):
         remote_workers.validate_server_record(invalid_server)
 
 
-def test_execute_remote_operation_persists_success_and_failure(monkeypatch):
+def test_execute_remote_operation_persists_success_and_failure(monkeypatch, request):
     """远程执行结果更新 Redis/嵌入式状态，异常不写入密钥或堆栈信息。"""
     machine_id = "remote-operation-test"
     operation_id = "operation-test"
     server = _server(machine_id=machine_id)
+    request.addfinalizer(lambda: manager.lease.delete_remote_server(machine_id))
     manager.lease.set_remote_server(machine_id, server)
     manager.lease.set_remote_operation(
         operation_id,
