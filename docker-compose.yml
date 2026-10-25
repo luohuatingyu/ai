@@ -79,8 +79,8 @@ services:
   trainer:
     build: ./backend
     container_name: mtp-trainer
-    ports:
-      - "8000:8000"
+    # 仅内网：对外入口统一走 frontend 容器（同源代理 /api）
+    # 本地单进程开发仍可直接 uvicorn app.main:app（后端自带静态兜底）
     # 外部 mysql/redis 容器发布在宿主机 localhost:3306 / localhost:6379；
     # 将容器内 localhost 映射到宿主机网关，使 .env 中的 localhost 配置在容器内直接生效
     extra_hosts:
@@ -97,6 +97,28 @@ services:
     depends_on:
       seaweedfs:
         condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    # 前端容器（Node 零依赖静态服务 + /api 反向代理，按语言与后端 Python 分离）
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NODE_BASE: ${NODE_BASE_IMAGE:-node:20-alpine}
+    container_name: mtp-frontend
+    ports:
+      - "8000:8000"   # 页面与 API 同源入口
+    environment:
+      API_PROXY_HOST: trainer
+      API_PROXY_PORT: 8000
+    depends_on:
+      - trainer
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   worker:

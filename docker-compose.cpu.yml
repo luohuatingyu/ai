@@ -62,8 +62,7 @@ services:
   trainer:
     build: ./backend
     container_name: mtp-trainer-cpu
-    ports:
-      - "8000:8000"
+    # 仅内网：对外入口统一走 frontend 容器（同源代理 /api）
     volumes:
       - ./data:/app/data
     environment:
@@ -87,6 +86,28 @@ services:
         condition: service_healthy
       seaweedfs:
         condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    # 前端容器（Node 零依赖静态服务 + /api 反向代理，按语言与后端 Python 分离）
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NODE_BASE: ${NODE_BASE_IMAGE:-node:20-alpine}
+    container_name: mtp-frontend-cpu
+    ports:
+      - "8000:8000"   # 页面与 API 同源入口
+    environment:
+      API_PROXY_HOST: trainer
+      API_PROXY_PORT: 8000
+    depends_on:
+      - trainer
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   worker:

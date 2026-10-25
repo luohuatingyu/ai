@@ -67,12 +67,17 @@ docker compose up -d --build
 平台从"单进程线程池训练"升级为**控制 / 协调 / 状态 / 计算**四平面，GPU 只是可随时释放的纯计算单元：
 
 ```
+前端入口  frontend (Node)        静态托管页面 + /api 同源反向代理（与后端 Python 按语言分离）
 控制平面  trainer (FastAPI)      提交/暂停/恢复/取消任务，任务面板，watchdog
 协调平面  redis                  任务队列 + 租约(SET NX+TTL) + worker 心跳注册
 状态平面  seaweedfs (S3)         数据集 / checkpoint / 产物；job.json 权威，MySQL 仅镜像
           （可替换为阿里云 OSS / 腾讯云 COS / AWS S3 等任意 S3 兼容服务）
 计算平面  worker (一卡一进程)    supervisor 按 GPU 数拉起子进程并守护恢复
 ```
+
+前端（原生 HTML/JS/CSS 单页）与后端（Python/FastAPI）按语言拆分为两个容器：
+- **frontend 容器**：Node 零依赖静态服务（无 npm 依赖、无构建链），页面与 `/api` 同源（8000 端口），`/api/*` 原样反代到 trainer——浏览器无需 CORS；
+- **trainer 容器**：仅内网服务 API；本地单进程开发时后端仍自带 `/static` 兜底，不起前端容器也能看页面。
 
 核心语义：
 
@@ -86,11 +91,13 @@ docker compose up -d --build
 
 ## 多机多卡部署
 
-### 1. 主节点（API + Redis + SeaweedFS + worker）
+### 1. 主节点（frontend + API + Redis + SeaweedFS + worker）
 
 ```bash
 docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cpu.yml
 ```
+
+打开 http://localhost:8000：页面由 frontend 容器托管，API 经同源代理转发。
 
 ### 2. 追加 GPU 服务器（可不同显卡型号）
 
@@ -154,13 +161,16 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 ## 目录结构
 
 ```
-├── docker-compose.yml        # 多机架构 GPU 版（trainer + redis + seaweedfs + worker）
+├── docker-compose.yml        # 多机架构 GPU 版（frontend + trainer + seaweedfs + worker，Redis/MySQL 走 .env 外部容器）
 ├── docker-compose.cpu.yml    # 多机架构 CPU 版（无 gpus 声明，worker 走 CPU 槽）
+├── frontend/
+│   ├── Dockerfile            # node:20-alpine（基础镜像经 .env 可配国内源）
+│   └── server.js             # 零依赖静态服务 + /api 反向代理（容器内运行）
 ├── backend/
 │   ├── Dockerfile            # python:3.12-slim + CUDA 构建 torch
 │   ├── requirements.txt
 │   ├── app/
-│   │   ├── main.py           # FastAPI 路由 + 静态页托管
+│   │   ├── main.py           # FastAPI 路由 + 静态页托管（本地开发兜底）
 │   │   ├── jobs.py           # 任务登记/控制/watchdog（状态平面版）
 │   │   ├── jobstore.py       # job.json CRUD / metrics 回滚 / 日志（权威记录层）
 │   │   ├── worker.py         # 无状态 TrainingWorker + 一卡一进程 WorkerSupervisor
