@@ -1,16 +1,19 @@
 """数据集导入工具，支持批量导入和多种数据源"""
-import os
 import json
+import shutil
+import stat
+import tempfile
 import time
 import zipfile
 import tarfile
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Union
+from pathlib import PurePosixPath
+from typing import Dict, List, Any
 import pandas as pd
 from fastapi import HTTPException, UploadFile
 import logging
 from app.dataset_manager import DatasetManager
-from app.utils import generate_id, safe_filename, validate_csv_structure
+from app.utils import safe_filename, validate_csv_structure
 
 logger = logging.getLogger(__name__)
 
@@ -39,52 +42,106 @@ class DatasetImporter:
         """
         try:
             # 检查文件格式
-            file_ext = Path(file.filename or "").suffix.lower()
+            filename = file.filename or ""
+            file_ext = self._file_extension(filename)
             if file_ext not in self.supported_formats:
                 raise HTTPException(400, f"不支持文件格式: {file_ext}")
             
-            # 保存临时文件
-            temp_file_path = self.temp_dir / safe_filename(file.filename or "")
-            with open(temp_file_path, "wb") as buffer:
-                buffer.write(file.file.read())
-            
-            # 处理文件
-            if file_ext in ['.zip', '.tar', '.tar.gz', '.tgz']:
-                # 压缩文件，解压后导入
-                result = self._import_from_archive(temp_file_path, description, tags, auto_validate)
-            else:
-                # 单个文件
-                result = self._import_single_file(temp_file_path, description, tags, auto_validate)
-            
-            # 清理临时文件
-            temp_file_path.unlink()
-            
-            return result
+            # 每次导入使用独立临时目录，避免并发覆盖和清理时误删上传文件。
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="upload-", dir=self.temp_dir) as work_dir:
+                temp_file_path = Path(work_dir) / safe_filename(filename)
+                with open(temp_file_path, "wb") as buffer:
+                    buffer.write(file.file.read())
+
+                if file_ext in {".zip", ".tar", ".tar.gz", ".tgz"}:
+                    return self._import_from_archive(
+                        temp_file_path, description, tags, auto_validate
+                    )
+                return self._import_single_file(
+                    temp_file_path, description, tags, auto_validate
+                )
             
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"导入数据集失败: {e}")
             raise HTTPException(500, f"导入数据集失败: {e}")
+
+    def _file_extension(self, filename: str) -> str:
+        """获取后缀并保留 .tar.gz 复合扩展名。"""
+        lowered = (filename or "").lower()
+        if lowered.endswith(".tar.gz"):
+            return ".tar.gz"
+        return Path(lowered).suffix
+
+    def _safe_member_path(self, destination: Path, member_name: str) -> Path:
+        """校验压缩包成员路径，拒绝绝对路径、盘符和目录穿越。"""
+        normalized = (member_name or "").replace("\\", "/")
+        member = PurePosixPath(normalized)
+        if (not normalized or normalized.startswith("/") or
+                any(part == ".." for part in member.parts) or
+                (member.parts and ":" in member.parts[0])):
+            raise HTTPException(400, f"压缩包包含危险路径: {member_name}")
+
+        root = destination.resolve()
+        target = (root / Path(*member.parts)).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise HTTPException(400, f"压缩包包含危险路径: {member_name}") from exc
+        return target
+
+    def _extract_archive_safely(self, archive_path: Path, destination: Path) -> None:
+        """只解出普通文件和目录，避免 ZIP/TAR 路径穿越及链接攻击。"""
+        destination.mkdir(parents=True, exist_ok=True)
+        file_ext = self._file_extension(archive_path.name)
+
+        if file_ext == ".zip":
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                for item in archive.infolist():
+                    target = self._safe_member_path(destination, item.filename)
+                    mode = (item.external_attr >> 16) & 0o170000
+                    if mode == stat.S_IFLNK:
+                        raise HTTPException(400, "压缩包不能包含符号链接")
+                    if item.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(item, "r") as source, open(target, "wb") as output:
+                        shutil.copyfileobj(source, output)
+            return
+
+        with tarfile.open(archive_path, "r:*") as archive:
+            for item in archive.getmembers():
+                target = self._safe_member_path(destination, item.name)
+                if item.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not item.isfile():
+                    raise HTTPException(400, "压缩包不能包含链接或特殊文件")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(item)
+                if source is None:
+                    raise HTTPException(400, f"压缩包成员无法读取: {item.name}")
+                with source, open(target, "wb") as output:
+                    shutil.copyfileobj(source, output)
     
     def _import_from_archive(self, archive_path: Path, description: str, 
                            tags: List[str], auto_validate: bool) -> Dict[str, Any]:
         """从压缩文件导入数据集"""
         extracted_files = []
         datasets = []
+        extraction_dir = archive_path.parent / "extracted"
         
         try:
-            # 解压文件
-            if archive_path.suffix == '.zip':
-                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                    zip_ref.extractall(self.temp_dir)
-            elif archive_path.suffix in ['.tar', '.tar.gz', '.tgz']:
-                with tarfile.open(archive_path, 'r:*') as tar_ref:
-                    tar_ref.extractall(self.temp_dir)
+            # 安全解压到当前上传的私有临时目录。
+            self._extract_archive_safely(archive_path, extraction_dir)
             
             # 查找数据文件
-            for file_path in self.temp_dir.rglob("*"):
-                if file_path.is_file() and file_path.suffix.lower() in ['.csv', '.xlsx', '.xls']:
+            supported_data = {".csv", ".xlsx", ".xls", ".json"}
+            for file_path in sorted(extraction_dir.rglob("*")):
+                if file_path.is_file() and self._file_extension(file_path.name) in supported_data:
                     extracted_files.append(file_path)
             
             if not extracted_files:
@@ -117,21 +174,28 @@ class DatasetImporter:
             
         except Exception as e:
             logger.error(f"解压文件失败: {e}")
+            if isinstance(e, HTTPException):
+                raise
             raise HTTPException(400, f"解压文件失败: {e}")
-        finally:
-            # 清理解压的文件
-            self._clean_extracted_files()
     
     def _import_single_file(self, file_path: Path, description: str, 
                           tags: List[str], auto_validate: bool) -> Dict[str, Any]:
         """导入单个数据文件"""
         # 读取数据
-        if file_path.suffix.lower() == '.csv':
-            df = pd.read_csv(file_path)
-        elif file_path.suffix.lower() in ['.xlsx', '.xls']:
-            df = pd.read_excel(file_path)
-        else:
-            raise HTTPException(400, f"不支持文件格式: {file_path.suffix}")
+        file_ext = self._file_extension(file_path.name)
+        try:
+            if file_ext == ".csv":
+                df = pd.read_csv(file_path)
+            elif file_ext == ".json":
+                df = pd.read_json(file_path)
+            elif file_ext in {".xlsx", ".xls"}:
+                df = pd.read_excel(file_path)
+            else:
+                raise HTTPException(400, f"不支持文件格式: {file_ext}")
+        except HTTPException:
+            raise
+        except (ValueError, ImportError, OSError) as exc:
+            raise HTTPException(400, f"数据文件解析失败: {exc}") from exc
         
         # 验证数据
         if auto_validate:
@@ -172,15 +236,6 @@ class DatasetImporter:
         record_path = import_records_dir / f"import_{dataset_info['id']}.json"
         record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2))
     
-    def _clean_extracted_files(self):
-        """清理解压的文件"""
-        for file_path in self.temp_dir.rglob("*"):
-            if file_path.is_file():
-                try:
-                    file_path.unlink()
-                except Exception:
-                    continue
-    
     def get_import_history(self, limit: int = 100) -> List[Dict[str, Any]]:
         """获取导入历史"""
         import_records_dir = self.datasets_dir / "import_records"
@@ -200,7 +255,7 @@ class DatasetImporter:
     
     def validate_file_structure(self, file_path: Path) -> Dict[str, Any]:
         """验证文件结构"""
-        file_ext = file_path.suffix.lower()
+        file_ext = self._file_extension(file_path.name)
         
         if file_ext not in self.supported_formats:
             return {
@@ -219,7 +274,7 @@ class DatasetImporter:
                         file_list = tar_ref.getnames()
                 
                 # 查找数据文件
-                data_files = [f for f in file_list if f.lower().endswith(('.csv', '.xlsx', '.xls'))]
+                data_files = [f for f in file_list if self._file_extension(f) in {".csv", ".xlsx", ".xls", ".json"}]
                 
                 return {
                     "valid": True,
@@ -238,6 +293,8 @@ class DatasetImporter:
             try:
                 if file_ext == '.csv':
                     df = pd.read_csv(file_path)
+                elif file_ext == '.json':
+                    df = pd.read_json(file_path)
                 elif file_ext in ['.xlsx', '.xls']:
                     df = pd.read_excel(file_path)
                 else:
