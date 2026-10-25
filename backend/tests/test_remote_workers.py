@@ -328,7 +328,7 @@ def test_local_docker_image_archive_uses_engine_api_version_and_tag_path(tmp_pat
     class FakeConnection:
         """模拟一个 HTTP over Unix socket 连接。"""
 
-        def __init__(self, path, timeout):
+        def __init__(self, path, timeout=60.0):
             self.path = path
             self.timeout = timeout
             self.requests = []
