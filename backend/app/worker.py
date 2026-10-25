@@ -459,6 +459,10 @@ class TrainingWorker:
                 with (scratch / "log.txt").open("a", encoding="utf-8") as f:
                     f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
 
+            # 本段执行的起始 epoch（续训场景 = 最近 checkpoint 之后）
+            segment_start = (int(resume_state.get("epoch", 0)) + 1) if resume_state else 1
+            last_ckpt: dict = {"epoch": None}  # 暂停/取消时记录本段实际执行到的 epoch
+
             def on_epoch_end(rec: dict) -> None:
                 """每 epoch 结束：同步 metrics/日志到状态平面（读方写后即可见）。"""
                 store.write_file(job_key(job_id, "metrics.jsonl"), scratch / "metrics.jsonl")
@@ -473,8 +477,11 @@ class TrainingWorker:
                 )
                 prune_checkpoints(store, job_id, config.WORKER_CHECKPOINT_KEEP)
                 controller.set_progress(epoch_done, "training")
+                last_ckpt["epoch"] = int(epoch_done)  # 供暂停分段记录用
 
             joblog(f"worker {self.worker_id} 开始执行训练任务")
+
+            # 本段执行的起始 epoch（续训场景 = 最近 checkpoint 之后）
 
             try:
                 summary = run_training(
@@ -503,8 +510,19 @@ class TrainingWorker:
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
+                # 记录本槽实际执行的分段（跨槽续训 UI 分段标注数据源）
+                paused_epoch = int(last_ckpt.get("epoch") or 0)
+                segments = list(record.get("segments") or [])
+                if paused_epoch >= segment_start:
+                    segments.append({
+                        "worker_id": self.worker_id,
+                        "device": "cuda" if (self.caps.get("gpu") or {}).get("available") else "cpu",
+                        "from_epoch": segment_start,
+                        "to_epoch": paused_epoch,
+                        "at": time.time(),
+                    })
                 jobstore.update_job(store, job_id, status=jobstore.PAUSED,
-                                   worker_id=self.worker_id)
+                                   worker_id=self.worker_id, segments=segments)
                 joblog(
                     f"训练暂停: {reason}；断点与产物已同步，可由任意节点接手"
                     f"（POST /api/jobs/{job_id}/resume）",

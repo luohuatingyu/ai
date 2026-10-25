@@ -1,0 +1,183 @@
+"""协调面测试：队列、租约（单写者/fencing）、控制信号、worker 注册。
+
+对应验收标准：
+- 租约语义：SET NX 单写者；token 校验续期/释放；过期即失效（不依赖时钟同步）；
+- 控制信号：set/get/clear（worker 领取时清脏信号）；
+- 队列：数量守恒、重复入队无害、snapshot 供 watchdog 防丢失。
+"""
+from __future__ import annotations
+
+import time
+
+from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore
+
+
+# ---------------------------------------------------------------------------
+# 队列
+# ---------------------------------------------------------------------------
+
+def test_queue_fifo_and_size():
+    q = EmbeddedJobQueue()
+    q.push("a"); q.push("b")
+    assert q.size() == 2
+    assert q.pop(timeout=0.1) == "a"
+    assert q.pop(timeout=0.1) == "b"
+    assert q.pop(timeout=0.05) is None
+
+
+def test_queue_snapshot():
+    q = EmbeddedJobQueue()
+    q.push("a"); q.push("b")
+    assert q.snapshot() == ["a", "b"]
+    q.pop(timeout=0.1)
+    assert q.snapshot() == ["b"]
+
+
+def test_queue_rebuild():
+    q = EmbeddedJobQueue()
+    q.push("x")
+    q.rebuild(["m", "n"])
+    assert q.snapshot() == ["m", "n"]
+
+
+def test_queue_pop_timeout_returns_none():
+    q = EmbeddedJobQueue()
+    t0 = time.time()
+    assert q.pop(timeout=0.2) is None
+    assert time.time() - t0 >= 0.15
+
+
+# ---------------------------------------------------------------------------
+# 租约（fencing 核心语义）
+# ---------------------------------------------------------------------------
+
+def test_lease_single_writer():
+    """同一任务只有一个 winner（SET NX）。"""
+    ls = EmbeddedLeaseStore()
+    assert ls.acquire("job-a", "tok-1", ttl=5) is True
+    assert ls.acquire("job-a", "tok-2", ttl=5) is False
+    assert ls.peek_holder("job-a") == "tok-1"
+
+
+def test_lease_renew_only_by_holder():
+    """续期仅持有者 token 生效；他人 token 续期失败。"""
+    ls = EmbeddedLeaseStore()
+    ls.acquire("job-a", "tok-1", ttl=5)
+    assert ls.renew("job-a", "tok-1", 5) is True
+    assert ls.renew("job-a", "tok-2", 5) is False
+
+
+def test_lease_expired_cannot_renew_but_reacquirable():
+    """过期语义与 Redis 对齐：过期后同 token 也无法续租（key 已不存在），
+    但任何 worker 可以立即重新获取——watchdog 重派依赖此语义。"""
+    ls = EmbeddedLeaseStore()
+    ls.acquire("job-a", "tok-1", ttl=0.05)
+    time.sleep(0.08)
+    assert ls.renew("job-a", "tok-1", 5) is False
+    assert ls.acquire("job-a", "tok-2", 5) is True
+
+
+def test_lease_release_token_guarded():
+    """释放仅持有者 token 生效，不误伤新持有者。"""
+    ls = EmbeddedLeaseStore()
+    ls.acquire("job-a", "tok-1", ttl=5)
+    assert ls.release("job-a", "tok-2") is False  # 他人不能释放
+    assert ls.peek_holder("job-a") == "tok-1"
+    assert ls.release("job-a", "tok-1") is True
+    assert ls.peek_holder("job-a") is None
+
+
+# ---------------------------------------------------------------------------
+# 控制信号
+# ---------------------------------------------------------------------------
+
+def test_signals_set_get_clear():
+    ls = EmbeddedLeaseStore()
+    ls.set_signal("job-a", "cancel")
+    ls.set_signal("job-a", "pause")
+    assert ls.get_signals("job-a") == {"cancel", "pause"}
+    ls.clear_signals("job-a")
+    assert ls.get_signals("job-a") == set()
+
+
+def test_signals_per_job_isolated():
+    ls = EmbeddedLeaseStore()
+    ls.set_signal("job-a", "cancel")
+    ls.set_signal("job-b", "pause")
+    assert ls.get_signals("job-a") == {"cancel"}
+    assert ls.get_signals("job-b") == {"pause"}
+
+
+# ---------------------------------------------------------------------------
+# worker 注册（/api/workers 数据源）
+# ---------------------------------------------------------------------------
+
+def test_worker_register_heartbeat_deregister():
+    ls = EmbeddedLeaseStore()
+    ls.register_worker("w1", {"gpu": {"available": False}}, ttl=5)
+    ls.heartbeat_worker("w1", {"state": "idle", "current_job": None}, ttl=5)
+    workers = ls.list_workers()
+    assert len(workers) == 1 and workers[0]["worker_id"] == "w1"
+    assert workers[0]["active"] is True
+    ls.deregister_worker("w1")
+    assert ls.list_workers() == []
+
+
+def test_lease_store_healthy():
+    assert EmbeddedLeaseStore().healthy() is True
+
+
+def test_build_coordination_embedded():
+    """兼容性：REDIS_URL 为空时返回嵌入式实现（单机零依赖形态）。"""
+    import pytest
+
+    from app import config
+    from app.coordination import build_coordination
+
+    if config.REDIS_URL:
+        pytest.skip("REDIS_URL 已配置（多机模式），嵌入式回退断言不适用")
+    queue, lease, distributed = build_coordination()
+    assert distributed is False
+    assert isinstance(queue, EmbeddedJobQueue)
+    assert isinstance(lease, EmbeddedLeaseStore)
+
+
+# ---------------------------------------------------------------------------
+# Redis 实现语义一致性（有 Redis 时执行；CI 无 Redis 自动跳过）
+# ---------------------------------------------------------------------------
+
+def test_redis_semantics_match_embedded():
+    """同一脚本在 Redis 实现上复跑全部租约/信号断言（需 MTP_TEST_REDIS）。"""
+    import os
+
+    if not os.environ.get("MTP_TEST_REDIS"):
+        import pytest
+
+        pytest.skip("未配置 MTP_TEST_REDIS，跳过 Redis 语义一致性测试")
+    import redis as redislib
+
+    from app.coordination import RedisJobQueue, RedisLeaseStore
+
+    client = redislib.Redis.from_url(os.environ["MTP_TEST_REDIS"], decode_responses=True)
+    client.flushdb()
+    q, ls = RedisJobQueue(client), RedisLeaseStore(client)
+
+    q.push("a"); q.push("b")
+    assert q.size() == 2 and q.snapshot() == ["a", "b"]
+    assert q.pop(timeout=1) == "a"
+
+    assert ls.acquire("job-r", "t1", 5) is True
+    assert ls.acquire("job-r", "t2", 5) is False
+    assert ls.renew("job-r", "t1", 5) is True
+    assert ls.renew("job-r", "t2", 5) is False
+    assert ls.release("job-r", "t2") is False
+    assert ls.release("job-r", "t1") is True
+
+    ls.set_signal("job-r", "cancel")
+    assert "cancel" in ls.get_signals("job-r")
+    ls.clear_signals("job-r")
+    assert ls.get_signals("job-r") == set()
+
+    ls.register_worker("wr", {"gpu": {"available": False}}, ttl=5)
+    assert ls.list_workers()[0]["worker_id"] == "wr"
+    ls.deregister_worker("wr")

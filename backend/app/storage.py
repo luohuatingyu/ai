@@ -350,8 +350,8 @@ def sync_dataset_to_store(ds_id: str, local_csv: Path) -> bool:
 def resolve_dataset_csv_local(ds_id: str) -> Path:
     """本地布局下查找数据集 CSV，兼容新旧两种存储结构。
 
-    旧扁平格式：{DATASETS_DIR}/{ds_id}.csv
-    新结构：processed/（优先）、raw/、数据集目录副本
+    旧扁平格式：{DATASETS_DIR}/{ds_id}.csv（优先，保持历史行为）
+    新结构：processed/、raw/、数据集目录副本（按序回退）
     找不到时返回旧扁平格式路径（由训练器抛出明确的文件不存在错误）。
     """
     if "/" in ds_id or ".." in ds_id or not _KEY_RE.match(ds_id):

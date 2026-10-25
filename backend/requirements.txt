@@ -15,3 +15,6 @@ torch>=2.6,<3
 # 多机模式（控制/协调平面）
 redis>=5.0          # 任务队列 + 租约 + worker 注册（无 Redis 时自动退化为嵌入式模式）
 minio>=7.2          # 状态平面 S3/MinIO 实现（STORAGE_BACKEND=minio 时需要）
+
+# 测试（正式套件 backend/tests/）
+pytest>=8.0

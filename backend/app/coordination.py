@@ -125,11 +125,12 @@ class RedisJobQueue(JobQueue):
         self._redis = redis_client
 
     def push(self, job_id: str) -> None:
-        self._redis.lpush(_QUEUE_KEY, job_id)
+        # RPUSH 尾插：列表顺序 = 入队顺序（snapshot 与 pop 方向一致）
+        self._redis.rpush(_QUEUE_KEY, job_id)
 
     def pop(self, timeout: float = 1.0) -> Optional[str]:
-        # BRPOP 是单命令原子出队：两个 worker 同时领取不会拿到同一个任务
-        result = self._redis.brpop(_QUEUE_KEY, timeout=max(int(timeout), 1))
+        # BLPOP 是单命令原子出队（队首）：两个 worker 同时领取不会拿到同一个任务
+        result = self._redis.blpop(_QUEUE_KEY, timeout=max(int(timeout), 1))
         if result is None:
             return None
         _, job_id = result
@@ -143,7 +144,7 @@ class RedisJobQueue(JobQueue):
         pipe = self._redis.pipeline()
         pipe.delete(_QUEUE_KEY)
         if job_ids:
-            pipe.rpush(_QUEUE_KEY, *reversed(job_ids))  # 反转保持原顺序
+            pipe.rpush(_QUEUE_KEY, *job_ids)  # 尾插保持原顺序（队首=第一个任务）
         pipe.execute()
 
     def size(self) -> int:
