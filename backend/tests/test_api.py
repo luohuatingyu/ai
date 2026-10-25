@@ -513,7 +513,7 @@ def test_remote_ssh_settings_require_redis_and_encryption_key(client, monkeypatc
 
 def test_remote_ssh_settings_redacts_redis_read_failure(client, monkeypatch):
     """共享 Redis 读取异常以脱敏 503 返回，不泄漏底层错误内容。"""
-    from app.routers import jobs as jobs_router
+    from app import remote_workers
 
     token = "remote-admin-token-redis-error-012345678"
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
@@ -522,7 +522,7 @@ def test_remote_ssh_settings_redacts_redis_read_failure(client, monkeypatch):
     def fail_status():
         raise OSError("redis password leaked")
 
-    monkeypatch.setattr(jobs_router, "remote_ssh_settings_status", fail_status)
+    monkeypatch.setattr(remote_workers, "remote_ssh_settings_status", fail_status)
     response = client.get(
         "/api/remote-ssh-settings",
         headers={"X-Worker-Admin-Token": token},
@@ -858,3 +858,39 @@ def test_process_dataset_rolls_back_when_object_store_sync_fails(client, store, 
     assert response.status_code == 503
     assert not (config.DATASETS_DIR / "processed" / f"{dataset_id}.csv").exists()
     assert client.get(f"/api/datasets/{dataset_id}").json()["rows"] == 3
+
+
+def test_upload_csv_with_integer_columns_is_serializable_and_listed(client, store):
+    """回归：CSV 整数列上传后元数据可序列化，并能在列表和预览中读取。"""
+    from app.state import dataset_manager
+
+    for directory in (
+        dataset_manager.raw_dir,
+        dataset_manager.processed_dir,
+        dataset_manager.temp_dir,
+        dataset_manager.metadata_dir,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    payload = b"feature,target\n1,no\n2,yes\n"
+    response = client.post(
+        "/api/datasets",
+        files={"file": ("integer-metadata.csv", payload, "text/csv")},
+    )
+
+    assert response.status_code == 200, response.text
+    uploaded = response.json()
+    assert uploaded["rows"] == 2
+    assert uploaded["columns"] == ["feature", "target"]
+    assert isinstance(uploaded["memory_usage"], int)
+
+    datasets = client.get("/api/datasets").json()["datasets"]
+    listed = next(item for item in datasets if item["id"] == uploaded["id"])
+    assert listed["rows"] == 2
+    assert listed["columns"] == ["feature", "target"]
+
+    preview = client.get(f"/api/datasets/{uploaded['id']}").json()
+    assert preview["preview"] == [
+        {"feature": 1, "target": "no"},
+        {"feature": 2, "target": "yes"},
+    ]

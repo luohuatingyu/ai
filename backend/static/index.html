@@ -295,7 +295,6 @@
       <button id="btnUpload">上传 CSV</button>
     </div>
     <input type="file" id="fileInput" accept=".csv" hidden>
-    <div id="sampleBox" class="chips" style="margin-bottom:10px;"></div>
     <div id="previewWrap"><div class="empty">选择或上传数据集后在此预览</div></div>
     <div id="previewMeta" class="hint" style="margin-top:6px;"></div>
 
@@ -544,14 +543,24 @@ async function loadSystem() {
 }
 
 /* ---------- 数据集 ---------- */
+/** 按数据集列表渲染选择框；列表为空时清理预览并禁用选择。 */
 function renderDatasetSelect() {
   const sel = $("datasetSelect");
   sel.innerHTML = "";
   if (!state.datasets.length) {
-    sel.innerHTML = `<option value="">（暂无数据集）</option>`;
-    $("btnStart").disabled = true;
+    state.datasetId = null;
+    state.preview = null;
+    sel.disabled = true;
+    sel.innerHTML = `<option value="">（暂无数据集，请上传 CSV）</option>`;
+    $("targetSelect").innerHTML = "";
+    $("timeColumnSelect").innerHTML = "";
+    $("previewWrap").innerHTML = `<div class="empty">暂无数据集，请上传 CSV 后预览</div>`;
+    $("previewMeta").hidden = true;
+    $("previewMeta").textContent = "";
+    updateStart();
     return;
   }
+  sel.disabled = false;
   for (const d of state.datasets) {
     const opt = document.createElement("option");
     opt.value = d.id;
@@ -566,32 +575,12 @@ function renderDatasetSelect() {
   sel.dispatchEvent(new Event("change"));
 }
 
+/** 读取数据集列表接口的 datasets 字段，并保留上传后的当前选择。 */
 async function loadDatasets(keepId) {
-  state.datasets = await apiJson("/api/datasets");
+  const response = await apiJson("/api/datasets");
+  state.datasets = Array.isArray(response.datasets) ? response.datasets : [];
   if (keepId) state.datasetId = keepId;
   renderDatasetSelect();
-}
-
-async function loadSamples() {
-  try {
-    const samples = await apiJson("/api/samples");
-    const box = $("sampleBox");
-    box.innerHTML = "";
-    for (const s of samples) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = "＋ " + s.name.replace(".csv", "");
-      b.title = "导入示例数据集 " + s.name;
-      b.onclick = async () => {
-        try {
-          const meta = await apiJson(`/api/datasets/sample/${encodeURIComponent(s.name)}`, { method: "POST" });
-          toast("示例数据已导入: " + meta.name, "ok");
-          await loadDatasets(meta.id);
-        } catch (e) { toast("导入失败: " + e.message, "err"); }
-      };
-      box.appendChild(b);
-    }
-  } catch { /* 静默 */ }
 }
 
 async function loadPreview() {
@@ -1463,7 +1452,6 @@ $("btnDownload").onclick = () => { if (state.jobId) location.href = `/api/jobs/$
 (async function init() {
   loadSystem();
   setInterval(loadSystem, 15000);
-  loadSamples();
   refreshWorkers();
   setInterval(refreshWorkers, 2000);
   try { await loadDatasets(); } catch (e) { toast("加载数据集失败: " + e.message, "err"); }
