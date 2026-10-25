@@ -669,6 +669,13 @@ html { min-width: 320px; background: var(--bg); }
 .training-page .hint { color: #718096; font-size: 12px; line-height: 1.55; }
 .training-page .row { gap: 10px; margin-bottom: 12px; }
 .training-page .formgrid { gap: 13px 12px; margin: 12px 0; }
+.training-page #trainForm > .formgrid > #llmFields {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+.training-page #llmFields > .formgrid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+}
 .training-page .stack { gap: 12px; }
 .training-page .empty,
 .dataset-page .empty-state {
