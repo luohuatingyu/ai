@@ -2,95 +2,139 @@
 
 ## Git基准点
 
-- **Commit Hash**: 3bb4a96
-- **提交信息**: Merge emdash/hot-boxes-clean-y9u6p: dataset compatibility fixes and AGENTS.md improvements
-- **测试日期**: 2026-10-24
-- **分支**: master（自 emdash/hot-boxes-clean-y9u6p 合并，该分支本地功能测试 32/32；容器化验证基于本合并提交）
+- **Commit Hash**: 2c9b101（本次重测基于分支 emdash/hot-boxes-clean-y9u6p 最新提交）
+- **提交信息**: Clean up dataset CSV copy in object store on dataset deletion
+- **测试日期**: 2026-10-25
+- **分支**: emdash/hot-boxes-clean-y9u6p
 
-## 本次变更测试结果（2026-10-24）
+## 本次变更测试结果（2026-10-25）
 
-**变更范围**：修复数据集新旧两套存储格式不兼容导致的链路断裂（4 个业务文件）
+**变更范围**：多机多卡无状态训练架构（四平面分离）+ 正式 pytest 测试套件 + 状态平面替换为 SeaweedFS
 
-- `backend/app/main.py`：`_load_meta_or_404` 支持回退读取 `metadata/{id}.json`；`_save_dataset_from_frame` 统一走 `DatasetManager` 保存；补齐缺失的 `safe_filename`、`get_job_logs` 导入；清理未使用导入
-- `backend/app/dataset_manager.py`：`get_dataset` 回退旧扁平格式；新增 `_resolve_csv` 双布局查找；`list_datasets` 合并两种元数据源并去重；`delete_dataset` 同时清理旧扁平文件
-- `backend/app/jobs.py`：训练前按新旧两种布局解析数据集 CSV 路径
-- `backend/app/config.py`：数据目录默认值改为容器安全（容器内 `/app/data`，本地回退项目根 `data/`）
+- 三层架构重构（`storage.py` / `coordination.py` / `worker.py` / `jobs.py` / `jobstore.py` / `trainer.py` / `main.py` / `config.py`）：控制（FastAPI）/ 协调（Redis 队列+租约+心跳）/ 状态（S3 对象存储 + 本地文件，job.json 权威）/ 计算（无状态 Worker 一卡一进程）四平面
+- 前端（`static/index.html`）：计算槽面板（机器→卡级状态）、暂停/恢复按钮、资源提示表单
+- 状态平面 MinIO → **SeaweedFS**（S3 协议兼容，可替换为阿里云 OSS / 腾讯云 COS / AWS S3）；`MINIO_*` 环境变量全部替换为 `S3_*`
+- 迁移脚本 `scripts/migrate_to_object_storage.py`（遗留数据迁入对象存储，幂等）
+- 正式 pytest 套件 `backend/tests/`（pytest 已纳入 requirements.txt）
 
-**测试执行结果**：
-- 总测试用例：32 个
-- 通过：32 个 (100%)
+**测试执行结果（正式 pytest 套件，嵌入式模式）**：
+- 总测试用例：86 个（83 通过 + 3 跳过）
+- 通过：83 个 (96.5%)
 - 失败：0 个
 - 错误：0 个
-- 跳过：0 个
+- 跳过：3 个（2 个需 `MTP_TEST_REDIS` 的多进程 E2E + 1 个需 `MTP_TEST_S3` 的 S3 后端集成）
 
-**关键模块测试**：
-- 系统接口（health/system/samples）：3/3
-- 数据集管理（导入/列表/详情/统计/删除）：9/9
-- 训练任务（发起/监控/日志/极限参数）：6/6
-- 预测与模型下载：3/3
-- 异常与安全（非法 ID/路径穿越/非法参数）：8/8
-- 兼容性回归（旧扁平格式数据集可查可训练）：2/2
-- 清理回归（删除任务/数据集/列表恢复基线）：3/3
+**Redis 模式补充验证**（`MTP_TEST_REDIS=redis://localhost:6399/0`，redis:7-alpine 容器）：
+- 协调面语义一致性（队列 FIFO/租约 fencing/信号/注册）：1/1
+- Supervisor 多进程 E2E（双槽并行 AC9、SIGKILL 子进程自动重启 AC10/AC11、任务重派后完成且 epochs 连续）：1/1
+- `--probe-gpu` 探测子进程语义（无 GPU 返回非 0）：1/1
+- Worker 注册往返（嵌套 gpu dict/进度字段类型还原）：1/1
+- 合计 8/8 通过
 
-**本次修复的缺陷**（均先复现失败场景再修复验证通过）：
+**S3 后端补充验证**（`MTP_TEST_S3`，真实 SeaweedFS 容器）：
+- S3ArtifactStore 写/读/存在性/递归列表/删除往返：1/1 通过
+- 数据集同步链路（入库 CSV → sync_dataset_to_store → worker 拉取）：1/1 通过
+- 此前另以 minio 客户端直连 SeaweedFS 实测建桶/上传/下载/stat/2MB 大对象全部通过
 
-| # | 缺陷 | 复现方式 | 修复验证 |
-|---|------|---------|---------|
-| 1 | 示例导入的数据集在列表不可见、详情 404（新旧元数据格式不兼容） | `POST /api/datasets/sample/...` 后 `GET /api/datasets/{id}` 返回 404 | 导入后详情 200、列表 +1 ✓ |
-| 2 | 上传/新格式数据集无法发起训练（`_load_meta_or_404` 仅读旧扁平格式） | 对列表中数据集 `POST /api/train` 返回 404 | 返回 job_id 且训练完成 ✓ |
-| 3 | `safe_filename` 在 main.py 使用但未导入（`/api/datasets/validate` 端点潜在 NameError） | 代码走查发现 | 导入补齐 ✓ |
-| 4 | `get_job_logs` 在日志端点使用但未导入（数据库日志路径静默失效） | 代码走查发现 | 导入补齐 ✓ |
-| 5 | config.py `DATA_DIR` 默认 `../data` 会破坏容器内路径（回归） | 代码走查：容器内解析为 `/data` 而非挂载的 `/app/data` | 按目录存在性自动选择 ✓ |
+**关键模块测试（嵌入式模式）**：
+- 存储层（双格式布局兼容/checkpoint 版本化/覆盖写语义/jobstore 回滚/日志）：17/17
+- 协调层（队列/租约/信号/worker 注册/嵌入式回退）：12/12
+- 训练器层（完整链路/续训等价/暂停恢复/取消/可复现性/损坏与架构校验）：8/8
+- Worker 层（执行/跨槽接手/租约丢失让位/资源提示/失败分类重试/checkpoint 回退）：19/19
+- 任务管理层（状态机/watchdog 重派/防丢失/删除保护/api_view 契约）：10/10
+- API 层（训练/暂停恢复/取消/删除/预测一致性/新结构数据集）：11/11
+- Supervisor 层（槽位规划/探测语义）：5/5
 
-**测试用例执行命令**（临时脚本，测试完成后已删除）：
+**验收标准映射**：
+- AC1（单机零依赖）→ test_build_coordination_embedded、test_sync_dataset_local_noop、全 API 测试
+- AC2（checkpoint 唯一权威 + 版本化回退）→ test_resume_equals_full_run、test_checkpoint_corrupt_falls_back_to_older、test_prune_checkpoints_keeps_latest_n
+- AC3（Redis/MinIO 基础设施）→ Redis 语义一致性测试、S3 后端往返测试
+- AC4（暂停/断点续训）→ test_pause_resume_state_machine、test_pause_at_epoch_boundary_via_callback
+- AC5（单卡故障不影响完成）→ test_pause_then_other_worker_resumes、test_watchdog_redispatches_expired_running
+- AC6（无状态 worker）→ test_worker_completes_job、test_completed_job_not_reprocessed
+- AC7（机器/卡不可用自动接手）→ test_lease_lost_graceful_pause、watchdog 重派与补投测试
+- AC8（任务分发匹配到卡级）→ test_require_gpu_job_not_claimed_by_cpu_worker、test_min_vram_job_skipped_by_smaller_gpu
+- AC9（多卡并行）→ test_supervisor_parallel_and_child_restart（Redis 版）
+- AC10（kill 接手）→ 同上（SIGKILL → 重启 → 重派 → completed，epochs 1..N 连续）
+- AC11（卡恢复检测）→ test_probe_gpu_exit_code、test_slot_planning_*
+- AC12（环境性错误自动重试上限可配）→ test_env_error_auto_retries_then_completes、test_env_error_exhausts_retry_then_failed、test_classify_retryable
+- ML 特有：训练链路指标/产物、同 seed 可复现、预测一致性（含缺失字段中位数/众数填充）、双布局数据兼容、预处理一致性（续训后预测可用）
+
+**测试套件发现并修复的缺陷**（先复现失败测试再修复）：
+| # | 缺陷 | 复现 | 修复 |
+|---|------|------|------|
+| 1 | 暂停时未记录本槽执行分段，跨槽续训只显示完成槽的 1 段（UI"跨槽续训 N 段"数据缺失） | `test_pause_then_other_worker_resumes` 断言 segments==2 失败 | `worker.py` JobPaused 分支记录本槽分段（on_checkpoint 捕获暂停 epoch） |
+| 2 | Redis 队列 LPUSH+BRPOP 使 snapshot 与出队顺序相反（队列契约不一致） | Redis 语义一致性测试 snapshot 断言失败 | 统一 RPUSH+BLPOP（FIFO，snapshot=入队序） |
+| 3 | worker 领取循环在 Redis 瞬断时（BLPOP socket 超时边界竞态）进程崩溃并被 supervisor 反复重启 | 容器运行观察 + `test_worker_survives_queue_pop_error` | `run_forever` 逐轮 try/except 退避重试；`RedisJobQueue.pop` 把阻塞窗口超时归一为"无任务" |
+| 4 | worker 注册信息经 Redis 存储时嵌套 dict/数值被 str() 扁平化，`/api/workers` 读回后 `gpu.get` 崩溃（500） | 容器实测 500 + Redis 注册往返测试 | `jsonable/unjsonable` 对称序列化（JSON + 旧 repr 数据回退兼容） |
+| 5 | S3 模式下数据集入库未同步对象存储，worker 领取后"数据集未同步到对象存储"直接失败 | 容器全链路冒烟（真实 SeaweedFS） | `main.py` 上传/示例导入路径调用 `sync_dataset_to_store`（尽力而为）；数据集删除同步清理 S3 副本 |
+| 6 | compose worker 服务缺少 command 覆盖，容器内跑的是 API 而非 supervisor（计算槽永远注册不上） | 容器实测：worker 容器日志为 uvicorn 启动 | 两个 compose 文件 worker 服务显式 `command: ["python", "-m", "app.worker"]` |
+
+**测试命令**：
 ```bash
-cd backend && python3 test_comprehensive.py   # 32/32 通过
+cd backend && python3 -m pytest tests/ -v                     # 嵌入式模式：83 通过 / 3 跳过
+MTP_TEST_REDIS=redis://localhost:6399/0 python3 -m pytest tests/test_coordination.py tests/test_supervisor.py -q  # 8/8
+MTP_TEST_S3=localhost:8333 python3 -m pytest tests/test_storage.py -q  # 19/19（含 S3 往返 + 数据集同步）
 ```
 
-## 容器化部署验证（2026-10-24）
+## 容器化部署验证（2026-10-25，SeaweedFS 版）
 
-**验证环境**：master 合并提交 `3bb4a96`；Apple Silicon 宿主机（无 NVIDIA GPU）→ 按 README 规范使用 `docker-compose.cpu.yml`（镜像相同，仅去掉 gpus 声明）；Docker Hub 网络已恢复。
+**验证环境**：本分支 `2c9b101`；Apple Silicon 宿主机（无 NVIDIA GPU）→ 按 README 规范使用 CPU 版 compose（GPU 版 worker 在本机因 `gpus: all` 无 GPU vendor 无法启动，属预期）；状态平面为 SeaweedFS（S3）。
+
+**镜像与依赖源**：
+- MinIO 已从 Docker Hub 下架（2025，AIStor 品牌迁移），AIStor 镜像无商业许可证时拒绝全部 S3 操作（实测日志："No valid license found... All S3 operations are denied"）→ **替换为 SeaweedFS**（`chrislusf/seaweedfs`，S3 协议兼容，可替换为阿里云 OSS / 腾讯云 COS / AWS S3）
+- SeaweedFS 镜像可正常拉取；minio 客户端（通用 S3 协议）与 SeaweedFS 全操作兼容（实测通过）
+- 镜像源经 `.env` 可配置（`SEAWEEDFS_IMAGE`，国内网络可换国内镜像源）
 
 **验证结果**：
-- ✅ 镜像构建成功：`docker compose -f docker-compose.cpu.yml up --build -d`（含 torch CUDA wheel 安装，容器内 Python 3.12 + torch 2.14.1+cu130，宿主有 GPU 时自动启用）
-- ✅ 容器启动正常：MySQL 不可达时按设计等待后跳过初始化，文件存储为主数据源
-- ✅ 核心链路端到端通过：示例导入 → 详情预览 → 训练（2 epochs，completed，准确率 0.75）→ 单条预测（返回预测 + 概率）
-- ✅ **数据持久化挂载验证**：容器内写入的数据集元数据与任务产物（best.pt / job.json / metrics.jsonl 等）正确落盘宿主机 `./data/`，证明 `config.py` 容器路径修复（633bbcb）在容器环境行为正确
-- ✅ 验证后清理：测试数据集/任务已通过 API 删除，容器已停止
+- ✅ 镜像构建成功：trainer / worker 两镜像（容器内 Python 3.12 + torch 2.14.1+cu130）
+- ✅ 四服务启动健康：redis（healthy）、seaweedfs（healthy，wget 健康检查；`-ip=0.0.0.0` 使 S3 监听全部接口）、trainer、worker（supervisor 拉起 2 个 CPU 槽子进程）
+- ✅ S3 状态平面：宿主 9000 → 容器 8333（S3 API）、9001 → 8888（控制台）
+- ✅ 计算槽面板：`/api/workers` 返回 2 个在线 CPU 槽（idle/active，含 gpu 能力结构）
+- ✅ 全链路端到端：示例数据集导入（自动同步 S3）→ 训练提交 → worker 槽领取 → completed（6 epochs，acc 0.833，segments 记录执行槽）→ 单条预测（返回"否"）→ best.pt 下载（8497 bytes）→ 任务日志 21 行
+- ✅ S3 状态平面产物核验：datasets/*.csv、jobs/*/job.json、metrics.jsonl、best.pt/last.pt、preprocessor.json、summary.json、版本化 checkpoint（ckpt-e0005/e0006.pt）全部落库
+- ✅ 验证后清理：任务/数据集经 API 删除，S3 对象清空；容器栈保留运行
 
-**已知噪音**：容器日志中 `/health` 404 来自外部监控探测（compose 与 Dockerfile 均未配置 healthcheck；应用路由为 `/api/health`），对功能无影响。
+**已知噪音**：容器日志中 `/health` 404 来自外部监控探测（应用路由为 `/api/health`），对功能无影响；宿主机系统代理（127.0.0.1:12334）会劫持本地 API 请求导致间歇 502——验证脚本已显式禁用代理（与平台代码无关）。
 
 ## 测试覆盖范围
 
-- ✅ 正常场景：健康检查、系统信息、示例导入全链路、训练监控、预测、模型下载
-- ✅ 边界场景：预览行数参数、极限训练参数（1 epoch/最大 batch/lr 上限/0 隐藏层）、epochs=0 校验
-- ✅ 异常场景：不存在资源 404、目标列不存在 400、非法任务类型 422、缺失字段 422
-- ✅ 权限与安全：路径穿越 ID 拒绝、非法示例文件名拒绝
-- ✅ 兼容性场景：修复前旧扁平格式数据集（07:57-08:09 期间创建）仍可查询、可训练
-- ✅ 回归场景：删除任务/数据集后列表恢复基线、旧格式数据集回归训练
+- ✅ 正常场景：完整训练链路（提交→指标→best.pt→summary→日志→下载）、跨槽续训、回归/分类双任务
+- ✅ 边界场景：空队列/空指标、首 epoch 前暂停、checkpoint 保留窗口（最近 3 个）、keep<=0 防御
+- ✅ 异常场景：损坏 checkpoint 回退、数据集缺失、目标列缺失、非法超参续训、坏 metrics 行容忍
+- ✅ 权限与安全：任务 ID 路径穿越拒绝、数据集 ID 非法拒绝、租约 token 校验（不可越权释放/续期）
+- ✅ 兼容性场景：旧扁平/新结构双布局数据集读写训练、旧前端字段契约（api_view）
+- ✅ 回归场景：重复入队幂等、健康租约不误重派、删除保护、同 seed 复跑一致
+- ✅ 故障注入：存储瞬断（环境性）自动重试与耗尽、执行槽 SIGKILL、租约过期重派
 
 ## 已知问题与限制
 
-1. **Docker 验证已完成（2026-10-24）**：早前因无法连接 Docker Hub 构建失败；网络恢复后已完成容器化验证，全链路通过且数据挂载正确（见"容器化部署验证"章节）。GPU 探测路径（CUDA 分支）因本机无 NVIDIA GPU 未验证，需在 GPU 宿主机复验
-2. **`/api/datasets/{id}/process` 与 `/api/datasets/{id}/profile` 端点仍仅支持新格式数据集**（读取 `raw/`、`processed/` 固定路径），对旧扁平格式数据集返回 500；核心链路（导入/列表/详情/训练/预测）已双格式兼容
-3. **MySQL 数据库路径未测试**：本地无可用数据库连接（`USE_DATABASE=false` 运行），DB 镜像逻辑仅做代码走查
-4. **远端仓库待同步（需 push 授权）**：`origin/hot-boxes-temp` 仍含历史临时测试脚本提交（本地已剔除并删除分支）；`origin/master` 落后于本地 master。AGENTS.md 禁止 `git push`，如需同步请明确授权
-5. **分支 `emdash/hot-boxes-clean-y9u6p` 存在并行开发中的新模块**（`fd40a1e`：storage 抽象 + coordination 平面，尚未接线到 main/jobs）：未纳入 master 合并范围，待其功能完成并测试后再合并
+1. **真实 GPU 行为未验证**：本机无 NVIDIA GPU（torch 2.8 CPU only，容器内 torch 2.14.1+cu130 亦无 GPU），CUDA_VISIBLE_DEVICES 隔离、驱动崩溃恢复、显存匹配的真实行为需在 GPU 服务器按以下清单复验：
+   - GPU 版 compose 的 `gpus: all` 与一卡一子进程隔离
+   - `--probe-gpu` 在有卡机器返回 0、掉卡恢复后 supervisor 自动重启槽位
+   - require_gpu / min_vram_mb 任务由真实 GPU 卡领取
+2. **MySQL 数据库路径未测试**：本地无可用 MySQL（`USE_DATABASE=false`），DB 镜像三表（datasets/training_jobs/job_logs）仅代码走查
+3. **SeaweedFS 单机单盘模式**：适用于中小规模状态平面；大规模部署建议 SeaweedFS 集群或阿里云 OSS/腾讯云 COS（S3_* 配置即切换）。实测观察：SeaweedFS 的 ListBuckets 未列出已创建 bucket（bucket 内对象读写均正常），不影响平台使用
+4. **阿里云 OSS / 腾讯云 COS 未实测**：S3 协议兼容性基于通用 S3 客户端保证（minio SDK），真实 OSS/COS 端点需配置 `S3_ENDPOINT/S3_SECURE` 后按 S3 集成测试（MTP_TEST_S3）复验
+5. 跨设备续训为语义连续（模型/优化器/RNG 完整恢复），不承诺逐位一致；同卡同 seed 复跑可复现（已实测一致）
+6. 容器启动时 init_db.sh 固定等待 MySQL 90s（`USE_DATABASE=false` 时也未跳过等待），为历史行为，服务最终正常启动
 
 ## 重测触发条件
 
-- ✅ 修改了 `backend/app/` 下的非测试代码
+- ✅ 修改了 `backend/app/` 下的非测试代码（storage/coordination/worker/jobs/jobstore/trainer/main/config 等）
 - ✅ 修改了数据库模型和操作
-- ✅ 修改了训练器、任务管理业务逻辑
-- ✅ 修改了 API 接口
+- ✅ 修改了数据集管理/导入/预处理逻辑
+- ✅ 修改了训练器或任务管理
+- ✅ 修改了 API 路由
 - ✅ 修改了核心配置（影响业务逻辑的配置）
+- ❌ 仅修改前端（`backend/static/`）、文档、数据库脚本、构建配置、测试代码时不强制重测
+
+标准测试命令：`cd backend && python3 -m pytest tests/ -v`；Redis/S3 集成用 `MTP_TEST_REDIS` / `MTP_TEST_S3` 环境变量门控开启。
 
 ## 下次测试建议
 
-1. 在 NVIDIA GPU 宿主机上验证 GPU 版 compose（`gpus` 声明与 CUDA 自动启用路径）
-2. 补齐 `/api/datasets/{id}/process`、`/profile` 端点的旧格式兼容（或明确限制新格式使用）
-3. 配置可用 MySQL 后测试数据库镜像路径（datasets/training_jobs/job_logs 三表双写）
-4. 补充前端页面交互测试（Chart.js 曲线、日志增量拉取、进度条）
-5. 将临时功能测试固化为正式测试套件（建议 pytest + httpx，纳入 requirements-dev）
-6. 上传接口实测 multipart 上传流程（本次因无现成 CSV 上传样例，通过示例导入覆盖等价路径）
-7. `fd40a1e` 的 storage/coordination 新模块接线后，补充多机架构（嵌入式模式/Redis/MinIO）功能测试
+1. GPU 服务器人工验证清单（见"已知问题"第 1 条）
+2. 配置真实 MySQL 后回归 DB 镜像路径
+3. 在阿里云 OSS / 腾讯云 COS 端点跑 `MTP_TEST_S3` 集成测试
+4. SeaweedFS 多机集群模式（filer replication）验证
+5. 前端页面交互测试（Chart.js 曲线、计算槽面板轮询、暂停/恢复按钮链路）
