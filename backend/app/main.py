@@ -264,12 +264,18 @@ def delete_dataset(ds_id: str) -> dict:
                     store.delete(key)
             except Exception:
                 pass
-            # 从数据库删除（如果可用）
+            # 从数据库删除（如果可用；仍有任务引用该数据集时 FK 约束会失败，
+            # 镜像行保留不影响主流程——任务删除时会同步清理自身镜像）
             if config.DB_AVAILABLE:
                 try:
-                    with db_session() as db:
-                        # 这里可以添加从数据库删除数据集的逻辑
-                        pass
+                    from app.database import SessionLocal
+                    from app.db_utils import get_dataset_from_db
+
+                    with SessionLocal() as db:
+                        row = get_dataset_from_db(db, ds_id)
+                        if row is not None:
+                            db.delete(row)
+                            db.commit()
                 except Exception:
                     pass
             return {"ok": True}

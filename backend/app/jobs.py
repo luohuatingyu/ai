@@ -269,16 +269,22 @@ class JobManager:
             jobstore.append_job_log(self.store, job_id, f"数据库保存失败: {exc}")
 
     def _mirror_delete(self, job_id: str) -> None:
-        """删除任务时的数据库镜像清理（失败静默；DB 表是镜像，可重建）。"""
+        """删除任务时的数据库镜像清理（失败静默；DB 表是镜像，可重建）。
+
+        先删子表 job_logs（外键引用 training_jobs），再删父表任务行，
+        否则会触发 FK 约束失败导致镜像残留。
+        """
         if not self._db_available:
             return
         try:
             from app.database import SessionLocal
             from app.db_utils import get_job_from_db
+            from app.models import JobLog
 
             with SessionLocal() as db:
                 row = get_job_from_db(db, job_id)
                 if row is not None:
+                    db.query(JobLog).filter(JobLog.job_id == job_id).delete()
                     db.delete(row)
                     db.commit()
         except Exception:
