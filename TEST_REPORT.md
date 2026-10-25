@@ -19,6 +19,7 @@
 - 6 项跳过：3 个 Redis 协调集成、1 个 Redis Supervisor 集成、2 个 S3 集成；需要分别配置 `MTP_TEST_REDIS` / `MTP_TEST_S3`。
 - 两条既有弃用警告：SQLAlchemy `declarative_base()` 和 Pandas `xlrd` 引擎；均非失败。
 - 前端内联 JavaScript `node --check`：通过；`git diff --check`：通过。
+- 首轮定向测试发现 KMeans 分支错误读取神经网络专用参数，已调整任务分支初始化顺序并补齐默认训练参数；首轮完整测试另有 1 项时序异常输入用例在测试数据构造阶段因浮点列赋字符串失败，已先转为字符串列再断言业务校验。修复后重新构建并运行完整套件，最终 165 通过、0 失败。
 
 **完整测试命令**：
 ```bash
