@@ -567,7 +567,18 @@ async def batch_import_datasets(
 ) -> dict:
     """批量导入数据集"""
     try:
-        return dataset_importer.batch_import(files, description, tags)
+        result = dataset_importer.batch_import(files, description, tags)
+        items = []
+        for entry in result.get("success", []):
+            dataset = dataset_manager.get_dataset(str(entry.get("dataset_id", "")))
+            if dataset:
+                items.append(dataset)
+        try:
+            _sync_imported_items(items)
+        except Exception as exc:
+            _rollback_imported_items(items)
+            raise HTTPException(503, "对象存储暂不可用，批量导入已回滚") from exc
+        return result
     except HTTPException:
         raise
     except Exception as e:
