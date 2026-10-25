@@ -2,10 +2,58 @@
 
 ## Git基准点
 
-- **Commit Hash**: ad5e961（本次测试覆盖代码与测试用例的提交）
-- **提交信息**: Expand platform SSH authentication tests
+- **Commit Hash**: cd6c986（本次测试覆盖代码与测试用例的提交）
+- **提交信息**: Add clustering and time series training tasks
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：KMeans 聚类与单序列时间序列预测（2026-10-25）
+
+**变更范围**：增加无目标列的 CPU KMeans 聚类任务，以及按时间列排序、使用数值目标和历史窗口的单序列时间序列预测任务；补齐任务参数校验、训练指标/模型产物、checkpoint 恢复、预测 API 和训练页面配置。
+
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；本机无可用 NVIDIA GPU。新任务 API 端到端用例使用旧扁平数据集布局，现有新结构数据集训练回归用例和数据格式回归用例也包含在完整套件中。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过；镜像构建完成，服务启动，SeaweedFS healthy。
+- 完整测试：171 项收集，165 通过、6 跳过、0 失败、0 错误（55.04 秒）。
+- 6 项跳过：3 个 Redis 协调集成、1 个 Redis Supervisor 集成、2 个 S3 集成；需要分别配置 `MTP_TEST_REDIS` / `MTP_TEST_S3`。
+- 两条既有弃用警告：SQLAlchemy `declarative_base()` 和 Pandas `xlrd` 引擎；均非失败。
+- 前端内联 JavaScript `node --check`：通过；`git diff --check`：通过。
+
+**完整测试命令**：
+```bash
+docker compose up --build -d
+docker compose run --rm --no-deps \
+  -v "$PWD/backend/tests:/app/backend/tests:ro" \
+  -v "$PWD/scripts:/app/scripts:ro" \
+  trainer python -m pytest backend/tests/ -v
+```
+
+**前端语法检查命令**：
+```bash
+set -o pipefail
+docker compose run --rm --no-deps trainer python -c 'import pathlib,sys; html=pathlib.Path("/app/static/index.html").read_text(); script=html.rsplit("<script", 1)[1].split(">", 1)[1].split("</script>", 1)[0]; sys.stdout.write(script)' | node --check -
+```
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 可创建不需要目标列的 KMeans 任务，产出指标、模型，并通过 API 稳定预测簇 | API：`test_train_e2e_kmeans_without_target_column`；训练器：`test_kmeans_run_produces_clusters_checkpoint_and_stable_predictions` | 旧扁平 CSV 特征数据、3 个簇；任务完成，簇指标与 `best.pt` 存在，模型预测簇编号有效且重复预测稳定 | 正常、训练产物、预测一致性、数据格式兼容 |
+| KMeans 参数边界、非法资源配置、簇数大于不同样本数时会明确拒绝 | API：`test_train_rejects_invalid_new_task_parameters`；训练器：`test_kmeans_rejects_more_clusters_than_distinct_rows` | 簇数小于 2、要求 GPU、不同样本数不足；请求/训练失败并给出明确校验错误 | 边界、异常、资源约束 |
+| KMeans checkpoint 可暂停后恢复，迭代历史连续 | 训练器：`test_kmeans_pause_resume_keeps_iteration_history` | 固定数据与初始参数，暂停后从 checkpoint 恢复；迭代历史连续且任务产物可继续读取 | 状态恢复、兼容、回归 |
+| 单序列预测按时间排序建立窗口，训练完成后接受恰好 lookback 长度的历史并返回未来数值 | API：`test_train_e2e_single_series_forecasting_and_history_validation`；训练器：`test_timeseries_run_uses_ordered_windows_and_predicts_future_value` | 带时间戳与数值目标的序列；乱序输入按时间重排，训练产生 RMSE/R² 和 `best.pt`，历史窗口预测返回有限数值 | 正常、边界、训练链路、预测一致性 |
+| 无效时间、重复时间点、数据太短、非数值目标、错误时间列或历史长度应拒绝 | API：`test_train_rejects_invalid_new_task_parameters`、`test_train_e2e_single_series_forecasting_and_history_validation`；训练器：`test_timeseries_rejects_invalid_time_values_and_short_history` | 非法/重复时间戳、短序列、非数值目标、缺失或与目标相同的时间列、不匹配的历史窗口；返回参数错误或明确训练错误 | 边界、异常、非法输入 |
+| 旧任务行为及两套数据集布局兼容，整体回归通过 | API：现有 `test_train_e2e_classification`、`test_train_e2e_regression`、`test_structured_layout_dataset_trains`；完整 `backend/tests/` | 回归/分类仍可训练；新结构数据集仍可通过通用训练读取；完整套件通过 | 兼容、回归 |
+
+**已知问题与限制**：
+- 时间序列目前只支持单一数值序列，时间列用于排序；预测单个配置预测步长对应的数值，不输出多变量或整段未来序列。
+- KMeans 任务固定在 CPU 运行；本机无 NVIDIA GPU，因此未执行真实 GPU 训练。该限制符合本功能设计。
+- Redis/S3 集成需要外部服务配置，本轮按门控跳过；已有弃用警告尚未处理。
+
+**下次测试建议**：若后续增加多变量/多步时间序列、GPU KMeans 或分布式执行支持，应补充对应数据结构、资源调度及真实硬件/服务集成验证。Redis/S3 集成环境可用时运行被跳过的 6 项用例。
+
+**Git基准点**：cd6c986（Add clustering and time series training tasks）。
 
 ## 本次变更测试结果：平台统一 SSH 认证与密钥格式兼容（2026-10-25）
 
