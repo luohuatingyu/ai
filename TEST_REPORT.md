@@ -2,8 +2,8 @@
 
 ## Git基准点
 
-- **Commit Hash**: f8abfb4（本次重测基于分支 emdash/hot-boxes-clean-y9u6p 最新提交）
-- **提交信息**: Split frontend into its own Node container (no nginx)
+- **Commit Hash**: 1ea281c（本次重测基于分支 emdash/hot-boxes-clean-y9u6p 最新提交）
+- **提交信息**: Fix DB mirror cleanup on job/dataset deletion
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
@@ -69,6 +69,8 @@
 | 4 | worker 注册信息经 Redis 存储时嵌套 dict/数值被 str() 扁平化，`/api/workers` 读回后 `gpu.get` 崩溃（500） | 容器实测 500 + Redis 注册往返测试 | `jsonable/unjsonable` 对称序列化（JSON + 旧 repr 数据回退兼容） |
 | 5 | S3 模式下数据集入库未同步对象存储，worker 领取后"数据集未同步到对象存储"直接失败 | 容器全链路冒烟（真实 SeaweedFS） | `main.py` 上传/示例导入路径调用 `sync_dataset_to_store`（尽力而为）；数据集删除同步清理 S3 副本 |
 | 6 | compose worker 服务缺少 command 覆盖，容器内跑的是 API 而非 supervisor（计算槽永远注册不上） | 容器实测：worker 容器日志为 uvicorn 启动 | 两个 compose 文件 worker 服务显式 `command: ["python", "-m", "app.worker"]` |
+| 7 | 任务删除时 DB 镜像只删父表 training_jobs，未删子表 job_logs，外键约束失败被吞掉，镜像行永久残留 | 容器实测：API 删除后 training_jobs/job_logs 行数不变 | `_mirror_delete` 先删子表日志再删父表任务行 |
+| 8 | 数据集删除的 DB 镜像清理是 pass 占位（datasets 行永久残留） | 容器实测：API 删除后 datasets 行数不变 | `delete_dataset` 实现镜像删除（被任务引用的 FK 失败按设计容忍） |
 
 **测试命令**：
 ```bash
@@ -94,7 +96,8 @@ MTP_TEST_S3=localhost:8333 python3 -m pytest tests/test_storage.py -q  # 19/19�
 - ✅ 全链路端到端：示例数据集导入（自动同步 S3）→ 训练提交 → worker 槽领取 → completed（6 epochs，acc 0.833，segments 记录执行槽）→ 单条预测（返回"否"）→ best.pt 下载（8497 bytes）→ 任务日志 21 行
 - ✅ S3 状态平面产物核验：datasets/*.csv、jobs/*/job.json、metrics.jsonl、best.pt/last.pt、preprocessor.json、summary.json、版本化 checkpoint（ckpt-e0005/e0006.pt）全部落库
 - ✅ **前后端容器拆分验证**：页面由 frontend（Node 零依赖静态服务）托管（`/` 返回 index.html、`/healthz` 健康检查 healthy）；`/api/*` 经同源反代到 trainer（workers 面板/导入/训练/预测/模型下载全链路通过，无需 CORS）；trainer 仅内网
-- ✅ 验证后清理：任务/数据集经 API 删除，S3 对象清空；容器栈保留运行
+- ✅ **MySQL 镜像路径验证**（宿主机外部 MySQL 8.0.46，`model_training` 库三表）：训练任务 → training_jobs（status/device/params/summary JSON 完整）+ job_logs（13 行）镜像写入 ✓；API 删除任务 → 父表与子表日志同步删除 ✓；删除数据集 → datasets 镜像同步删除 ✓
+- ✅ 验证后清理：任务/数据集经 API 删除，S3 对象清空，DB 镜像同步清空（用户 07:30 的自测数据保留）；容器栈保留运行
 
 **已知噪音**：容器日志中 `/health` 404 来自外部监控探测（应用路由为 `/api/health`），对功能无影响；宿主机系统代理（127.0.0.1:12334）会劫持本地 API 请求导致间歇 502——验证脚本已显式禁用代理（与平台代码无关）。
 
@@ -114,7 +117,7 @@ MTP_TEST_S3=localhost:8333 python3 -m pytest tests/test_storage.py -q  # 19/19�
    - GPU 版 compose 的 `gpus: all` 与一卡一子进程隔离
    - `--probe-gpu` 在有卡机器返回 0、掉卡恢复后 supervisor 自动重启槽位
    - require_gpu / min_vram_mb 任务由真实 GPU 卡领取
-2. **MySQL 数据库路径未测试**：本地无可用 MySQL（`USE_DATABASE=false`），DB 镜像三表（datasets/training_jobs/job_logs）仅代码走查
+2. **MySQL 数据库路径已验证（2026-10-25）**：宿主机外部 MySQL 8.0.46（`model_training` 库）三表镜像写入/删除同步全链路通过（见容器化部署验证章节）；集群/并发场景未测
 3. **SeaweedFS 单机单盘模式**：适用于中小规模状态平面；大规模部署建议 SeaweedFS 集群或阿里云 OSS/腾讯云 COS（S3_* 配置即切换）。实测观察：SeaweedFS 的 ListBuckets 未列出已创建 bucket（bucket 内对象读写均正常），不影响平台使用
 4. **阿里云 OSS / 腾讯云 COS 未实测**：S3 协议兼容性基于通用 S3 客户端保证（minio SDK），真实 OSS/COS 端点需配置 `S3_ENDPOINT/S3_SECURE` 后按 S3 集成测试（MTP_TEST_S3）复验
 5. 跨设备续训为语义连续（模型/优化器/RNG 完整恢复），不承诺逐位一致；同卡同 seed 复跑可复现（已实测一致）
