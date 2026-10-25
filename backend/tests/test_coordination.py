@@ -123,6 +123,19 @@ def test_worker_register_heartbeat_deregister():
     assert ls.list_workers() == []
 
 
+def test_cleanup_stale_workers_embedded():
+    """幽灵槽清理：心跳长期未更新的注册被清除，存活 worker 保留。"""
+    ls = EmbeddedLeaseStore()
+    ls.register_worker("w-old", {"gpu": {"available": False}}, ttl=5)
+    ls.register_worker("w-live", {"gpu": {"available": False}}, ttl=5)
+    # 人为回拨 last_seen，模拟崩溃后心跳永久停止
+    with ls._lock:
+        ls._workers["w-old"]["last_seen"] = time.time() - 1000
+    removed = ls.cleanup_stale_workers(grace_seconds=300)
+    assert removed == 1
+    assert [w["worker_id"] for w in ls.list_workers()] == ["w-live"]
+
+
 def test_lease_store_healthy():
     assert EmbeddedLeaseStore().healthy() is True
 
@@ -230,3 +243,37 @@ def test_redis_worker_registry_roundtrip_nested_caps():
     assert w["started_at"] == 1700000000.5
     assert w["active"] is True
     ls.deregister_worker("w-nested")
+
+
+def test_cleanup_stale_workers_redis():
+    """Redis 幽灵槽清理：HB 消失且 last_seen 超宽限的条目被清除，在线 worker 保留。"""
+    import os
+
+    if not os.environ.get("MTP_TEST_REDIS"):
+        import pytest
+
+        pytest.skip("未配置 MTP_TEST_REDIS，跳过 Redis 幽灵槽清理测试")
+    import redis as redislib
+
+    from app.coordination import RedisLeaseStore
+
+    client = redislib.Redis.from_url(os.environ["MTP_TEST_REDIS"], decode_responses=True)
+    client.flushdb()
+    ls = RedisLeaseStore(client)
+    ls.register_worker("w-dead", {"gpu": {"available": False}}, ttl=5)
+    ls.register_worker("w-live", {"gpu": {"available": False}}, ttl=300)
+    ls.heartbeat_worker("w-live", {"state": "idle"}, ttl=300)  # 注册后立即心跳（真实时序）
+    # 模拟崩溃：删除 HB key + 回拨 last_seen
+    client.delete("mtp:worker:w-dead:hb")
+    client.hset("mtp:worker:w-dead:info", "last_seen", time.time() - 1000)
+    try:
+        removed = ls.cleanup_stale_workers(grace_seconds=300)
+        assert removed == 1
+        ids = [w["worker_id"] for w in ls.list_workers()]
+        assert "w-dead" not in ids and "w-live" in ids
+        # 宽限期内不清理：HB 消失但 last_seen 新鲜（注册/重启间隙）
+        client.delete("mtp:worker:w-live:hb")
+        assert ls.cleanup_stale_workers(grace_seconds=300) == 0
+    finally:
+        ls.deregister_worker("w-dead")
+        ls.deregister_worker("w-live")

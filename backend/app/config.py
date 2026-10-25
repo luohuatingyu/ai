@@ -62,6 +62,7 @@ WORKER_CPU_SLOTS = int(os.environ.get("WORKER_CPU_SLOTS", "1"))  # Supervisor �
 JOB_MAX_AUTO_RETRY = int(os.environ.get("JOB_MAX_AUTO_RETRY", "5"))       # 自动重试上限（.env 可配，默认 5）
 JOB_RETRY_BACKOFF = float(os.environ.get("JOB_RETRY_BACKOFF", "2"))       # 重试退避（秒）
 WATCHDOG_INTERVAL = float(os.environ.get("WATCHDOG_INTERVAL", "5"))       # watchdog 巡检周期（秒）：重派心跳迷失任务 / 防队列丢失
+WORKER_STALE_CLEANUP_AGE = int(os.environ.get("WORKER_STALE_CLEANUP_AGE", "300"))  # 崩溃残留 worker 注册的清理宽限期（秒）
 
 # 运行期目录统一创建（幂等）
 for _d in (DATA_DIR, DATASETS_DIR, JOBS_DIR, WORKER_SCRATCH_DIR):

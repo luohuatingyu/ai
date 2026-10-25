@@ -303,8 +303,13 @@ class JobManager:
     def _watchdog_once(self) -> None:
         """一轮巡检：
         - running 且租约不存在（执行槽崩溃/心跳迷失）→ 重新排队（不消耗重试额度）；
-        - queued 但不在队列里 → 补投（防丢失；重复入队由领取方按状态跳过）。
+        - queued 但不在队列里 → 补投（防丢失；重复入队由领取方按状态跳过）；
+        - 清理崩溃残留的 worker 注册条目（心跳长期未更新的幽灵槽）。
         """
+        try:
+            self.lease.cleanup_stale_workers(config.WORKER_STALE_CLEANUP_AGE)
+        except Exception:
+            pass  # 清理失败不影响本轮巡检主逻辑
         try:
             inflight = set(self.queue.snapshot())
         except Exception:

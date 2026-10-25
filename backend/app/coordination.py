@@ -224,6 +224,10 @@ class LeaseStore:
         """列出全部注册过的 worker；active 字段标识心跳是否仍在有效期。"""
         raise NotImplementedError
 
+    def cleanup_stale_workers(self, grace_seconds: float) -> int:
+        """清理心跳长期未更新的 worker 注册条目（崩溃/未优雅退出残留），返回清除数量。"""
+        raise NotImplementedError
+
 
 class EmbeddedLeaseStore(LeaseStore):
     """进程内租约实现：字典 + 锁，语义与 Redis 版完全一致（测试友好）。"""
@@ -318,6 +322,18 @@ class EmbeddedLeaseStore(LeaseStore):
                 out.append(item)
             return out
 
+    def cleanup_stale_workers(self, grace_seconds: float) -> int:
+        """清理心跳长期未更新的注册条目（存活 worker 心跳远短于宽限期）。"""
+        now = time.time()
+        removed = 0
+        with self._lock:
+            for worker_id in list(self._workers.keys()):
+                last_seen = float(self._workers[worker_id].get("last_seen", 0))
+                if now - last_seen > grace_seconds:
+                    del self._workers[worker_id]
+                    removed += 1
+        return removed
+
 
 class RedisLeaseStore(LeaseStore):
     """Redis 实现的租约/信号/注册（多机模式）。
@@ -411,6 +427,29 @@ class RedisLeaseStore(LeaseStore):
             item["active"] = bool(self._redis.exists(_WORKER_HB.format(worker_id=worker_id)))
             out.append(item)
         return out
+
+    def cleanup_stale_workers(self, grace_seconds: float) -> int:
+        """清理心跳 key 已消失且注册信息长期未更新的 worker 条目。
+
+        进程崩溃（未优雅退出）时 HB key 自动过期，但 _WORKERS_SET 与 info 残留；
+        watch 侧定期调用本方法清除（存活 worker 心跳远短于宽限期，不受影响）。
+        """
+        now = time.time()
+        removed = 0
+        for worker_id in self._redis.smembers(_WORKERS_SET):
+            if self._redis.exists(_WORKER_HB.format(worker_id=worker_id)):
+                continue  # 心跳存活：worker 在线
+            info = self._redis.hgetall(_WORKER_INFO.format(worker_id=worker_id))
+            last_seen = info.get("last_seen")
+            if last_seen is not None and (now - float(last_seen)) <= grace_seconds:
+                continue  # 宽限期内（可能正处于注册/重启间隙）
+            pipe = self._redis.pipeline()
+            pipe.srem(_WORKERS_SET, worker_id)
+            pipe.delete(_WORKER_INFO.format(worker_id=worker_id))
+            pipe.delete(_WORKER_HB.format(worker_id=worker_id))
+            pipe.execute()
+            removed += 1
+        return removed
 
 
 def jsonable(value: object) -> str:
