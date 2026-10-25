@@ -2,10 +2,39 @@
 
 ## Git基准点
 
-- **Commit Hash**: 92283c1（本次测试覆盖代码与测试用例的提交）
-- **提交信息**: Refresh training stylesheet cache key
+- **Commit Hash**: 9085e9b（远程添加提示层级修复代码与测试）
+- **提交信息**: Show remote server feedback above modal
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：远程添加问题提示层级修复（2026-10-25）
+
+**变更范围**：远程添加服务器弹窗打开时，将 toast 提示层级从 50 提高到 70，高于弹窗层级 60；增加静态前端回归测试，保证提示层级继续高于弹窗。
+
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15。测试执行时工作区另有未提交的远程配置、后端及测试改动；完整测试覆盖了当前工作区内容，这些既有改动未包含在 `9085e9b` 提交中。
+
+**测试执行结果**：
+- 回归测试先在旧样式下失败（提示层级 50 不高于弹窗 60），确认稳定复现；调整后定向用例通过（1 通过）。
+- `docker compose up --build -d`：通过；trainer、worker、frontend 镜像重建并启动，frontend 与 SeaweedFS healthy。
+- `docker compose run --rm --no-deps -v "$PWD/backend/tests:/app/tests:ro" -v "$PWD/scripts:/scripts:ro" trainer python -m pytest /app/tests/test_api.py::test_remote_server_feedback_toasts_render_above_add_modal -v`：1 通过、0 失败。
+- `docker compose run --rm --no-deps -v "$PWD/backend/tests:/app/tests:ro" -v "$PWD/scripts:/scripts:ro" trainer python -m pytest /app/tests -v`：207 项收集，201 通过、6 跳过、0 失败、0 错误（68.36 秒）。
+- 6 项跳过：3 项 Redis 集成、2 项 S3 集成、1 项 Supervisor 子进程集成，受外部服务或环境门控。
+- 前端内联 JavaScript `node --check -`：通过；`git diff --check`：通过。
+- 保留 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+- 未执行真实浏览器截图核对；层级关系由新增 CSS 静态契约测试验证。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 远程添加弹窗显示时，校验或提交错误提示位于弹窗上方 | 前端静态契约：`test_remote_server_feedback_toasts_render_above_add_modal`；读取内联 CSS | 比较 `.server-modal` 与 `#toastWrap` 的 z-index；toast 层级必须更高 | 错误提示、弹窗层叠、回归 |
+| 现有 API、训练、数据、存储和远程管理行为保持兼容 | 完整 `backend/tests/` | 207 项收集，201 通过、6 跳过、0 失败 | 兼容性、回归 |
+
+**已知问题与限制**：Redis/S3/Supervisor 集成测试需相应外部服务或环境配置；本轮未做浏览器截图级人工核对。
+
+**重测触发条件**：修改远程添加弹窗或 toast 的层叠样式时，重新运行新增前端静态契约用例；若改动业务后端，再运行完整测试并更新本报告基准点。
+
+**Git基准点**：`9085e9b`（Show remote server feedback above modal）；本报告在后续单独提交。
 
 ## 本次变更测试结果：LLM 配置表单响应式布局修复（2026-10-25）
 
