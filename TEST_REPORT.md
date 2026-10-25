@@ -2,47 +2,50 @@
 
 ## Git基准点
 
-- **Commit Hash**: 1ea281c（本次重测基于分支 emdash/hot-boxes-clean-y9u6p 最新提交）
-- **提交信息**: Fix DB mirror cleanup on job/dataset deletion
+- **Commit Hash**: a91f265（本次重测基于分支 emdash/hot-boxes-clean-y9u6p 最新提交）
+- **提交信息**: Fix /api/datasets/tags and import-history shadowed by {ds_id} route
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
 ## 本次变更测试结果（2026-10-25）
 
-**变更范围**：多机多卡无状态训练架构（四平面分离）+ 正式 pytest 测试套件 + 状态平面替换为 SeaweedFS
+**变更范围**：多机多卡无状态训练架构（四平面分离）+ 正式 pytest 测试套件 + 状态平面替换为 SeaweedFS + 前后端容器拆分 + **P0 框架治理重构**
 
-- 三层架构重构（`storage.py` / `coordination.py` / `worker.py` / `jobs.py` / `jobstore.py` / `trainer.py` / `main.py` / `config.py`）：控制（FastAPI）/ 协调（Redis 队列+租约+心跳）/ 状态（S3 对象存储 + 本地文件，job.json 权威）/ 计算（无状态 Worker 一卡一进程）四平面
+- 三层架构重构（`storage.py` / `coordination.py` / `worker.py` / `jobs.py` / `jobstore.py` / `trainer.py` / `config.py`）：控制（FastAPI）/ 协调（Redis 队列+租约+心跳）/ 状态（S3 对象存储 + 本地文件，job.json 权威）/ 计算（无状态 Worker 一卡一进程）四平面
 - 前端（`static/index.html`）：计算槽面板（机器→卡级状态）、暂停/恢复按钮、资源提示表单
 - 状态平面 MinIO → **SeaweedFS**（S3 协议兼容，可替换为阿里云 OSS / 腾讯云 COS / AWS S3）；`MINIO_*` 环境变量全部替换为 `S3_*`
 - 迁移脚本 `scripts/migrate_to_object_storage.py`（遗留数据迁入对象存储，幂等）
 - 正式 pytest 套件 `backend/tests/`（pytest 已纳入 requirements.txt）
+- 前后端按语言拆分容器：`frontend/`（Node 零依赖静态服务 + /api 同源反代），trainer 仅内网
+- **P0 框架治理**：DB 配置收敛到 `config.py`（单源）；`init_db.sh` 按 `USE_DATABASE` 跳过 90s 等待；`main.py` 864→75 行拆为 `app/routers/`（datasets/jobs/schemas/common）+ `app/state.py` 单例；watchdog 定期清理崩溃残留的 worker 注册（`WORKER_STALE_CLEANUP_AGE`）
 
 **测试执行结果（正式 pytest 套件，嵌入式模式）**：
-- 总测试用例：86 个（83 通过 + 3 跳过）
-- 通过：83 个 (96.5%)
+- 总测试用例：99 个（93 通过 + 6 跳过）
+- 通过：93 个 (93.9%)
 - 失败：0 个
 - 错误：0 个
-- 跳过：3 个（2 个需 `MTP_TEST_REDIS` 的多进程 E2E + 1 个需 `MTP_TEST_S3` 的 S3 后端集成）
+- 跳过：6 个（3 个需 `MTP_TEST_REDIS` + 2 个需 `MTP_TEST_S3` + 1 个 Redis 模式下的嵌入式回退断言）
 
-**Redis 模式补充验证**（`MTP_TEST_REDIS=redis://localhost:6399/0`，redis:7-alpine 容器）：
-- 协调面语义一致性（队列 FIFO/租约 fencing/信号/注册）：1/1
-- Supervisor 多进程 E2E（双槽并行 AC9、SIGKILL 子进程自动重启 AC10/AC11、任务重派后完成且 epochs 连续）：1/1
-- `--probe-gpu` 探测子进程语义（无 GPU 返回非 0）：1/1
-- Worker 注册往返（嵌套 gpu dict/进度字段类型还原）：1/1
-- 合计 8/8 通过
+**Redis 模式补充验证**（`MTP_TEST_REDIS=redis://localhost:6399/0`，redis:7-alpine 容器）：23 通过 / 1 跳过，包括：
+- 协调面语义一致性（队列 FIFO/租约 fencing/信号/注册）
+- Supervisor 多进程 E2E（双槽并行 AC9、SIGKILL 子进程自动重启 AC10/AC11、任务重派后完成且 epochs 连续）
+- `--probe-gpu` 探测子进程语义（无 GPU 返回非 0）
+- Worker 注册往返（嵌套 gpu dict/进度字段类型还原）
+- 幽灵槽清理（HB 消失 + last_seen 超宽限清除；宽限期内保护）
 
-**S3 后端补充验证**（`MTP_TEST_S3`，真实 SeaweedFS 容器）：
-- S3ArtifactStore 写/读/存在性/递归列表/删除往返：1/1 通过
-- 数据集同步链路（入库 CSV → sync_dataset_to_store → worker 拉取）：1/1 通过
+**S3 后端补充验证**（`MTP_TEST_S3=localhost:9000`，运行中的 SeaweedFS 容器）：22 通过，包括：
+- S3ArtifactStore 写/读/存在性/递归列表/删除往返
+- 数据集同步链路（入库 CSV → sync_dataset_to_store → worker 拉取）
 - 此前另以 minio 客户端直连 SeaweedFS 实测建桶/上传/下载/stat/2MB 大对象全部通过
 
 **关键模块测试（嵌入式模式）**：
-- 存储层（双格式布局兼容/checkpoint 版本化/覆盖写语义/jobstore 回滚/日志）：17/17
-- 协调层（队列/租约/信号/worker 注册/嵌入式回退）：12/12
-- 训练器层（完整链路/续训等价/暂停恢复/取消/可复现性/损坏与架构校验）：8/8
-- Worker 层（执行/跨槽接手/租约丢失让位/资源提示/失败分类重试/checkpoint 回退）：19/19
-- 任务管理层（状态机/watchdog 重派/防丢失/删除保护/api_view 契约）：10/10
-- API 层（训练/暂停恢复/取消/删除/预测一致性/新结构数据集）：11/11
+- 存储层（双格式布局兼容/checkpoint 版本化/覆盖写语义/jobstore 回滚/日志/S3 门控）：17+2S3
+- 协调层（队列/租约/信号/worker 注册/嵌入式回退/幽灵槽清理/旧数据回退兼容）：13
+- 训练器层（完整链路/续训等价/暂停恢复/取消/可复现性/损坏与架构校验）：8
+- Worker 层（执行/跨槽接手/租约丢失让位/资源提示/失败分类重试/checkpoint 回退/协调面瞬断幸存）：20
+- 任务管理层（状态机/watchdog 重派/防丢失/删除保护/api_view 契约）：10
+- API 层（训练/暂停恢复/取消/删除/预测一致性/新结构数据集/静态路径不被参数路由遮蔽）：12
+- 配置层（DB 单源/引擎惰性/DB_AVAILABLE 一致性）：3
 - Supervisor 层（槽位规划/探测语义）：5/5
 
 **验收标准映射**：
@@ -71,12 +74,13 @@
 | 6 | compose worker 服务缺少 command 覆盖，容器内跑的是 API 而非 supervisor（计算槽永远注册不上） | 容器实测：worker 容器日志为 uvicorn 启动 | 两个 compose 文件 worker 服务显式 `command: ["python", "-m", "app.worker"]` |
 | 7 | 任务删除时 DB 镜像只删父表 training_jobs，未删子表 job_logs，外键约束失败被吞掉，镜像行永久残留 | 容器实测：API 删除后 training_jobs/job_logs 行数不变 | `_mirror_delete` 先删子表日志再删父表任务行 |
 | 8 | 数据集删除的 DB 镜像清理是 pass 占位（datasets 行永久残留） | 容器实测：API 删除后 datasets 行数不变 | `delete_dataset` 实现镜像删除（被任务引用的 FK 失败按设计容忍） |
+| 9 | `GET /api/datasets/tags` 与 `/api/datasets/import-history` 被 `{ds_id}` 参数路由遮蔽，永久 404（存量死端点，重构冒烟时暴露） | `GET /api/datasets/tags` 返回 404"数据集不存在" | 静态路径路由移到参数路由之前 + 两个回归测试 |
 
 **测试命令**：
 ```bash
-cd backend && python3 -m pytest tests/ -v                     # 嵌入式模式：83 通过 / 3 跳过
-MTP_TEST_REDIS=redis://localhost:6399/0 python3 -m pytest tests/test_coordination.py tests/test_supervisor.py -q  # 8/8
-MTP_TEST_S3=localhost:8333 python3 -m pytest tests/test_storage.py -q  # 19/19（含 S3 往返 + 数据集同步）
+cd backend && python3 -m pytest tests/ -v                     # 嵌入式模式：93 通过 / 6 跳过
+MTP_TEST_REDIS=redis://localhost:6399/0 python3 -m pytest tests/test_coordination.py tests/test_supervisor.py -q  # 23/1
+MTP_TEST_S3=localhost:9000 python3 -m pytest tests/test_storage.py -q  # 22/22
 ```
 
 ## 容器化部署验证（2026-10-25，SeaweedFS 版）
@@ -97,6 +101,7 @@ MTP_TEST_S3=localhost:8333 python3 -m pytest tests/test_storage.py -q  # 19/19�
 - ✅ S3 状态平面产物核验：datasets/*.csv、jobs/*/job.json、metrics.jsonl、best.pt/last.pt、preprocessor.json、summary.json、版本化 checkpoint（ckpt-e0005/e0006.pt）全部落库
 - ✅ **前后端容器拆分验证**：页面由 frontend（Node 零依赖静态服务）托管（`/` 返回 index.html、`/healthz` 健康检查 healthy）；`/api/*` 经同源反代到 trainer（workers 面板/导入/训练/预测/模型下载全链路通过，无需 CORS）；trainer 仅内网
 - ✅ **MySQL 镜像路径验证**（宿主机外部 MySQL 8.0.46，`model_training` 库三表）：训练任务 → training_jobs（status/device/params/summary JSON 完整）+ job_logs（13 行）镜像写入 ✓；API 删除任务 → 父表与子表日志同步删除 ✓；删除数据集 → datasets 镜像同步删除 ✓
+- ✅ **P0 重构后回归冒烟**：路由拆分后各领域端点（workers/tags/import-history/operations）与训练/预测/删除全链路经 frontend 同源代理通过；`GET /api/datasets/tags` 与 `import-history` 遮蔽修复后在容器内可达
 - ✅ 验证后清理：任务/数据集经 API 删除，S3 对象清空，DB 镜像同步清空（用户 07:30 的自测数据保留）；容器栈保留运行
 
 **已知噪音**：容器日志中 `/health` 404 来自外部监控探测（应用路由为 `/api/health`），对功能无影响；宿主机系统代理（127.0.0.1:12334）会劫持本地 API 请求导致间歇 502——验证脚本已显式禁用代理（与平台代码无关）。
