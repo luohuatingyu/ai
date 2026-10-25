@@ -1,6 +1,7 @@
 """远程 worker 安全、SSH 命令构造、异步操作状态和单文件脚本测试。"""
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import stat
@@ -275,6 +276,37 @@ def test_remote_server_redis_override_can_be_preserved_replaced_or_cleared(tmp_p
     )
     assert "remote_redis_url_encrypted" not in cleared
     assert remote_workers.remote_server_public_view(cleared)["has_remote_redis_url_override"] is False
+
+
+def test_remote_image_config_does_not_inherit_local_compose_fallback(monkeypatch):
+    """本机 worker 的 Compose 默认镜像不应冒充远程平台默认镜像。"""
+    monkeypatch.setenv("WORKER_IMAGE", "mtp-worker:local")
+    monkeypatch.setenv("WORKER_REMOTE_IMAGE", "")
+    spec = importlib.util.spec_from_file_location("isolated_remote_config", config.__file__)
+    assert spec is not None and spec.loader is not None
+    isolated_config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated_config)
+
+    assert isolated_config.WORKER_REMOTE_IMAGE == ""
+
+    monkeypatch.setenv("WORKER_REMOTE_IMAGE", "registry.example.net/ml/worker:stable")
+    spec = importlib.util.spec_from_file_location("isolated_remote_config", config.__file__)
+    assert spec is not None and spec.loader is not None
+    isolated_config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated_config)
+    assert isolated_config.WORKER_REMOTE_IMAGE == "registry.example.net/ml/worker:stable"
+
+
+def test_compose_separates_local_worker_image_from_remote_default():
+    """GPU 与 CPU Compose 都只把显式 WORKER_IMAGE 传作远程默认值。"""
+    repository_root = Path(__file__).resolve().parents[2]
+    for filename, local_default in (
+        ("docker-compose.yml", "mtp-worker:local"),
+        ("docker-compose.cpu.yml", "mtp-worker-cpu:local"),
+    ):
+        compose = (repository_root / filename).read_text(encoding="utf-8")
+        assert "WORKER_REMOTE_IMAGE: ${WORKER_IMAGE:-}" in compose
+        assert f"WORKER_IMAGE: ${{WORKER_IMAGE:-{local_default}}}" in compose
 
 
 def test_server_redis_override_is_redacted_from_remote_output(tmp_path, monkeypatch):
