@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import threading
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from app import config, trainer
@@ -18,14 +20,14 @@ from tests.conftest import job_epochs
 
 
 def _run(store, ds_id: str, task: str, epochs: int, tmp_dir, resume_state=None,
-         cancel_event=None, pause_event=None):
+         cancel_event=None, pause_event=None, target="target", **extra_params):
     """统一参数的训练调用（与 worker 的调用方式一致）。"""
     return run_training(
         dataset_path=config.DATASETS_DIR / f"{ds_id}.csv",
-        target="target",
+        target=target,
         task=task,
         params={"epochs": epochs, "batch_size": 32, "lr": 0.01, "hidden_size": 16,
-                "hidden_layers": 1, "test_split": 0.2, "seed": 42},
+                "hidden_layers": 1, "test_split": 0.2, "seed": 42, **extra_params},
         cancel_event=cancel_event or threading.Event(),
         log_fn=lambda msg: None,
         job_dir=tmp_dir,
@@ -53,6 +55,139 @@ def test_regression_run_produces_r2_rmse(store, make_dataset, tmp_path):
     ds = make_dataset(kind="regression")
     summary = _run(store, ds, "regression", 3, tmp_path)
     assert "val_r2" in summary["final"] and "val_rmse" in summary["final"]
+
+
+def test_kmeans_run_produces_clusters_checkpoint_and_stable_predictions(
+    store, make_dataset, tmp_path
+):
+    """聚类链路产出惯性/轮廓系数、checkpoint，固定 seed 下预测稳定。"""
+    ds = make_dataset(kind="clustering", n=90)
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = _run(store, ds, "clustering", 20, first_dir, target="", n_clusters=3)
+    second = _run(store, ds, "clustering", 20, second_dir, target="", n_clusters=3)
+
+    assert first["task"] == "clustering"
+    assert first["n_clusters"] == 3
+    assert sum(first["cluster_counts"].values()) == 90
+    assert first["final"]["val_inertia"] >= 0
+    assert first["final"]["val_silhouette"] > 0.5
+    assert (first_dir / "best.pt").exists()
+    assert (first_dir / "checkpoints" / f"ckpt-e{first['epochs_total']:04d}.pt").exists()
+    assert [json.loads(line)["epoch"] for line in
+            (first_dir / "metrics.jsonl").read_text().splitlines()] == list(
+                range(1, first["epochs_total"] + 1)
+            )
+    input_row = {"f1": 0.2, "f2": -0.1, "f3": 0.3}
+    prediction_a = trainer.predict_row(first_dir / "best.pt", input_row)
+    prediction_b = trainer.predict_row(second_dir / "best.pt", input_row)
+    assert prediction_a["prediction"] == prediction_b["prediction"]
+
+
+def test_kmeans_pause_resume_keeps_iteration_history(store, make_dataset, tmp_path):
+    """聚类在迭代边界暂停后可从中心 checkpoint 接续。"""
+    ds = make_dataset(kind="clustering", n=90)
+    pause = threading.Event()
+
+    def pause_after_one(record):
+        if record["epoch"] == 1:
+            pause.set()
+
+    with pytest.raises(trainer.JobPaused):
+        trainer.run_training(
+            dataset_path=config.DATASETS_DIR / f"{ds}.csv",
+            target="", task="clustering",
+            params={"epochs": 20, "n_clusters": 3, "seed": 42},
+            cancel_event=threading.Event(), log_fn=lambda _message: None,
+            job_dir=tmp_path, pause_event=pause, on_epoch_end=pause_after_one,
+        )
+    state = load_trainer_state(tmp_path / "checkpoints" / "ckpt-e0001.pt")
+    summary = _run(
+        store, ds, "clustering", 20, tmp_path, resume_state=state,
+        target="", n_clusters=3,
+    )
+    epochs = [json.loads(line)["epoch"] for line in
+              (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert epochs == list(range(1, summary["epochs_total"] + 1))
+    assert summary["resumed_from"] == 1
+
+
+def test_kmeans_rejects_more_clusters_than_distinct_rows(store, make_dataset, tmp_path):
+    """不同特征样本数量不足时拒绝生成空簇或伪造聚类结果。"""
+    ds = make_dataset(kind="clustering", n=12)
+    frame = pd.DataFrame({"feature": [0.0] * 6 + [1.0] * 6})
+    frame.to_csv(config.DATASETS_DIR / f"{ds}.csv", index=False)
+    with pytest.raises(ValueError, match="不同特征样本数"):
+        _run(store, ds, "clustering", 5, tmp_path, target="", n_clusters=3)
+
+
+def test_timeseries_run_uses_ordered_windows_and_predicts_future_value(
+    store, make_dataset, tmp_path
+):
+    """单序列训练按时间列排序，产出回归指标和可用的历史窗口预测。"""
+    ds = make_dataset(kind="time_series", n=100)
+    summary = _run(
+        store, ds, "time_series_forecasting", 4, tmp_path,
+        target="target", time_column="timestamp", lookback=8, forecast_horizon=2,
+    )
+    repeat_dir = tmp_path / "repeat"
+    repeat_dir.mkdir()
+    repeat = _run(
+        store, ds, "time_series_forecasting", 4, repeat_dir,
+        target="target", time_column="timestamp", lookback=8, forecast_horizon=2,
+    )
+    assert summary["task"] == "time_series_forecasting"
+    assert summary["lookback"] == 8
+    assert summary["forecast_horizon"] == 2
+    assert summary["rows"]["train"] > summary["rows"]["val"]
+    assert "val_rmse" in summary["final"] and "val_r2" in summary["final"]
+    assert abs(summary["final"]["val_rmse"] - repeat["final"]["val_rmse"]) < 1e-6
+    assert (tmp_path / "best.pt").exists()
+
+    frame = pd.read_csv(config.DATASETS_DIR / f"{ds}.csv")
+    series = frame["target"].tail(8).tolist()
+    prediction = trainer.predict_row(tmp_path / "best.pt", history=series)
+    repeated_prediction = trainer.predict_row(repeat_dir / "best.pt", history=series)
+    assert prediction["task"] == "time_series_forecasting"
+    assert np.isfinite(prediction["prediction"])
+    assert prediction["prediction"] == repeated_prediction["prediction"]
+
+    from app.trainer import _prepare_time_series_windows
+
+    ordered_windows = _prepare_time_series_windows(frame, "target", "timestamp", 8, 2)
+    shuffled_windows = _prepare_time_series_windows(
+        frame.sample(frac=1.0, random_state=17), "target", "timestamp", 8, 2
+    )
+    np.testing.assert_array_equal(ordered_windows[0], shuffled_windows[0])
+    np.testing.assert_array_equal(ordered_windows[1], shuffled_windows[1])
+
+
+def test_timeseries_rejects_invalid_time_values_and_short_history(make_dataset, store):
+    """非法时间戳和不足以形成验证窗口的数据集明确失败。"""
+    from app.trainer import _prepare_time_series_windows
+
+    ds = make_dataset(kind="time_series", n=30)
+    frame = pd.read_csv(config.DATASETS_DIR / f"{ds}.csv")
+    frame.loc[0, "timestamp"] = "not-a-date"
+    with pytest.raises(ValueError, match="无法解析"):
+        _prepare_time_series_windows(frame, "target", "timestamp", 5, 1)
+
+    frame = pd.read_csv(config.DATASETS_DIR / f"{ds}.csv").head(10)
+    with pytest.raises(ValueError, match="至少需要"):
+        _prepare_time_series_windows(frame, "target", "timestamp", 5, 1)
+
+    frame = pd.read_csv(config.DATASETS_DIR / f"{ds}.csv")
+    frame.loc[1, "timestamp"] = frame.loc[0, "timestamp"]
+    with pytest.raises(ValueError, match="重复时间点"):
+        _prepare_time_series_windows(frame, "target", "timestamp", 5, 1)
+
+    frame = pd.read_csv(config.DATASETS_DIR / f"{ds}.csv")
+    frame["target"] = frame["target"].astype(str)
+    frame.loc[0, "target"] = "not-a-number"
+    with pytest.raises(ValueError, match="必须全部为数值"):
+        _prepare_time_series_windows(frame, "target", "timestamp", 5, 1)
 
 
 def test_resume_equals_full_run(store, make_dataset, tmp_path):

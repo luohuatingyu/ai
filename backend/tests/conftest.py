@@ -96,16 +96,31 @@ def make_dataset(store):
         counter["n"] += 1
         ds_id = name or f"ds-{uuid.uuid4().hex[:8]}"
         rng = np.random.RandomState(7)
-        data = {f"f{i+1}": rng.randn(n) for i in range(cols)}
         if kind == "classification":
+            data = {f"f{i+1}": rng.randn(n) for i in range(cols)}
             data["target"] = rng.randint(0, 3, n)
+        elif kind == "clustering":
+            groups = np.arange(n) % 3
+            rng.shuffle(groups)
+            data = {
+                f"f{i+1}": groups * (5.0 + i) + rng.normal(0.0, 0.25, n)
+                for i in range(cols)
+            }
+        elif kind == "time_series":
+            time_index = np.arange(n, dtype=np.float32)
+            data = {
+                "timestamp": pd.date_range("2024-01-01", periods=n, freq="h").astype(str),
+                "target": (0.03 * time_index + np.sin(time_index / 4.0)).astype(np.float32),
+            }
         else:
+            data = {f"f{i+1}": rng.randn(n) for i in range(cols)}
             data["target"] = rng.randn(n) * 10
         df = pd.DataFrame(data)
         config.DATASETS_DIR.mkdir(parents=True, exist_ok=True)
         df.to_csv(config.DATASETS_DIR / f"{ds_id}.csv", index=False)
         meta = {"id": ds_id, "name": ds_id, "columns": list(df.columns),
-                "row_count": n, "target": "target", "task": kind}
+                "row_count": n, "target": "target" if "target" in df.columns else None,
+                "task": kind}
         config.DATASETS_DIR.joinpath(f"{ds_id}.meta.json").write_text(
             json.dumps(meta, ensure_ascii=False), encoding="utf-8")
         return ds_id

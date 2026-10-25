@@ -118,11 +118,14 @@ class JobManager:
 
     def submit(self, spec: dict) -> dict:
         """创建任务：写权威 job.json → 入队 → 尽力镜像数据库。"""
-        for required in ("dataset_id", "target", "task"):
+        for required in ("dataset_id", "task"):
             if not spec.get(required):
                 raise ValueError(f"缺少必填字段: {required}")
+        if spec.get("task") != "clustering" and not spec.get("target"):
+            raise ValueError("缺少必填字段: target")
         job_id = f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         spec = dict(spec)
+        spec["target"] = spec.get("target") or ""
         spec.setdefault("dataset_name", spec["dataset_id"])
         spec.setdefault("resource_hint", {})  # resource_hint: {require_gpu, min_vram_mb}
         record = {

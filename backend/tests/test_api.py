@@ -97,6 +97,90 @@ def test_train_e2e_regression(client, make_dataset):
     assert "val_r2" in detail["summary"]["final"]
 
 
+def test_train_e2e_kmeans_without_target_column(client, make_dataset):
+    """KMeans API 可提交无目标列任务，完成后返回聚类指标和簇预测。"""
+    ds = make_dataset(kind="clustering", n=90)
+    response = client.post(
+        "/api/train",
+        json=_train_payload(ds, task="clustering", target=None, epochs=20, n_clusters=3),
+    )
+    assert response.status_code == 200, response.text
+    job = response.json()["job_id"]
+    assert wait_until(lambda: job_status(get_store(), job) == "completed", 60)
+
+    detail = client.get(f"/api/jobs/{job}").json()
+    assert detail["spec"]["target"] == ""
+    assert detail["summary"]["n_clusters"] == 3
+    assert detail["summary"]["final"]["val_silhouette"] > 0.5
+    assert client.get(f"/api/jobs/{job}/model").status_code == 200
+    prediction = client.post(
+        f"/api/jobs/{job}/predict", json={"row": {"f1": 0.1, "f2": 0.2, "f3": -0.1}}
+    )
+    assert prediction.status_code == 200, prediction.text
+    assert prediction.json()["task"] == "clustering"
+    assert 0 <= prediction.json()["prediction"] < 3
+
+
+def test_train_e2e_single_series_forecasting_and_history_validation(client, make_dataset):
+    """时序预测 API 按时间列训练并要求恰好 lookback 个历史值。"""
+    ds = make_dataset(kind="time_series", n=100)
+    response = client.post(
+        "/api/train",
+        json=_train_payload(
+            ds, task="time_series_forecasting", epochs=3, target="target",
+            time_column="timestamp", lookback=8, forecast_horizon=2,
+        ),
+    )
+    assert response.status_code == 200, response.text
+    job = response.json()["job_id"]
+    assert wait_until(lambda: job_status(get_store(), job) == "completed", 60)
+    detail = client.get(f"/api/jobs/{job}").json()
+    assert detail["summary"]["forecast_horizon"] == 2
+    assert "val_rmse" in detail["summary"]["final"]
+
+    prediction = client.post(
+        f"/api/jobs/{job}/predict", json={"history": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]}
+    )
+    assert prediction.status_code == 200, prediction.text
+    assert prediction.json()["task"] == "time_series_forecasting"
+    assert isinstance(prediction.json()["prediction"], float)
+    invalid_history = client.post(f"/api/jobs/{job}/predict", json={"history": [1.0, 2.0]})
+    assert invalid_history.status_code == 400
+
+
+def test_train_rejects_invalid_new_task_parameters(client, make_dataset):
+    """新任务的目标/时间列及聚类数校验在创建任务前拒绝非法请求。"""
+    clustering_ds = make_dataset(kind="clustering", n=60)
+    invalid_clusters = client.post(
+        "/api/train",
+        json=_train_payload(clustering_ds, task="clustering", target=None, n_clusters=1),
+    )
+    assert invalid_clusters.status_code == 422
+    gpu_clustering = client.post(
+        "/api/train",
+        json=_train_payload(
+            clustering_ds, task="clustering", target=None, n_clusters=3, require_gpu=True
+        ),
+    )
+    assert gpu_clustering.status_code == 422
+
+    time_ds = make_dataset(kind="time_series", n=60)
+    missing_time_column = client.post(
+        "/api/train",
+        json=_train_payload(
+            time_ds, task="time_series_forecasting", target="target", time_column="missing"
+        ),
+    )
+    assert missing_time_column.status_code == 400
+    same_time_and_target = client.post(
+        "/api/train",
+        json=_train_payload(
+            time_ds, task="time_series_forecasting", target="target", time_column="target"
+        ),
+    )
+    assert same_time_and_target.status_code == 422
+
+
 def test_predict_consistency(client, make_dataset):
     """ML 特有：同一输入对同一 best.pt 预测结果稳定；输出含概率。"""
     ds = make_dataset()

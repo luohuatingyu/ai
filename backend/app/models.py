@@ -34,7 +34,7 @@ class TrainingJob(Base):
     dataset_id = Column(String(50), ForeignKey("datasets.id"), nullable=False)
     dataset_name = Column(String(255), nullable=False)
     target = Column(String(255), nullable=False)
-    task = Column(String(50), nullable=False)  # classification 或 regression
+    task = Column(String(50), nullable=False)  # classification / regression / clustering / time_series_forecasting
     status = Column(String(50), default="queued")  # queued, running, completed, failed, cancelled
     created_at = Column(DateTime, default=func.now())
     started_at = Column(DateTime, nullable=True)

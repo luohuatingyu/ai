@@ -1,4 +1,4 @@
-"""CSV 表格训练器：分类 / 回归（PyTorch MLP）。
+"""CSV 表格训练器：分类、回归、KMeans 聚类与单序列预测。
 
 - 设备自动探测：有 NVIDIA GPU（torch.cuda.is_available()）则用 cuda，否则退回 cpu。
 - 产物：日志(job manager 写)、metrics.jsonl（逐 epoch 指标）、best.pt / last.pt、
@@ -29,6 +29,7 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     r2_score,
+    silhouette_score,
 )
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
@@ -156,6 +157,17 @@ def _build_model(
     return nn.Sequential(*layers).to(device)
 
 
+class _KMeansCenters(nn.Module):
+    """保存 KMeans 中心的轻量模块，供 checkpoint 安全序列化。"""
+
+    def __init__(self, centers: np.ndarray) -> None:
+        """创建 CPU 中心参数；中心由 KMeans 迭代直接更新。"""
+        super().__init__()
+        self.centers = nn.Parameter(
+            torch.as_tensor(centers, dtype=torch.float32), requires_grad=False
+        )
+
+
 def _pick_device(log_fn: LogFn) -> torch.device:
     # 首先尝试初始化GPU
     try:
@@ -178,9 +190,9 @@ def _pick_device(log_fn: LogFn) -> torch.device:
 # 数据预处理
 # ---------------------------------------------------------------------------
 
-def _prepare_features(df: pd.DataFrame, target: str) -> tuple[pd.DataFrame, dict]:
+def _prepare_features(df: pd.DataFrame, target: str | None) -> tuple[pd.DataFrame, dict]:
     """数值列中位数填充；类别列众数填充并 one-hot 展开；返回特征表与元信息。"""
-    X = df.drop(columns=[target]).copy()
+    X = df.drop(columns=[target]).copy() if target else df.copy()
     cat_cols = [c for c in X.columns if str(X[c].dtype) in ("object", "category", "bool")]
     num_cols = [c for c in X.columns if c not in cat_cols]
 
@@ -211,6 +223,50 @@ def _prepare_features(df: pd.DataFrame, target: str) -> tuple[pd.DataFrame, dict
         "cat_modes": cat_modes,
     }
     return X, meta
+
+
+def _prepare_time_series_windows(
+    df: pd.DataFrame, target: str, time_column: str, lookback: int, horizon: int
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """按时间排序单变量序列，并转换为历史窗口与未来目标值。"""
+    if lookback < 2 or horizon < 1:
+        raise ValueError("历史窗口至少为 2，预测步数至少为 1")
+    if target not in df.columns or time_column not in df.columns:
+        raise ValueError("时间列或目标列不在数据集中")
+    if target == time_column:
+        raise ValueError("时间列不能与目标列相同")
+
+    timestamps = pd.to_datetime(df[time_column], format="mixed", errors="coerce", utc=True)
+    if timestamps.isna().any():
+        raise ValueError(f"时间列 '{time_column}' 含有无法解析的值")
+    values = pd.to_numeric(df[target], errors="coerce")
+    invalid_values = df[target].notna() & values.isna()
+    if invalid_values.any():
+        raise ValueError(f"时间序列目标列 '{target}' 必须全部为数值")
+    values = values.replace([np.inf, -np.inf], np.nan)
+
+    series = pd.DataFrame({"time": timestamps, "value": values}).dropna(subset=["value"])
+    if series["time"].duplicated().any():
+        raise ValueError("时间列存在重复时间点，单序列预测要求每个时间点唯一")
+    series = series.sort_values("time", kind="stable").reset_index(drop=True)
+    raw = series["value"].to_numpy(dtype=np.float32)
+    required = lookback + horizon + 9
+    if len(raw) < required:
+        raise ValueError(
+            f"有效时间序列过短（{len(raw)} 行，至少需要 {required} 行以形成训练和验证窗口）"
+        )
+
+    windows = []
+    labels = []
+    stop = len(raw) - horizon + 1
+    for target_index in range(lookback, stop):
+        windows.append(raw[target_index - lookback:target_index])
+        labels.append(raw[target_index + horizon - 1])
+    return (
+        np.asarray(windows, dtype=np.float32),
+        np.asarray(labels, dtype=np.float32),
+        {"time_column": time_column, "lookback": lookback, "forecast_horizon": horizon},
+    )
 
 
 def _encode_target(y: pd.Series, task: str) -> tuple[np.ndarray, list[str] | None]:
@@ -404,6 +460,295 @@ def _validate_resume_state(
     log_fn(f"checkpoint 兼容性校验通过（保存于 torch {saved_tv}）")
 
 
+def _initialize_kmeans(values: np.ndarray, clusters: int, seed: int) -> np.ndarray:
+    """使用 KMeans++ 规则从不同样本中确定性地初始化聚类中心。"""
+    rng = np.random.RandomState(seed)
+    chosen = [int(rng.randint(len(values)))]
+    closest = np.sum((values - values[chosen[0]]) ** 2, axis=1)
+    while len(chosen) < clusters:
+        weights = closest.copy()
+        weights[chosen] = 0.0
+        total = float(weights.sum())
+        if total <= 0.0:
+            remaining = [index for index in range(len(values)) if index not in chosen]
+            chosen.append(remaining[0])
+        else:
+            next_index = int(rng.choice(len(values), p=weights / total))
+            chosen.append(next_index)
+        distance = np.sum((values - values[chosen[-1]]) ** 2, axis=1)
+        closest = np.minimum(closest, distance)
+    return values[chosen].astype(np.float32, copy=True)
+
+
+def _assign_kmeans(values: np.ndarray, centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """分块计算最近中心，限制大数据集聚类时的临时内存占用。"""
+    labels = np.empty(len(values), dtype=np.int64)
+    min_distances = np.empty(len(values), dtype=np.float32)
+    center_squares = np.sum(centers ** 2, axis=1)
+    for start in range(0, len(values), 8192):
+        stop = min(start + 8192, len(values))
+        batch = values[start:stop]
+        distances = np.maximum(
+            np.sum(batch ** 2, axis=1, keepdims=True)
+            + center_squares[None, :]
+            - 2.0 * batch @ centers.T,
+            0.0,
+        )
+        labels[start:stop] = distances.argmin(axis=1)
+        min_distances[start:stop] = distances.min(axis=1)
+    return labels, min_distances
+
+
+def _run_kmeans_training(
+    dataset_path: Path,
+    params: dict,
+    cancel_event: threading.Event,
+    job_dir: Path,
+    pause_event: threading.Event,
+    resume_state: dict | None,
+    on_epoch_end: Callable[[dict], None] | None,
+    on_checkpoint: Callable[[int], None] | None,
+    db_log_fn: LogFn,
+    started_at: float,
+) -> dict:
+    """训练并检查点保存 KMeans 聚类，生成与平台兼容的 best.pt 和报告。"""
+    if resume_state is not None and resume_state.get("task") != "clustering":
+        raise ValueError("checkpoint 任务类型与 KMeans 聚类不匹配")
+
+    max_iter = int(params["epochs"])
+    clusters = int(params.get("n_clusters", 4))
+    seed = int(params["seed"])
+    if max_iter < 1 or max_iter > 500:
+        raise ValueError("KMeans 最大迭代次数必须在 1 到 500 之间")
+    if clusters < 2 or clusters > 64:
+        raise ValueError("聚类数必须在 2 到 64 之间")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    df = pd.read_csv(dataset_path)
+    if len(df) < 2:
+        raise ValueError("KMeans 聚类至少需要 2 行数据")
+    try:
+        feature_frame, feature_meta = _prepare_features(df, None)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"特征预处理失败：{exc}") from exc
+    if feature_frame.empty or feature_frame.shape[1] == 0:
+        raise ValueError("数据集没有可用于聚类的特征列")
+
+    raw = feature_frame.to_numpy(dtype=np.float32)
+    unique_rows = np.unique(raw, axis=0).shape[0]
+    if clusters >= len(raw):
+        raise ValueError(f"聚类数必须小于样本数（{len(raw)}）")
+    if clusters > unique_rows:
+        raise ValueError(
+            f"聚类数 {clusters} 超过不同特征样本数 {unique_rows}，无法形成指定数量的簇"
+        )
+
+    mean = raw.mean(axis=0).astype(np.float32)
+    std = raw.std(axis=0).astype(np.float32)
+    std[std < 1e-8] = 1.0
+    values = ((raw - mean) / std).astype(np.float32)
+    n_features = values.shape[1]
+    arch = {"model_type": "kmeans", "in_dim": n_features, "n_clusters": clusters}
+    preprocessor = {
+        "feature_names": [str(column) for column in feature_frame.columns],
+        "num_cols": feature_meta["num_cols"],
+        "cat_cols": feature_meta["cat_cols"],
+        "num_medians": feature_meta["num_medians"],
+        "cat_modes": feature_meta["cat_modes"],
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "classes": None,
+        "target": None,
+        "task": "clustering",
+    }
+    (job_dir / "preprocessor.json").write_text(
+        json.dumps(_py(preprocessor), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    if resume_state is not None:
+        _validate_resume_state(resume_state, arch, "clustering", db_log_fn)
+        centers = resume_state["state_dict"]["centers"].cpu().numpy().astype(np.float32)
+        model = _KMeansCenters(centers)
+        model.load_state_dict(resume_state["state_dict"])
+        start_epoch = int(resume_state.get("epoch", 0))
+        best_score = resume_state.get("best_score")
+        best_epoch = int(resume_state.get("best_epoch", 0))
+        best_record = resume_state.get("best_record") or None
+        _rng_restore(resume_state.get("rng") or {}, db_log_fn)
+    else:
+        centers = _initialize_kmeans(values, clusters, seed)
+        model = _KMeansCenters(centers)
+        start_epoch = 0
+        best_score = None
+        best_epoch = 0
+        best_record = None
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer"])
+    device = torch.device("cpu")
+    db_log_fn(
+        f"KMeans 聚类: 样本 {len(values)} 条，特征 {n_features} 个，簇数 {clusters}，"
+        f"最大迭代 {max_iter} 次（CPU）"
+    )
+
+    def persist_state(finished_iteration: int) -> None:
+        """保存当前聚类中心和随机状态，支持暂停、重派及跨机续训。"""
+        save_trainer_state(
+            job_dir / "checkpoints" / f"ckpt-e{finished_iteration:04d}.pt",
+            model=model,
+            optimizer=optimizer,
+            arch=arch,
+            preprocessor=preprocessor,
+            task="clustering",
+            params={"epochs": max_iter, "n_clusters": clusters, "seed": seed},
+            epoch=finished_iteration,
+            best_score=best_score,
+            best_epoch=best_epoch,
+            best_record=best_record,
+            device=device,
+        )
+        if on_checkpoint is not None:
+            on_checkpoint(finished_iteration)
+
+    if pause_event.is_set():
+        persist_state(start_epoch)
+        raise JobPaused(f"KMeans 聚类已在第 {start_epoch} 次迭代后暂停")
+
+    previous_labels = None
+    if start_epoch:
+        previous_labels, _ = _assign_kmeans(values, centers)
+
+    metrics_path = job_dir / "metrics.jsonl"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.touch(exist_ok=True)
+    iterations_done = start_epoch
+    final_labels = previous_labels
+    for iteration in range(start_epoch + 1, max_iter + 1):
+        if cancel_event.is_set():
+            raise JobCancelled()
+        if pause_event.is_set():
+            persist_state(iteration - 1)
+            raise JobPaused(f"KMeans 聚类已在第 {iteration - 1} 次迭代后暂停")
+
+        current = model.centers.detach().cpu().numpy().astype(np.float32)
+        labels, min_distances = _assign_kmeans(values, current)
+        updated = current.copy()
+        used_fallbacks = set()
+        for cluster_index in range(clusters):
+            members = values[labels == cluster_index]
+            if len(members):
+                updated[cluster_index] = members.mean(axis=0)
+            else:
+                candidates = np.argsort(min_distances)[::-1]
+                fallback = next(
+                    (int(index) for index in candidates if int(index) not in used_fallbacks),
+                    int(candidates[0]),
+                )
+                used_fallbacks.add(fallback)
+                updated[cluster_index] = values[fallback]
+
+        final_labels, updated_min_distances = _assign_kmeans(values, updated)
+        inertia = float(updated_min_distances.sum())
+        shift = float(np.sqrt(np.sum((updated - current) ** 2)))
+        with torch.no_grad():
+            model.centers.copy_(torch.as_tensor(updated, dtype=torch.float32))
+
+        record = {
+            "epoch": iteration,
+            "train_loss": round(inertia / len(values), 6),
+            "val_loss": round(inertia / len(values), 6),
+            "inertia": round(inertia, 6),
+        }
+        _append_jsonl(metrics_path, record)
+        score = -inertia
+        if best_score is None or score > best_score:
+            best_score = score
+            best_epoch = iteration
+            best_record = dict(record)
+            _save_checkpoint(
+                job_dir / "best.pt", model, arch, preprocessor, "clustering", "best", record
+            )
+        _save_checkpoint(
+            job_dir / "last.pt", model, arch, preprocessor, "clustering", "last", record
+        )
+        iterations_done = iteration
+        persist_state(iteration)
+        if on_epoch_end is not None:
+            on_epoch_end(record)
+        db_log_fn(
+            f"[迭代 {iteration}/{max_iter}] inertia={inertia:.4f} "
+            f"平均惯性={inertia / len(values):.6f}"
+        )
+
+        converged = previous_labels is not None and np.array_equal(final_labels, previous_labels)
+        previous_labels = final_labels.copy()
+        if converged or shift < 1e-4:
+            break
+
+    if final_labels is None:
+        final_centers = model.centers.detach().cpu().numpy()
+        final_labels, _ = _assign_kmeans(values, final_centers)
+    final_centers = model.centers.detach().cpu().numpy()
+    final_labels, final_min_distances = _assign_kmeans(values, final_centers)
+    inertia = float(final_min_distances.sum())
+    silhouette = None
+    label_count = np.unique(final_labels).size
+    if 2 <= label_count < len(values):
+        sample_size = min(len(values), 1000)
+        try:
+            silhouette = float(
+                silhouette_score(values, final_labels, sample_size=sample_size, random_state=seed)
+            )
+        except ValueError as exc:
+            db_log_fn(f"轮廓系数无法计算: {exc}")
+    final_result = {"val_inertia": inertia, "val_silhouette": silhouette}
+    final_record = dict(best_record or {})
+    final_record["val_silhouette"] = silhouette
+    final_record["val_inertia"] = inertia
+    _save_checkpoint(
+        job_dir / "best.pt", model, arch, preprocessor, "clustering", "best", final_record
+    )
+
+    metric_lines = [line for line in metrics_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if metric_lines:
+        last_metric = json.loads(metric_lines[-1])
+        last_metric.update({"val_silhouette": silhouette, "val_inertia": round(inertia, 6)})
+        metric_lines[-1] = json.dumps(last_metric, ensure_ascii=False)
+        metrics_path.write_text("\n".join(metric_lines) + "\n", encoding="utf-8")
+        if on_epoch_end is not None:
+            on_epoch_end(last_metric)
+
+    summary = {
+        "task": "clustering",
+        "target": None,
+        "device": "cpu",
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "epochs_total": iterations_done,
+        "epochs_done": iterations_done,
+        "resumed_from": start_epoch,
+        "best_epoch": best_epoch,
+        "best": best_record,
+        "final": _py(final_result),
+        "rows": {"total": int(len(values))},
+        "features": int(n_features),
+        "classes": None,
+        "n_clusters": clusters,
+        "cluster_counts": {
+            str(cluster): int((final_labels == cluster).sum()) for cluster in range(clusters)
+        },
+        "duration_sec": round(time.time() - started_at, 1),
+    }
+    (job_dir / "summary.json").write_text(
+        json.dumps(_py(summary), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    db_log_fn(
+        f"聚类完成: inertia={inertia:.4f}，"
+        f"silhouette={silhouette if silhouette is not None else '不可计算'}"
+    )
+    return _py(summary)
+
+
 # ---------------------------------------------------------------------------
 # 入口（由 app.jobs.JobManager 在工作线程中调用）
 # ---------------------------------------------------------------------------
@@ -451,17 +796,32 @@ def run_training(
         pause_event = threading.Event()
     if not dataset_path.exists():
         raise ValueError("数据集文件不存在（可能已被删除）")
-    if task not in ("classification", "regression"):
+    if task not in ("classification", "regression", "clustering", "time_series_forecasting"):
         raise ValueError(f"未知任务类型: {task}")
 
     # ---- 超参 ----
-    epochs = int(params["epochs"])
+    epochs = int(params.get("epochs", 20))
+    seed = int(params.get("seed", 42))
+
+    if task == "clustering":
+        return _run_kmeans_training(
+            dataset_path=dataset_path,
+            params={**params, "epochs": epochs, "seed": seed},
+            cancel_event=cancel_event,
+            job_dir=job_dir,
+            pause_event=pause_event,
+            resume_state=resume_state,
+            on_epoch_end=on_epoch_end,
+            on_checkpoint=on_checkpoint,
+            db_log_fn=db_log_fn,
+            started_at=t0,
+        )
+
     batch_size = int(params["batch_size"])
     lr = float(params["lr"])
     hidden_size = int(params["hidden_size"])
     hidden_layers = int(params["hidden_layers"])
     test_split = float(params["test_split"])
-    seed = int(params["seed"])
 
     # ---- 环境 ----
     device = _pick_device(db_log_fn)
@@ -477,23 +837,32 @@ def run_training(
     # ---- 数据 ----
     db_log_fn(f"读取数据集 {dataset_path.name} …")
     df = pd.read_csv(dataset_path)
-    if target not in df.columns:
-        raise ValueError(f"目标列 '{target}' 不在数据集中")
-    df = df.dropna(subset=[target]).reset_index(drop=True)
-    if len(df) < 10:
-        raise ValueError(f"有效样本过少（{len(df)} 行，需要 >= 10 行）")
+    sequence_meta = None
+    if task == "time_series_forecasting":
+        time_column = str(params.get("time_column") or "")
+        lookback = int(params.get("lookback", 12))
+        forecast_horizon = int(params.get("forecast_horizon", 1))
+        X_all, y_all, sequence_meta = _prepare_time_series_windows(
+            df, target, time_column, lookback, forecast_horizon
+        )
+        classes = None
+        feat_meta = {"num_cols": [], "cat_cols": [], "num_medians": {}, "cat_modes": {}}
+    else:
+        if not target or target not in df.columns:
+            raise ValueError(f"目标列 '{target}' 不在数据集中")
+        df = df.dropna(subset=[target]).reset_index(drop=True)
+        if len(df) < 10:
+            raise ValueError(f"有效样本过少（{len(df)} 行，需要 >= 10 行）")
+        try:
+            X_df, feat_meta = _prepare_features(df, target)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"特征预处理失败：{exc}") from exc
+        try:
+            y_all, classes = _encode_target(df[target], task)
+        except ValueError as exc:
+            raise ValueError("回归任务要求目标列全部为数值") from exc
+        X_all = X_df.to_numpy(dtype=np.float32)
 
-    try:
-        X_df, feat_meta = _prepare_features(df, target)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"特征预处理失败：{exc}") from exc
-    try:
-        y_enc, classes = _encode_target(df[target], task)
-    except ValueError as exc:
-        raise ValueError("回归任务要求目标列全部为数值") from exc
-
-    X_all = X_df.to_numpy(dtype=np.float32)
-    y_all = y_enc
     n_features = X_all.shape[1]
     db_log_fn(
         f"样本 {len(X_all)} 条；特征 {n_features} 个"
@@ -510,9 +879,21 @@ def run_training(
         else:
             log_fn("存在仅 1 个样本的类别，改为普通随机划分")
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_all, y_all, test_size=test_split, random_state=seed, stratify=stratify
-    )
+    if task == "time_series_forecasting":
+        raw_row_count = (
+            len(X_all) + int(sequence_meta["lookback"])
+            + int(sequence_meta["forecast_horizon"]) - 1
+        )
+        cutoff = int(raw_row_count * (1.0 - test_split))
+        split_index = cutoff - int(sequence_meta["lookback"]) - int(sequence_meta["forecast_horizon"]) + 1
+        if split_index < 2 or len(X_all) - split_index < 2:
+            raise ValueError("时间序列训练集和验证集都至少需要 2 个窗口")
+        X_train, X_val = X_all[:split_index], X_all[split_index:]
+        y_train, y_val = y_all[:split_index], y_all[split_index:]
+    else:
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_all, y_all, test_size=test_split, random_state=seed, stratify=stratify
+        )
     db_log_fn(f"划分: 训练 {X_train.shape[0]} 条 / 验证 {X_val.shape[0]} 条")
 
     mean = np.asarray(X_train.mean(axis=0), dtype=np.float32)
@@ -523,7 +904,7 @@ def run_training(
 
     # 回归目标标准化（避免大数值目标导致 loss 梯度过小、训练不动）
     y_scale: tuple[float, float] | None = None
-    if task == "regression":
+    if task in ("regression", "time_series_forecasting"):
         y_mean = float(np.asarray(y_train, dtype=np.float64).mean())
         y_std = float(np.asarray(y_train, dtype=np.float64).std())
         if y_std < 1e-8:
@@ -533,8 +914,12 @@ def run_training(
         y_train = ((y_train - y_mean) / y_std).astype(np.float32)
         y_val = ((y_val - y_mean) / y_std).astype(np.float32)
 
+    feature_names = (
+        [f"lag_{sequence_meta['lookback'] - index}" for index in range(sequence_meta["lookback"])]
+        if sequence_meta else [str(c) for c in X_df.columns]
+    )
     preprocessor = {
-        "feature_names": [str(c) for c in X_df.columns],
+        "feature_names": feature_names,
         "num_cols": feat_meta["num_cols"],
         "cat_cols": feat_meta["cat_cols"],
         "num_medians": feat_meta["num_medians"],
@@ -546,6 +931,8 @@ def run_training(
         "task": task,
         "target_scale": y_scale,
     }
+    if sequence_meta:
+        preprocessor.update(sequence_meta)
     (job_dir / "preprocessor.json").write_text(
         json.dumps(_py(preprocessor), ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -716,6 +1103,8 @@ def run_training(
         "classes": classes,
         "duration_sec": round(time.time() - t0, 1),
     }
+    if sequence_meta:
+        summary.update(sequence_meta)
     if task == "classification":
         report = classification_report(
             y_true, y_pred,
@@ -743,13 +1132,47 @@ def run_training(
 # 在线预测（加载 best.pt）
 # ---------------------------------------------------------------------------
 
-def predict_row(ckpt_path: Path, row: dict) -> dict:
+def predict_row(
+    ckpt_path: Path, row: dict | None = None, history: list[Any] | None = None
+) -> dict:
+    """加载 best.pt，对单条表格记录、KMeans 样本或时间序列历史窗口进行预测。"""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     pre: dict = ckpt["preprocessor"]
-    arch: dict = ckpt["arch"]
     task = ckpt["task"]
 
-    x = _featurize_row(row, pre)
+    if task == "clustering":
+        if row is None:
+            raise ValueError("KMeans 聚类预测需要提供 row 对象")
+        x = _featurize_row(row, pre)
+        centers = ckpt["state_dict"]["centers"].detach().cpu().numpy()
+        distances = np.sum((centers - x[0]) ** 2, axis=1)
+        cluster = int(np.argmin(distances))
+        return {
+            "task": task,
+            "prediction": cluster,
+            "distance": float(np.sqrt(distances[cluster])),
+        }
+
+    arch: dict = ckpt["arch"]
+    if task == "time_series_forecasting":
+        if history is None:
+            raise ValueError("时间序列预测需要提供 history 数组")
+        try:
+            values = np.asarray(history, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("history 必须是数值数组") from exc
+        lookback = int(pre["lookback"])
+        if values.ndim != 1 or len(values) != lookback:
+            raise ValueError(f"history 必须恰好包含 {lookback} 个数值")
+        if not np.isfinite(values).all():
+            raise ValueError("history 不能包含空值或非有限数值")
+        x = ((values.reshape(1, -1) - np.asarray(pre["mean"], dtype=np.float32))
+             / np.asarray(pre["std"], dtype=np.float32)).astype(np.float32)
+    else:
+        if row is None:
+            raise ValueError("表格预测需要提供 row 对象")
+        x = _featurize_row(row, pre)
+
     model = _build_model(
         arch["in_dim"], arch["out_dim"], arch["hidden_size"], arch["hidden_layers"],
         torch.device("cpu"),

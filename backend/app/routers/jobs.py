@@ -36,13 +36,28 @@ router = APIRouter(prefix="/api", tags=["jobs"])
 @router.post("/train")
 def start_training(req: TrainRequest) -> dict:
     meta = _load_meta_or_404(req.dataset_id)
-    if req.target not in meta["columns"]:
-        raise HTTPException(400, f"目标列 '{req.target}' 不在数据集列中")
+    target = "" if req.task == "clustering" else (req.target or "")
+    columns = meta["columns"]
+    if req.task in {"classification", "regression", "time_series_forecasting"}:
+        if target not in columns:
+            raise HTTPException(400, f"目标列 '{target}' 不在数据集列中")
+    if req.task == "time_series_forecasting" and req.time_column not in columns:
+        raise HTTPException(400, f"时间列 '{req.time_column}' 不在数据集列中")
 
     params = req.model_dump()
     dataset_id = params.pop("dataset_id")
-    target = params.pop("target")
+    params.pop("target")
     task = params.pop("task")
+    time_column = params.pop("time_column")
+    n_clusters = params.pop("n_clusters")
+    lookback = params.pop("lookback")
+    forecast_horizon = params.pop("forecast_horizon")
+    if task == "clustering":
+        params["n_clusters"] = n_clusters
+    if task == "time_series_forecasting":
+        params["time_column"] = time_column
+        params["lookback"] = lookback
+        params["forecast_horizon"] = forecast_horizon
     resource_hint = {
         "require_gpu": bool(params.pop("require_gpu")),
         "min_vram_mb": int(params.pop("min_vram_mb") or 0),
@@ -375,6 +390,6 @@ def predict(job_id: str, body: PredictRequest) -> dict:
         key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best.pt"
     )
     try:
-        return predict_row(local_ckpt, body.row)
+        return predict_row(local_ckpt, body.row, history=body.history)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"预测失败: {exc}") from exc

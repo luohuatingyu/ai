@@ -293,7 +293,7 @@
     <h2>② 训练配置</h2>
     <form id="trainForm" class="stack" onsubmit="return false;">
       <div class="formgrid">
-        <div class="field">
+        <div class="field" id="targetField">
           <label>目标列（要预测的列）</label>
           <select id="targetSelect"></select>
         </div>
@@ -302,15 +302,30 @@
           <select id="taskSelect">
             <option value="classification">分类</option>
             <option value="regression">回归</option>
+            <option value="clustering">KMeans 聚类</option>
+            <option value="time_series_forecasting">时间序列预测</option>
           </select>
         </div>
-        <div class="field"><label>轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"></div>
-        <div class="field"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"></div>
-        <div class="field"><label>学习率 lr</label><input id="p_lr" type="number" value="0.001" step="0.0001" min="0.0001"></div>
-        <div class="field"><label>隐藏层数</label><input id="p_hidden_layers" type="number" value="3" min="0" max="8"></div>
-        <div class="field"><label>每层神经元</label><input id="p_hidden_size" type="number" value="128" min="1" max="2048"></div>
-        <div class="field"><label>验证集比例</label><input id="p_test_split" type="number" value="0.2" step="0.05" min="0.05" max="0.5"></div>
-        <div class="field">
+        <div class="field" id="timeColumnField" hidden>
+          <label>时间列（用于排序）</label>
+          <select id="timeColumnSelect"></select>
+        </div>
+        <div class="field" id="nClustersField" hidden>
+          <label>聚类数</label><input id="p_n_clusters" type="number" value="3" min="2" max="64">
+        </div>
+        <div class="field" id="lookbackField" hidden>
+          <label>历史窗口长度</label><input id="p_lookback" type="number" value="12" min="2" max="512">
+        </div>
+        <div class="field" id="forecastHorizonField" hidden>
+          <label>预测步数</label><input id="p_forecast_horizon" type="number" value="1" min="1" max="64">
+        </div>
+        <div class="field"><label id="epochLabel">轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"></div>
+        <div class="field" id="batchSizeField"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"></div>
+        <div class="field" id="learningRateField"><label>学习率 lr</label><input id="p_lr" type="number" value="0.001" step="0.0001" min="0.0001"></div>
+        <div class="field" id="hiddenLayersField"><label>隐藏层数</label><input id="p_hidden_layers" type="number" value="3" min="0" max="8"></div>
+        <div class="field" id="hiddenSizeField"><label>每层神经元</label><input id="p_hidden_size" type="number" value="128" min="1" max="2048"></div>
+        <div class="field" id="testSplitField"><label>验证集比例</label><input id="p_test_split" type="number" value="0.2" step="0.05" min="0.05" max="0.5"></div>
+        <div class="field" id="resourceHintField">
           <label>资源提示</label>
           <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-top:4px; color:var(--text);">
             <input id="p_require_gpu" type="checkbox" style="width:auto;"> 要求在 GPU 上训练
@@ -323,7 +338,7 @@
         </div>
       </div>
       <button id="btnStart" class="primary" disabled>🚀 开始训练</button>
-      <div class="hint">提示：目标列为连续数值时请选择「回归」，否则选「分类」。</div>
+      <div class="hint" id="taskHint">分类适用于离散标签，回归适用于连续数值目标。</div>
     </form>
   </aside>
 
@@ -468,6 +483,10 @@ function toast(msg, kind = "") {
 }
 const fmtTime = (ts) => ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "-";
 const fmtLoss = (v) => (v === null || v === undefined) ? "-" : Number(v).toFixed(4);
+const taskName = (task) => ({
+  classification: "分类", regression: "回归", clustering: "KMeans 聚类",
+  time_series_forecasting: "时间序列预测",
+}[task] || task || "未知任务");
 
 /* ---------- 设备徽章 ---------- */
 async function loadSystem() {
@@ -538,7 +557,9 @@ async function loadSamples() {
 async function loadPreview() {
   const wrap = $("previewWrap"), metaBox = $("previewMeta");
   const targetSel = $("targetSelect");
+  const timeColumnSel = $("timeColumnSelect");
   targetSel.innerHTML = "";
+  timeColumnSel.innerHTML = "";
   $("previewMeta").hidden = true;
   metaBox.textContent = "";
   if (!state.datasetId) { wrap.innerHTML = `<div class="empty">选择或上传数据集后在此预览</div>`; state.preview = null; updateStart(); return; }
@@ -550,10 +571,14 @@ async function loadPreview() {
       const opt = document.createElement("option");
       opt.value = c; opt.textContent = c;
       targetSel.appendChild(opt);
+      const timeOpt = document.createElement("option");
+      timeOpt.value = c; timeOpt.textContent = c;
+      timeColumnSel.appendChild(timeOpt);
     }
     targetSel.value = d.columns[d.columns.length - 1];
+    timeColumnSel.value = d.columns.find((column) => column !== targetSel.value) || "";
     targetSel.onchange = updateStart;
-    taskSelect.onchange = updateStart;
+    timeColumnSel.onchange = updateStart;
     // 预览表
     let html = `<table class="preview-table"><tr>${d.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>`;
     for (const row of (d.preview || []).slice(0, 5)) {
@@ -571,7 +596,37 @@ async function loadPreview() {
 }
 
 function updateStart() {
-  $("btnStart").disabled = !(state.datasetId && $("targetSelect").value);
+  const task = taskSelect.value;
+  const hasTarget = Boolean($("targetSelect").value);
+  const hasTimeColumn = Boolean($("timeColumnSelect").value)
+    && $("timeColumnSelect").value !== $("targetSelect").value;
+  const ready = state.datasetId && (task === "clustering"
+    || (hasTarget && (task !== "time_series_forecasting" || hasTimeColumn)));
+  $("btnStart").disabled = !ready;
+}
+
+function updateTaskFields() {
+  const task = taskSelect.value;
+  const isClustering = task === "clustering";
+  const isForecasting = task === "time_series_forecasting";
+  $("targetField").hidden = isClustering;
+  $("timeColumnField").hidden = !isForecasting;
+  $("nClustersField").hidden = !isClustering;
+  $("lookbackField").hidden = !isForecasting;
+  $("forecastHorizonField").hidden = !isForecasting;
+  ["batchSizeField", "learningRateField", "hiddenLayersField", "hiddenSizeField", "testSplitField", "resourceHintField"]
+    .forEach((id) => { $(id).hidden = isClustering; });
+  if (isClustering) {
+    $("p_require_gpu").checked = false;
+    $("minVramField").hidden = true;
+  }
+  $("epochLabel").textContent = isClustering ? "最大迭代次数" : "轮数 epochs";
+  $("taskHint").textContent = isClustering
+    ? "KMeans 根据所有特征自动分组，不需要目标列，当前使用 CPU。"
+    : isForecasting
+      ? "按时间列排序目标值；使用最近窗口预测指定步数后的数值。"
+      : "分类适用于离散标签，回归适用于连续数值目标。";
+  updateStart();
 }
 
 /* 上传 */
@@ -594,14 +649,16 @@ $("datasetSelect").onchange = (e) => { state.datasetId = e.target.value; loadPre
 
 /* ---------- 训练任务 ---------- */
 const taskSelect = $("taskSelect");
+taskSelect.addEventListener("change", updateTaskFields);
 $("p_require_gpu").onchange = () => { $("minVramField").hidden = !$("p_require_gpu").checked; };
 
 $("btnStart").onclick = async () => {
-  if (!state.datasetId || !$("targetSelect").value) return;
+  const task = taskSelect.value;
+  if (!state.datasetId || (task !== "clustering" && !$("targetSelect").value)) return;
   const payload = {
     dataset_id: state.datasetId,
-    target: $("targetSelect").value,
-    task: taskSelect.value,
+    target: task === "clustering" ? null : $("targetSelect").value,
+    task,
     epochs: Number($("p_epochs").value),
     batch_size: Number($("p_batch_size").value),
     lr: Number($("p_lr").value),
@@ -612,6 +669,12 @@ $("btnStart").onclick = async () => {
     require_gpu: $("p_require_gpu").checked,
     min_vram_mb: $("p_require_gpu").checked ? Math.max(Number($("p_min_vram").value) || 0, 0) : 0,
   };
+  if (task === "clustering") payload.n_clusters = Number($("p_n_clusters").value);
+  if (task === "time_series_forecasting") {
+    payload.time_column = $("timeColumnSelect").value;
+    payload.lookback = Number($("p_lookback").value);
+    payload.forecast_horizon = Number($("p_forecast_horizon").value);
+  }
   $("btnStart").disabled = true;
   try {
     const { job_id } = await apiJson("/api/train", {
@@ -628,23 +691,28 @@ const statusText = { queued: "排队中", running: "训练中", completed: "已�
 function jobCard(j) {
   const m = j.spec.params || {};
   const last = (j.metrics || []).slice(-1)[0] || {};
-  const taskLabel = j.spec.task === "regression" ? "回归" : "分类";
+  const label = taskName(j.spec.task);
+  const target = j.spec.target || (j.spec.task === "clustering" ? "无目标列" : "目标列");
   const pct = j.progress ? Math.round(j.progress.percent) : 0;
   const active = j.id === state.jobId ? " active" : "";
   let metric = "";
   if (last.val_accuracy !== undefined) metric = `acc ${fmtLoss(last.val_accuracy)}`;
   else if (last.val_r2 !== undefined) metric = `R² ${fmtLoss(last.val_r2)}`;
+  else if (last.val_silhouette !== undefined) metric = `silhouette ${fmtLoss(last.val_silhouette)}`;
   return `<div class="jobcard${active}" data-id="${esc(j.id)}">
     <div class="jobline">
-      <span class="jobname">${esc(j.spec.target)} · ${taskLabel}</span>
+      <span class="jobname">${esc(target)} · ${esc(label)}</span>
       <span class="chip st-${esc(j.status)}">${statusText[j.status] || j.status}</span>
       <span class="chip">${esc(j.spec.dataset_name || "")}</span>
       ${(j.spec.resource_hint || {}).require_gpu ? `<span class="chip" title="要求 GPU 训练">GPU</span>` : ""}
       ${j.retry_count ? `<span class="chip" title="环境性错误自动重试次数">↻ ${j.retry_count}</span>` : ""}
     </div>
     <div class="chips">
-      <span class="chip">ep ${m.epochs}</span><span class="chip">bs ${m.batch_size}</span>
-      <span class="chip">lr ${m.lr}</span>${metric ? `<span class="chip">${metric}</span>` : ""}
+      <span class="chip">${j.spec.task === "clustering" ? "最多迭代" : "ep"} ${m.epochs}</span>
+      ${m.n_clusters ? `<span class="chip">${m.n_clusters} 簇</span>` : ""}
+      ${m.lookback ? `<span class="chip">窗口 ${m.lookback} · 预测 ${m.forecast_horizon} 步</span>` : ""}
+      ${m.batch_size ? `<span class="chip">bs ${m.batch_size}</span>` : ""}
+      ${m.lr ? `<span class="chip">lr ${m.lr}</span>` : ""}${metric ? `<span class="chip">${metric}</span>` : ""}
       <span class="chip">${fmtTime(j.created_at)}</span>
     </div>
     <div class="progress ${(j.status === "completed" ? "done" : "") + (j.status === "failed" || j.status === "cancelled" ? " failed" : "")}">
@@ -689,8 +757,8 @@ async function loadDetail() {
   try { j = await apiJson(`/api/jobs/${state.jobId}`); }
   catch { state.jobId = null; $("detail").hidden = true; return; }
 
-  const taskLabel = j.spec.task === "regression" ? "回归" : "分类";
-  $("dName").textContent = `${j.spec.target} · ${taskLabel}（${j.spec.dataset_name || ""}）`;
+  const taskLabel = taskName(j.spec.task);
+  $("dName").textContent = `${j.spec.target || "无目标列"} · ${taskLabel}（${j.spec.dataset_name || ""}）`;
   const st = $("dStatus");
   st.textContent = statusText[j.status] || j.status;
   st.className = "chip st-" + j.status;
@@ -728,7 +796,7 @@ async function loadDetail() {
   const pct = Math.round(j.progress.percent || 0);
   bar.querySelector("div").style.width = pct + "%";
   let ptxt = `进度 ${pct}%`;
-  if (j.progress.epochs_total) ptxt = `epoch ${j.progress.epoch}/${j.progress.epochs_total}`;
+  if (j.progress.epochs_total) ptxt = `${j.spec.task === "clustering" ? "迭代" : "epoch"} ${j.progress.epoch}/${j.progress.epochs_total}`;
   if (j.status === "failed" && j.error) ptxt += ` · ${esc(j.error)}`;
   if (j.summary && j.summary.duration_sec) ptxt += ` · 用时 ${j.summary.duration_sec}s`;
   if ((j.segments || []).length > 1) ptxt += ` · 跨槽续训 ${j.segments.length} 段`;
@@ -774,12 +842,23 @@ function renderCharts(j) {
   loss.data.labels = labels;
   loss.data.datasets[0].data = m.map((r) => r.train_loss);
   loss.data.datasets[1].data = m.map((r) => r.val_loss);
+  if (j.spec.task === "clustering") {
+    loss.data.datasets[0].label = "平均惯性";
+    loss.data.datasets[1].label = "惯性";
+    $("lossChart").previousElementSibling.textContent = "KMeans 惯性（越低越好）";
+  } else {
+    loss.data.datasets[0].label = "train_loss";
+    loss.data.datasets[1].label = "val_loss";
+    $("lossChart").previousElementSibling.textContent = "Loss（训练 / 验证）";
+  }
   loss.update("none");
 
   const metric = state.charts.metric;
   let key, title;
-  if (j.spec.task === "regression") { key = "val_r2"; title = "验证 R²（越高越好）"; }
-  else { key = "val_accuracy"; title = "验证准确率 accuracy"; }
+  if (j.spec.task === "clustering") { key = "val_silhouette"; title = "轮廓系数 Silhouette（越高越好）"; }
+  else if (j.spec.task === "regression" || j.spec.task === "time_series_forecasting") {
+    key = "val_r2"; title = "验证 R²（越高越好）";
+  } else { key = "val_accuracy"; title = "验证准确率 accuracy"; }
   if (state.metricKind !== key) {
     state.metricKind = key;
     metric.data.datasets[0].label = key;
@@ -816,8 +895,23 @@ function renderResult(j) {
   }
   const stat = (k, v) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
   let html = `<div class="statgrid">`;
+  if (j.spec.task === "clustering") {
+    html += stat("收敛迭代", s.epochs_total);
+    html += stat("聚类数", s.n_clusters);
+    html += stat("轮廓系数", fmtLoss(s.final.val_silhouette));
+    html += stat("惯性 inertia", fmtLoss(s.final.val_inertia));
+    html += stat("样本数", s.rows.total);
+    html += stat("特征数", s.features);
+    html += stat("用时", s.duration_sec + "s");
+    html += `</div>`;
+    html += `<div class="hint">各簇样本数：${Object.entries(s.cluster_counts || {}).map(([k, v]) => `簇 ${esc(k)}：${v}`).join(" · ")}</div>`;
+    html += `<div class="hint" style="margin-top:8px;">KMeans 中心已保存为该任务的 best.pt，可下载或在预测页输入一条特征记录。</div>`;
+    box.className = "";
+    box.innerHTML = html;
+    return;
+  }
   html += stat("最佳 epoch", s.best_epoch + " / " + s.epochs_total);
-  if (j.spec.task === "regression") {
+  if (j.spec.task === "regression" || j.spec.task === "time_series_forecasting") {
     html += stat("验证 R²", fmtLoss(s.final.val_r2));
     html += stat("验证 RMSE", fmtLoss(s.final.val_rmse));
     html += stat("验证 MAE", fmtLoss(s.final.val_mae));
@@ -851,28 +945,44 @@ function renderResult(j) {
 async function fillPredictTemplate() {
   const j = state.jobs.find((x) => x.id === state.jobId);
   if (!j) return;
+  if (j.spec.task === "time_series_forecasting") {
+    $("predictInput").value = "[]";
+    $("predictInput").placeholder = `输入最近 ${j.spec.params.lookback} 个目标值，例如 [1.2, 1.4, 1.3, ...]`;
+    $("tab-predict").querySelector(".hint").textContent =
+      `输入按时间顺序排列的最近 ${j.spec.params.lookback} 个目标值（JSON 数组），模型预测 ${j.spec.params.forecast_horizon} 步后的值。`;
+    return;
+  }
   try {
     const d = await apiJson(`/api/datasets/${j.spec.dataset_id}`);
     if (d.preview && d.preview[0]) {
       const row = { ...d.preview[0] };
-      delete row[j.spec.target];
+      if (j.spec.target) delete row[j.spec.target];
       for (const k of Object.keys(row)) if (row[k] === null) delete row[k];
       $("predictInput").value = JSON.stringify(row, null, 2);
+      $("tab-predict").querySelector(".hint").textContent = j.spec.task === "clustering"
+        ? "输入一条 JSON 特征记录（字段名与数据集列名一致），模型返回最近簇编号。"
+        : "使用最佳模型进行单条预测（JSON，与数据集列同名字段）：";
     }
   } catch { /* 无预览则留空 */ }
 }
 
 $("btnPredict").onclick = async () => {
   const out = $("predictOut");
+  const job = state.jobs.find((item) => item.id === state.jobId);
   let body;
-  try { body = { row: JSON.parse($("predictInput").value) }; }
+  try {
+    const input = JSON.parse($("predictInput").value);
+    body = job && job.spec.task === "time_series_forecasting" ? { history: input } : { row: input };
+  }
   catch (e) { toast("预测输入不是合法 JSON: " + e.message, "err"); return; }
   try {
     const r = await apiJson(`/api/jobs/${state.jobId}/predict`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     out.hidden = false;
-    let txt = "预测结果: " + (typeof r.prediction === "number" ? r.prediction.toFixed(4) : r.prediction);
+    let txt = job && job.spec.task === "clustering"
+      ? `所属簇：${r.prediction}（中心距离 ${Number(r.distance).toFixed(4)}）`
+      : "预测结果: " + (typeof r.prediction === "number" ? r.prediction.toFixed(4) : r.prediction);
     if (r.probabilities) txt += "\n各类别概率:\n" + Object.entries(r.probabilities).map(([k, v]) => `  ${k}: ${(v * 100).toFixed(2)}%`).join("\n");
     out.textContent = txt;
   } catch (e) { toast(e.message, "err"); out.hidden = true; }
