@@ -13,17 +13,19 @@
 """
 from __future__ import annotations
 
+import argparse
 import platform
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
 import traceback
 import uuid
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import app.config as config
 from app import jobstore
@@ -40,12 +42,19 @@ from app.storage import (
 from app.trainer import JobCancelled, JobPaused, load_trainer_state, run_training
 
 
-def detect_capabilities(worker_id: Optional[str] = None) -> dict:
+def detect_capabilities(
+    worker_id: Optional[str] = None,
+    machine_id: Optional[str] = None,
+    slot: Optional[str] = None,
+) -> dict:
     """探测本机计算能力（GPU 型号/显存/软件版本）。
 
     worker 启动时调用一次：既是 /api/workers 展示的数据源，
     也是资源提示匹配（require_gpu / min_vram）的依据。
     GPU 探测失败不阻塞启动（退化为 CPU 计算单元）。
+
+    machine_id / slot：一卡一进程模式下，Supervisor 传入机器与卡槽标识，
+    使 /api/workers 可按「机器 -> 卡」两级聚合展示。
     """
     gpu = {"available": False, "name": None, "count": 0, "vram_mb": 0}
     try:
@@ -66,15 +75,64 @@ def detect_capabilities(worker_id: Optional[str] = None) -> dict:
         torch_version, cuda_version = str(_torch.__version__), _torch.version.cuda
     except Exception:
         torch_version, cuda_version = "未知", None
+    hostname = socket.gethostname()
     return {
-        "worker_id": worker_id or f"worker-{socket.gethostname()}-{uuid.uuid4().hex[:6]}",
-        "hostname": socket.gethostname(),
+        "worker_id": worker_id or f"worker-{hostname}-{uuid.uuid4().hex[:6]}",
+        "machine_id": machine_id or hostname,
+        "slot": slot or "cpu0",
+        "hostname": hostname,
         "gpu": gpu,
         "torch_version": torch_version,
         "cuda_version": cuda_version,
         "python_version": platform.python_version(),
         "started_at": time.time(),
     }
+
+
+def probe_visible_gpu() -> bool:
+    """GPU 软探测：验证当前进程可见的 GPU 能完成一次微型张量运算。
+
+    供两类场景使用：
+    - 子进程心跳周期内自检（CUDA_VISIBLE_DEVICES 已隔离到单卡）；
+    - `python -m app.worker --probe-gpu` 探测子进程（Supervisor 恢复判定）。
+    任何异常均视为不健康，绝不抛出——探测本身必须先于一切可靠。
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        x = torch.tensor([2.0], device="cuda")
+        return float((x * 2).item()) == 4.0
+    except Exception:
+        return False
+
+
+# 环境性错误特征（可重试）：硬件/驱动/网络/存储瞬断——换卡/换机/稍后重试即可能成功
+_RETRYABLE_PATTERNS = (
+    "cuda", "out of memory", "oom", "device-side assert", "nccl",
+    "connection reset", "connection refused", "timed out", "timeout",
+    "temporarily unavailable", "broken pipe", "no space left",
+    "storage", "rpc error", "econnreset",
+)
+
+# 业务性错误类型（不可重试）：重试也无法改变结果，直接判 FAILED
+_FATAL_EXCEPTION_TYPES = (FileNotFoundError, ValueError, KeyError)
+
+
+def classify_retryable(exc: BaseException) -> bool:
+    """失败分类：环境性错误重试（带 checkpoint 续试），业务性错误直接失败。
+
+    规则：
+    - FileNotFoundError / ValueError / KeyError 视为业务性错误（数据集缺失、
+      超参/格式非法、续训不兼容等），重试无意义；
+    - 其余异常（RuntimeError/OSError/ConnectionError 等）按错误文本匹配
+      环境性特征词（CUDA/OOM/网络瞬断/存储故障）判定可重试。
+    """
+    if isinstance(exc, _FATAL_EXCEPTION_TYPES):
+        return False
+    text = f"{exc}".lower()
+    return any(p in text for p in _RETRYABLE_PATTERNS)
 
 
 class JobController:
@@ -176,6 +234,7 @@ class TrainingWorker:
         capabilities: Optional[dict] = None,
         idle_poll: float = 1.0,
         log: Callable[[str], None] = print,
+        gpu_probe_enabled: Optional[bool] = None,
     ) -> None:
         self.store = store or get_store()
         self.queue = queue  # type: ignore[assignment]
@@ -187,6 +246,10 @@ class TrainingWorker:
         self._shutdown = threading.Event()
         self._controller: Optional[JobController] = None
         self._last_skip: Tuple[Optional[str], float] = (None, 0.0)
+        self._degraded = False  # 卡软探测失败标记：不再领取新任务，恢复后自动摘除
+        self._gpu_probe_enabled = (
+            config.WORKER_GPU_PROBE if gpu_probe_enabled is None else gpu_probe_enabled
+        )
 
     # ------------------------------------------------------------------
     # 对外
@@ -203,20 +266,53 @@ class TrainingWorker:
         if pause_current and self._controller is not None:
             self._controller.pause_event.set()
 
+    def _self_probe(self) -> bool:
+        """本执行槽健康自检：GPU 槽做微型张量探测，CPU 槽恒为健康。
+
+        探测失败 -> degraded（不领取新任务，等待恢复）；这是两级自愈中的
+        第一级（软故障不杀进程，恢复后自动摘标记）。
+        """
+        if not self.gpu_available or not self._gpu_probe_enabled:
+            return True
+        return probe_visible_gpu()
+
     def run_forever(self) -> None:
-        """主循环：注册 -> 空闲心跳 -> 领取任务 -> 执行，直到优雅停机。"""
+        """主循环：注册 -> 健康探测 -> 空闲心跳 -> 领取任务 -> 执行，直到优雅停机。
+
+        degraded 状态下仍然维持心跳（/api/workers 可见卡异常），但不领取新任务；
+        探测恢复后自动摘除 degraded 标记，重新投入调度——即"检测不可用的卡是否恢复"。
+        """
         hb_ttl = max(config.WORKER_LEASE_TTL * 2.0, config.WORKER_HEARTBEAT_INTERVAL * 3.0)
         self.lease_store.register_worker(self.worker_id, self.caps, hb_ttl)
         gpu = self.caps.get("gpu") or {}
         self._log(
-            f"worker {self.worker_id} 启动: 设备={'cuda(' + str(gpu.get('name')) + ')' if gpu.get('available') else 'cpu'}"
+            f"worker {self.worker_id} 启动: 机器={self.caps.get('machine_id')} 槽位={self.caps.get('slot')} "
+            f"设备={'cuda(' + str(gpu.get('name')) + ')' if gpu.get('available') else 'cpu'}"
             f" / torch={self.caps.get('torch_version')} / 存储={config.STORAGE_BACKEND}"
         )
         try:
             while not self._shutdown.is_set():
+                healthy = self._self_probe()
+                if healthy == self._degraded:  # 状态翻转才打日志，避免刷屏
+                    self._degraded = not healthy
+                    if self._degraded:
+                        self._log(f"worker {self.worker_id}: GPU 探测失败，进入 degraded（暂停领取新任务，等待恢复）")
+                    else:
+                        self._log(f"worker {self.worker_id}: GPU 探测恢复，重新投入调度")
                 self.lease_store.heartbeat_worker(
-                    self.worker_id, {"state": "idle", "current_job": None}, hb_ttl
+                    self.worker_id,
+                    {
+                        "state": "degraded" if self._degraded else "idle",
+                        "current_job": None,
+                        "machine_id": self.caps.get("machine_id"),
+                        "slot": self.caps.get("slot"),
+                    },
+                    hb_ttl,
                 )
+                if self._degraded:
+                    # 掉卡期间不领取新任务；已被其它节点重派的心跳丢失处理照常生效
+                    self._shutdown.wait(self._idle_poll)
+                    continue
                 job_id = self.queue.pop(timeout=self._idle_poll)
                 if job_id is None:
                     continue
@@ -253,7 +349,13 @@ class TrainingWorker:
             return
         token = f"{self.worker_id}:{uuid.uuid4().hex[:8]}"
         if not self.lease_store.acquire(job_id, token, config.WORKER_LEASE_TTL):
-            self._log(f"[{job_id}] 租约被其它 worker 持有（重派竞态），跳过")
+            # 租约被其它 worker 持有（重派竞态）：把弹出的条目放回队列。
+            # 数量守恒——每个 worker 只放回自己弹出的条目，不会重复堆积；
+            # 持有者是活着的 worker 时该副本稍后会被按状态跳过，无害；
+            # 持有者已死但 TTL 未到时，该副本是任务不丢失的关键兜底。
+            self._log(f"[{job_id}] 租约被其它 worker 持有，稍后重试领取")
+            time.sleep(min(1.0, self._idle_poll))
+            self.queue.push(job_id)
             return
         # 清除可能遗留的控制信号，保证本轮执行从干净状态开始
         self.lease_store.clear_signals(job_id)
@@ -274,6 +376,23 @@ class TrainingWorker:
             scratch.mkdir(parents=True, exist_ok=True)
             params = spec.get("params") or {}
 
+            def joblog(msg: str) -> None:
+                """统一任务日志通道：本地 scratch 追加 + 整文件同步到状态平面。
+
+                不能直接 append 到状态平面：finally 的 _flush_final 会用
+                scratch 副本整文件覆盖状态平面日志，直接 append 的行会被冲掉。
+                """
+                stamp = time.strftime("%H:%M:%S")
+                try:
+                    with (scratch / "log.txt").open("a", encoding="utf-8") as f:
+                        f.write(f"[{stamp}] {msg}\n")
+                except Exception:
+                    pass
+                try:
+                    store.write_file(job_key(job_id, "log.txt"), scratch / "log.txt")
+                except Exception:
+                    pass
+
             # 拉取历史产物到 scratch：日志/指标延续既有内容，best.pt 供最终报告加载
             for name in ("log.txt", "metrics.jsonl", "best.pt"):
                 key = job_key(job_id, name)
@@ -290,22 +409,21 @@ class TrainingWorker:
                     resumed_epoch = epoch
                     break
                 except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
-                    jobstore.append_job_log(
-                        store, job_id,
-                        f"checkpoint e{epoch} 加载失败，回退更早版本: {exc}",
-                    )
+                    joblog(f"checkpoint e{epoch} 加载失败，回退更早版本: {exc}")
                     resume_state = None
+            # checkpoint 是进度唯一权威：无条件把 metrics 回滚到 resume epoch
+            # （resume_state 为空时回滚到 0——孤儿进度清空，重试曲线不会出现重复 epoch）
+            truncated = jobstore.truncate_metrics_to_epoch(store, job_id, resumed_epoch)
+            (scratch / "metrics.jsonl").write_text(truncated, encoding="utf-8")
             if resume_state is not None:
-                # checkpoint 是进度唯一权威：先回滚指标到存档 epoch，再续训（曲线无重复无锯齿）
-                truncated = jobstore.truncate_metrics_to_epoch(store, job_id, resumed_epoch)
-                (scratch / "metrics.jsonl").write_text(truncated, encoding="utf-8")
                 gpu_name = (self.caps.get("gpu") or {}).get("name") or "CPU"
-                jobstore.append_job_log(
-                    store, job_id,
+                joblog(
                     f"接手续训: 从 epoch {resumed_epoch} 的 checkpoint 恢复"
                     f"（本节点 {self.worker_id}，{'GPU: ' + gpu_name if self.gpu_available else 'CPU'}，"
                     f"跨设备续训语义连续、不承诺逐位一致）",
                 )
+            elif resumed_epoch == 0 and truncated == "":
+                joblog("未找到可用 checkpoint：从头开始训练（此前孤儿进度已回滚）")
 
             # ---- 标记 running（started_at 只在首次运行时固定） ----
             jobstore.update_job(
@@ -345,9 +463,7 @@ class TrainingWorker:
                 prune_checkpoints(store, job_id, config.WORKER_CHECKPOINT_KEEP)
                 controller.set_progress(epoch_done, "training")
 
-            jobstore.append_job_log(
-                store, job_id, f"worker {self.worker_id} 开始执行训练任务"
-            )
+            joblog(f"worker {self.worker_id} 开始执行训练任务")
 
             try:
                 summary = run_training(
@@ -372,8 +488,7 @@ class TrainingWorker:
                 )
                 jobstore.update_job(store, job_id, status=jobstore.PAUSED,
                                    worker_id=self.worker_id)
-                jobstore.append_job_log(
-                    store, job_id,
+                joblog(
                     f"训练暂停: {reason}；断点已保存，可由任意节点接手"
                     f"（POST /api/jobs/{job_id}/resume）",
                 )
@@ -381,7 +496,7 @@ class TrainingWorker:
             except JobCancelled:
                 jobstore.update_job(store, job_id, status=jobstore.CANCELLED,
                                    finished_at=time.time())
-                jobstore.append_job_log(store, job_id, "任务已取消")
+                joblog("任务已取消")
                 return
 
             # ---- 成功：上传最终产物 + 记录训练分段（UI 分段设备标注数据源） ----
@@ -406,16 +521,13 @@ class TrainingWorker:
                 segments=segments,
                 finished_at=time.time(),
             )
-            jobstore.append_job_log(
-                store, job_id,
+            joblog(
                 f"训练完成: 最佳 epoch {summary.get('best_epoch')}，"
                 f"用时 {summary.get('duration_sec')}s（worker {self.worker_id}）",
             )
-        except FileNotFoundError as exc:
-            # 数据集未同步到状态平面等可预期错误：任务失败并给出明确指引
-            self._set_failed(job_id, str(exc))
         except Exception as exc:  # noqa: BLE001
-            self._set_failed(job_id, f"{exc}\n{traceback.format_exc(limit=8)}")
+            # 失败分类：业务性错误直接 FAILED；环境性错误带 checkpoint 自动重试
+            self._handle_run_failure(job_id, exc, scratch)
         finally:
             if controller is not None:
                 controller.stop()
@@ -423,14 +535,86 @@ class TrainingWorker:
             self._flush_final(scratch, job_id)
             shutil.rmtree(scratch, ignore_errors=True)
 
-    def _set_failed(self, job_id: str, error: str) -> None:
-        """任务失败收尾：状态/错误信息落状态平面并写日志。"""
+    def _set_failed(self, job_id: str, error: str, scratch: Optional[Path] = None) -> None:
+        """任务失败收尾：状态/错误信息落状态平面并写日志（日志统一走 joblog 防覆盖）。"""
+        error = str(error).strip()
         try:
             jobstore.update_job(self.store, job_id, status=jobstore.FAILED,
-                               error=str(error).strip(), finished_at=time.time())
-            jobstore.append_job_log(self.store, job_id, f"任务失败: {error}".strip()[:2000])
+                               error=error, finished_at=time.time())
+            if scratch is not None and scratch.exists():
+                stamp = time.strftime("%H:%M:%S")
+                try:
+                    with (scratch / "log.txt").open("a", encoding="utf-8") as f:
+                        f.write(f"[{stamp}] 任务失败: {error[:2000]}\n")
+                except Exception:
+                    pass
+            else:
+                jobstore.append_job_log(self.store, job_id, f"任务失败: {error}".strip()[:2000])
         except Exception:
             self._log(f"[{job_id}] 失败状态写入异常:\n{traceback.format_exc()}")
+
+    def _handle_run_failure(self, job_id: str, exc: BaseException, scratch: Optional[Path] = None) -> None:
+        """失败分类收尾：这是"单卡故障不影响整体任务完成"的核心保障。
+
+        - 环境性错误（CUDA/OOM/网络瞬断/存储故障等，classify_retryable 判定）：
+          未超过 JOB_MAX_AUTO_RETRY 上限时，任务回到队列，任意可用卡/机器
+          从最近 checkpoint 接续训练（进度不丢失），重试计数写入任务记录。
+        - 业务性错误（数据集缺失/超参非法等）或重试额度耗尽：直接 FAILED。
+
+        日志写本地 scratch（若有）：finally 的 _flush_final 会整文件同步，
+        避免状态平面直接 append 被 scratch 副本覆盖而丢失。
+        """
+        def local_log(msg: str) -> None:
+            """失败消息写入本地 scratch 日志（随 finally 同步到状态平面）。"""
+            if scratch is None or not scratch.exists():
+                return
+            try:
+                with (scratch / "log.txt").open("a", encoding="utf-8") as f:
+                    f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            except Exception:
+                pass
+
+        retry_count = 0
+        try:
+            record = jobstore.read_job(self.store, job_id) or {}
+            retry_count = int(record.get("retry_count") or 0)
+        except Exception:
+            pass
+        retryable = classify_retryable(exc)
+        if retryable and retry_count < config.JOB_MAX_AUTO_RETRY:
+            new_count = retry_count + 1
+            local_log(
+                f"环境性错误，自动重试 {new_count}/{config.JOB_MAX_AUTO_RETRY}"
+                f"（断点已保留，任意可用卡可接续）: {exc}",
+            )
+            try:
+                jobstore.update_job(
+                    self.store, job_id,
+                    status=jobstore.QUEUED,
+                    retry_count=new_count,
+                    # 记录最近一次失败原因，但任务仍可续试（非终态）
+                    last_error=f"{exc}",
+                )
+            except Exception:
+                self._log(f"[{job_id}] 重试状态写入异常:\n{traceback.format_exc()}")
+            self._log(
+                f"[{job_id}] retryable error, auto-retry {new_count}/{config.JOB_MAX_AUTO_RETRY}: {exc}"
+            )
+            if config.JOB_RETRY_BACKOFF > 0:
+                # 退避（可被停机信号打断）：避免同卡立刻陷入失败循环
+                self._shutdown.wait(min(float(config.JOB_RETRY_BACKOFF), 30.0))
+            self.queue.push(job_id)  # 回到队列，任意 worker（含本卡恢复后）可续试
+            return
+        if retryable:
+            local_log(f"环境性错误自动重试已耗尽 {config.JOB_MAX_AUTO_RETRY} 次")
+            self._set_failed(
+                job_id,
+                f"{exc}\n[环境性错误自动重试已耗尽 {config.JOB_MAX_AUTO_RETRY} 次]"
+                f"\n{traceback.format_exc(limit=8)}",
+                scratch,
+            )
+        else:
+            self._set_failed(job_id, f"{exc}\n{traceback.format_exc(limit=8)}", scratch)
 
     def _flush_final(self, scratch: Path, job_id: str) -> None:
         """收尾兜底：尽力把本地 metrics/日志的最后状态同步到状态平面（幂等）。"""
@@ -455,11 +639,196 @@ def _list_checkpoints(store: ArtifactStore, job_id: str) -> List[Tuple[int, str]
 
 
 # ---------------------------------------------------------------------------
+# 机器级守护（Supervisor）：一卡一进程 + 掉卡探测自动恢复
+# ---------------------------------------------------------------------------
+
+class WorkerSupervisor:
+    """一机一守护：按可见 GPU 数量启动一卡一子进程，监控子进程存活。
+
+    设计（对应验收 AC9/AC10/AC11）：
+    - 每张可见 GPU 一个子进程（CUDA_VISIBLE_DEVICES=i 隔离），另加
+      WORKER_CPU_SLOTS 个 CPU 执行槽（纯 CPU 训练 / require_gpu=false 任务）；
+    - 一张卡的驱动崩溃只杀死对应子进程，同机其它卡完全不受影响（故障隔离）；
+    - 子进程死亡不等于卡死亡：重启前先用一次性探测子进程（--probe-gpu）
+      验证该卡可用，探测不通过则本轮进入 recovering（下轮再试），卡恢复后
+      自动重启子进程并重新领取任务——即"检测不可用的卡是否恢复"；
+    - CPU 槽子进程死亡直接重启（不涉及卡）。
+
+    协调约定：子进程死亡期间，其心跳 TTL 自然过期，watchdog 会把该卡
+    正在训练的任务重派给其它卡/机器（进度由 checkpoint 保证不丢失）。
+    """
+
+    def __init__(
+        self,
+        queue: JobQueue,
+        lease_store: LeaseStore,
+        store: ArtifactStore,
+        log: Callable[[str], None] = print,
+        cpu_slots: Optional[int] = None,
+    ) -> None:
+        self.queue = queue
+        self.lease_store = lease_store
+        self.store = store
+        self._log = log
+        self._interval = max(float(config.WORKER_SUPERVISOR_PROBE_INTERVAL), 1.0)
+        self._shutdown = threading.Event()
+        self._children: Dict[str, "subprocess.Popen"] = {}  # slot -> 子进程
+        self._slots: List[Tuple[str, Optional[str]]] = []   # (slot 名, GPU 索引或 None)
+        gpu_count = _gpu_count()
+        machine = socket.gethostname()
+        for i in range(gpu_count):
+            # 槽位名全局可读：{机器}-{gpuN}，/api/workers 按卡聚合展示
+            self._slots.append((f"{machine}-gpu{i}", str(i)))
+        n_cpu = config.WORKER_CPU_SLOTS if cpu_slots is None else cpu_slots
+        for j in range(max(int(n_cpu), 1) if gpu_count == 0 else int(n_cpu)):
+            self._slots.append((f"{machine}-cpu{j}", None))
+
+    # ------------------------------------------------------------------
+    def _spawn(self, slot: str, gpu_index: Optional[str]) -> "subprocess.Popen":
+        """启动一个卡槽子进程：CUDA_VISIBLE_DEVICES 隔离到单卡（必须在 CUDA 初始化前设置）。"""
+        env = dict(os.environ)
+        env.pop("_", None)  # 防止个别环境变量干扰 torch 启动偏好
+        if gpu_index is not None:
+            env["CUDA_VISIBLE_DEVICES"] = gpu_index
+        env["WORKER_SLOT"] = slot
+        env["PYTHONUNBUFFERED"] = "1"
+        child = subprocess.Popen(
+            [sys.executable, "-m", "app.worker", "--slot", slot],
+            env=env,
+        )
+        self._log(f"supervisor: 启动卡槽 {slot} 子进程 pid={child.pid}")
+        return child
+
+    def _probe_gpu(self, gpu_index: Optional[str]) -> bool:
+        """探测指定卡是否恢复：一次性 --probe-gpu 子进程（退出码 0 = 健康）。"""
+        if gpu_index is None:
+            return True
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = gpu_index
+        try:
+            probe = subprocess.run(
+                [sys.executable, "-m", "app.worker", "--probe-gpu"],
+                env=env, capture_output=True, timeout=60,
+            )
+            return probe.returncode == 0
+        except Exception as exc:
+            self._log(f"supervisor: 探测 GPU {gpu_index} 异常: {exc}")
+            return False
+
+    def _launch_slots(self) -> None:
+        """启动全部未运行的卡槽子进程（首次启动与掉卡恢复共用）。"""
+        for slot, gpu_index in self._slots:
+            if slot in self._children and self._children[slot] is not None:
+                continue
+            if gpu_index is not None and not self._probe_gpu(gpu_index):
+                # 掉卡时先不启动子进程：等下轮探测恢复再启动（recovering）
+                self._log(f"supervisor: 卡 {slot}（GPU {gpu_index}）探测失败，暂不启动（recovering）")
+                continue
+            self._children[slot] = self._spawn(slot, gpu_index)
+
+    def start(self) -> None:
+        """首次按 current 能力拉起全部卡槽。"""
+        self._launch_slots()
+
+    def request_shutdown(self) -> None:
+        """优雅停机：级联向全部子进程发送 SIGTERM（子进程存档暂停后退出）。"""
+        self._shutdown.set()
+        self._stop_children()
+
+    def _stop_children(self) -> None:
+        """向全部子进程发送优雅停机信号并回收。"""
+        for slot, child in list(self._children.items()):
+            if child is not None and child.poll() is None:
+                self._log(f"supervisor: 通知卡槽 {slot} 优雅停机")
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+        for slot, child in list(self._children.items()):
+            if child is None:
+                continue
+            try:
+                child.wait(timeout=30)
+            except Exception:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+            self._children.pop(slot, None)
+
+    def run_forever(self) -> None:
+        """守护循环：周期检查子进程存活；死亡槽位经探测确认卡片健康后自动重启。"""
+        gpu_count = sum(1 for _, idx in self._slots if idx is not None)
+        self._log(
+            f"supervisor 启动: 机器={socket.gethostname()} 卡槽数={len(self._slots)}"
+            f"（GPU 槽 {gpu_count} + CPU 槽 {len(self._slots) - gpu_count}）"
+        )
+        try:
+            while not self._shutdown.is_set():
+                self._supervise_once()
+                self._shutdown.wait(self._interval)
+        finally:
+            self._stop_children()
+            self._log("supervisor 已退出")
+
+    def _supervise_once(self) -> None:
+        """一轮守护：发现死亡/缺失槽位 -> 探测卡恢复 -> 重启子进程。"""
+        # 正常子进程死亡（驱动崩溃/OOM kill/异常退出）→ 按卡探测决定重启
+        for slot, child in list(self._children.items()):
+            if child is None:
+                continue
+            rc = child.poll()
+            if rc is None:
+                continue
+            self._children.pop(slot, None)
+            self._log(f"supervisor: 卡槽 {slot} 子进程退出（rc={rc}），进入恢复流程")
+        self._launch_slots()
+        # 全部子进程死亡时无需额外处理：心跳 TTL 过期后 watchdog 重派任务
+
+    def all_children_alive(self) -> bool:
+        """测试观察点：全部槽位子进程是否存活。"""
+        return all(
+            slot in self._children and self._children[slot] is not None
+            and self._children[slot].poll() is None
+            for slot, _gpu in self._slots
+        )
+
+
+def _gpu_count() -> int:
+    """本机可见 GPU 数（Supervisor 决定拉起几个卡槽用）；失败按 0 处理。"""
+    try:
+        import torch
+
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # 独立进程入口：python -m app.worker（多机模式，需 Redis 作为队列）
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    """独立 worker 进程入口：环境自检 -> 注册 -> 领取循环（SIGTERM 优雅停机）。"""
+def main(argv: Optional[List[str]] = None) -> int:
+    """独立进程入口（多机模式）。
+
+    三种运行模式（argparse）：
+    - 无参数    : Supervisor 模式——按本机 GPU 数一卡一子进程并守护恢复；
+    - --slot    : 卡槽子进程模式（由 Supervisor 拉起，CUDA_VISIBLE_DEVICES 已隔离）；
+    - --probe-gpu: 一次性卡健康探测（退出码 0 = 该进程可见的 GPU 可用）。
+    """
+    parser = argparse.ArgumentParser(description="无状态训练 worker（一卡一进程）")
+    parser.add_argument("--slot", default=None, help="卡槽标识（如 A-gpu0 / A-cpu0），Supervisor 子进程模式")
+    parser.add_argument("--probe-gpu", action="store_true", help="一次性 GPU 健康探测：健康退出码 0，否则 1")
+    parser.add_argument("--cpu-slots", type=int, default=None,
+                        help="Supervisor 额外 CPU 执行槽数（默认取 WORKER_CPU_SLOTS）")
+    parser.add_argument("--idle-poll", type=float, default=5.0, help="空闲轮询周期（秒）")
+    args = parser.parse_args(argv)
+
+    # ---- 探测模式：健康快速退出，不建立任何长连接 ----
+    if args.probe_gpu:
+        return 0 if probe_visible_gpu() else 1
+
+    # ---- 协调平面自检（Supervisor 与卡槽子进程都必须接入分布式队列）----
     if not config.REDIS_URL:
         print("[worker] REDIS_URL 未配置：独立 worker 需要 Redis 作为任务队列与租约中心。")
         print("[worker] 单机模式无需启动独立 worker——API 进程已内置嵌入式 worker。")
@@ -469,8 +838,6 @@ def main() -> int:
         print("[worker] 协调平面初始化异常：请检查 REDIS_URL 配置。")
         return 2
     store = get_store()
-
-    # ---- 启动自检：协调平面 / 状态平面 / GPU，任何一步失败给出明确指引 ----
     if not lease_store.healthy():
         print(f"[worker] Redis 连接失败（REDIS_URL={config.REDIS_URL}），请检查网络与凭据。")
         return 2
@@ -480,25 +847,53 @@ def main() -> int:
         print(f"[worker] 状态平面不可达（STORAGE_BACKEND={config.STORAGE_BACKEND}）: {exc}")
         return 2
 
-    caps = detect_capabilities(config.WORKER_ID or None)
-    if caps["gpu"]["available"]:
-        print(f"[worker] GPU 就绪: {caps['gpu']['name']}（{caps['gpu']['vram_mb']} MiB）")
-    else:
-        print("[worker] 未检测到 GPU：将以 CPU 训练（require_gpu 任务不会被本节点领取）")
-
-    worker = TrainingWorker(
-        store=store, queue=queue, lease_store=lease_store,
-        capabilities=caps, idle_poll=5.0,
-    )
 
     def _handle(signum, _frame):  # noqa: ANN001
-        """SIGTERM/SIGINT：优雅停机——当前任务立即存档暂停，随后退出主循环。"""
-        print(f"[worker] 收到信号 {signum}，正在优雅停机（保存断点后退出）…", flush=True)
-        worker.request_shutdown(pause_current=True)
+        """SIGTERM/SIGINT：优雅停机（Supervisor 级联子进程；卡槽存档暂停任务）。"""
+        print(f"[worker] 收到信号 {signum}，正在优雅停机…", flush=True)
+        if supervisor is not None:
+            supervisor.request_shutdown()
+        elif worker is not None:
+            worker.request_shutdown(pause_current=True)
 
+
+    supervisor: Optional[WorkerSupervisor] = None
+
+    # ---- 卡槽子进程模式：本进程绑定单卡，注册后进入领取循环 ----
+    if args.slot is not None:
+        slot_worker_id = (
+            config.WORKER_ID
+            or f"{socket.gethostname()}-{args.slot}"
+        )
+        caps = detect_capabilities(slot_worker_id, machine_id=socket.gethostname(), slot=args.slot)
+        if caps["gpu"]["available"]:
+            print(f"[worker] GPU 就绪: {caps['gpu']['name']}（{caps['gpu']['vram_mb']} MiB）slot={args.slot}")
+        else:
+            print(f"[worker] 槽位 {args.slot} 无可见 GPU：以 CPU 训练（require_gpu 任务不会被领取）")
+        worker = TrainingWorker(
+            store=store, queue=queue, lease_store=lease_store,
+            capabilities=caps, idle_poll=args.idle_poll,
+        )
+        signal.signal(signal.SIGTERM, _handle)   # Supervisor 停机 -> 子进程存档暂停
+        signal.signal(signal.SIGINT, _handle)
+        worker.run_forever()
+        return 0
+
+    # ---- Supervisor 模式：一卡一子进程 + 掉卡探测自动恢复 ----
+    caps = detect_capabilities()
+    gpu_count = _gpu_count()
+    if gpu_count:
+        print(f"[supervisor] 检测到 {gpu_count} 张 GPU，将一卡一进程启动")
+    else:
+        print("[supervisor] 未检测到 GPU：启动 CPU 执行槽（require_gpu 任务不会被领取）")
+    supervisor = WorkerSupervisor(
+        queue=queue, lease_store=lease_store, store=store,
+        cpu_slots=args.cpu_slots,
+    )
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
-    worker.run_forever()
+    supervisor.start()
+    supervisor.run_forever()
     return 0
 
 

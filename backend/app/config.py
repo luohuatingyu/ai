@@ -48,6 +48,15 @@ EMBEDDED_WORKERS = int(os.environ.get("EMBEDDED_WORKERS", "2"))                 
 WORKER_CHECKPOINT_INTERVAL = int(os.environ.get("WORKER_CHECKPOINT_INTERVAL", "5"))     # 每训练 N 个 epoch 存一次 checkpoint
 WORKER_CHECKPOINT_KEEP = int(os.environ.get("WORKER_CHECKPOINT_KEEP", "3"))             # 版本化 checkpoint 保留个数（可回退）
 
+# 多机多卡：一卡一进程的机器级守护（Supervisor）与卡健康自愈
+WORKER_SUPERVISOR_PROBE_INTERVAL = float(os.environ.get("WORKER_SUPERVISOR_PROBE_INTERVAL", "15"))  # 掉卡探测周期（秒）
+WORKER_GPU_PROBE = os.environ.get("WORKER_GPU_PROBE", "true").strip().lower() == "true"  # 心跳周期内是否做 GPU 软探测
+WORKER_CPU_SLOTS = int(os.environ.get("WORKER_CPU_SLOTS", "1"))  # Supervisor 额外提供的 CPU 执行槽数（纯 CPU 训练）
+
+# 任务失败分类重试：环境性错误（CUDA/OOM/网络瞬断等）带 checkpoint 自动续试，不影响整体完成
+JOB_MAX_AUTO_RETRY = int(os.environ.get("JOB_MAX_AUTO_RETRY", "5"))       # 自动重试上限（.env 可配，默认 5）
+JOB_RETRY_BACKOFF = float(os.environ.get("JOB_RETRY_BACKOFF", "2"))       # 重试退避（秒）
+
 # 运行期目录统一创建（幂等）
 for _d in (DATA_DIR, DATASETS_DIR, JOBS_DIR, WORKER_SCRATCH_DIR):
     _d.mkdir(parents=True, exist_ok=True)
