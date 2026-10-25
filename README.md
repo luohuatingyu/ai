@@ -5,11 +5,13 @@
 - 📦 上传 CSV 数据集，在线预览与列选择
 - 🚀 页面配置超参（epochs / batch_size / lr / 网络结构 / 验证集比例）一键发起训练
 - 📈 实时 Loss 曲线、验证指标曲线（Chart.js）、进度条
-- 📜 实时训练日志，任务可排队、取消、删除
+- 📜 实时训练日志，任务可排队、暂停（保存断点）、恢复（跨卡/跨机接续）、取消、删除
+- 🖥 计算槽面板：多机多卡一卡一进程，卡状态（空闲/训练/降级/恢复中/离线）实时可见
 - 🏆 训练完成自动给出分类报告 / 回归指标（MSE、RMSE、MAE、R²）
 - 🔮 加载 best.pt 在线单条预测，模型权重可下载
+- ♻️ 环境性故障（CUDA/OOM/网络瞬断）自动从断点续训（`JOB_MAX_AUTO_RETRY` 次内），单卡故障不影响整体任务完成
 - 🔧 预留 GPU 接入：镜像内置 CUDA 12 构建 torch，宿主机装好驱动即自动启用 GPU
-- 💾 支持MySQL数据库存储，使用已有MySQL服务器
+- 💾 支持MySQL数据库存储（可选镜像），使用已有MySQL服务器
 
 无需任何登录/权限逻辑，开放访问。
 
@@ -60,6 +62,71 @@ docker compose up -d --build
 
 建议流程：在左侧先点「＋ classification_demo」「＋ regression_demo」导入任意一个内置示例数据集（客户流失二分类 / 房价回归），点「开始训练」，右侧实时观看曲线与日志。
 
+## 架构（四平面 + 无状态计算单元）
+
+平台从"单进程线程池训练"升级为**控制 / 协调 / 状态 / 计算**四平面，GPU 只是可随时释放的纯计算单元：
+
+```
+控制平面  trainer (FastAPI)      提交/暂停/恢复/取消任务，任务面板，watchdog
+协调平面  redis                  任务队列 + 租约(SET NX+TTL) + worker 心跳注册
+状态平面  minio (S3)             数据集 / checkpoint / 产物；job.json 权威，MySQL 仅镜像
+计算平面  worker (一卡一进程)    supervisor 按 GPU 数拉起子进程并守护恢复
+```
+
+核心语义：
+
+- **checkpoint 是进度唯一权威**：完整 trainer-state（模型+优化器+RNG+epoch+预处理器）CPU 化保存；服务器 A 训练后释放，服务器 B 用不同型号显卡从 checkpoint 接续（跨设备语义连续、不承诺逐位一致）。
+- **租约 fencing**：任务执行前抢租约（单写者）；心跳即 TTL，进程崩溃 key 自动过期，watchdog 只看 key 是否存在（不依赖时钟同步），把迷失任务自动重派（不消耗重试额度）。
+- **两级自愈**：① worker 内软探测（微型张量运算）失败 → `degraded` 停止领取新任务，恢复后自动摘除；② 子进程死亡 → supervisor 用 `--probe-gpu` 探测该卡，**卡恢复后才重启子进程**（`recovering` → 重启入列）。
+- **失败分类**：数据集缺失/超参非法等业务性错误直接 FAILED；CUDA/OOM/网络瞬断等环境性错误自动重试（上限 `JOB_MAX_AUTO_RETRY`，默认 5，.env 可配），每次重试都从最近 checkpoint 续训。
+- **两种部署形态**：
+  - **单机零依赖**（默认）：`STORAGE_BACKEND=local`、`REDIS_URL` 留空 —— API 进程内嵌 worker 线程，协调面为进程内实现，行为与多机模式一致；
+  - **多机多卡**：所有节点连同一 Redis + MinIO，任意服务器加卡即自动入列领取任务。
+
+## 多机多卡部署
+
+### 1. 主节点（API + Redis + MinIO + worker）
+
+```bash
+docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cpu.yml
+```
+
+### 2. 追加 GPU 服务器（可不同显卡型号）
+
+```bash
+# 在新服务器上克隆同一仓库，配置指向主节点：
+cat > .env <<'EOF'
+REDIS_URL=redis://主节点IP:6379/0
+STORAGE_BACKEND=minio
+MINIO_ENDPOINT=主节点IP:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_BUCKET=mtp-artifacts
+EOF
+docker compose up -d --build worker
+```
+
+新服务器的每一张卡会注册为独立计算槽（页面「计算槽」面板可见），空闲即领任务；该机掉卡/驱动崩溃只影响其上的任务，其余机器继续训练。
+
+### 3. 迁移历史数据（老版本升级）
+
+```bash
+cd backend
+STORAGE_BACKEND=minio MINIO_ENDPOINT=主节点IP:9000 python scripts/migrate_to_object_storage.py
+```
+
+把本地遗留数据集与任务产物（含版本化 checkpoint）幂等迁入对象存储，老任务即可跨机续训。
+
+### 4. Worker 进程模型（也可在裸机 GPU 服务器直接跑）
+
+```bash
+cd backend
+REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=minio MINIO_ENDPOINT=主节点IP:9000 python -m app.worker
+# supervisor：探测可见 GPU 数 N → N 个"一卡一子进程"+WORKER_CPU_SLOTS 个 CPU 槽，掉卡自动探测恢复
+python -m app.worker --slot A-gpu0   # 单卡子进程（CUDA_VISIBLE_DEVICES 由 supervisor 注入）
+python -m app.worker --probe-gpu     # 一次性卡健康探测（退出码 0=健康）
+```
+
 ## GPU 环境接入（后续补充）
 
 | 环节 | 说明 |
@@ -84,23 +151,28 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 ## 目录结构
 
 ```
-├── docker-compose.yml        # GPU 版（默认）
-├── docker-compose.cpu.yml    # CPU 临时版（GPU 环境就绪前使用）
+├── docker-compose.yml        # 多机架构 GPU 版（trainer + redis + minio + worker）
+├── docker-compose.cpu.yml    # 多机架构 CPU 版（无 gpus 声明，worker 走 CPU 槽）
 ├── backend/
 │   ├── Dockerfile            # python:3.12-slim + CUDA 构建 torch
 │   ├── requirements.txt
 │   ├── app/
 │   │   ├── main.py           # FastAPI 路由 + 静态页托管
-│   │   ├── jobs.py           # 任务管理：线程池、状态机、持久化、日志
-│   │   ├── trainer.py        # CSV 分类/回归训练器（PyTorch）+ 在线预测
+│   │   ├── jobs.py           # 任务登记/控制/watchdog（状态平面版）
+│   │   ├── jobstore.py       # job.json CRUD / metrics 回滚 / 日志（权威记录层）
+│   │   ├── worker.py         # 无状态 TrainingWorker + 一卡一进程 WorkerSupervisor
+│   │   ├── coordination.py   # 队列/租约/worker 注册（Redis 与嵌入式双实现）
+│   │   ├── storage.py        # ArtifactStore（local / MinIO）+ checkpoint 版本化
+│   │   ├── trainer.py        # 可续训训练器（PyTorch）+ 在线预测
 │   │   ├── database.py / models.py / db_utils.py / db_init.py  # MySQL 可选镜像
 │   │   └── config.py
-│   ├── static/index.html     # 可视化单页（无 Node 构建）
+│   ├── static/index.html     # 可视化单页（计算槽面板 + 暂停/恢复）
 │   ├── sample_data/          # 内置示例数据集
-│   └── scripts/generate_samples.py
+│   ├── scripts/generate_samples.py
+│   └── scripts/migrate_to_object_storage.py  # 老数据迁入对象存储（幂等）
 └── data/                     # 运行时产物（持久化卷，已 gitignore）
     ├── datasets/             # 上传的 CSV + 元信息
-    └── jobs/<job_id>/        # log.txt / metrics.jsonl / best.pt / summary.json
+    └── jobs/<job_id>/        # log.txt / metrics.jsonl / best.pt / checkpoints/
 ```
 
 ## API 摘要
@@ -110,14 +182,17 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 | GET | `/api/system` | 设备信息（GPU 型号 / torch 版本），页面徽章数据源 |
 | POST | `/api/datasets` | 上传 CSV（multipart 字段名 `file`） |
 | GET | `/api/datasets/{id}` | 元信息 + 前 N 行预览 + 列类型 |
-| POST | `/api/train` | 发起训练 `{dataset_id, target, task, epochs, batch_size, lr, hidden_layers, hidden_size, test_split, seed}` |
+| POST | `/api/train` | 发起训练 `{dataset_id, target, task, epochs, batch_size, lr, hidden_layers, hidden_size, test_split, seed, require_gpu, min_vram_mb}` |
 | GET | `/api/jobs` | 任务列表（含各任务逐 epoch 指标） |
-| GET | `/api/jobs/{id}` | 任务详情：状态、进度、指标序列、summary |
+| GET | `/api/jobs/{id}` | 任务详情：状态、进度、指标序列、summary、segments（跨槽续训分段） |
 | GET | `/api/jobs/{id}/logs` | 日志增量拉取（`?offset=` 行号） |
 | POST | `/api/jobs/{id}/cancel` | 取消（当前批次结束后停止） |
+| POST | `/api/jobs/{id}/pause` | 暂停（保存断点后进入 paused，可跨机/卡恢复） |
+| POST | `/api/jobs/{id}/resume` | 恢复（重新排队，任意可用卡从 checkpoint 接续） |
 | DELETE | `/api/jobs/{id}` | 删除任务及产物 |
 | GET | `/api/jobs/{id}/model` | 下载 best.pt |
 | POST | `/api/jobs/{id}/predict` | `{ "row": {...单行字段...} }` 用最佳模型预测 |
+| GET | `/api/workers` | 计算槽列表（多机多卡，卡级状态/当前任务/心跳）+ 队列深度 |
 
 ## 扩展新的训练类型
 
@@ -129,7 +204,8 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 
 ## 注意事项
 
-- 数据与模型产物保存在宿主机 `./data/` 目录，容器重建不丢失。
-- 任务由进程内线程池执行（并发 2），适合单机训练场景；多机/多队列可在 `jobs.py` 基础上替换为 Celery/Redis。
-- 页面图表依赖 Chart.js CDN，浏览器需可访问公网；日志与训练完全本地运行。
+- 数据与模型产物保存在宿主机 `./data/` 目录（本地模式）或 MinIO 卷（多机模式），容器重建不丢失。
+- 单机模式任务由 API 进程内嵌 worker 线程执行；多机模式由各服务器的 worker 服务（一卡一进程）领取，可混合部署。
+- 页面图表依赖 Chart.js CDN，浏览器需可访问公网；日志与训练数据全程本地/内网运行。
 - 镜像构建首次约 2~4 GB 下载（torch CUDA wheel），后续走 Docker 缓存。
+- 跨设备续训为语义连续（模型权重/优化器动量/RNG 状态完整恢复），不承诺逐位一致；同卡同 seed 复跑可复现。
