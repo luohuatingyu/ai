@@ -38,7 +38,9 @@ function send(res, status, body, headers) {
   res.end(body);
 }
 
-/** 静态文件服务：根路径映射 index.html，防目录穿越。 */
+/** 静态文件服务：根路径映射 index.html，防目录穿越。
+ *  缓存策略：HTML 一律 no-cache（应用入口必须每次校验，否则前端更新不生效）；
+ *  其余静态资源允许短缓存（单文件前端，实际只有 index.html）。 */
 function serveStatic(req, res) {
   let urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
   if (urlPath === '/') urlPath = '/index.html';
@@ -50,7 +52,13 @@ function serveStatic(req, res) {
   fs.readFile(filePath, (err, data) => {
     if (err) return send(res, 404, 'Not Found');
     const ext = path.extname(filePath).toLowerCase();
-    send(res, 200, data, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    const cache = ext === '.html'
+      ? 'no-cache, no-store, must-revalidate'   // 应用入口：每次校验，前端改动即时生效
+      : 'public, max-age=3600';
+    send(res, 200, data, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': cache,
+    });
   });
 }
 
