@@ -2,53 +2,64 @@
 
 ## Git基准点
 
-- **Commit Hash**: f8839c5（本次测试覆盖代码的提交）
-- **提交信息**: Require shared backends for remote workers
+- **Commit Hash**: ad5e961（本次测试覆盖代码与测试用例的提交）
+- **提交信息**: Expand platform SSH authentication tests
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
-## 本次变更测试结果：平台 SSH 远程计算服务器管理（2026-10-25）
+## 本次变更测试结果：平台统一 SSH 认证与密钥格式兼容（2026-10-25）
 
-**变更范围**：由平台在页面登记目标 SSH 主机，后端通过固定主机密钥校验远程执行单文件 Bash 脚本并拉取 worker 镜像，不向目标机同步项目源码；检测到的 CPU/GPU 槽由用户手动加入资源池；页面可远程重新部署、启动、停止和重启 worker。远程服务器及异步操作状态保存于 Redis；远程管理 API 使用独立令牌保护。
+**变更范围**：远程 SSH 增加平台统一配置的密钥/密码认证，OpenSSH 自动识别私钥格式；支持加密私钥口令。密码和私钥口令通过 askpass 环境传递，不进入 SSH 命令行或输出；远程凭证只注入 trainer，不注入 worker。现有服务器记录仍默认走密钥认证，远程 API、严格 known_hosts 校验和服务器生命周期行为保持兼容。
 
-**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；本机无可用 NVIDIA GPU；未配置真实远程服务器、SSH 私钥或镜像仓库凭据。
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；本机无可用 NVIDIA GPU；未配置真实远程服务器或 SSH 凭证。
 
 **测试执行结果**：
-- `docker compose up --build -d`：通过；trainer、worker、frontend 均重建并启动，SeaweedFS 健康。
-- 定向测试：65 项收集，62 通过、3 跳过、0 失败、0 错误（16.20 秒）。
-- 完整测试：153 项收集，147 通过、6 跳过、0 失败、0 错误（41.20 秒）。
-- pytest 在 Python 3.12.15 容器中只读挂载 `backend/tests/` 和 `scripts/` 执行；工作区原有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 也参与全量测试，但没有纳入 `f8839c5` 提交。
+- `docker compose up --build -d`：通过；trainer、worker、frontend 重建并启动，SeaweedFS 健康。
+- 完整测试：163 项收集，157 通过、6 跳过、0 失败、0 错误（51.89 秒）。
+- 远程管理定向测试：26 项通过（0.39 秒），在 Python 3.12.15 容器运行。
+- pytest 在 Python 3.12.15 容器中只读挂载 `backend/tests/` 与 `scripts/`；工作区原有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 也参与全量测试，但没有纳入 `79175c4` 提交。测试结束后，工作区出现 `backend/app/jobs.py`、`backend/app/routers/jobs.py`、`backend/app/routers/schemas.py`、`backend/app/trainer.py` 和 `backend/static/index.html` 的其他未提交改动；这些不属于本次提交，也未纳入本次测试镜像。
 - 跳过项：3 个 Redis 协调集成、1 个 Redis Supervisor 集成、2 个 S3 集成；分别需要 `MTP_TEST_REDIS` / `MTP_TEST_S3` 配置。
 - 两条非失败警告：SQLAlchemy `declarative_base()` 弃用提示；Pandas 对 xlrd 引擎的未来弃用提示。
-- 静态检查通过：`bash -n backend/app/remote_worker.sh`、Node 解析内嵌 JavaScript、GPU/CPU 主 Compose 与远程覆盖 Compose 解析、`git diff --check`。
-- Safari 手动检查：远程添加表单显示 SSH 主机/账号/端口、资源类型、令牌说明；GPU/CPU 选项布局正常，CPU 模式显示 CPU 槽数量；页面明确显示不会同步项目源码。
-- `/api/workers` 页面运行时检查：本机在线 CPU 槽、CPU 线程/内存、稳定槽位标识和当前任务状态正常。
+- GPU/CPU 两种远程 Compose 配置解析通过；密码环境检查确认 SSH 密码只进入 trainer 环境，不进入 worker 环境。
+- `git diff --check` 通过；OpenSSH `ssh-keygen` 解析测试覆盖 Ed25519、ECDSA、RSA OpenSSH 与 RSA PEM 私钥。
+- 首轮本机定向测试的 mock 曾递归调用被替换的 `subprocess.run`；修正后在 Python 3.12 容器定向测试 26 项通过。首轮完整测试未把 `scripts/` 挂载到 `/scripts`，导致 13 项节点脚本用例找不到脚本；改正挂载路径后完整套件通过。这两项均为测试调用问题，不是产品失败。
 
 **定向和完整测试命令**：
 ```bash
+# 项目根目录：完整测试
 docker compose run --rm --no-deps \
-  -v "$PWD/backend/tests:/app/backend/tests:ro" \
-  -v "$PWD/scripts:/app/scripts:ro" \
-  trainer python -m pytest backend/tests/test_remote_workers.py backend/tests/test_coordination.py backend/tests/test_api.py -v
+  -v ./backend/tests:/app/tests:ro \
+  -v ./scripts:/scripts:ro \
+  trainer python -m pytest /app/tests -v
 
+# 项目根目录：远程 SSH 定向测试
 docker compose run --rm --no-deps \
-  -v "$PWD/backend/tests:/app/backend/tests:ro" \
-  -v "$PWD/scripts:/app/scripts:ro" \
-  trainer python -m pytest backend/tests/ -v
+  -v ./backend/tests:/app/tests:ro \
+  -v ./scripts:/scripts:ro \
+  trainer python -m pytest /app/tests/test_remote_workers.py -v
+
+# 项目根目录：GPU 与 CPU 的远程管理 Compose 解析
+WORKER_SSH_KNOWN_HOSTS_HOST_PATH=/etc/hosts WORKER_SSH_KEY_HOST_PATH=/dev/null \
+  docker compose -f docker-compose.yml -f docker-compose.remote.yml config --services
+WORKER_SSH_KNOWN_HOSTS_HOST_PATH=/etc/hosts WORKER_SSH_KEY_HOST_PATH=/dev/null \
+  docker compose -f docker-compose.cpu.yml -f docker-compose.remote.yml config --services
 ```
 
 **验收标准—测试用例映射**：
 
 | 验收标准 | 测试层级与用例 | 输入与预期 | 场景 |
 |---|---|---|---|
-| 页面登记服务器后由平台 SSH 执行脚本，目标机不接收项目源码 | API/脚本：`test_remote_server_api_installs_and_manages_with_nonsecret_records`、`test_render_remote_script_quotes_values_and_does_not_transfer_repository`、`test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv`；Safari 表单检查 | 授权请求创建异步安装；脚本经 stdin 发送、镜像由目标机拉取；记录不含令牌/私钥；SSH 严格校验已登记主机密钥 | 正常、权限与安全、兼容 |
+| 平台可统一选择 SSH 密钥或密码认证，密码与密钥口令不写入命令行或日志，密码不发给 worker 容器 | 执行器：`test_remote_configuration_supports_platform_password_without_key_file`、`test_remote_configuration_requires_password_and_valid_auth_method`、`test_remote_configuration_rejects_newline_in_platform_password`、`test_run_remote_action_uses_password_from_platform_askpass`、`test_run_remote_action_redacts_password_from_ssh_error`、`test_run_remote_action_uses_key_passphrase_without_exposing_it`；Compose 环境检查 | 密码模式不需要私钥；askpass 读取平台环境；命令参数不含凭证、输出会脱敏；worker 环境不含密码 | 正常、边界、异常、权限与安全 |
+| 常见私钥格式由 OpenSSH 识别，现有配置默认仍使用私钥认证 | 执行器：`test_openssh_reads_supported_private_key_formats`、`test_remote_configuration_requires_key_permissions_and_registry`、`test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv` | Ed25519、ECDSA、RSA OpenSSH/PEM 可解析；保留固定 known_hosts 严格校验；不自动启用弱算法 | 正常、兼容、安全 |
+| 页面登记服务器后由平台 SSH 执行脚本，目标机不接收项目源码 | API/脚本：`test_remote_server_api_installs_and_manages_with_nonsecret_records`、`test_render_remote_script_quotes_values_and_does_not_transfer_repository`、`test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv` | 授权请求创建异步安装；脚本经 stdin 发送、镜像由目标机拉取；记录不含令牌/私钥；SSH 严格校验已登记主机密钥 | 正常、权限与安全、兼容 |
 | 缺配置、错误令牌、非法目标或注入输入会拒绝 SSH 操作 | API/执行器：`test_remote_management_requires_an_enabled_admin_token`、`test_remote_server_api_rejects_shell_injection_before_ssh`、`test_render_remote_script_rejects_shell_and_path_injection`、`test_remote_configuration_requires_key_permissions_and_registry`、`test_remote_configuration_requires_shared_queue_and_object_storage` | 远程功能默认关闭；错误令牌 401、关闭时 503、格式非法 422；共享 Redis/S3、私钥权限或镜像引用不满足时配置检查失败 | 边界、异常、权限与安全 |
 | 安装后可启动、停止、重启并重试部署；操作状态可轮询 | API/执行器：`test_remote_server_api_installs_and_manages_with_nonsecret_records`、`test_execute_remote_operation_persists_success_and_failure`、`test_remote_bootstrap_script_lifecycle` | install/start/stop/restart 返回可轮询状态；错误记录失败原因；停止/重启使用 45 秒优雅等待 | 正常、异常、状态冲突、回归 |
-| 目标 worker 自动报告 CPU/GPU，资源槽由用户手动选择 | Shell/worker/API：`test_remote_bootstrap_script_installs_cpu_and_gpu_workers`、`test_detect_capabilities_reports_cpu_and_stable_server_identity`、`test_managed_worker_selection_api`、Safari 表单检查 | CPU/GPU 镜像配置正确；槽位首次默认待选；用户可手动启用 | 正常、边界、兼容；真实 GPU 受硬件限制 |
-| 远程配置可持久读取，既有训练、数据集和存储行为不回归 | `test_remote_server_and_operation_metadata_roundtrip` 与完整 `backend/tests/` | 远程服务器/操作元数据往返通过；完整测试 147 通过、6 跳过、0 失败 | 正常、兼容、回归 |
+| 目标 worker 自动报告 CPU/GPU，资源槽由用户手动选择 | Shell/worker/API：`test_remote_bootstrap_script_installs_cpu_and_gpu_workers`、`test_detect_capabilities_reports_cpu_and_stable_server_identity`、`test_managed_worker_selection_api` | CPU/GPU 镜像配置正确；槽位首次默认待选；用户可手动启用 | 正常、边界、兼容；真实 GPU 受硬件限制 |
+| 远程配置可持久读取，既有训练、数据集和存储行为不回归 | `test_remote_server_and_operation_metadata_roundtrip` 与完整 `backend/tests/` | 远程服务器/操作元数据往返通过；完整测试 157 通过、6 跳过、0 失败 | 正常、兼容、回归 |
 
 **未验证内容和限制**：
 - 未在真实外部服务器上运行 SSH 安装及生命周期操作；目标机的 Docker 权限、主机指纹、镜像拉取、Redis/S3 连通仍需在目标环境验收。
+- 平台密码是全局配置并用于所有远程账号；需要每台服务器使用不同登录密码时，当前版本不支持分别设置。旧服务器若只支持 RSA/SHA-1 等弱 SSH 算法，也不会自动降低客户端安全设置。
 - 本机无 NVIDIA GPU，未验证真实 GPU 型号、显存与训练执行；CPU 路径已覆盖。
 - Redis/S3 集成按门控跳过，无法在本轮证明外部 Redis 中的选择持久化及对象存储连通。
 - 私有镜像仓库需要先让目标机具备镜像拉取凭据；目标机不需要检出源码或手动运行项目脚本。
@@ -203,7 +214,7 @@ MTP_TEST_S3=localhost:9000 python3 -m pytest tests/test_storage.py -q  # 22/22
 
 ## 已知问题与限制
 
-**新增限制—远程 SSH 目标环境尚未实测**：当前测试使用 fake SSH/Docker；上线前需配置只读挂载且权限为 600 的 SSH 私钥、核验后的 `known_hosts`、可拉取的 worker 镜像，以及从目标机可访问的 Redis/S3 地址。私有镜像需目标机预置 registry 登录凭据。
+**新增限制—远程 SSH 目标环境尚未实测**：当前测试使用 fake SSH/Docker；上线前需配置平台统一的 SSH 私钥或密码、核验后的 `known_hosts`、可拉取的 worker 镜像，以及从目标机可访问的 Redis/S3 地址。密钥认证的私钥文件权限需限制为 600。私有镜像需目标机预置 registry 登录凭据。
 1. **真实 GPU 行为未验证**：本机无 NVIDIA GPU（torch 2.8 CPU only，容器内 torch 2.14.1+cu130 亦无 GPU），CUDA_VISIBLE_DEVICES 隔离、驱动崩溃恢复、显存匹配的真实行为需在 GPU 服务器按以下清单复验：
    - GPU 版 compose 的 `gpus: all` 与一卡一子进程隔离
    - `--probe-gpu` 在有卡机器返回 0、掉卡恢复后 supervisor 自动重启槽位
@@ -222,7 +233,7 @@ MTP_TEST_S3=localhost:9000 python3 -m pytest tests/test_storage.py -q  # 22/22
 - ✅ 修改了训练器或任务管理
 - ✅ 修改了 API 路由
 - ✅ 修改了核心配置（影响业务逻辑的配置）
-- ✅ 修改了远程 SSH 执行器或目标机单文件脚本（`backend/app/remote_workers.py`、`backend/app/remote_worker.sh`）
+- ✅ 修改了远程 SSH 执行器、认证 helper、认证配置或目标机单文件脚本（`backend/app/remote_workers.py`、`backend/app/ssh_askpass.sh`、`backend/app/config.py`、`backend/app/remote_worker.sh`）
 - ❌ 仅修改前端（`backend/static/`）、文档、数据库脚本、构建配置、测试代码时不强制重测
 
 标准测试命令：`cd backend && python3 -m pytest tests/ -v`；Redis/S3 集成用 `MTP_TEST_REDIS` / `MTP_TEST_S3` 环境变量门控开启。
