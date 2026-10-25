@@ -200,11 +200,16 @@
   @keyframes toastIn { from { opacity: 0; transform: translateX(12px); }
                        to { opacity: 1; transform: none; } }
 </style>
+<link rel="stylesheet" href="/app.css">
 </head>
 <body>
 
 <header class="topbar">
   <div class="brand">🏋️ 可视化模型训练平台<span class="sub">Docker · Python 3.12 · PyTorch GPU</span></div>
+  <nav class="app-nav" aria-label="主导航">
+    <a href="/" aria-current="page">训练工作台</a>
+    <a href="/dataset-manager.html">数据集管理</a>
+  </nav>
   <div id="deviceBadge" class="badge"><span class="dot"></span><span id="deviceText">检测训练设备中…</span></div>
 </header>
 
