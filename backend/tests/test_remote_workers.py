@@ -96,6 +96,16 @@ def test_remote_configuration_requires_password_and_valid_auth_method(tmp_path, 
     assert any("只能是 key 或 password" in item for item in errors)
 
 
+def test_remote_configuration_rejects_newline_in_platform_password(tmp_path, monkeypatch):
+    """平台统一密码不能包含换行，避免 askpass 凭证产生多行响应。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
+    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", "password\nsecond-line")
+
+    assert any("SSH 凭证不能包含换行符" in item for item in remote_workers.remote_configuration_errors())
+
+
 @pytest.mark.parametrize(
     ("key_type", "key_options"),
     [
@@ -216,6 +226,27 @@ def test_run_remote_action_uses_password_from_platform_askpass(tmp_path, monkeyp
     assert calls["askpass_mode"] == 0o755
     assert "[redacted]" in result["stdout"]
     assert Path(calls["environment"]["SSH_ASKPASS"]).name == "ssh_askpass.sh"
+
+
+def test_run_remote_action_redacts_password_from_ssh_error(tmp_path, monkeypatch):
+    """SSH 登录失败信息即使回显凭证也应脱敏后返回。"""
+    _remote_config(tmp_path, monkeypatch)
+    password = "platform-secret-for-error-test"
+    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
+    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", password)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+
+    def fake_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command, 255, stdout="", stderr=f"SSH rejected credential {password}"
+        )
+
+    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    with pytest.raises(remote_workers.RemoteWorkerError) as exc_info:
+        remote_workers.run_remote_action(_server(), "start")
+
+    assert password not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
 
 
 def test_run_remote_action_uses_key_passphrase_without_exposing_it(tmp_path, monkeypatch):
