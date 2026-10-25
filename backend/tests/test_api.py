@@ -191,6 +191,98 @@ def test_managed_worker_selection_api(client):
         manager.lease.deregister_worker(worker_id)
 
 
+def test_remote_management_requires_an_enabled_admin_token(client, monkeypatch):
+    """SSH 管理接口默认关闭，启用后未提供或提供错误令牌均不得访问。"""
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", False)
+    assert client.get("/api/remote-servers").status_code == 503
+
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", "remote-admin-token-0123456789-abcd")
+    assert client.get("/api/remote-servers").status_code == 401
+    assert client.get(
+        "/api/remote-servers", headers={"X-Worker-Admin-Token": "incorrect-token"}
+    ).status_code == 401
+
+
+def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, monkeypatch):
+    """令牌保护的远程添加与生命周期 API 仅保存 SSH 目标元数据并记录异步操作。"""
+    from app.routers import jobs as jobs_router
+    from app import remote_workers
+    from app.state import manager
+
+    token = "remote-admin-token-0123456789-abcd"
+    headers = {"X-Worker-Admin-Token": token}
+    machine_id = f"remote-api-{time.time_ns()}"
+    calls = []
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda: [])
+    monkeypatch.setattr(
+        remote_workers,
+        "run_remote_action",
+        lambda server, action: calls.append((server["machine_id"], action)) or {"stdout": "done"},
+    )
+    payload = {
+        "machine_id": machine_id,
+        "host": "compute.example.net",
+        "username": "worker",
+        "port": 2222,
+        "mode": "gpu",
+        "cpu_slots": 0,
+    }
+    added = client.post("/api/remote-servers", json=payload, headers=headers)
+    assert added.status_code == 202
+    operation_id = added.json()["operation_id"]
+    operation = client.get(f"/api/remote-operations/{operation_id}", headers=headers).json()
+    assert operation["status"] == "completed"
+    assert operation["output"] == "done"
+    assert calls == [(machine_id, "install")]
+
+    servers = client.get("/api/remote-servers", headers=headers).json()["servers"]
+    server = next(item for item in servers if item["machine_id"] == machine_id)
+    assert server["host"] == payload["host"]
+    assert "private_key" not in server and "token" not in server
+    assert client.post("/api/remote-servers", json=payload, headers=headers).status_code == 409
+
+    for action in ("install", "start", "stop", "restart"):
+        result = client.post(f"/api/remote-servers/{machine_id}/{action}", headers=headers)
+        assert result.status_code == 202
+        current = client.get(
+            f"/api/remote-operations/{result.json()['operation_id']}", headers=headers
+        ).json()
+        assert current["status"] == "completed"
+        assert calls[-1] == (machine_id, action)
+
+    assert client.post(
+        f"/api/remote-servers/missing-{machine_id}/start", headers=headers
+    ).status_code == 404
+    assert client.get(f"/api/remote-operations/{operation_id}").status_code == 401
+    manager.lease.delete_remote_server(machine_id)
+
+
+def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatch):
+    """非法主机字段由请求模型拒绝，不进入 SSH 执行器。"""
+    from app.routers import jobs as jobs_router
+
+    token = "remote-admin-token-0123456789-abcd"
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda: [])
+    response = client.post(
+        "/api/remote-servers",
+        headers={"X-Worker-Admin-Token": token},
+        json={
+            "machine_id": "remote-injection-test",
+            "host": "compute.example.net;touch /tmp/pwned",
+            "username": "worker",
+            "port": 22,
+            "mode": "cpu",
+            "cpu_slots": 2,
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_pause_resume_via_http(client, make_dataset):
     """HTTP 链路：running → pause → paused → resume → completed，曲线连续。"""
     ds = make_dataset(n=2000)

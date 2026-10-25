@@ -155,6 +155,26 @@ def test_worker_selection_is_saved_independently_of_heartbeat():
     assert ls.is_worker_enabled("remote-a-cpu0", default=True) is False
 
 
+def test_remote_server_and_operation_metadata_roundtrip():
+    """远程连接元数据与操作状态可持久读取，且服务器记录不要求 SSH 私钥字段。"""
+    ls = EmbeddedLeaseStore()
+    server = {
+        "machine_id": "remote-server-a",
+        "host": "compute.example.net",
+        "username": "worker",
+        "port": 22,
+        "mode": "gpu",
+        "status": "provisioning",
+    }
+    ls.set_remote_server("remote-server-a", server)
+    operation = {"operation_id": "op-a", "status": "queued", "machine_id": "remote-server-a"}
+    ls.set_remote_operation("op-a", operation)
+
+    assert ls.get_remote_server("remote-server-a") == server
+    assert ls.list_remote_servers() == [server]
+    assert ls.get_remote_operation("op-a") == operation
+
+
 def test_build_coordination_embedded():
     """兼容性：REDIS_URL 为空时返回嵌入式实现（单机零依赖形态）。"""
     import pytest
@@ -226,6 +246,14 @@ def test_redis_semantics_match_embedded():
     assert ls.is_worker_enabled("wr", default=True) is False
     ls.deregister_worker("wr")
     assert ls.is_worker_enabled("wr", default=True) is False
+
+    server = {"machine_id": "remote-wr", "host": "compute.example.net", "port": 22}
+    ls.set_remote_server("remote-wr", server)
+    assert ls.get_remote_server("remote-wr") == server
+    assert ls.list_remote_servers() == [server]
+    operation = {"operation_id": "remote-op", "status": "queued"}
+    ls.set_remote_operation("remote-op", operation)
+    assert ls.get_remote_operation("remote-op") == operation
 
 
 def test_redis_worker_registry_roundtrip_nested_caps():

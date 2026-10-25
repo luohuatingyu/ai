@@ -34,3 +34,14 @@ class WorkerSelectionRequest(BaseModel):
     """外部计算槽接单选择请求。"""
 
     enabled: StrictBool
+
+
+class RemoteServerRequest(BaseModel):
+    """登记一台由平台经 SSH 远程接入的计算服务器。"""
+
+    machine_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    host: str = Field(min_length=1, max_length=253, pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
+    username: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z_][A-Za-z0-9_-]*$")
+    port: int = Field(default=22, ge=1, le=65535)
+    mode: Literal["cpu", "gpu"] = "gpu"
+    cpu_slots: int = Field(default=2, ge=0, le=256)

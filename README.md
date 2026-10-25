@@ -6,7 +6,7 @@
 - 🚀 页面配置超参（epochs / batch_size / lr / 网络结构 / 验证集比例）一键发起训练
 - 📈 实时 Loss 曲线、验证指标曲线（Chart.js）、进度条
 - 📜 实时训练日志，任务可排队、暂停（保存断点）、恢复（跨卡/跨机接续）、取消、删除
-- 🖥 计算资源管理：一次脚本接入服务器、自动检测 CPU/GPU、手动选择计算槽加入资源池
+- 🖥 计算资源管理：平台通过 SSH 远程执行单文件部署脚本、自动检测 CPU/GPU、手动选择计算槽加入资源池，并可远程启动/停止/重启 worker
 - 🏆 训练完成自动给出分类报告 / 回归指标（MSE、RMSE、MAE、R²）
 - 🔮 加载 best.pt 在线单条预测，模型权重可下载
 - ♻️ 环境性故障（CUDA/OOM/网络瞬断）自动从断点续训（`JOB_MAX_AUTO_RETRY` 次内），单卡故障不影响整体任务完成
@@ -101,30 +101,41 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
 
 ### 2. 追加计算服务器（CPU / GPU 均可）
 
-主页面点击「添加服务器」，在目标服务器获取本项目代码后运行一次引导命令：
+外接服务器由平台直接通过 SSH 管理。目标服务器不需要检出或接收本项目源码；平台经 SSH stdin 发送一个部署脚本，目标机从镜像仓库拉取已构建的 worker 镜像。开始前准备：
 
-```bash
-# GPU 服务器
-./scripts/worker-node.sh add
+1. 在平台宿主机准备专用 SSH 私钥和 `known_hosts` 文件。将目标服务器主机密钥指纹通过可信渠道核验后加入 `known_hosts`；SSH 使用严格主机校验，不接受未登记或变化的主机密钥。
+2. 在项目 `.env` 中设置远程管理与目标网络配置：
+   ```dotenv
+   WORKER_IMAGE=registry.example.com/your-project/mtp-worker:tag
+   WORKER_REMOTE_TOKEN=替换为至少32位的随机令牌
+   WORKER_REMOTE_REDIS_URL=redis://目标服务器可访问的Redis主机:6379/0
+   WORKER_REMOTE_S3_ENDPOINT=目标服务器可访问的S3主机:8333
+   WORKER_SSH_KEY_HOST_PATH=/宿主机路径/worker_ssh_key
+   WORKER_SSH_KNOWN_HOSTS_HOST_PATH=/宿主机路径/worker_known_hosts
+   ```
+   `WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 必须从目标机网络可达，并分别对应当前平台使用的 Redis 和 S3 存储。`WORKER_REMOTE_TOKEN` 用于保护页面的远程管理 API。
+3. 登录镜像仓库，构建并推送 worker 镜像。GPU 平台使用默认 Compose 文件；纯 CPU 平台使用 CPU 文件：
+   ```bash
+   docker login registry.example.com
+   docker compose build worker
+   docker compose push worker
 
-# CPU 服务器改用纯 CPU compose 文件
-WORKER_COMPOSE_FILE=docker-compose.cpu.yml ./scripts/worker-node.sh add
-```
+   # CPU 版
+   docker compose -f docker-compose.cpu.yml build worker
+   docker compose -f docker-compose.cpu.yml push worker
+   ```
+4. 使用远程管理 Compose 覆盖文件启动平台。GPU / CPU 两种启动方式如下：
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.remote.yml up --build -d
 
-首次运行会询问主节点 Redis URL、S3 地址和服务器标识，并可填写 S3 凭据；配置写入仓库根目录 `.env.worker`，文件权限为 `600`，不会覆盖项目 `.env`。之后脚本会构建并启动本机 worker，不会启动目标服务器上的 Redis 或 S3。目标机需要安装 Docker Compose，并能访问主节点 Redis 与 S3。
+   # CPU 版
+   docker compose -f docker-compose.cpu.yml -f docker-compose.remote.yml up --build -d
+   ```
+5. 打开主页面「添加服务器」，填写目标主机、SSH 用户/端口、服务器标识、CPU/GPU 类型及 `WORKER_REMOTE_TOKEN`。平台会执行安装并启动 worker；资源心跳出现后，CPU/GPU 槽默认处于待选择状态，手动点击「加入资源池」才会接收训练任务。服务器卡片还可通过 SSH 启动、停止或重启 worker。
 
-worker 会自动上报可用 CPU 线程数、内存、GPU 型号和显存。槽位首次出现时默认为「待选择」，不会领取任务；在主页面按 GPU 卡或 CPU 执行槽点击「加入资源池」后，才会接收任务。页面的「停止接单」会阻止该槽领取新任务，已经运行的任务会正常结束。加入状态保存在 Redis，worker 重启后仍然有效。
+平台的 `trainer` 容器需要能读取私钥与 `known_hosts` 文件，且 SSH 用户需要有 Docker 权限。目标服务器需要运行 Docker Engine；私有镜像仓库需确保目标机已经具备 `docker login` 凭据。GPU 目标机还需要 NVIDIA 驱动和 NVIDIA Container Toolkit。`stop` 和 `restart` 会给予 worker 最多 45 秒优雅停机时间，运行中的任务会保存断点，再由其它在线计算槽接续。
 
-在目标服务器上可直接管理 worker 进程：
-
-```bash
-./scripts/worker-node.sh start
-./scripts/worker-node.sh stop
-./scripts/worker-node.sh restart
-./scripts/worker-node.sh status
-```
-
-`stop` 和 `restart` 会给 worker 最多 45 秒优雅停机时间，正在运行的任务会保存断点，随后可由其它在线计算槽接续。worker 离线后会在心跳过期时从面板移除。页面控制的是接单状态；实际容器进程启动、停止和重启仍由目标机上的脚本执行。
+远程操作配置以单文件脚本通过 SSH stdin 发送；脚本会把 worker 运行所需配置以权限 `600` 保存到目标机用户的 `~/.config/mtp-worker/`，不会把平台源码复制到目标服务器。服务器记录不保存 SSH 密钥、远程管理令牌或 S3 密钥。平台现有 API 尚未提供通用身份认证；远程管理路由使用独立令牌，部署时仍应限制平台管理页面的网络访问。
 
 ### 3. 迁移历史数据（老版本升级）
 
@@ -175,7 +186,7 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 ├── frontend/
 │   ├── Dockerfile            # node:20-alpine（基础镜像经 .env 可配国内源）
 │   └── server.js             # 零依赖静态服务 + /api 反向代理（容器内运行）
-├── scripts/worker-node.sh    # 外接计算服务器的一次接入脚本与本地生命周期管理
+├── docker-compose.remote.yml # 远程 SSH 管理覆盖配置（只读挂载私钥与 known_hosts）
 ├── backend/
 │   ├── Dockerfile            # python:3.12-slim + CUDA 构建 torch
 │   ├── requirements.txt

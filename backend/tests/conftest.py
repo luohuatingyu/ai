@@ -32,6 +32,8 @@ os.environ.update(
         "WORKER_CPU_SLOTS": "2",  # Supervisor E2E 需要 >=2 个槽验证并行
         "WORKER_MANAGED": "false",  # 测试夹具中的 worker 保持原有自动接单语义
         "WORKER_MACHINE_ID": "",
+        "WORKER_REMOTE_ENABLED": "false",
+        "WORKER_REMOTE_TOKEN": "",
         "WORKER_HEARTBEAT_INTERVAL": "0.3",
         "WORKER_LEASE_TTL": "2",
         "WORKER_CHECKPOINT_INTERVAL": "2",

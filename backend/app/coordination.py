@@ -28,6 +28,9 @@ _WORKERS_SET = "mtp:workers:all"
 _WORKER_INFO = "mtp:worker:{worker_id}:info"
 _WORKER_HB = "mtp:worker:{worker_id}:hb"
 _WORKER_ENABLED = "mtp:workers:enabled"
+_REMOTE_SERVERS = "mtp:remote:servers"
+_REMOTE_OPERATION = "mtp:remote:operation:{operation_id}"
+_REMOTE_OPERATION_TTL = 7 * 24 * 3600
 
 # 信号 TTL：控制信号 1 小时后自动清理，避免遗留脏信号影响后续轮次
 _SIGNAL_TTL = 3600
@@ -233,6 +236,30 @@ class LeaseStore:
         """读取计算槽接单开关；未配置时返回调用方给定的兼容默认值。"""
         raise NotImplementedError
 
+    def set_remote_server(self, machine_id: str, info: Dict[str, object]) -> None:
+        """保存不含密钥的远程服务器连接信息。"""
+        raise NotImplementedError
+
+    def get_remote_server(self, machine_id: str) -> Optional[Dict[str, object]]:
+        """读取远程服务器连接信息。"""
+        raise NotImplementedError
+
+    def list_remote_servers(self) -> List[Dict[str, object]]:
+        """列出已登记的远程服务器连接信息。"""
+        raise NotImplementedError
+
+    def delete_remote_server(self, machine_id: str) -> None:
+        """删除一条远程服务器连接记录，不访问目标服务器。"""
+        raise NotImplementedError
+
+    def set_remote_operation(self, operation_id: str, info: Dict[str, object]) -> None:
+        """保存远程 SSH 操作进度。"""
+        raise NotImplementedError
+
+    def get_remote_operation(self, operation_id: str) -> Optional[Dict[str, object]]:
+        """读取远程 SSH 操作进度。"""
+        raise NotImplementedError
+
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的 worker 注册条目（崩溃/未优雅退出残留），返回清除数量。"""
         raise NotImplementedError
@@ -247,6 +274,8 @@ class EmbeddedLeaseStore(LeaseStore):
         self._signals: Dict[str, Set[str]] = {}   # job_id -> 活跃信号集合
         self._workers: Dict[str, Dict[str, object]] = {}  # worker_id -> info(含 last_seen)
         self._worker_enabled: Dict[str, bool] = {}  # worker_id -> 是否允许接单
+        self._remote_servers: Dict[str, Dict[str, object]] = {}
+        self._remote_operations: Dict[str, Dict[str, object]] = {}
 
     def healthy(self) -> bool:
         return True
@@ -341,6 +370,38 @@ class EmbeddedLeaseStore(LeaseStore):
         """读取进程内计算槽接单状态；未显式配置时保持旧 worker 默认行为。"""
         with self._lock:
             return self._worker_enabled.get(worker_id, bool(default))
+
+    def set_remote_server(self, machine_id: str, info: Dict[str, object]) -> None:
+        """在进程内保存非敏感远程服务器元数据。"""
+        with self._lock:
+            self._remote_servers[machine_id] = dict(info)
+
+    def get_remote_server(self, machine_id: str) -> Optional[Dict[str, object]]:
+        """读取进程内远程服务器元数据副本。"""
+        with self._lock:
+            info = self._remote_servers.get(machine_id)
+            return dict(info) if info is not None else None
+
+    def list_remote_servers(self) -> List[Dict[str, object]]:
+        """列出进程内登记的远程服务器。"""
+        with self._lock:
+            return [dict(info) for info in self._remote_servers.values()]
+
+    def delete_remote_server(self, machine_id: str) -> None:
+        """删除进程内远程服务器元数据。"""
+        with self._lock:
+            self._remote_servers.pop(machine_id, None)
+
+    def set_remote_operation(self, operation_id: str, info: Dict[str, object]) -> None:
+        """在进程内保存远程操作状态副本。"""
+        with self._lock:
+            self._remote_operations[operation_id] = dict(info)
+
+    def get_remote_operation(self, operation_id: str) -> Optional[Dict[str, object]]:
+        """读取进程内远程操作状态副本。"""
+        with self._lock:
+            info = self._remote_operations.get(operation_id)
+            return dict(info) if info is not None else None
 
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的注册条目（存活 worker 心跳远短于宽限期）。"""
@@ -458,6 +519,49 @@ class RedisLeaseStore(LeaseStore):
         if value is None:
             return bool(default)
         return str(value) == "1"
+
+    def set_remote_server(self, machine_id: str, info: Dict[str, object]) -> None:
+        """将不含凭证的远程服务器配置写入 Redis。"""
+        self._redis.hset(_REMOTE_SERVERS, machine_id, json.dumps(info, ensure_ascii=False))
+
+    def get_remote_server(self, machine_id: str) -> Optional[Dict[str, object]]:
+        """从 Redis 读取一个远程服务器配置。"""
+        value = self._redis.hget(_REMOTE_SERVERS, machine_id)
+        if value is None:
+            return None
+        parsed = unjsonable(value)
+        return parsed if isinstance(parsed, dict) else None
+
+    def list_remote_servers(self) -> List[Dict[str, object]]:
+        """从 Redis 列出服务器配置，避免将 SSH 凭证放入协调存储。"""
+        values = self._redis.hgetall(_REMOTE_SERVERS)
+        out = []
+        for machine_id, value in values.items():
+            parsed = unjsonable(value)
+            if isinstance(parsed, dict):
+                parsed.setdefault("machine_id", str(machine_id))
+                out.append(parsed)
+        return sorted(out, key=lambda item: str(item.get("machine_id", "")))
+
+    def set_remote_operation(self, operation_id: str, info: Dict[str, object]) -> None:
+        """将远程操作状态写入 Redis，供页面轮询和 API 重启后查询。"""
+        self._redis.set(
+            _REMOTE_OPERATION.format(operation_id=operation_id),
+            json.dumps(info, ensure_ascii=False),
+            ex=_REMOTE_OPERATION_TTL,
+        )
+
+    def get_remote_operation(self, operation_id: str) -> Optional[Dict[str, object]]:
+        """从 Redis 读取远程操作状态。"""
+        value = self._redis.get(_REMOTE_OPERATION.format(operation_id=operation_id))
+        if value is None:
+            return None
+        parsed = unjsonable(value)
+        return parsed if isinstance(parsed, dict) else None
+
+    def delete_remote_server(self, machine_id: str) -> None:
+        """从 Redis 删除远程服务器元数据，不访问目标服务器。"""
+        self._redis.hdel(_REMOTE_SERVERS, machine_id)
 
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳 key 已消失且注册信息长期未更新的 worker 条目。

@@ -1,0 +1,17 @@
+# 远程服务器管理覆盖配置：平台 trainer 挂载专用 SSH 私钥与已核验 known_hosts。
+# 使用前通过环境变量 WORKER_SSH_KEY_HOST_PATH 与
+# WORKER_SSH_KNOWN_HOSTS_HOST_PATH 指向平台宿主机上的只读文件。
+
+services:
+  trainer:
+    volumes:
+      - type: bind
+        source: ${WORKER_SSH_KEY_HOST_PATH:?请设置 WORKER_SSH_KEY_HOST_PATH}
+        target: /run/remote-worker/ssh_key
+        read_only: true
+      - type: bind
+        source: ${WORKER_SSH_KNOWN_HOSTS_HOST_PATH:?请设置 WORKER_SSH_KNOWN_HOSTS_HOST_PATH}
+        target: /run/remote-worker/known_hosts
+        read_only: true
+    environment:
+      WORKER_REMOTE_ENABLED: "true"

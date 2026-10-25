@@ -55,6 +55,7 @@
     font-size: 13px; width: 100%; transition: border-color var(--trans), box-shadow var(--trans); }
   input:hover, select:hover, textarea:hover { border-color: var(--border-strong); }
   input[type="checkbox"] { width: auto; accent-color: var(--accent); cursor: pointer; }
+  input[type="radio"] { width: auto; margin: 0; padding: 0; accent-color: var(--accent); cursor: pointer; flex: none; }
   textarea { font-family: ui-monospace, Menlo, monospace; min-height: 120px; resize: vertical; }
   select { cursor: pointer; }
 
@@ -146,6 +147,7 @@
     background:linear-gradient(135deg, rgba(88,166,255,.055), transparent 42%), var(--panel2); }
   .server-head { display:flex; align-items:center; justify-content:space-between; gap:14px;
     padding:13px 15px; border-bottom:1px solid var(--border); }
+  .server-head-main { min-width:0; flex:1; }
   .server-title { min-width:0; display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
   .server-title strong { font-size:14px; overflow-wrap:anywhere; }
   .server-kind { padding:2px 8px; border:1px solid var(--border); border-radius:999px;
@@ -154,6 +156,10 @@
   .server-presence.offline { color:var(--muted); }
   .server-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:9px 15px 2px;
     color:var(--muted); font-size:12px; }
+  .server-head-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+  .server-controls { display:flex; gap:6px; flex-wrap:wrap; }
+  .server-controls button { padding:5px 9px; font-size:11px; }
+  .server-operation { padding:7px 15px 0; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
   .server-slots { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:8px; padding:10px 12px 13px; }
   .resource-slot { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px;
     padding:10px 11px; border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.42); }
@@ -170,24 +176,29 @@
   .server-modal { position:fixed; inset:0; z-index:60; display:none; align-items:center; justify-content:center;
     padding:18px; background:rgba(4,8,14,.78); backdrop-filter:blur(5px); }
   .server-modal.open { display:flex; }
-  .server-modal-card { width:min(620px,100%); max-height:90vh; overflow:auto; padding:22px;
+  .server-modal-card { width:min(660px,100%); max-height:90vh; overflow:auto; padding:22px;
     border:1px solid var(--border-strong); border-radius:14px; background:var(--panel); box-shadow:var(--shadow-md); }
   .server-modal-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
   .server-modal-head h3 { margin:0; font-size:18px; }
-  .server-modal-card p, .server-modal-card li { color:var(--muted); font-size:13px; }
-  .server-modal-card ol { padding-left:21px; }
-  .server-modal-card li + li { margin-top:7px; }
-  .server-command { display:flex; align-items:center; gap:8px; margin-top:12px; padding:10px;
-    border:1px solid var(--border); border-radius:9px; background:#0d1117; }
-  .server-command code { min-width:0; flex:1; overflow-x:auto; color:#a5d6ff; white-space:nowrap; }
-  .server-mode { display:flex; gap:7px; flex-wrap:wrap; margin-top:15px; }
-  .server-mode button.active { border-color:var(--accent); color:#a5d6ff; background:rgba(88,166,255,.1); }
+  .server-modal-card p { color:var(--muted); font-size:13px; line-height:1.6; }
+  .server-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:15px; }
+  .server-form .field { min-width:0; }
+  .server-form .field.wide { grid-column:1/-1; }
+  .server-mode { display:flex; gap:7px; flex-wrap:wrap; }
+  .server-mode label { display:flex; align-items:center; gap:7px; padding:8px 11px;
+    border:1px solid var(--border); border-radius:9px; cursor:pointer; color:var(--text); }
+  .server-mode label:has(input:checked) { border-color:var(--accent); color:#a5d6ff; background:rgba(88,166,255,.1); }
+  .server-form .hint { margin-top:4px; }
+  .server-form-actions { grid-column:1/-1; display:flex; justify-content:flex-end; gap:8px; margin-top:3px; }
+  .server-form-actions button { min-width:120px; }
   .server-modal-note { margin-top:14px; padding:10px 12px; border-left:3px solid var(--warning,var(--warn));
     border-radius:5px; color:#e3b341; background:rgba(210,153,34,.08); font-size:12px; }
   @media (max-width:560px) {
     .server-head { align-items:flex-start; flex-direction:column; gap:5px; }
     .server-slots { grid-template-columns:1fr; padding:9px; }
     .server-modal-card { padding:17px; }
+    .server-form { grid-template-columns:1fr; }
+    .server-form .field.wide,.server-form-actions { grid-column:auto; }
   }
 
   /* ===== 进度条 ===== */
@@ -328,7 +339,7 @@
         <button id="btnAddServer" class="primary">＋ 添加服务器</button>
       </div>
     </div>
-    <div class="hint" style="margin-top:4px;">连接服务器后自动检测 CPU / GPU；选择要加入资源池的计算槽。停用后不再领取新任务，运行中的任务会完成后退出。</div>
+    <div class="hint" style="margin-top:4px;">平台通过 SSH 连接服务器并执行单文件脚本，不同步项目源码；worker 自动检测 CPU / GPU，槽位需手动加入资源池。停用后不再领取新任务，运行中的任务会完成后退出。</div>
     <div id="workerSummary" class="compute-summary" aria-live="polite"></div>
     <div id="workerGrid" class="server-grid"><div class="empty">尚未发现计算服务器。添加服务器后，页面会显示检测到的计算资源。</div></div>
 
@@ -379,21 +390,50 @@
 <div id="addServerModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="addServerTitle" hidden>
   <div class="server-modal-card">
     <div class="server-modal-head">
-      <h3 id="addServerTitle">添加计算服务器</h3>
+      <h3 id="addServerTitle">通过 SSH 添加服务器</h3>
       <button id="btnCloseAddServer" class="close-btn" aria-label="关闭">×</button>
     </div>
-    <p>为避免保存服务器登录凭证，平台通过一次引导脚本接入。目标服务器需要安装 Docker Compose，并能访问主节点的 Redis 和 S3 服务。</p>
-    <div class="server-mode" role="group" aria-label="目标服务器类型">
-      <button type="button" class="active" data-worker-mode="gpu">GPU 服务器</button>
-      <button type="button" data-worker-mode="cpu">CPU 服务器</button>
-    </div>
-    <div class="server-command"><code id="workerAddCommand">./scripts/worker-node.sh add</code><button id="btnCopyWorkerCommand">复制命令</button></div>
-    <ol>
-      <li>在目标服务器获取本项目代码；已有项目目录时直接进入该目录。</li>
-      <li>运行上方命令。首次运行会询问 Redis、S3 地址和服务器标识，并把配置以仅当前用户可读的权限保存在 <code>.env.worker</code>。</li>
-      <li>worker 自动上报 CPU 线程数、内存、GPU 型号和显存。回到本页，在每个计算槽上点击「加入资源池」。</li>
-    </ol>
-    <div class="server-modal-note">GPU 服务器需要 NVIDIA 驱动和 nvidia-container-toolkit。首次探测到的计算槽默认不会接收训练任务，需手动加入。</div>
+    <p>平台会通过预配置的 SSH 密钥连接目标机，远程执行单文件部署脚本并拉取 worker 镜像。不会同步项目源码。目标机需要 SSH 可达、安装 Docker，并能访问镜像仓库、Redis 和 S3。</p>
+    <form id="remoteServerForm" class="server-form">
+      <div class="field">
+        <label for="remoteMachineId">服务器标识</label>
+        <input id="remoteMachineId" name="machine_id" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" placeholder="例如 gpu-node-01">
+      </div>
+      <div class="field">
+        <label for="remoteHost">SSH 主机</label>
+        <input id="remoteHost" name="host" required maxlength="253" pattern="[A-Za-z0-9][A-Za-z0-9.:-]*" placeholder="主机名或 IP 地址">
+      </div>
+      <div class="field">
+        <label for="remoteUsername">SSH 用户</label>
+        <input id="remoteUsername" name="username" required maxlength="32" pattern="[A-Za-z_][A-Za-z0-9_-]*" placeholder="有 Docker 权限的账号">
+      </div>
+      <div class="field">
+        <label for="remotePort">SSH 端口</label>
+        <input id="remotePort" name="port" type="number" min="1" max="65535" value="22" required>
+      </div>
+      <div class="field wide">
+        <label>计算类型</label>
+        <div class="server-mode" role="group" aria-label="目标服务器计算类型">
+          <label><input type="radio" name="mode" value="gpu" checked> GPU（使用全部可见 GPU）</label>
+          <label><input type="radio" name="mode" value="cpu"> CPU</label>
+        </div>
+      </div>
+      <div class="field" id="remoteCpuSlotsField" hidden>
+        <label for="remoteCpuSlots">CPU 计算槽</label>
+        <input id="remoteCpuSlots" name="cpu_slots" type="number" min="0" max="256" value="2">
+        <div class="hint">设为 0 可只运行管理容器，不提供 CPU 槽。</div>
+      </div>
+      <div class="field wide">
+        <label for="remoteAdminToken">远程管理令牌</label>
+        <input id="remoteAdminToken" type="password" autocomplete="current-password" required placeholder="平台配置的 WORKER_REMOTE_TOKEN">
+        <div class="hint">只保存在当前浏览器标签页会话中；平台端需预先配置 SSH 私钥、known_hosts 和镜像/存储地址。</div>
+      </div>
+      <div class="server-form-actions">
+        <button type="button" id="btnCancelAddServer">取消</button>
+        <button type="submit" id="btnSubmitRemoteServer" class="primary">远程添加并检测资源</button>
+      </div>
+    </form>
+    <div class="server-modal-note">GPU 服务器还需要 NVIDIA 驱动和 NVIDIA Container Toolkit。安装完成后，检测到的槽位默认不接收任务；请在服务器卡片中手动加入资源池。镜像拉取时间取决于镜像大小和网络。</div>
   </div>
 </div>
 
@@ -408,6 +448,7 @@ const state = {
   datasets: [], datasetId: null, preview: null,
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   charts: { loss: null, metric: null }, metricKind: null,
+  remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
 };
 
 /* ---------- 基础工具 ---------- */
@@ -878,10 +919,10 @@ function workerSlotCard(w) {
   </div>`;
 }
 
-// 按服务器聚合计算槽，让在线状态、硬件能力和待选资源在同一张卡片中可见。
-function workerServerCard(machineId, slots) {
+// 按服务器聚合计算槽、SSH 操作和远程生命周期按钮。
+function workerServerCard(machineId, slots, remoteServer = null) {
   const online = slots.filter((slot) => slot.active).length;
-  const managed = slots.some((slot) => slot.managed);
+  const managed = Boolean(remoteServer) || slots.some((slot) => slot.managed);
   const gpuCount = slots.filter((slot) => slot.gpu && slot.gpu.available).length;
   const cpuCount = slots.length - gpuCount;
   const cpu = slots.find((slot) => slot.cpu && slot.cpu.cores)?.cpu || {};
@@ -892,34 +933,99 @@ function workerServerCard(machineId, slots) {
   const lastSeen = heartbeat.length ? `${Math.min(...heartbeat).toFixed(0)} 秒前更新` : "等待首次心跳";
   const summary = [gpuCount ? `${gpuCount} 个 GPU 槽` : "", cpuCount ? `${cpuCount} 个 CPU 槽` : ""]
     .filter(Boolean).join(" · ") || "未发现计算槽";
+  const operation = remoteServer && remoteServer.operation;
+  const operationBusy = operation && ["queued", "running"].includes(operation.status);
+  const remoteStatus = remoteServer ? {
+    provisioning: "正在安装并检测资源", starting: "正在启动 worker", stopping: "正在停止 worker",
+    restarting: "正在重启 worker", online: "worker 已启动", stopped: "worker 已停止", error: "上次远程操作失败",
+  }[remoteServer.status] || "SSH 服务器已登记" : "";
+  const operationLabel = operation ? {
+    queued: "操作排队中", running: operation.action === "install" ? "正在远程安装并检测…" : `正在远程${operation.action}…`,
+    completed: "最近操作已完成", failed: "最近操作失败",
+  }[operation.status] : remoteStatus;
+  const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
+      ${remoteServer.status === "error" ? `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="install" ${operationBusy ? "disabled" : ""}>重新部署</button>` : ""}
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="start" ${operationBusy ? "disabled" : ""}>启动</button>
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop" ${operationBusy ? "disabled" : ""}>停止</button>
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="restart" ${operationBusy ? "disabled" : ""}>重启</button>
+    </div>` : "";
+  const endpoint = remoteServer ? `${remoteServer.username}@${remoteServer.host}:${remoteServer.port} · ${remoteServer.mode.toUpperCase()}` : "";
+  const operationDetails = operation && operation.status === "failed" && operation.error
+    ? `${operationLabel}：${operation.error}` : operationLabel;
   return `<article class="server-card">
     <header class="server-head">
-      <div class="server-title"><strong>${esc(machineId || "未命名服务器")}</strong>
-        <span class="server-kind">${managed ? "外接服务器" : "平台内置"}</span>
-        <span class="chip">${esc(summary)}</span></div>
-      <span class="server-presence ${online ? "" : "offline"}">${online ? `在线 · ${online}/${slots.length} 槽` : "离线"}</span>
+      <div class="server-head-main">
+        <div class="server-title"><strong>${esc(machineId || "未命名服务器")}</strong>
+          <span class="server-kind">${managed ? "远程服务器" : "平台内置"}</span>
+          <span class="chip">${esc(summary)}</span></div>
+        ${endpoint ? `<div class="server-meta">SSH ${esc(endpoint)}</div>` : ""}
+      </div>
+      <div class="server-head-actions">${serverControls}<span class="server-presence ${online ? "" : "offline"}">${online ? `在线 · ${online}/${slots.length} 槽` : remoteServer && operationBusy ? "远程操作中" : "离线"}</span></div>
     </header>
-    <div class="server-meta">${cpu.cores ? `CPU ${esc(cpu.cores)} 线程` : "CPU 信息未知"} · ${esc(memory)} · ${esc(lastSeen)}</div>
-    <div class="server-slots">${slots.map(workerSlotCard).join("")}</div>
+    ${remoteServer && operationDetails ? `<div class="server-operation" role="status">${esc(operationDetails)}</div>` : ""}
+    ${slots.length
+      ? `<div class="server-meta">${cpu.cores ? `CPU ${esc(cpu.cores)} 线程` : "CPU 信息未知"} · ${esc(memory)} · ${esc(lastSeen)}</div><div class="server-slots">${slots.map(workerSlotCard).join("")}</div>`
+      : `<div class="server-meta">${remoteServer ? "尚未收到资源心跳；worker 启动后将自动检测 CPU / GPU。" : "等待计算资源心跳"}</div>`}
   </article>`;
 }
 
-// 刷新服务器和槽位状态，同时显示在线数、待启用数与资源池规模。
+// 读取仅在当前会话授权的远程服务器状态，缓存操作结果以减少重复请求。
+async function loadRemoteServers() {
+  const token = getRemoteAdminToken();
+  if (!token) return { servers: [], error: null, authorized: false };
+  try {
+    const result = await remoteApiJson("/api/remote-servers");
+    const servers = result.servers || [];
+    for (const server of servers) {
+      if (!server.operation_id) continue;
+      let operation = state.remoteOperations.get(server.operation_id);
+      if (!operation || ["queued", "running"].includes(operation.status)) {
+        try {
+          operation = await remoteApiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`);
+          state.remoteOperations.set(server.operation_id, operation);
+          if (["completed", "failed"].includes(operation.status) && !state.remoteOperationNotified.has(server.operation_id)) {
+            state.remoteOperationNotified.add(server.operation_id);
+            toast(operation.status === "completed" ? `${server.machine_id}：远程操作完成` : `${server.machine_id}：${operation.error || "远程操作失败"}`,
+              operation.status === "completed" ? "ok" : "err");
+          }
+        } catch (error) {
+          operation = { status: "failed", error: error.message };
+        }
+      }
+      server.operation = operation;
+    }
+    state.remoteServers = servers;
+    return { servers, error: null, authorized: true };
+  } catch (error) {
+    state.remoteServers = [];
+    return { servers: [], error: error.message, authorized: true };
+  }
+}
+
+// 刷新服务器和槽位状态，同时合并 SSH 登记记录与 worker 心跳信息。
 async function refreshWorkers() {
+  if (state.refreshingWorkers) return;
+  state.refreshingWorkers = true;
   try {
     const d = await apiJson("/api/workers");
     const grid = $("workerGrid");
     const workers = d.workers || [];
+    const remoteResult = await loadRemoteServers();
     const groups = new Map();
     for (const worker of workers) {
       const machineId = worker.machine_id || worker.hostname || "未命名服务器";
       if (!groups.has(machineId)) groups.set(machineId, []);
       groups.get(machineId).push(worker);
     }
+    const remoteById = new Map(remoteResult.servers.map((server) => [server.machine_id, server]));
+    for (const server of remoteResult.servers) if (!groups.has(server.machine_id)) groups.set(server.machine_id, []);
     const servers = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b, "zh-CN"));
-    grid.innerHTML = servers.length
-      ? servers.map(([machineId, slots]) => workerServerCard(machineId, slots)).join("")
-      : `<div class="empty">尚未发现计算服务器。点击「添加服务器」，运行一次引导脚本后即可检测 CPU / GPU。</div>`;
+    const cards = servers.map(([machineId, slots]) => workerServerCard(machineId, slots, remoteById.get(machineId))).join("");
+    const authorizationNote = !remoteResult.authorized
+      ? `<div class="empty">SSH 管理服务器需使用管理令牌查看。<button type="button" data-open-remote-modal>配置令牌并添加服务器</button></div>`
+      : remoteResult.error
+        ? `<div class="empty">远程服务器列表读取失败：${esc(remoteResult.error)}。请检查令牌后重新添加服务器。</div>` : "";
+    grid.innerHTML = cards + authorizationNote || `<div class="empty">尚未添加计算服务器。点击「添加服务器」，由平台通过 SSH 安装 worker 并检测 CPU / GPU 资源。</div>`;
     const onlineSlots = workers.filter((worker) => worker.active).length;
     const selectedSlots = workers.filter((worker) => worker.active && worker.enabled).length;
     const pendingSlots = workers.filter((worker) => worker.managed && worker.active && !worker.enabled).length;
@@ -930,6 +1036,7 @@ async function refreshWorkers() {
       `<span class="chip">在线计算槽 ${onlineSlots}</span>`,
       `<span class="chip">已加入资源池 ${selectedSlots}</span>`,
       `<span class="chip">待选择 ${pendingSlots}</span>`,
+      `<span class="chip">远程服务器 ${remoteResult.servers.length}</span>`,
     ].join("");
     $("gpuResourceHint").textContent = selectedGpuSlots
       ? `当前有 ${selectedGpuSlots} 个已启用 GPU 槽可接单。`
@@ -937,15 +1044,31 @@ async function refreshWorkers() {
     $("queueDepth").textContent = `队列 ${d.queue_depth ?? 0}`;
   } catch {
     $("gpuResourceHint").textContent = "GPU 资源状态暂不可用，请检查连接后刷新。";
+  } finally {
+    state.refreshingWorkers = false;
   }
 }
 
-// 展开接入引导，说明脚本只在目标服务器执行一次。
+// 从标签页会话读取 SSH 管理令牌，不把令牌写入长期浏览器存储。
+function getRemoteAdminToken() {
+  try { return sessionStorage.getItem("workerAdminToken") || ""; }
+  catch { return ""; }
+}
+
+// 为受保护的远程管理接口附加当前标签页令牌。
+async function remoteApiJson(url, opt = {}) {
+  const headers = new Headers(opt.headers || {});
+  headers.set("X-Worker-Admin-Token", getRemoteAdminToken());
+  return apiJson(url, { ...opt, headers });
+}
+
+// 打开远程服务器表单，并恢复会话内令牌。
 function openAddServerModal() {
   const modal = $("addServerModal");
+  $("remoteAdminToken").value = getRemoteAdminToken();
   modal.hidden = false;
   modal.classList.add("open");
-  $("btnCloseAddServer").focus();
+  $("remoteMachineId").focus();
 }
 
 // 关闭接入引导并把焦点交还给触发按钮。
@@ -956,19 +1079,50 @@ function closeAddServerModal() {
   $("btnAddServer").focus();
 }
 
-// 复制 GPU/CPU 对应的单条 worker 接入命令。
-async function copyWorkerAddCommand() {
-  const command = $("workerAddCommand").textContent;
+// 用令牌提交 SSH 服务器配置，后台接入完成后继续读取自动检测到的资源。
+async function submitRemoteServer(event) {
+  event.preventDefault();
+  const form = $("remoteServerForm");
+  const submit = $("btnSubmitRemoteServer");
+  const token = $("remoteAdminToken").value;
+  if (!token) { toast("请填写平台远程管理令牌", "err"); $("remoteAdminToken").focus(); return; }
+  try { sessionStorage.setItem("workerAdminToken", token); }
+  catch { toast("当前浏览器无法保存标签页令牌，请检查隐私模式设置", "err"); return; }
+  const payload = Object.fromEntries(new FormData(form).entries());
+  payload.port = Number(payload.port);
+  payload.cpu_slots = Number(payload.cpu_slots || 0);
+  submit.disabled = true;
+  submit.textContent = "正在提交…";
   try {
-    await navigator.clipboard.writeText(command);
-    toast("接入命令已复制", "ok");
-  } catch {
-    const range = document.createRange();
-    range.selectNodeContents($("workerAddCommand"));
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    toast("已选中命令，请复制", "");
+    await remoteApiJson("/api/remote-servers", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    toast("服务器已登记，平台正在通过 SSH 安装并检测资源", "ok");
+    closeAddServerModal();
+    await refreshWorkers();
+  } catch (error) {
+    toast(error.message, "err");
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "远程添加并检测资源";
+  }
+}
+
+// 通过平台 SSH 启动、停止或重启服务器上的 worker 容器。
+async function manageRemoteServer(button) {
+  const machineId = button.dataset.remoteMachineId;
+  const action = button.dataset.remoteAction;
+  if (!getRemoteAdminToken()) { openAddServerModal(); toast("请先填写远程管理令牌", "err"); return; }
+  const actionText = { install: "重新部署", start: "启动", stop: "停止", restart: "重启" }[action];
+  if (action !== "start" && !window.confirm(`确认${actionText} ${machineId} 上的 worker？`)) return;
+  button.disabled = true;
+  try {
+    await remoteApiJson(`/api/remote-servers/${encodeURIComponent(machineId)}/${action}`, { method: "POST" });
+    toast(`${machineId}：已提交${actionText}操作`, "ok");
+    await refreshWorkers();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
   }
 }
 
@@ -990,14 +1144,21 @@ async function toggleWorkerSelection(button) {
   }
 }
 
-// 绑定接入向导、资源池开关、CPU/GPU 命令选择和键盘关闭行为。
+// 绑定远程接入、资源池开关、生命周期操作和键盘关闭行为。
 $("btnAddServer").onclick = openAddServerModal;
 $("btnCloseAddServer").onclick = closeAddServerModal;
+$("btnCancelAddServer").onclick = closeAddServerModal;
 $("btnRefreshWorkers").onclick = refreshWorkers;
-$("btnCopyWorkerCommand").onclick = copyWorkerAddCommand;
+$("remoteServerForm").addEventListener("submit", submitRemoteServer);
+document.querySelectorAll("input[name='mode']").forEach((input) => {
+  input.addEventListener("change", () => { $("remoteCpuSlotsField").hidden = input.value !== "cpu" || !input.checked; });
+});
 $("workerGrid").addEventListener("click", (event) => {
   const button = event.target.closest("[data-worker-id]");
   if (button && !button.disabled) toggleWorkerSelection(button);
+  const remoteButton = event.target.closest("[data-remote-machine-id]");
+  if (remoteButton && !remoteButton.disabled) manageRemoteServer(remoteButton);
+  if (event.target.closest("[data-open-remote-modal]")) openAddServerModal();
 });
 $("addServerModal").addEventListener("click", (event) => {
   if (event.target === $("addServerModal")) closeAddServerModal();

@@ -60,6 +60,17 @@ WORKER_SUPERVISOR_PROBE_INTERVAL = float(os.environ.get("WORKER_SUPERVISOR_PROBE
 WORKER_GPU_PROBE = os.environ.get("WORKER_GPU_PROBE", "true").strip().lower() == "true"  # 心跳周期内是否做 GPU 软探测
 WORKER_CPU_SLOTS = int(os.environ.get("WORKER_CPU_SLOTS", "1"))  # Supervisor 额外提供的 CPU 执行槽数（纯 CPU 训练）
 
+# 远程计算服务器管理：默认关闭；启用后通过预配置 SSH 身份执行短脚本，并从镜像仓库拉取 worker。
+WORKER_REMOTE_ENABLED = os.environ.get("WORKER_REMOTE_ENABLED", "false").strip().lower() == "true"
+WORKER_REMOTE_TOKEN = os.environ.get("WORKER_REMOTE_TOKEN", "").strip()
+WORKER_REMOTE_IMAGE = os.environ.get("WORKER_IMAGE", "").strip()
+WORKER_REMOTE_REDIS_URL = os.environ.get("WORKER_REMOTE_REDIS_URL", "").strip()
+WORKER_REMOTE_S3_ENDPOINT = os.environ.get("WORKER_REMOTE_S3_ENDPOINT", "").strip()
+WORKER_SSH_KEY_PATH = os.environ.get("WORKER_SSH_KEY_PATH", "/run/remote-worker/ssh_key").strip()
+WORKER_SSH_KNOWN_HOSTS_PATH = os.environ.get(
+    "WORKER_SSH_KNOWN_HOSTS_PATH", "/run/remote-worker/known_hosts"
+).strip()
+
 # 任务失败分类重试：环境性错误（CUDA/OOM/网络瞬断等）带 checkpoint 自动续试，不影响整体完成
 JOB_MAX_AUTO_RETRY = int(os.environ.get("JOB_MAX_AUTO_RETRY", "5"))       # 自动重试上限（.env 可配，默认 5）
 JOB_RETRY_BACKOFF = float(os.environ.get("JOB_RETRY_BACKOFF", "2"))       # 重试退避（秒）

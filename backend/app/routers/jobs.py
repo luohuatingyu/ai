@@ -1,9 +1,13 @@
 """训练任务领域路由：提交/列表/详情/日志/控制/workers 面板/模型下载/预测。"""
 from __future__ import annotations
 
+import re
+import secrets
 import time
+import uuid
+from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
 from fastapi.responses import FileResponse
 
 import app.config as config
@@ -15,7 +19,16 @@ from app.state import manager
 from app.storage import job_key
 from app.trainer import predict_row
 from app.routers.common import _check_id, _load_meta_or_404
-from app.routers.schemas import PredictRequest, TrainRequest, WorkerSelectionRequest
+from app.routers.schemas import (
+    PredictRequest,
+    RemoteServerRequest,
+    TrainRequest,
+    WorkerSelectionRequest,
+)
+from app.remote_workers import (
+    execute_remote_operation,
+    remote_configuration_errors,
+)
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 
@@ -227,6 +240,115 @@ def update_worker_selection(
             else "已停止接收新任务；正在运行的任务会正常完成"
         ),
     }
+
+
+def _require_remote_admin_token(
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> None:
+    """仅在启用远程管理且令牌配置有效时接受受保护的 SSH 管理请求。"""
+    if not config.WORKER_REMOTE_ENABLED:
+        raise HTTPException(503, "远程服务器管理尚未启用")
+    if len(config.WORKER_REMOTE_TOKEN) < 32:
+        raise HTTPException(503, "平台未配置有效的远程管理令牌")
+    if not x_worker_admin_token or not secrets.compare_digest(
+        x_worker_admin_token, config.WORKER_REMOTE_TOKEN
+    ):
+        raise HTTPException(401, "远程管理令牌无效")
+
+
+def _start_remote_operation(
+    server: dict, action: str, background_tasks: BackgroundTasks
+) -> dict:
+    """创建可轮询的远程操作记录，并交由 FastAPI 后台任务运行 SSH。"""
+    operation_id = uuid.uuid4().hex
+    now = time.time()
+    operation = {
+        "operation_id": operation_id,
+        "machine_id": str(server["machine_id"]),
+        "action": action,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "output": "",
+        "error": None,
+    }
+    server = dict(server)
+    server["status"] = {
+        "install": "provisioning",
+        "start": "starting",
+        "stop": "stopping",
+        "restart": "restarting",
+    }[action]
+    server["operation_id"] = operation_id
+    manager.lease.set_remote_server(str(server["machine_id"]), server)
+    manager.lease.set_remote_operation(operation_id, operation)
+    background_tasks.add_task(execute_remote_operation, operation_id, server, action)
+    return {"ok": True, "operation_id": operation_id, "status": "queued"}
+
+
+@router.get("/remote-servers")
+def list_remote_servers(
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """列出经 SSH 接入的远程服务器；管理元数据仅对令牌持有者可见。"""
+    _require_remote_admin_token(x_worker_admin_token)
+    servers = manager.lease.list_remote_servers()
+    return {"servers": servers}
+
+
+@router.post("/remote-servers", status_code=202)
+def add_remote_server(
+    request: RemoteServerRequest,
+    background_tasks: BackgroundTasks,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """经平台 SSH 远程安装 worker；目标主机只接收单文件脚本和容器镜像。"""
+    _require_remote_admin_token(x_worker_admin_token)
+    errors = remote_configuration_errors()
+    if errors:
+        raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
+    if manager.lease.get_remote_server(request.machine_id):
+        raise HTTPException(409, "服务器标识已登记")
+    server = request.model_dump()
+    server.update({"status": "provisioning", "created_at": time.time()})
+    return _start_remote_operation(server, "install", background_tasks)
+
+
+@router.post("/remote-servers/{machine_id}/{action}", status_code=202)
+def manage_remote_server(
+    machine_id: str,
+    action: Literal["install", "start", "stop", "restart"],
+    background_tasks: BackgroundTasks,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """经 SSH 重装、启动、优雅停止或重启目标服务器上的 worker 容器。"""
+    _require_remote_admin_token(x_worker_admin_token)
+    errors = remote_configuration_errors()
+    if errors:
+        raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
+    _check_id(machine_id, "服务器")
+    server = manager.lease.get_remote_server(machine_id)
+    if server is None:
+        raise HTTPException(404, "远程服务器不存在")
+    previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
+    if previous and previous.get("status") in {"queued", "running"}:
+        raise HTTPException(409, "该服务器已有远程操作正在执行")
+    return _start_remote_operation(server, action, background_tasks)
+
+
+@router.get("/remote-operations/{operation_id}")
+def get_remote_operation(
+    operation_id: str,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """返回远程接入或生命周期操作的状态和经过凭证过滤的输出。"""
+    _require_remote_admin_token(x_worker_admin_token)
+    if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+        raise HTTPException(404, "远程操作不存在")
+    operation = manager.lease.get_remote_operation(operation_id)
+    if operation is None:
+        raise HTTPException(404, "远程操作不存在")
+    return operation
 
 
 @router.get("/jobs/{job_id}/model")
