@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import signal
@@ -673,15 +674,13 @@ class WorkerSupervisor:
         self._interval = max(float(config.WORKER_SUPERVISOR_PROBE_INTERVAL), 1.0)
         self._shutdown = threading.Event()
         self._children: Dict[str, "subprocess.Popen"] = {}  # slot -> 子进程
-        self._slots: List[Tuple[str, Optional[str]]] = []   # (slot 名, GPU 索引或 None)
+        self._slots: List[Tuple[str, Optional[str]]] = []   # (slot 短名, GPU 索引或 None)
         gpu_count = _gpu_count()
-        machine = socket.gethostname()
         for i in range(gpu_count):
-            # 槽位名全局可读：{机器}-{gpuN}，/api/workers 按卡聚合展示
-            self._slots.append((f"{machine}-gpu{i}", str(i)))
+            self._slots.append((f"gpu{i}", str(i)))
         n_cpu = config.WORKER_CPU_SLOTS if cpu_slots is None else cpu_slots
         for j in range(max(int(n_cpu), 1) if gpu_count == 0 else int(n_cpu)):
-            self._slots.append((f"{machine}-cpu{j}", None))
+            self._slots.append((f"cpu{j}", None))
 
     # ------------------------------------------------------------------
     def _spawn(self, slot: str, gpu_index: Optional[str]) -> "subprocess.Popen":
