@@ -140,6 +140,21 @@ def test_lease_store_healthy():
     assert EmbeddedLeaseStore().healthy() is True
 
 
+def test_worker_selection_is_saved_independently_of_heartbeat():
+    """外部槽默认待启用，人工选择在 worker 断线重连后仍保留。"""
+    ls = EmbeddedLeaseStore()
+    ls.register_worker("remote-a-cpu0", {"managed": True}, ttl=5)
+
+    assert ls.is_worker_enabled("remote-a-cpu0", default=False) is False
+    ls.set_worker_enabled("remote-a-cpu0", True)
+    ls.deregister_worker("remote-a-cpu0")
+    ls.register_worker("remote-a-cpu0", {"managed": True}, ttl=5)
+    assert ls.is_worker_enabled("remote-a-cpu0", default=False) is True
+
+    ls.set_worker_enabled("remote-a-cpu0", False)
+    assert ls.is_worker_enabled("remote-a-cpu0", default=True) is False
+
+
 def test_build_coordination_embedded():
     """兼容性：REDIS_URL 为空时返回嵌入式实现（单机零依赖形态）。"""
     import pytest
@@ -168,6 +183,8 @@ def test_unjsonable_legacy_repr_fallback():
     assert unjsonable("somehost") == "somehost"      # 普通字符串原样返回
     assert unjsonable("'a:b'") == "'a:b'"            # 引号包裹的字符串保守保留原值（避免歧义）
     assert unjsonable("[1, 2]") == [1, 2]            # JSON 优先路径
+    assert unjsonable("None") is None                 # 旧 Redis 字段中的空值应还原为空
+    assert unjsonable("null") is None                 # JSON null 同样还原为空
     assert unjsonable(3) == 3                        # 非字符串原样
 
 
@@ -205,7 +222,10 @@ def test_redis_semantics_match_embedded():
 
     ls.register_worker("wr", {"gpu": {"available": False}}, ttl=5)
     assert ls.list_workers()[0]["worker_id"] == "wr"
+    ls.set_worker_enabled("wr", False)
+    assert ls.is_worker_enabled("wr", default=True) is False
     ls.deregister_worker("wr")
+    assert ls.is_worker_enabled("wr", default=True) is False
 
 
 def test_redis_worker_registry_roundtrip_nested_caps():

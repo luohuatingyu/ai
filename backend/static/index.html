@@ -135,7 +135,60 @@
   .wstate.running   { color: #79c0ff; background: rgba(88,166,255,.12); border-color: rgba(88,166,255,.35); }
   .wstate.degraded, .wstate.recovering { color: var(--warn); background: rgba(210,153,34,.12); border-color: rgba(210,153,34,.35); }
   .wstate.offline   { color: #ff7b72; background: rgba(248,85,49,.12); border-color: rgba(248,85,49,.35); }
+  .wstate.disabled  { color: #e3b341; background: rgba(210,153,34,.12); border-color: rgba(210,153,34,.35); }
   .wcard:has(.wstate.offline) { opacity: .6; }
+  .compute-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .compute-actions { display:flex; gap:7px; flex-wrap:wrap; }
+  .compute-summary { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .compute-summary .chip { font-size:12px; padding:3px 10px; }
+  .server-grid { display:grid; gap:12px; margin-top:12px; }
+  .server-card { overflow:hidden; border:1px solid var(--border); border-radius:12px;
+    background:linear-gradient(135deg, rgba(88,166,255,.055), transparent 42%), var(--panel2); }
+  .server-head { display:flex; align-items:center; justify-content:space-between; gap:14px;
+    padding:13px 15px; border-bottom:1px solid var(--border); }
+  .server-title { min-width:0; display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+  .server-title strong { font-size:14px; overflow-wrap:anywhere; }
+  .server-kind { padding:2px 8px; border:1px solid var(--border); border-radius:999px;
+    color:var(--muted); background:rgba(13,17,23,.35); font-size:11px; }
+  .server-presence { color:var(--ok); font-size:12px; white-space:nowrap; }
+  .server-presence.offline { color:var(--muted); }
+  .server-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:9px 15px 2px;
+    color:var(--muted); font-size:12px; }
+  .server-slots { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:8px; padding:10px 12px 13px; }
+  .resource-slot { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px;
+    padding:10px 11px; border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.42); }
+  .resource-slot.enabled { border-color:rgba(63,185,80,.35); }
+  .slot-main { min-width:0; }
+  .slot-title { display:flex; align-items:center; gap:7px; font-weight:650; }
+  .slot-title .dot { width:7px; height:7px; border-radius:50%; background:var(--muted); }
+  .resource-slot.enabled .slot-title .dot { background:var(--ok); box-shadow:0 0 9px rgba(63,185,80,.5); }
+  .slot-details { margin-top:3px; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+  .slot-action { min-width:96px; padding:6px 10px; }
+  .slot-action.enable { border-color:rgba(63,185,80,.4); color:#7ee787; }
+  .slot-action.disable { color:var(--muted); }
+  .slot-action:disabled { cursor:not-allowed; opacity:.5; }
+  .server-modal { position:fixed; inset:0; z-index:60; display:none; align-items:center; justify-content:center;
+    padding:18px; background:rgba(4,8,14,.78); backdrop-filter:blur(5px); }
+  .server-modal.open { display:flex; }
+  .server-modal-card { width:min(620px,100%); max-height:90vh; overflow:auto; padding:22px;
+    border:1px solid var(--border-strong); border-radius:14px; background:var(--panel); box-shadow:var(--shadow-md); }
+  .server-modal-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .server-modal-head h3 { margin:0; font-size:18px; }
+  .server-modal-card p, .server-modal-card li { color:var(--muted); font-size:13px; }
+  .server-modal-card ol { padding-left:21px; }
+  .server-modal-card li + li { margin-top:7px; }
+  .server-command { display:flex; align-items:center; gap:8px; margin-top:12px; padding:10px;
+    border:1px solid var(--border); border-radius:9px; background:#0d1117; }
+  .server-command code { min-width:0; flex:1; overflow-x:auto; color:#a5d6ff; white-space:nowrap; }
+  .server-mode { display:flex; gap:7px; flex-wrap:wrap; margin-top:15px; }
+  .server-mode button.active { border-color:var(--accent); color:#a5d6ff; background:rgba(88,166,255,.1); }
+  .server-modal-note { margin-top:14px; padding:10px 12px; border-left:3px solid var(--warning,var(--warn));
+    border-radius:5px; color:#e3b341; background:rgba(210,153,34,.08); font-size:12px; }
+  @media (max-width:560px) {
+    .server-head { align-items:flex-start; flex-direction:column; gap:5px; }
+    .server-slots { grid-template-columns:1fr; padding:9px; }
+    .server-modal-card { padding:17px; }
+  }
 
   /* ===== 进度条 ===== */
   .progress { height: 6px; background: var(--chip); border-radius: 4px; margin-top: 8px; overflow: hidden; }
@@ -251,6 +304,7 @@
           <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-top:4px; color:var(--text);">
             <input id="p_require_gpu" type="checkbox" style="width:auto;"> 要求在 GPU 上训练
           </label>
+          <div id="gpuResourceHint" class="hint" style="margin-top:5px;">正在读取已启用的 GPU 资源…</div>
         </div>
         <div class="field" id="minVramField" hidden>
           <label>最低显存（MiB，可选）</label>
@@ -262,14 +316,21 @@
     </form>
   </aside>
 
-  <!-- 右栏：计算槽 + 任务列表 + 详情 -->
+  <!-- 右栏：计算资源 + 任务列表 + 详情 -->
   <section class="panel">
-    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-      <h2 style="margin:0;">🖥 计算槽（多机多卡）</h2>
-      <span id="queueDepth" class="chip">队列 0</span>
+    <div class="compute-toolbar">
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <h2 style="margin:0;">🖥 计算资源</h2>
+        <span id="queueDepth" class="chip">队列 0</span>
+      </div>
+      <div class="compute-actions">
+        <button id="btnRefreshWorkers" title="重新读取服务器和计算槽状态">↻ 刷新</button>
+        <button id="btnAddServer" class="primary">＋ 添加服务器</button>
+      </div>
     </div>
-    <div class="hint" style="margin-top:4px;">每张卡一个独立执行进程；某张卡不可用时任务自动由其它卡/服务器从断点接续。</div>
-    <div id="workerGrid" class="wgrid"><div class="empty">未发现计算槽</div></div>
+    <div class="hint" style="margin-top:4px;">连接服务器后自动检测 CPU / GPU；选择要加入资源池的计算槽。停用后不再领取新任务，运行中的任务会完成后退出。</div>
+    <div id="workerSummary" class="compute-summary" aria-live="polite"></div>
+    <div id="workerGrid" class="server-grid"><div class="empty">尚未发现计算服务器。添加服务器后，页面会显示检测到的计算资源。</div></div>
 
     <h2>③ 训练任务</h2>
     <div id="jobList"><div class="empty">暂无任务，先在左侧发起训练</div></div>
@@ -315,6 +376,27 @@
   </section>
 </main>
 
+<div id="addServerModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="addServerTitle" hidden>
+  <div class="server-modal-card">
+    <div class="server-modal-head">
+      <h3 id="addServerTitle">添加计算服务器</h3>
+      <button id="btnCloseAddServer" class="close-btn" aria-label="关闭">×</button>
+    </div>
+    <p>为避免保存服务器登录凭证，平台通过一次引导脚本接入。目标服务器需要安装 Docker Compose，并能访问主节点的 Redis 和 S3 服务。</p>
+    <div class="server-mode" role="group" aria-label="目标服务器类型">
+      <button type="button" class="active" data-worker-mode="gpu">GPU 服务器</button>
+      <button type="button" data-worker-mode="cpu">CPU 服务器</button>
+    </div>
+    <div class="server-command"><code id="workerAddCommand">./scripts/worker-node.sh add</code><button id="btnCopyWorkerCommand">复制命令</button></div>
+    <ol>
+      <li>在目标服务器获取本项目代码；已有项目目录时直接进入该目录。</li>
+      <li>运行上方命令。首次运行会询问 Redis、S3 地址和服务器标识，并把配置以仅当前用户可读的权限保存在 <code>.env.worker</code>。</li>
+      <li>worker 自动上报 CPU 线程数、内存、GPU 型号和显存。回到本页，在每个计算槽上点击「加入资源池」。</li>
+    </ol>
+    <div class="server-modal-note">GPU 服务器需要 NVIDIA 驱动和 nvidia-container-toolkit。首次探测到的计算槽默认不会接收训练任务，需手动加入。</div>
+  </div>
+</div>
+
 <div id="toastWrap"></div>
 
 <script>
@@ -353,10 +435,10 @@ async function loadSystem() {
     const dot = $("deviceBadge").querySelector(".dot");
     if (sys.device === "cuda") {
       dot.className = "dot ok";
-      $("deviceText").textContent = `GPU 已就绪：${sys.device_name}${sys.gpu_count > 1 ? " ×" + sys.gpu_count : ""}（CUDA ${sys.cuda_version || ""}）`;
+      $("deviceText").textContent = `部署节点 GPU 已就绪：${sys.device_name}${sys.gpu_count > 1 ? " ×" + sys.gpu_count : ""}（CUDA ${sys.cuda_version || ""}）`;
     } else {
       dot.className = "dot";
-      $("deviceText").textContent = "未检测到 GPU，将使用 CPU 训练";
+      $("deviceText").textContent = "部署节点未检测到 GPU；集群资源请看右侧计算资源";
     }
   } catch { $("deviceText").textContent = "后端连接失败"; }
 }
@@ -755,35 +837,182 @@ $("btnPredict").onclick = async () => {
   } catch (e) { toast(e.message, "err"); out.hidden = true; }
 };
 
-/* ---------- 计算槽面板（多机多卡） ---------- */
-const workerStateText = { idle: "空闲", running: "训练中", degraded: "卡降级", recovering: "恢复中", offline: "离线" };
-function workerCard(w) {
+/* ---------- 计算服务器与手动资源选择 ---------- */
+const workerStateText = {
+  idle: "空闲", running: "训练中", degraded: "卡降级", recovering: "恢复中",
+  disabled: "未启用", offline: "离线",
+};
+
+// 把检测到的内存统一格式化为用户容易比较的容量。
+function formatMemory(memoryMb) {
+  if (!Number.isFinite(Number(memoryMb)) || Number(memoryMb) <= 0) return "内存未知";
+  const gb = Number(memoryMb) / 1024;
+  return `${gb >= 10 ? gb.toFixed(0) : gb.toFixed(1)} GB 内存`;
+}
+
+// 渲染单个 CPU/GPU 执行槽，并把加入资源池的操作绑定到槽位 ID。
+function workerSlotCard(w) {
   const gpu = w.gpu || {};
-  const device = gpu.available
-    ? `${gpu.name || "GPU"}${gpu.vram_mb ? " · " + gpu.vram_mb + "MiB" : ""}`
-    : "CPU";
-  const st = w.state || (w.active ? "idle" : "offline");
-  const job = w.current_job ? `${w.current_job}${w.epoch ? " · ep" + w.epoch : ""}` : "—";
-  const hb = w.heartbeat_age_sec != null ? `心跳 ${w.heartbeat_age_sec}s` : "";
-  return `<div class="wcard">
-    <div class="wtop">
-      <span class="wid" title="${esc(w.worker_id || "")}">${esc(w.worker_id || "?")}</span>
-      <span class="wstate ${esc(st)}">${workerStateText[st] || st}</span>
+  const cpu = w.cpu || {};
+  const isGpu = Boolean(gpu.available);
+  const device = isGpu
+    ? `${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB 显存` : ""}`
+    : `CPU${cpu.cores ? ` · ${cpu.cores} 线程` : ""}${cpu.memory_mb ? ` · ${formatMemory(cpu.memory_mb)}` : ""}`;
+  const active = Boolean(w.active);
+  const enabled = Boolean(w.enabled);
+  const rawState = w.state || (active ? "idle" : "offline");
+  const state = !active ? "offline" : (["running", "degraded", "recovering"].includes(rawState)
+    ? rawState : (enabled ? rawState : "disabled"));
+  const job = w.current_job ? `${w.current_job}${w.epoch ? ` · 第 ${w.epoch} 轮` : ""}` : "当前无任务";
+  const heartbeat = w.heartbeat_age_sec != null ? `最近心跳 ${w.heartbeat_age_sec}s 前` : "尚无心跳";
+  const action = w.managed
+    ? `<button class="slot-action ${enabled ? "disable" : "enable"}" data-worker-id="${esc(w.worker_id)}" data-worker-enabled="${enabled ? "true" : "false"}" ${active ? "" : "disabled"}>${enabled ? "停止接单" : "加入资源池"}</button>`
+    : `<span class="server-kind">平台内置</span>`;
+  return `<div class="resource-slot ${enabled && active ? "enabled" : ""}">
+    <div class="slot-main">
+      <div class="slot-title"><span class="dot"></span>${isGpu ? "GPU" : "CPU"} · ${esc(w.slot || "计算槽")}
+        <span class="wstate ${esc(state)}">${workerStateText[state] || esc(state)}</span></div>
+      <div class="slot-details">${esc(device)} · ${esc(job)} · ${esc(heartbeat)}</div>
     </div>
-    <div class="wmuted">${esc(w.machine_id || w.hostname || "")} · ${esc(device)}</div>
-    <div class="wmuted">任务: ${esc(job)} ${hb ? "· " + esc(hb) : ""}</div>
+    ${action}
   </div>`;
 }
+
+// 按服务器聚合计算槽，让在线状态、硬件能力和待选资源在同一张卡片中可见。
+function workerServerCard(machineId, slots) {
+  const online = slots.filter((slot) => slot.active).length;
+  const managed = slots.some((slot) => slot.managed);
+  const gpuCount = slots.filter((slot) => slot.gpu && slot.gpu.available).length;
+  const cpuCount = slots.length - gpuCount;
+  const cpu = slots.find((slot) => slot.cpu && slot.cpu.cores)?.cpu || {};
+  const memory = formatMemory(cpu.memory_mb);
+  const heartbeat = slots
+    .filter((slot) => slot.heartbeat_age_sec != null)
+    .map((slot) => Number(slot.heartbeat_age_sec));
+  const lastSeen = heartbeat.length ? `${Math.min(...heartbeat).toFixed(0)} 秒前更新` : "等待首次心跳";
+  const summary = [gpuCount ? `${gpuCount} 个 GPU 槽` : "", cpuCount ? `${cpuCount} 个 CPU 槽` : ""]
+    .filter(Boolean).join(" · ") || "未发现计算槽";
+  return `<article class="server-card">
+    <header class="server-head">
+      <div class="server-title"><strong>${esc(machineId || "未命名服务器")}</strong>
+        <span class="server-kind">${managed ? "外接服务器" : "平台内置"}</span>
+        <span class="chip">${esc(summary)}</span></div>
+      <span class="server-presence ${online ? "" : "offline"}">${online ? `在线 · ${online}/${slots.length} 槽` : "离线"}</span>
+    </header>
+    <div class="server-meta">${cpu.cores ? `CPU ${esc(cpu.cores)} 线程` : "CPU 信息未知"} · ${esc(memory)} · ${esc(lastSeen)}</div>
+    <div class="server-slots">${slots.map(workerSlotCard).join("")}</div>
+  </article>`;
+}
+
+// 刷新服务器和槽位状态，同时显示在线数、待启用数与资源池规模。
 async function refreshWorkers() {
   try {
     const d = await apiJson("/api/workers");
     const grid = $("workerGrid");
-    grid.innerHTML = (d.workers || []).length
-      ? d.workers.map(workerCard).join("")
-      : `<div class="empty">未发现计算槽（本地模式：任务由 API 内置线程执行）</div>`;
+    const workers = d.workers || [];
+    const groups = new Map();
+    for (const worker of workers) {
+      const machineId = worker.machine_id || worker.hostname || "未命名服务器";
+      if (!groups.has(machineId)) groups.set(machineId, []);
+      groups.get(machineId).push(worker);
+    }
+    const servers = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b, "zh-CN"));
+    grid.innerHTML = servers.length
+      ? servers.map(([machineId, slots]) => workerServerCard(machineId, slots)).join("")
+      : `<div class="empty">尚未发现计算服务器。点击「添加服务器」，运行一次引导脚本后即可检测 CPU / GPU。</div>`;
+    const onlineSlots = workers.filter((worker) => worker.active).length;
+    const selectedSlots = workers.filter((worker) => worker.active && worker.enabled).length;
+    const pendingSlots = workers.filter((worker) => worker.managed && worker.active && !worker.enabled).length;
+    const selectedGpuSlots = workers.filter((worker) => worker.active && worker.enabled && worker.gpu && worker.gpu.available).length;
+    const onlineServers = new Set(workers.filter((worker) => worker.active).map((worker) => worker.machine_id || worker.hostname)).size;
+    $("workerSummary").innerHTML = [
+      `<span class="chip">在线服务器 ${onlineServers}</span>`,
+      `<span class="chip">在线计算槽 ${onlineSlots}</span>`,
+      `<span class="chip">已加入资源池 ${selectedSlots}</span>`,
+      `<span class="chip">待选择 ${pendingSlots}</span>`,
+    ].join("");
+    $("gpuResourceHint").textContent = selectedGpuSlots
+      ? `当前有 ${selectedGpuSlots} 个已启用 GPU 槽可接单。`
+      : "当前没有已启用的 GPU 槽；要求 GPU 的任务会排队等待。可先添加服务器并启用 GPU 槽。";
     $("queueDepth").textContent = `队列 ${d.queue_depth ?? 0}`;
-  } catch { /* 轮询失败静默 */ }
+  } catch {
+    $("gpuResourceHint").textContent = "GPU 资源状态暂不可用，请检查连接后刷新。";
+  }
 }
+
+// 展开接入引导，说明脚本只在目标服务器执行一次。
+function openAddServerModal() {
+  const modal = $("addServerModal");
+  modal.hidden = false;
+  modal.classList.add("open");
+  $("btnCloseAddServer").focus();
+}
+
+// 关闭接入引导并把焦点交还给触发按钮。
+function closeAddServerModal() {
+  const modal = $("addServerModal");
+  modal.classList.remove("open");
+  modal.hidden = true;
+  $("btnAddServer").focus();
+}
+
+// 复制 GPU/CPU 对应的单条 worker 接入命令。
+async function copyWorkerAddCommand() {
+  const command = $("workerAddCommand").textContent;
+  try {
+    await navigator.clipboard.writeText(command);
+    toast("接入命令已复制", "ok");
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents($("workerAddCommand"));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    toast("已选中命令，请复制", "");
+  }
+}
+
+// 修改一个外接槽位是否接收新任务，并立即刷新状态。
+async function toggleWorkerSelection(button) {
+  const workerId = button.dataset.workerId;
+  const enabled = button.dataset.workerEnabled !== "true";
+  button.disabled = true;
+  try {
+    const result = await apiJson(`/api/workers/${encodeURIComponent(workerId)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    toast(result.message, "ok");
+    await refreshWorkers();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
+  }
+}
+
+// 绑定接入向导、资源池开关、CPU/GPU 命令选择和键盘关闭行为。
+$("btnAddServer").onclick = openAddServerModal;
+$("btnCloseAddServer").onclick = closeAddServerModal;
+$("btnRefreshWorkers").onclick = refreshWorkers;
+$("btnCopyWorkerCommand").onclick = copyWorkerAddCommand;
+$("workerGrid").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-worker-id]");
+  if (button && !button.disabled) toggleWorkerSelection(button);
+});
+$("addServerModal").addEventListener("click", (event) => {
+  if (event.target === $("addServerModal")) closeAddServerModal();
+});
+document.querySelectorAll("[data-worker-mode]").forEach((button) => {
+  button.onclick = () => {
+    document.querySelectorAll("[data-worker-mode]").forEach((item) => item.classList.toggle("active", item === button));
+    $("workerAddCommand").textContent = button.dataset.workerMode === "cpu"
+      ? "WORKER_COMPOSE_FILE=docker-compose.cpu.yml ./scripts/worker-node.sh add"
+      : "./scripts/worker-node.sh add";
+  };
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && $("addServerModal").classList.contains("open")) closeAddServerModal();
+});
 
 /* ---------- Tab 切换 ---------- */
 document.querySelectorAll(".tabs button").forEach((b) => {

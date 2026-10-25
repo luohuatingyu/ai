@@ -46,6 +46,8 @@ S3_SECURE = os.environ.get("S3_SECURE", "false").strip().lower() == "true"
 
 # Worker（计算单元）配置
 WORKER_ID = os.environ.get("WORKER_ID", "").strip()  # 独立 worker 身份标识（空则自动生成）
+WORKER_MACHINE_ID = os.environ.get("WORKER_MACHINE_ID", "").strip()  # 外部计算服务器的稳定显示名
+WORKER_MANAGED = os.environ.get("WORKER_MANAGED", "false").strip().lower() == "true"  # 新接入槽位默认待人工启用
 WORKER_SCRATCH_DIR = DATA_DIR / "worker-scratch"       # 本地临时缓存（scratch），可随时清空
 WORKER_HEARTBEAT_INTERVAL = float(os.environ.get("WORKER_HEARTBEAT_INTERVAL", "10"))   # 心跳周期（秒）
 WORKER_LEASE_TTL = float(os.environ.get("WORKER_LEASE_TTL", "30"))                     # 租约有效期（秒）

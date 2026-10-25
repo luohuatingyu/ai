@@ -27,6 +27,7 @@ _SIGNAL_KEY = "mtp:signal:{job_id}"
 _WORKERS_SET = "mtp:workers:all"
 _WORKER_INFO = "mtp:worker:{worker_id}:info"
 _WORKER_HB = "mtp:worker:{worker_id}:hb"
+_WORKER_ENABLED = "mtp:workers:enabled"
 
 # 信号 TTL：控制信号 1 小时后自动清理，避免遗留脏信号影响后续轮次
 _SIGNAL_TTL = 3600
@@ -224,6 +225,14 @@ class LeaseStore:
         """列出全部注册过的 worker；active 字段标识心跳是否仍在有效期。"""
         raise NotImplementedError
 
+    def set_worker_enabled(self, worker_id: str, enabled: bool) -> None:
+        """保存计算槽是否允许接收新任务的设置。"""
+        raise NotImplementedError
+
+    def is_worker_enabled(self, worker_id: str, default: bool = True) -> bool:
+        """读取计算槽接单开关；未配置时返回调用方给定的兼容默认值。"""
+        raise NotImplementedError
+
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的 worker 注册条目（崩溃/未优雅退出残留），返回清除数量。"""
         raise NotImplementedError
@@ -237,6 +246,7 @@ class EmbeddedLeaseStore(LeaseStore):
         self._leases: Dict[str, List] = {}       # job_id -> [token, expires_at]
         self._signals: Dict[str, Set[str]] = {}   # job_id -> 活跃信号集合
         self._workers: Dict[str, Dict[str, object]] = {}  # worker_id -> info(含 last_seen)
+        self._worker_enabled: Dict[str, bool] = {}  # worker_id -> 是否允许接单
 
     def healthy(self) -> bool:
         return True
@@ -321,6 +331,16 @@ class EmbeddedLeaseStore(LeaseStore):
                 item["active"] = age <= float(info.get("ttl", 30)) * 2
                 out.append(item)
             return out
+
+    def set_worker_enabled(self, worker_id: str, enabled: bool) -> None:
+        """在进程内记录计算槽接单开关，供嵌入式模式和测试复用。"""
+        with self._lock:
+            self._worker_enabled[worker_id] = bool(enabled)
+
+    def is_worker_enabled(self, worker_id: str, default: bool = True) -> bool:
+        """读取进程内计算槽接单状态；未显式配置时保持旧 worker 默认行为。"""
+        with self._lock:
+            return self._worker_enabled.get(worker_id, bool(default))
 
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的注册条目（存活 worker 心跳远短于宽限期）。"""
@@ -428,6 +448,17 @@ class RedisLeaseStore(LeaseStore):
             out.append(item)
         return out
 
+    def set_worker_enabled(self, worker_id: str, enabled: bool) -> None:
+        """将接单选择写入 Redis，使计算槽重启后仍保留人工选择。"""
+        self._redis.hset(_WORKER_ENABLED, worker_id, "1" if enabled else "0")
+
+    def is_worker_enabled(self, worker_id: str, default: bool = True) -> bool:
+        """读取 Redis 中的接单选择；尚未人工选择的槽位使用兼容默认值。"""
+        value = self._redis.hget(_WORKER_ENABLED, worker_id)
+        if value is None:
+            return bool(default)
+        return str(value) == "1"
+
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳 key 已消失且注册信息长期未更新的 worker 条目。
 
@@ -472,6 +503,8 @@ def unjsonable(value: object) -> object:
         parsed = json.loads(value)
     except (json.JSONDecodeError, TypeError):
         parsed = value
+    if parsed is None:
+        return None
     if isinstance(parsed, (dict, list, bool, int, float)):
         return parsed
     # 旧格式回退：ast.literal_eval 解析 Python repr（普通字符串原样返回）
@@ -479,6 +512,8 @@ def unjsonable(value: object) -> object:
         parsed = ast.literal_eval(value)
     except (ValueError, SyntaxError, MemoryError):
         return value
+    if parsed is None:
+        return None
     if isinstance(parsed, (dict, list, bool, int, float)):
         return parsed
     return value

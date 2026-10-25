@@ -15,7 +15,7 @@ from app.state import manager
 from app.storage import job_key
 from app.trainer import predict_row
 from app.routers.common import _check_id, _load_meta_or_404
-from app.routers.schemas import PredictRequest, TrainRequest
+from app.routers.schemas import PredictRequest, TrainRequest, WorkerSelectionRequest
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 
@@ -183,16 +183,49 @@ def list_workers() -> dict:
         info["state"] = state
         info["current_job"] = current_job
         info["epoch"] = epoch
+        info["managed"] = bool(info.get("managed", False))
+        info["enabled"] = manager.lease.is_worker_enabled(
+            str(info.get("worker_id", "")), default=not info["managed"]
+        )
         info["heartbeat_age_sec"] = (
             round(_time.time() - float(info.get("last_seen", _time.time())), 1)
             if info.get("last_seen") else None
         )
         workers.append(info)
-    workers.sort(key=lambda x: (str(x.get("machine_id")), str(x.get("worker_id"))))
+    workers.sort(key=lambda x: (str(x.get("machine_id")), str(x.get("slot")), str(x.get("worker_id"))))
     return {
         "workers": workers,
         "queue_depth": manager.queue.size(),
         "ts": time.time(),
+    }
+
+
+@router.patch("/workers/{worker_id}")
+def update_worker_selection(
+    worker_id: str, request: WorkerSelectionRequest
+) -> dict:
+    """更新已发现外部计算槽的接单状态；正在执行的任务会正常完成。"""
+    _check_id(worker_id, "计算槽")
+    worker = next(
+        (item for item in manager.lease.list_workers()
+         if str(item.get("worker_id", "")) == worker_id),
+        None,
+    )
+    if worker is None:
+        raise HTTPException(404, "计算槽不存在或已清理")
+    if not bool(worker.get("managed", False)):
+        raise HTTPException(409, "本机内置计算槽由平台自动管理")
+
+    manager.lease.set_worker_enabled(worker_id, request.enabled)
+    return {
+        "ok": True,
+        "worker_id": worker_id,
+        "enabled": request.enabled,
+        "message": (
+            "计算槽已加入资源池"
+            if request.enabled
+            else "已停止接收新任务；正在运行的任务会正常完成"
+        ),
     }
 
 

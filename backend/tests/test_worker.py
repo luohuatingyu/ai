@@ -38,6 +38,19 @@ def test_probe_visible_gpu_never_raises():
     assert probe_visible_gpu() in (True, False)
 
 
+def test_detect_capabilities_reports_cpu_and_stable_server_identity(monkeypatch):
+    """硬件上报含 CPU 核心/内存，并优先使用配置的稳定服务器标识。"""
+    monkeypatch.setattr(config, "WORKER_MACHINE_ID", "worker-lab")
+    monkeypatch.setattr(config, "WORKER_MANAGED", True)
+
+    caps = detect_capabilities("worker-lab-cpu0", slot="cpu0")
+
+    assert caps["machine_id"] == "worker-lab"
+    assert caps["managed"] is True
+    assert caps["cpu"]["cores"] >= 1
+    assert caps["cpu"]["memory_mb"] is None or caps["cpu"]["memory_mb"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # 正常执行（AC6）
 # ---------------------------------------------------------------------------
@@ -57,6 +70,48 @@ def test_worker_completes_job(store, make_dataset, make_job, q, ls, spawn_worker
     assert rec["segments"] and rec["segments"][0]["worker_id"] == w.worker.worker_id
     assert rec["segments"][0]["from_epoch"] == 1 and rec["segments"][0]["to_epoch"] == 4
     w.stop()
+
+
+def test_managed_worker_waits_for_manual_selection(
+    store, make_dataset, make_job, q, ls, spawn_worker
+):
+    """外部计算槽默认只上报硬件与心跳，人工启用后才领取任务。"""
+    ds = make_dataset(n=1200)
+    job = make_job(ds, epochs=30)
+    queued_job = make_job(ds, epochs=1)
+    q.push(job)
+    q.push(queued_job)
+    caps = _caps("remote-pending", gpu=False)
+    caps.update({"worker_id": "remote-pending-cpu0", "machine_id": "remote-pending",
+                 "slot": "cpu0", "managed": True})
+
+    handle = spawn_worker(capabilities=caps, idle_poll=0.05)
+    assert wait_until(
+        lambda: any(
+            item.get("worker_id") == "remote-pending-cpu0"
+            and item.get("state") == "disabled"
+            for item in ls.list_workers()
+        ),
+        timeout=5,
+    )
+    assert job_status(store, job) == "queued"
+    assert q.size() == 2, "待选资源不得取走排队任务"
+
+    ls.set_worker_enabled("remote-pending-cpu0", True)
+    assert wait_until(lambda: job_status(store, job) == "running", timeout=5)
+    ls.set_worker_enabled("remote-pending-cpu0", False)
+    assert wait_until(lambda: job_status(store, job) == "completed", timeout=40)
+    assert wait_until(
+        lambda: any(
+            item.get("worker_id") == "remote-pending-cpu0"
+            and item.get("state") == "disabled"
+            for item in ls.list_workers()
+        ),
+        timeout=5,
+    )
+    assert job_status(store, queued_job) == "queued"
+    assert q.size() == 1, "停用后已运行任务可以收尾，但不可再领取下一任务"
+    handle.stop()
 
 
 def test_completed_job_not_reprocessed(store, make_dataset, make_job, q, ls, spawn_worker):

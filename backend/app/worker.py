@@ -79,15 +79,48 @@ def detect_capabilities(
     hostname = socket.gethostname()
     return {
         "worker_id": worker_id or f"worker-{hostname}-{uuid.uuid4().hex[:6]}",
-        "machine_id": machine_id or hostname,
+        "machine_id": machine_id or config.WORKER_MACHINE_ID or hostname,
         "slot": slot or "cpu0",
         "hostname": hostname,
+        "managed": config.WORKER_MANAGED,
+        "cpu": {"cores": _detect_cpu_cores(), "memory_mb": _detect_memory_mb()},
         "gpu": gpu,
         "torch_version": torch_version,
         "cuda_version": cuda_version,
         "python_version": platform.python_version(),
         "started_at": time.time(),
     }
+
+
+def _detect_cpu_cores() -> int:
+    """优先按容器 CPU 亲和性返回可用核心数，回退到系统逻辑核心数。"""
+    try:
+        return max(len(os.sched_getaffinity(0)), 1)
+    except (AttributeError, OSError):
+        return max(int(os.cpu_count() or 1), 1)
+
+
+def _detect_memory_mb() -> Optional[int]:
+    """探测容器可用内存上限，结合系统总内存避免把整台宿主机内存误报给容器。"""
+    limits: List[int] = []
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path, "r", encoding="utf-8") as memory_file:
+                raw = memory_file.read().strip()
+            if raw != "max":
+                value = int(raw)
+                if 0 < value < 2**60:
+                    limits.append(value)
+        except (OSError, ValueError):
+            pass
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        if pages > 0 and page_size > 0:
+            limits.append(pages * page_size)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return max(min(limits) // (1024 * 1024), 1) if limits else None
 
 
 def probe_visible_gpu() -> bool:
@@ -305,7 +338,7 @@ class TrainingWorker:
             self._log(f"worker {self.worker_id} 已退出")
 
     def _run_forever_iteration(self, hb_ttl: float) -> None:
-        """单轮调度迭代：自探测 -> 心跳 -> 领取 -> 执行。"""
+        """单轮调度迭代：自探测并心跳；未启用的外部槽只保持在线、不领取任务。"""
         healthy = self._self_probe()
         if healthy == self._degraded:  # 状态翻转才打日志，避免刷屏
             self._degraded = not healthy
@@ -313,18 +346,22 @@ class TrainingWorker:
                 self._log(f"worker {self.worker_id}: GPU 探测失败，进入 degraded（暂停领取新任务，等待恢复）")
             else:
                 self._log(f"worker {self.worker_id}: GPU 探测恢复，重新投入调度")
+        enabled = self.lease_store.is_worker_enabled(
+            self.worker_id, default=not bool(self.caps.get("managed"))
+        )
         self.lease_store.heartbeat_worker(
             self.worker_id,
             {
-                "state": "degraded" if self._degraded else "idle",
+                "state": "degraded" if self._degraded else ("idle" if enabled else "disabled"),
                 "current_job": None,
                 "machine_id": self.caps.get("machine_id"),
                 "slot": self.caps.get("slot"),
+                "managed": bool(self.caps.get("managed")),
             },
             hb_ttl,
         )
-        if self._degraded:
-            # 掉卡期间不领取新任务；已被其它节点重派的心跳丢失处理照常生效
+        if self._degraded or not enabled:
+            # 掉卡或人工停用期间保持心跳，但不领取新任务。
             self._shutdown.wait(self._idle_poll)
             return
         try:
@@ -335,6 +372,13 @@ class TrainingWorker:
             self._shutdown.wait(self._idle_poll)
             return
         if job_id is None:
+            return
+        if not self.lease_store.is_worker_enabled(
+            self.worker_id, default=not bool(self.caps.get("managed"))
+        ):
+            # 停用开关可能在队列弹出后到达；把任务放回队列，避免该槽接到新工作。
+            self.queue.push(job_id)
+            self._shutdown.wait(self._idle_poll)
             return
         self._execute_job(job_id)
 
@@ -919,11 +963,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- 卡槽子进程模式：本进程绑定单卡，注册后进入领取循环 ----
     if args.slot is not None:
-        slot_worker_id = (
-            config.WORKER_ID
-            or f"{socket.gethostname()}-{args.slot}"
-        )
-        caps = detect_capabilities(slot_worker_id, machine_id=socket.gethostname(), slot=args.slot)
+        machine_id = config.WORKER_MACHINE_ID or socket.gethostname()
+        worker_prefix = config.WORKER_ID or machine_id
+        slot_worker_id = f"{worker_prefix}-{args.slot}"
+        caps = detect_capabilities(slot_worker_id, machine_id=machine_id, slot=args.slot)
         if caps["gpu"]["available"]:
             print(f"[worker] GPU 就绪: {caps['gpu']['name']}（{caps['gpu']['vram_mb']} MiB）slot={args.slot}")
         else:

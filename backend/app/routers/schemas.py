@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 
 class TrainRequest(BaseModel):
@@ -28,3 +28,9 @@ class PredictRequest(BaseModel):
 
 class ProcessRequest(BaseModel):
     operations: list[dict[str, Any]]
+
+
+class WorkerSelectionRequest(BaseModel):
+    """外部计算槽接单选择请求。"""
+
+    enabled: StrictBool

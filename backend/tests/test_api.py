@@ -148,6 +148,49 @@ def test_require_gpu_resource_hint_roundtrip(client, make_dataset):
     assert "workers" in panel and "queue_depth" in panel
 
 
+def test_managed_worker_selection_api(client):
+    """外部在线槽默认待选；仅已发现且由脚本接入的槽位可加入或停用。"""
+    from app.state import manager
+
+    worker_id = f"api-managed-{time.time_ns()}"
+    manager.lease.register_worker(
+        worker_id,
+        {"managed": True, "machine_id": "api-managed", "slot": "cpu0",
+         "gpu": {"available": False}, "current_job": None},
+        ttl=30,
+    )
+    try:
+        panel = client.get("/api/workers").json()
+        worker = next(item for item in panel["workers"] if item["worker_id"] == worker_id)
+        assert worker["managed"] is True
+        assert worker["enabled"] is False
+        assert worker["current_job"] is None
+
+        selected = client.patch(f"/api/workers/{worker_id}", json={"enabled": True})
+        assert selected.status_code == 200
+        assert selected.json()["enabled"] is True
+
+        panel = client.get("/api/workers").json()
+        worker = next(item for item in panel["workers"] if item["worker_id"] == worker_id)
+        assert worker["enabled"] is True
+
+        stopped = client.patch(f"/api/workers/{worker_id}", json={"enabled": False})
+        assert stopped.status_code == 200
+        assert "正在运行的任务会正常完成" in stopped.json()["message"]
+        assert client.patch("/api/workers/not-found", json={"enabled": True}).status_code == 404
+        assert client.patch(f"/api/workers/{worker_id}", json={"enabled": "yes"}).status_code == 422
+
+        built_in_id = f"api-builtin-{time.time_ns()}"
+        manager.lease.register_worker(built_in_id, {"managed": False}, ttl=30)
+        try:
+            conflict = client.patch(f"/api/workers/{built_in_id}", json={"enabled": False})
+            assert conflict.status_code == 409
+        finally:
+            manager.lease.deregister_worker(built_in_id)
+    finally:
+        manager.lease.deregister_worker(worker_id)
+
+
 def test_pause_resume_via_http(client, make_dataset):
     """HTTP 链路：running → pause → paused → resume → completed，曲线连续。"""
     ds = make_dataset(n=2000)

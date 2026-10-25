@@ -6,7 +6,7 @@
 - 🚀 页面配置超参（epochs / batch_size / lr / 网络结构 / 验证集比例）一键发起训练
 - 📈 实时 Loss 曲线、验证指标曲线（Chart.js）、进度条
 - 📜 实时训练日志，任务可排队、暂停（保存断点）、恢复（跨卡/跨机接续）、取消、删除
-- 🖥 计算槽面板：多机多卡一卡一进程，卡状态（空闲/训练/降级/恢复中/离线）实时可见
+- 🖥 计算资源管理：一次脚本接入服务器、自动检测 CPU/GPU、手动选择计算槽加入资源池
 - 🏆 训练完成自动给出分类报告 / 回归指标（MSE、RMSE、MAE、R²）
 - 🔮 加载 best.pt 在线单条预测，模型权重可下载
 - ♻️ 环境性故障（CUDA/OOM/网络瞬断）自动从断点续训（`JOB_MAX_AUTO_RETRY` 次内），单卡故障不影响整体任务完成
@@ -87,7 +87,7 @@ docker compose up -d --build
 - **失败分类**：数据集缺失/超参非法等业务性错误直接 FAILED；CUDA/OOM/网络瞬断等环境性错误自动重试（上限 `JOB_MAX_AUTO_RETRY`，默认 5，.env 可配），每次重试都从最近 checkpoint 续训。
 - **两种部署形态**：
   - **单机零依赖**（默认）：`STORAGE_BACKEND=local`、`REDIS_URL` 留空 —— API 进程内嵌 worker 线程，协调面为进程内实现，行为与多机模式一致；
-  - **多机多卡**：所有节点连同一 Redis + S3 对象存储（SeaweedFS / 阿里云 OSS / 腾讯云 COS 等），任意服务器加卡即自动入列领取任务。
+  - **多机多卡**：所有节点连同一 Redis + S3 对象存储（SeaweedFS / 阿里云 OSS / 腾讯云 COS 等），外接服务器的计算槽经页面手动启用后才参与调度。
 
 ## 多机多卡部署
 
@@ -99,23 +99,32 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
 
 打开 http://localhost:8000：页面由 frontend 容器托管，API 经同源代理转发。
 
-### 2. 追加 GPU 服务器（可不同显卡型号）
+### 2. 追加计算服务器（CPU / GPU 均可）
+
+主页面点击「添加服务器」，在目标服务器获取本项目代码后运行一次引导命令：
 
 ```bash
-# 在新服务器上克隆同一仓库，配置指向主节点：
-cat > .env <<'EOF'
-REDIS_URL=redis://主节点IP:6379/0
-STORAGE_BACKEND=s3
-S3_ENDPOINT=主节点IP:9000
-S3_ACCESS_KEY=minioadmin
-S3_SECRET_KEY=minioadmin
-S3_BUCKET=mtp-artifacts
-S3_SECURE=false
-EOF
-docker compose up -d --build worker
+# GPU 服务器
+./scripts/worker-node.sh add
+
+# CPU 服务器改用纯 CPU compose 文件
+WORKER_COMPOSE_FILE=docker-compose.cpu.yml ./scripts/worker-node.sh add
 ```
 
-新服务器的每一张卡会注册为独立计算槽（页面「计算槽」面板可见），空闲即领任务；该机掉卡/驱动崩溃只影响其上的任务，其余机器继续训练。
+首次运行会询问主节点 Redis URL、S3 地址和服务器标识，并可填写 S3 凭据；配置写入仓库根目录 `.env.worker`，文件权限为 `600`，不会覆盖项目 `.env`。之后脚本会构建并启动本机 worker，不会启动目标服务器上的 Redis 或 S3。目标机需要安装 Docker Compose，并能访问主节点 Redis 与 S3。
+
+worker 会自动上报可用 CPU 线程数、内存、GPU 型号和显存。槽位首次出现时默认为「待选择」，不会领取任务；在主页面按 GPU 卡或 CPU 执行槽点击「加入资源池」后，才会接收任务。页面的「停止接单」会阻止该槽领取新任务，已经运行的任务会正常结束。加入状态保存在 Redis，worker 重启后仍然有效。
+
+在目标服务器上可直接管理 worker 进程：
+
+```bash
+./scripts/worker-node.sh start
+./scripts/worker-node.sh stop
+./scripts/worker-node.sh restart
+./scripts/worker-node.sh status
+```
+
+`stop` 和 `restart` 会给 worker 最多 45 秒优雅停机时间，正在运行的任务会保存断点，随后可由其它在线计算槽接续。worker 离线后会在心跳过期时从面板移除。页面控制的是接单状态；实际容器进程启动、停止和重启仍由目标机上的脚本执行。
 
 ### 3. 迁移历史数据（老版本升级）
 
@@ -166,6 +175,7 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 ├── frontend/
 │   ├── Dockerfile            # node:20-alpine（基础镜像经 .env 可配国内源）
 │   └── server.js             # 零依赖静态服务 + /api 反向代理（容器内运行）
+├── scripts/worker-node.sh    # 外接计算服务器的一次接入脚本与本地生命周期管理
 ├── backend/
 │   ├── Dockerfile            # python:3.12-slim + CUDA 构建 torch
 │   ├── requirements.txt
@@ -179,7 +189,7 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 │   │   ├── trainer.py        # 可续训训练器（PyTorch）+ 在线预测
 │   │   ├── database.py / models.py / db_utils.py / db_init.py  # MySQL 可选镜像
 │   │   └── config.py
-│   ├── static/index.html     # 可视化单页（计算槽面板 + 暂停/恢复）
+│   ├── static/index.html     # 可视化单页（服务器/资源池面板 + 暂停/恢复）
 │   ├── sample_data/          # 内置示例数据集
 │   ├── scripts/generate_samples.py
 │   └── scripts/migrate_to_object_storage.py  # 老数据迁入对象存储（幂等）
@@ -205,7 +215,8 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 | DELETE | `/api/jobs/{id}` | 删除任务及产物 |
 | GET | `/api/jobs/{id}/model` | 下载 best.pt |
 | POST | `/api/jobs/{id}/predict` | `{ "row": {...单行字段...} }` 用最佳模型预测 |
-| GET | `/api/workers` | 计算槽列表（多机多卡，卡级状态/当前任务/心跳）+ 队列深度 |
+| GET | `/api/workers` | 服务器、硬件能力、心跳与槽位启用状态 + 队列深度 |
+| PATCH | `/api/workers/{worker_id}` | 设置外接计算槽是否加入资源池 `{ "enabled": true/false }` |
 
 ## 扩展新的训练类型
 
