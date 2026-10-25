@@ -89,13 +89,45 @@ def test_resume_rejects_non_paused(store, q, ls, make_dataset, make_job):
         mgr.resume(job_id)
 
 
+@pytest.mark.parametrize("worker_id", [None, "gpu-node-gpu0"])
+def test_manual_retry_requeues_failed_job_with_selected_assignment(
+    store, q, ls, make_dataset, make_job, worker_id
+):
+    """失败任务可重新排队并记录自动分配或指定槽位，且重置本轮自动重试额度。"""
+    ds = make_dataset()
+    job_id = make_job(ds, epochs=2)
+    jobstore.update_job(
+        store, job_id, status=jobstore.FAILED, error="previous worker failed",
+        retry_count=config.JOB_MAX_AUTO_RETRY, finished_at=time.time(),
+    )
+    mgr = JobManager(store=store, queue=q, lease=ls, start_workers=False,
+                     start_watchdog=False)
+
+    retried = mgr.retry(job_id, worker_id=worker_id)
+
+    assert retried["status"] == jobstore.QUEUED
+    assert retried["retry_worker_id"] == worker_id
+    assert retried["retry_assignment_mode"] == ("worker" if worker_id else "auto")
+    assert retried["retry_count"] == 0
+    assert retried["manual_retry_count"] == 1
+    assert retried["last_error"] == "previous worker failed"
+    assert q.pop(timeout=0.2) == job_id
+    assert "手动重试" in jobstore.read_job_log(store, job_id)
+
+
 def test_watchdog_redispatches_expired_running(store, q, ls, make_dataset, make_job):
     """AC7（watchdog）：running 且租约过期 → 重新排队 + redispatched+1（不耗重试额度）。"""
     ds = make_dataset()
     job_id = make_job(ds, epochs=30)
     # 直接伪造 running + 过期租约（模拟执行槽崩溃/心跳迷失）
-    jobstore.update_job(store, job_id, status="running", worker_id="ghost",
-                        started_at=time.time())
+    jobstore.update_job(
+        store, job_id, status="running", worker_id="ghost", machine_id="node-old",
+        slot="gpu1", current_attempt={"id": "attempt-old", "worker_id": "ghost",
+                                      "machine_id": "node-old", "slot": "gpu1",
+                                      "device": "cuda", "from_epoch": 1,
+                                      "started_at": time.time(), "status": "running"},
+        started_at=time.time(),
+    )
     with ls._lock:
         ls._leases[job_id] = ["ghost:tok", time.time() - 1]
     mgr = JobManager(store=store, queue=q, lease=ls, start_workers=False,
@@ -106,6 +138,9 @@ def test_watchdog_redispatches_expired_running(store, q, ls, make_dataset, make_
         rec = jobstore.read_job(store, job_id)
         assert rec["redispatched"] == 1
         assert (rec.get("retry_count") or 0) == 0, "watchdog 重派不消耗重试额度"
+        assert rec["segments"][-1]["status"] == "interrupted"
+        assert rec["segments"][-1]["machine_id"] == "node-old"
+        assert rec["segments"][-1]["slot"] == "gpu1"
         assert "watchdog" in jobstore.read_job_log(store, job_id)
         assert q.size() >= 1
     finally:
@@ -166,6 +201,8 @@ def test_api_view_shape(store, q, ls, make_dataset, make_job):
     rec = mgr.get(job_id)
     view = api_view(rec, include_metrics=True, include_summary=True, store=store)
     for key in ("id", "status", "spec", "resource_hint", "worker_id",
-                "retry_count", "segments", "last_error"):
+                "retry_count", "segments", "last_error", "machine_id", "slot",
+                "current_attempt", "retry_worker_id", "retry_assignment_mode",
+                "manual_retry_count"):
         assert key in view, f"api_view 缺少 {key}"
     assert view["metrics"] == []

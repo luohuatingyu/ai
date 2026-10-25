@@ -396,6 +396,18 @@ class TrainingWorker:
             # 已被取消/暂停的排队任务：直接丢弃（不再回队列）
             self._log(f"[{job_id}] 状态为 {record.get('status')}，跳过")
             return
+        requested_worker = record.get("retry_worker_id")
+        if requested_worker and requested_worker != self.worker_id:
+            self.queue.push(job_id)
+            last_id, last_ts = self._last_skip
+            if last_id != job_id or time.time() - last_ts > 30.0:
+                self._log(
+                    f"[{job_id}] 重试指定计算槽 {requested_worker}，"
+                    f"本槽 {self.worker_id} 不匹配，已放回队列"
+                )
+                self._last_skip = (job_id, time.time())
+            time.sleep(min(2.0, self._idle_poll))
+            return
         spec = record.get("spec") or {}
         hint = spec.get("resource_hint") or {}
         gpu = self.caps.get("gpu") or {}
@@ -443,6 +455,31 @@ class TrainingWorker:
         scratch = config.WORKER_SCRATCH_DIR / job_id
         controller: Optional[JobController] = None
         try:
+            gpu = self.caps.get("gpu") or {}
+            current_attempt = {
+                "id": uuid.uuid4().hex,
+                "worker_id": self.worker_id,
+                "machine_id": self.caps.get("machine_id"),
+                "slot": self.caps.get("slot"),
+                "device": "cuda" if gpu.get("available") else "cpu",
+                "gpu_name": gpu.get("name") if gpu.get("available") else None,
+                "vram_mb": int(gpu.get("vram_mb") or 0) if gpu.get("available") else None,
+                "from_epoch": 1,
+                "status": "running",
+                "started_at": time.time(),
+            }
+            jobstore.update_job(
+                store,
+                job_id,
+                status=jobstore.RUNNING,
+                started_at=record.get("started_at") or current_attempt["started_at"],
+                worker_id=self.worker_id,
+                machine_id=self.caps.get("machine_id"),
+                slot=self.caps.get("slot"),
+                current_attempt=current_attempt,
+                retry_worker_id=None,
+                error=None,
+            )
             shutil.rmtree(scratch, ignore_errors=True)
             scratch.mkdir(parents=True, exist_ok=True)
             params = spec.get("params") or {}
@@ -486,6 +523,9 @@ class TrainingWorker:
             # （resume_state 为空时回滚到 0——孤儿进度清空，重试曲线不会出现重复 epoch）
             truncated = jobstore.truncate_metrics_to_epoch(store, job_id, resumed_epoch)
             (scratch / "metrics.jsonl").write_text(truncated, encoding="utf-8")
+            segment_start = (int(resume_state.get("epoch", 0)) + 1) if resume_state else 1
+            current_attempt["from_epoch"] = segment_start
+            jobstore.update_job(store, job_id, current_attempt=current_attempt)
             if resume_state is not None:
                 gpu_name = (self.caps.get("gpu") or {}).get("name") or "CPU"
                 joblog(
@@ -495,15 +535,6 @@ class TrainingWorker:
                 )
             elif resumed_epoch == 0 and truncated == "":
                 joblog("未找到可用 checkpoint：从头开始训练（此前孤儿进度已回滚）")
-
-            # ---- 标记 running（started_at 只在首次运行时固定） ----
-            jobstore.update_job(
-                store, job_id,
-                status=jobstore.RUNNING,
-                started_at=record.get("started_at") or time.time(),
-                worker_id=self.worker_id,
-                error=None,
-            )
 
             controller = JobController(
                 self.lease_store, job_id, token, self.worker_id,
@@ -523,10 +554,6 @@ class TrainingWorker:
                 with (scratch / "log.txt").open("a", encoding="utf-8") as f:
                     f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
 
-            # 本段执行的起始 epoch（续训场景 = 最近 checkpoint 之后）
-            segment_start = (int(resume_state.get("epoch", 0)) + 1) if resume_state else 1
-            last_ckpt: dict = {"epoch": None}  # 暂停/取消时记录本段实际执行到的 epoch
-
             def on_epoch_end(rec: dict) -> None:
                 """每 epoch 结束：同步 metrics/日志到状态平面（读方写后即可见）。"""
                 store.write_file(job_key(job_id, "metrics.jsonl"), scratch / "metrics.jsonl")
@@ -541,7 +568,6 @@ class TrainingWorker:
                 )
                 prune_checkpoints(store, job_id, config.WORKER_CHECKPOINT_KEEP)
                 controller.set_progress(epoch_done, "training")
-                last_ckpt["epoch"] = int(epoch_done)  # 供暂停分段记录用
 
             joblog(f"worker {self.worker_id} 开始执行训练任务")
 
@@ -574,19 +600,15 @@ class TrainingWorker:
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
-                # 记录本槽实际执行的分段（跨槽续训 UI 分段标注数据源）
-                paused_epoch = int(last_ckpt.get("epoch") or 0)
-                segments = list(record.get("segments") or [])
-                if paused_epoch >= segment_start:
-                    segments.append({
-                        "worker_id": self.worker_id,
-                        "device": "cuda" if (self.caps.get("gpu") or {}).get("available") else "cpu",
-                        "from_epoch": segment_start,
-                        "to_epoch": paused_epoch,
-                        "at": time.time(),
-                    })
-                jobstore.update_job(store, job_id, status=jobstore.PAUSED,
-                                   worker_id=self.worker_id, segments=segments)
+                jobstore.finish_current_attempt(
+                    store,
+                    job_id,
+                    attempt_status="paused",
+                    status=jobstore.PAUSED,
+                    worker_id=self.worker_id,
+                    machine_id=self.caps.get("machine_id"),
+                    slot=self.caps.get("slot"),
+                )
                 joblog(
                     f"训练暂停: {reason}；断点与产物已同步，可由任意节点接手"
                     f"（POST /api/jobs/{job_id}/resume）",
@@ -598,8 +620,13 @@ class TrainingWorker:
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
-                jobstore.update_job(store, job_id, status=jobstore.CANCELLED,
-                                   finished_at=time.time())
+                jobstore.finish_current_attempt(
+                    store,
+                    job_id,
+                    attempt_status="cancelled",
+                    status=jobstore.CANCELLED,
+                    finished_at=time.time(),
+                )
                 joblog("任务已取消")
                 return
 
@@ -609,20 +636,12 @@ class TrainingWorker:
                 artifact = scratch / name
                 if artifact.exists():
                     store.write_file(job_key(job_id, name), artifact)
-            segments = list(record.get("segments") or [])
-            segments.append({
-                "worker_id": self.worker_id,
-                "device": summary.get("device"),
-                "from_epoch": (int(resume_state.get("epoch", 0)) + 1) if resume_state else 1,
-                "to_epoch": summary.get("epochs_total"),
-                "at": time.time(),
-            })
-            jobstore.update_job(
+            jobstore.finish_current_attempt(
                 store, job_id,
+                attempt_status="completed",
                 status=jobstore.COMPLETED,
                 device=summary.get("device"),
                 summary=summary,
-                segments=segments,
                 finished_at=time.time(),
             )
             joblog(
@@ -643,8 +662,15 @@ class TrainingWorker:
         """任务失败收尾：状态/错误信息落状态平面并写日志（日志统一走 joblog 防覆盖）。"""
         error = str(error).strip()
         try:
-            jobstore.update_job(self.store, job_id, status=jobstore.FAILED,
-                               error=error, finished_at=time.time())
+            jobstore.finish_current_attempt(
+                self.store,
+                job_id,
+                attempt_status="failed",
+                attempt_error=error,
+                status=jobstore.FAILED,
+                error=error,
+                finished_at=time.time(),
+            )
             if scratch is not None and scratch.exists():
                 stamp = time.strftime("%H:%M:%S")
                 try:
@@ -692,12 +718,18 @@ class TrainingWorker:
                 f"（断点已保留，任意可用卡可接续）: {exc}",
             )
             try:
-                jobstore.update_job(
-                    self.store, job_id,
+                jobstore.finish_current_attempt(
+                    self.store,
+                    job_id,
+                    attempt_status="retrying",
+                    attempt_error=str(exc),
                     status=jobstore.QUEUED,
                     retry_count=new_count,
                     # 记录最近一次失败原因，但任务仍可续试（非终态）
                     last_error=f"{exc}",
+                    finished_at=None,
+                    retry_worker_id=None,
+                    retry_assignment_mode="auto",
                 )
             except Exception:
                 self._log(f"[{job_id}] 重试状态写入异常:\n{traceback.format_exc()}")

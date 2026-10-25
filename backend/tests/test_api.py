@@ -12,6 +12,7 @@ import io
 import tarfile
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -1051,3 +1052,104 @@ def test_upload_csv_with_integer_columns_is_serializable_and_listed(client, stor
         {"feature": 1, "target": "no"},
         {"feature": 2, "target": "yes"},
     ]
+
+
+def test_failed_job_retry_api_checks_resource_requirements_and_assignment(
+    client, store, monkeypatch, request
+):
+    """失败任务可自动或指定 GPU 槽重试，未知/停用/不兼容资源会被拒绝。"""
+    from app.coordination import EmbeddedJobQueue
+    from app.state import manager
+    from tests.conftest import make_job_record
+
+    monkeypatch.setattr(manager, "queue", EmbeddedJobQueue())
+    job_ids = ["job-manual-retry-gpu", "job-auto-retry", "job-retry-not-failed"]
+    worker_ids = ["retry-cpu", "retry-small-gpu", "retry-big-gpu", "retry-disabled"]
+
+    def cleanup():
+        for worker_id in worker_ids:
+            manager.lease.deregister_worker(worker_id)
+        for job_id in job_ids:
+            try:
+                jobstore.delete_job_artifacts(manager.store, job_id)
+            except Exception:
+                pass
+
+    request.addfinalizer(cleanup)
+
+    workers = [
+        ("retry-cpu", {"available": False, "vram_mb": 0}, True),
+        ("retry-small-gpu", {"available": True, "name": "Small", "vram_mb": 4096}, True),
+        ("retry-big-gpu", {"available": True, "name": "Big", "vram_mb": 8192}, True),
+        ("retry-disabled", {"available": True, "name": "Disabled", "vram_mb": 16384}, False),
+    ]
+    for worker_id, gpu, enabled in workers:
+        manager.lease.register_worker(
+            worker_id,
+            {"worker_id": worker_id, "machine_id": "retry-node", "slot": worker_id,
+             "managed": True, "gpu": gpu, "cpu": {"cores": 4}},
+            ttl=60,
+        )
+        manager.lease.set_worker_enabled(worker_id, enabled)
+
+    failed = make_job_record(
+        job_ids[0], require_gpu=True, min_vram_mb=8192
+    )
+    failed.update({"status": "failed", "error": "GPU worker lost", "retry_count": 3})
+    jobstore.write_job(manager.store, failed)
+
+    assert client.post(f"/api/jobs/{job_ids[0]}/retry", json={"worker_id": "missing-worker"}).status_code == 409
+    assert client.post(f"/api/jobs/{job_ids[0]}/retry", json={"worker_id": ""}).status_code == 422
+    assert client.post(
+        f"/api/jobs/{job_ids[0]}/retry", json={"worker_id": "x" * 161}
+    ).status_code == 422
+    assert client.post(
+        f"/api/jobs/{job_ids[0]}/retry", json={"worker_id": "../../;rm -rf /"}
+    ).status_code == 409
+    assert client.post(f"/api/jobs/{job_ids[0]}/retry", json={"worker_id": "retry-cpu"}).status_code == 409
+    assert client.post(f"/api/jobs/{job_ids[0]}/retry", json={"worker_id": "retry-small-gpu"}).status_code == 409
+    assert client.post(f"/api/jobs/{job_ids[0]}/retry", json={"worker_id": "retry-disabled"}).status_code == 409
+
+    selected = client.post(
+        f"/api/jobs/{job_ids[0]}/retry", json={"worker_id": "retry-big-gpu"}
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["assignment_mode"] == "worker"
+    assert selected.json()["worker_id"] == "retry-big-gpu"
+    selected_detail = client.get(f"/api/jobs/{job_ids[0]}").json()
+    assert selected_detail["status"] == "queued"
+    assert selected_detail["retry_worker_id"] == "retry-big-gpu"
+    assert selected_detail["retry_count"] == 0
+    assert selected_detail["manual_retry_count"] == 1
+    assert selected_detail["last_error"] == "GPU worker lost"
+
+    automatic = make_job_record(job_ids[1])
+    automatic.update({"status": "failed", "error": "previous attempt failed"})
+    jobstore.write_job(manager.store, automatic)
+    auto_response = client.post(f"/api/jobs/{job_ids[1]}/retry", json={})
+    assert auto_response.status_code == 200, auto_response.text
+    assert auto_response.json()["assignment_mode"] == "auto"
+    assert auto_response.json()["worker_id"] is None
+
+    non_failed = make_job_record(job_ids[2])
+    jobstore.write_job(manager.store, non_failed)
+    assert client.post(f"/api/jobs/{job_ids[2]}/retry", json={}).status_code == 409
+    assert client.post("/api/jobs/job-does-not-exist/retry", json={}).status_code == 404
+
+
+def test_training_page_resource_retry_and_chart_style_contract():
+    """训练页应提供资源轨迹、失败重试控件与浅色曲线样式。"""
+    backend_dir = Path(__file__).resolve().parents[1]
+    static_dir = backend_dir / "static"
+    if not static_dir.is_dir():
+        static_dir = backend_dir.parent / "static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    css = (static_dir / "app.css").read_text(encoding="utf-8")
+
+    assert 'id="resourceAllocation"' in html
+    assert 'id="retryResourceSelect"' in html
+    assert "/api/jobs/${encodeURIComponent(jobId)}/retry" in html
+    assert "state.workerSlots.filter" in html
+    assert 'Chart.defaults.borderColor = "#e6ecf3"' in html
+    assert ".training-page .chartbox canvas" in css
+    assert ".training-page .resource-allocation-row" in css

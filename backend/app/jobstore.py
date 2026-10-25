@@ -55,6 +55,44 @@ def update_job(store: ArtifactStore, job_id: str, **fields: Any) -> dict:
     return record
 
 
+def finish_current_attempt(
+    store: ArtifactStore,
+    job_id: str,
+    attempt_status: str,
+    attempt_error: Optional[str] = None,
+    **fields: Any,
+) -> dict:
+    """收尾当前执行槽记录，并与任务状态一起持久化。"""
+    record = read_job(store, job_id)
+    if record is None:
+        raise KeyError(job_id)
+    attempt = record.get("current_attempt")
+    if isinstance(attempt, dict):
+        finished_at = time.time()
+        try:
+            metrics = read_metrics(store, job_id)
+            latest_epoch = int(metrics[-1].get("epoch") or 0) if metrics else 0
+        except Exception:
+            latest_epoch = 0
+        first_epoch = int(attempt.get("from_epoch") or 1)
+        segment = dict(attempt)
+        segment.update(
+            {
+                "status": attempt_status,
+                "to_epoch": max(latest_epoch, first_epoch - 1),
+                "finished_at": finished_at,
+                "at": finished_at,
+            }
+        )
+        if attempt_error:
+            segment["error"] = str(attempt_error)[:2000]
+        segments = list(record.get("segments") or [])
+        if not any(item.get("id") == segment.get("id") for item in segments if isinstance(item, dict)):
+            segments.append(segment)
+        fields.update({"segments": segments, "current_attempt": None})
+    return update_job(store, job_id, **fields)
+
+
 def _mirror_to_db(record: dict, fields: dict) -> None:
     """把状态变更镜像到 MySQL（可用时）；失败静默，不影响文件权威源。"""
     if not config.DB_AVAILABLE:

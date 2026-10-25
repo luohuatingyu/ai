@@ -51,9 +51,15 @@ def api_view(
         "finished_at": record.get("finished_at"),
         "error": record.get("error"),
         "device": record.get("device"),
+        "machine_id": record.get("machine_id"),
+        "slot": record.get("slot"),
+        "current_attempt": record.get("current_attempt"),
         "spec": record.get("spec") or {},
         "resource_hint": (record.get("spec") or {}).get("resource_hint") or {},
         "worker_id": record.get("worker_id"),
+        "retry_worker_id": record.get("retry_worker_id"),
+        "retry_assignment_mode": record.get("retry_assignment_mode") or "auto",
+        "manual_retry_count": record.get("manual_retry_count") or 0,
         "retry_count": record.get("retry_count") or 0,
         "last_error": record.get("last_error"),
         "redispatched": record.get("redispatched") or 0,
@@ -142,7 +148,13 @@ class JobManager:
             "summary": None,
             "segments": [],
             "worker_id": None,
+            "machine_id": None,
+            "slot": None,
+            "current_attempt": None,
+            "retry_worker_id": None,
+            "retry_assignment_mode": "auto",
             "retry_count": 0,
+            "manual_retry_count": 0,
             "last_error": None,
             "redispatched": 0,
         }
@@ -215,6 +227,50 @@ class JobManager:
             "任务恢复：重新排队，任意可用卡/机器将从最近 checkpoint 接续训练",
         )
         return updated
+
+    def retry(self, job_id: str, worker_id: Optional[str] = None) -> dict:
+        """重试失败任务；可将下一次执行固定到一个 worker 或交回自动调度。"""
+        token = f"manual-retry:{uuid.uuid4().hex}"
+        if not self.lease.acquire(
+            job_id, token, max(float(config.WORKER_LEASE_TTL), 10.0)
+        ):
+            raise RuntimeError("任务租约仍有效，或另一个重试请求正在处理")
+        try:
+            record = self.get(job_id)
+            if record is None:
+                raise KeyError(job_id)
+            if record.get("status") != FAILED:
+                raise ValueError("仅失败任务可重新排队")
+
+            previous_error = record.get("error") or record.get("last_error")
+            assignment_mode = "worker" if worker_id else "auto"
+            updated = jobstore.update_job(
+                self.store,
+                job_id,
+                status=QUEUED,
+                error=None,
+                finished_at=None,
+                current_attempt=None,
+                retry_count=0,
+                manual_retry_count=int(record.get("manual_retry_count") or 0) + 1,
+                last_error=previous_error,
+                retry_worker_id=worker_id,
+                retry_assignment_mode=assignment_mode,
+                retry_requested_at=time.time(),
+            )
+            jobstore.append_job_log(
+                self.store,
+                job_id,
+                "手动重试：" + (
+                    f"指定计算槽 {worker_id}"
+                    if worker_id
+                    else "使用自动资源分配"
+                ) + "；自动重试额度已重新计数",
+            )
+            self.queue.push(job_id)
+            return updated
+        finally:
+            self.lease.release(job_id, token)
 
     def delete(self, job_id: str) -> None:
         """删除任务及其全部产物（终态或暂停/排队任务；running 需先取消）。"""
@@ -326,10 +382,17 @@ class JobManager:
             status = record.get("status")
             if status == RUNNING and self.lease.peek_holder(job_id) is None:
                 redispatched = int(record.get("redispatched") or 0) + 1
-                jobstore.update_job(
-                    self.store, job_id,
+                jobstore.finish_current_attempt(
+                    self.store,
+                    job_id,
+                    attempt_status="interrupted",
+                    error="执行槽心跳丢失，任务由 watchdog 重新派发",
                     status=QUEUED,
                     worker_id=None,
+                    machine_id=None,
+                    slot=None,
+                    retry_worker_id=None,
+                    retry_assignment_mode="auto",
                     redispatched=redispatched,
                 )
                 jobstore.append_job_log(

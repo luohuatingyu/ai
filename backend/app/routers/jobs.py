@@ -23,6 +23,7 @@ from app.routers.schemas import (
     GenerateRequest,
     PredictRequest,
     RemoteServerRequest,
+    RetryJobRequest,
     TrainRequest,
     WorkerSelectionRequest,
 )
@@ -187,6 +188,52 @@ def resume_job(job_id: str) -> dict:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"ok": True, "status": record["status"]}
+
+
+@router.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, request: RetryJobRequest) -> dict:
+    """失败任务重新排队；指定槽位时先验证在线、启用及资源要求。"""
+    _check_id(job_id, "任务")
+    if request.worker_id:
+        worker = next(
+            (
+                item for item in manager.lease.list_workers()
+                if str(item.get("worker_id", "")) == request.worker_id
+            ),
+            None,
+        )
+        if worker is None or not worker.get("active"):
+            raise HTTPException(409, "所选计算槽不在线或已失效，请刷新资源列表")
+        if not manager.lease.is_worker_enabled(
+            request.worker_id, default=not bool(worker.get("managed", False))
+        ):
+            raise HTTPException(409, "所选计算槽已停用，不能接收重试任务")
+        record = manager.get(job_id)
+        if record is None:
+            raise HTTPException(404, "任务不存在")
+        hint = (record.get("spec") or {}).get("resource_hint") or {}
+        gpu = worker.get("gpu") or {}
+        min_vram = int(hint.get("min_vram_mb") or 0)
+        if (hint.get("require_gpu") or min_vram > 0) and not gpu.get("available"):
+            raise HTTPException(409, "任务要求 GPU，所选计算槽不含可用 GPU")
+        if min_vram > 0 and int(gpu.get("vram_mb") or 0) < min_vram:
+            raise HTTPException(409, "所选 GPU 显存不足以满足任务要求")
+
+    try:
+        record = manager.retry(job_id, worker_id=request.worker_id)
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": record["status"],
+        "assignment_mode": record.get("retry_assignment_mode", "auto"),
+        "worker_id": record.get("retry_worker_id"),
+    }
 
 
 @router.delete("/jobs/{job_id}")

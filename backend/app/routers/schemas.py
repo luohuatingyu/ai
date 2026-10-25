@@ -117,6 +117,12 @@ class WorkerSelectionRequest(BaseModel):
     enabled: StrictBool
 
 
+class RetryJobRequest(BaseModel):
+    """失败任务的重试分配方式；worker_id 为空表示继续自动调度。"""
+
+    worker_id: str | None = Field(default=None, min_length=1, max_length=160)
+
+
 class RemoteServerRequest(BaseModel):
     """登记一台由平台经 SSH 远程接入的计算服务器。"""
 

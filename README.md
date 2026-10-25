@@ -228,11 +228,12 @@ CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch
 | GET | `/api/datasets/{id}` | 元信息 + 前 N 行预览 + 列类型 |
 | POST | `/api/train` | 发起训练 `{dataset_id, target, task, epochs, batch_size, lr, hidden_layers, hidden_size, test_split, seed, require_gpu, min_vram_mb}` |
 | GET | `/api/jobs` | 任务列表（含各任务逐 epoch 指标） |
-| GET | `/api/jobs/{id}` | 任务详情：状态、进度、指标序列、summary、segments（跨槽续训分段） |
+| GET | `/api/jobs/{id}` | 任务详情：状态、进度、指标序列、summary、资源执行轨迹 |
 | GET | `/api/jobs/{id}/logs` | 日志增量拉取（`?offset=` 行号） |
 | POST | `/api/jobs/{id}/cancel` | 取消（当前批次结束后停止） |
 | POST | `/api/jobs/{id}/pause` | 暂停（保存断点后进入 paused，可跨机/卡恢复） |
 | POST | `/api/jobs/{id}/resume` | 恢复（重新排队，任意可用卡从 checkpoint 接续） |
+| POST | `/api/jobs/{id}/retry` | 失败任务重试；`{ "worker_id": null }` 自动分配，指定 ID 时固定到兼容槽位 |
 | DELETE | `/api/jobs/{id}` | 删除任务及产物 |
 | GET | `/api/jobs/{id}/model` | 下载 best.pt |
 | POST | `/api/jobs/{id}/predict` | `{ "row": {...单行字段...} }` 用最佳模型预测 |

@@ -68,6 +68,8 @@ def test_worker_completes_job(store, make_dataset, make_job, q, ls, spawn_worker
     assert store.exists(job_key(job, "preprocessor.json"))
     assert rec["summary"]["epochs_total"] == 4
     assert rec["segments"] and rec["segments"][0]["worker_id"] == w.worker.worker_id
+    assert rec["segments"][0]["machine_id"] == w.worker.caps["machine_id"]
+    assert rec["segments"][0]["slot"] == w.worker.caps["slot"]
     assert rec["segments"][0]["from_epoch"] == 1 and rec["segments"][0]["to_epoch"] == 4
     w.stop()
 
@@ -213,6 +215,46 @@ def _caps(name: str, gpu: bool = False, vram: int = 0) -> dict:
     return caps
 
 
+def test_manual_retry_target_is_the_only_worker_that_claims_job(
+    store, make_dataset, make_job, q, ls, spawn_worker
+):
+    """指定重试槽时其他 worker 放回任务，目标槽执行并留下机器与卡槽记录。"""
+    ds = make_dataset(n=120)
+    job = make_job(ds, epochs=2)
+    target_id = "retry-node-cpu2"
+    jobstore.update_job(
+        store,
+        job,
+        status=jobstore.QUEUED,
+        retry_worker_id=target_id,
+        retry_assignment_mode="worker",
+        error=None,
+    )
+    q.push(job)
+
+    other_caps = _caps("other-node-cpu0")
+    other_caps.update({"worker_id": "other-node-cpu0", "machine_id": "other-node", "slot": "cpu0"})
+    other = spawn_worker(capabilities=other_caps)
+    assert wait_until(lambda: any(item.get("worker_id") == "other-node-cpu0" for item in ls.list_workers()), 5)
+    assert wait_until(lambda: other.worker._last_skip[0] == job, 5)
+    assert job_status(store, job) == jobstore.QUEUED
+
+    target_caps = _caps(target_id)
+    target_caps.update({"worker_id": target_id, "machine_id": "retry-node", "slot": "cpu2"})
+    target = spawn_worker(capabilities=target_caps)
+    assert wait_until(lambda: job_status(store, job) == jobstore.COMPLETED, 40)
+
+    record = jobstore.read_job(store, job)
+    assert record["worker_id"] == target_id
+    assert record["segments"][-1]["worker_id"] == target_id
+    assert record["segments"][-1]["machine_id"] == "retry-node"
+    assert record["segments"][-1]["slot"] == "cpu2"
+    assert record["segments"][-1]["status"] == "completed"
+    assert record["retry_worker_id"] is None
+    other.stop()
+    target.stop()
+
+
 def test_require_gpu_job_not_claimed_by_cpu_worker(store, make_dataset, make_job, q, ls):
     """AC8：require_gpu 任务在 CPU 槽保持排队（放回队列，等 GPU 卡）。"""
     ds = make_dataset()
@@ -298,6 +340,7 @@ def test_env_error_auto_retries_then_completes(store, make_dataset, make_job, q,
     assert wait_until(lambda: job_status(store, job) == "completed", 60)
     rec = jobstore.read_job(store, job)
     assert rec["retry_count"] == 1
+    assert [segment["status"] for segment in rec["segments"]] == ["retrying", "completed"]
     assert "storage connection reset" in (rec.get("last_error") or "")
     assert job_epochs(store, job) == list(range(1, 7)), "重试不得产生重复/缺失 epoch"
     assert rec["error"] is None, "最终成功应清空 error"
@@ -321,6 +364,8 @@ def test_env_error_exhausts_retry_then_failed(store, make_dataset, make_job, q, 
     assert wait_until(lambda: job_status(store, job) == "failed", 120)
     rec = jobstore.read_job(store, job)
     assert rec["retry_count"] == int(config.JOB_MAX_AUTO_RETRY)
+    assert len(rec["segments"]) == int(config.JOB_MAX_AUTO_RETRY) + 1
+    assert rec["segments"][-1]["status"] == "failed"
     assert "自动重试已耗尽" in str(rec["error"])
     log = jobstore.read_job_log(store, job)
     assert log.count("自动重试 ") == int(config.JOB_MAX_AUTO_RETRY)
@@ -336,6 +381,10 @@ def test_business_error_fails_without_retry(store, make_dataset, make_job, q, ls
     assert wait_until(lambda: job_status(store, job) == "failed", 30)
     rec = jobstore.read_job(store, job)
     assert rec.get("retry_count", 0) == 0
+    assert rec["segments"][-1]["status"] == "failed"
+    assert rec["segments"][-1]["worker_id"] == w.worker.worker_id
+    assert rec["segments"][-1]["machine_id"] == w.worker.caps["machine_id"]
+    assert rec["segments"][-1]["slot"] == w.worker.caps["slot"]
     assert q.size() == 0, "业务性失败不应回队列"
     assert "任务失败" in jobstore.read_job_log(store, job)
     w.stop()

@@ -435,6 +435,19 @@
       </div>
       <div class="progress" id="dProgress"><div></div></div>
       <div id="dProgressText" class="hint" style="margin:4px 0 12px;"></div>
+      <div id="resourceAllocation" class="resource-allocation" hidden></div>
+      <div id="retryPanel" class="retry-panel" hidden>
+        <div class="retry-panel-copy">
+          <strong>失败后重试</strong>
+          <span class="hint">可由队列自动分配，也可指定一个在线计算槽。</span>
+        </div>
+        <div class="retry-panel-controls">
+          <label class="sr-only" for="retryResourceSelect">重试资源</label>
+          <select id="retryResourceSelect" aria-label="选择重试资源"></select>
+          <button id="btnRetry" type="button" class="primary">重新排队</button>
+        </div>
+        <div id="retryHint" class="hint" aria-live="polite"></div>
+      </div>
 
       <div class="tabs">
         <button data-tab="curves" class="active">📈 曲线</button>
@@ -573,6 +586,7 @@ const state = {
   datasets: [], datasetId: null, preview: null,
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   charts: { loss: null, metric: null }, metricKind: null,
+  workerSlots: [], detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
   remoteCredentials: [], remoteCredentialDefaultId: null, remoteCredentialsCanConfigure: false,
 };
@@ -594,6 +608,156 @@ function toast(msg, kind = "") {
 }
 const fmtTime = (ts) => ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "-";
 const fmtLoss = (v) => (v === null || v === undefined) ? "-" : Number(v).toFixed(4);
+// 将一次执行记录转换成稳定可读的机器、槽位和设备标签。
+function resourceText(attempt) {
+  if (!attempt) return "";
+  const machine = attempt.machine_id || attempt.worker_id || "未知机器";
+  const slot = attempt.slot ? ` / ${attempt.slot}` : "";
+  const worker = attempt.worker_id && attempt.worker_id !== machine ? ` · ${attempt.worker_id}` : "";
+  const device = attempt.device === "cuda"
+    ? `GPU${attempt.gpu_name ? ` · ${attempt.gpu_name}` : ""}${attempt.vram_mb ? ` ${(Number(attempt.vram_mb) / 1024).toFixed(1)} GB` : ""}`
+    : attempt.device === "cpu" ? "CPU" : "设备未知";
+  return `${machine}${slot}${worker} · ${device}`;
+}
+
+// 按任务状态显示待分配、正在运行或已完成分段的资源位置。
+function renderResourceAllocation(job) {
+  const box = $("resourceAllocation");
+  const segments = Array.isArray(job.segments) ? job.segments : [];
+  const rows = [];
+  if (job.status === "queued") {
+    if (job.retry_worker_id) {
+      rows.push({
+        title: "重试目标",
+        resource: job.retry_worker_id,
+        meta: "等待指定槽位领取",
+        status: "手动指定",
+      });
+    } else {
+      const hint = job.spec.resource_hint || {};
+      rows.push({
+        title: "等待分配",
+        resource: "自动匹配空闲资源",
+        meta: hint.require_gpu ? "仅 GPU 槽位" : hint.min_vram_mb ? `GPU 显存 ≥ ${hint.min_vram_mb} MiB` : "CPU / GPU 均可",
+        status: "排队中",
+      });
+    }
+  }
+  if (job.current_attempt) {
+    rows.push({
+      title: "当前执行",
+      resource: resourceText(job.current_attempt),
+      meta: `epoch ${job.current_attempt.from_epoch || 1} 起 · ${fmtTime(job.current_attempt.started_at)}`,
+      status: "训练中",
+    });
+  } else if (job.status === "running" && job.worker_id) {
+    rows.push({
+      title: "当前执行",
+      resource: resourceText({ worker_id: job.worker_id, machine_id: job.machine_id, slot: job.slot, device: job.device }),
+      meta: "旧任务记录未保存执行分段详情",
+      status: "训练中",
+    });
+  }
+  const segmentStates = {
+    completed: "完成", paused: "暂停交接", retrying: "自动重试", interrupted: "中断重派",
+    failed: "失败", cancelled: "已取消",
+  };
+  for (const segment of segments.slice().reverse()) {
+    rows.push({
+      title: "执行分段",
+      resource: resourceText(segment),
+      meta: `epoch ${segment.from_epoch ?? "?"}–${segment.to_epoch ?? "?"}${segment.finished_at ? ` · ${fmtTime(segment.finished_at)}` : ""}`,
+      status: segmentStates[segment.status] || "已记录",
+    });
+  }
+  if (!rows.length && job.worker_id) {
+    rows.push({
+      title: "最近执行",
+      resource: resourceText({ worker_id: job.worker_id, machine_id: job.machine_id, slot: job.slot, device: job.device }),
+      meta: "旧任务记录未保存分段位置",
+      status: "已记录",
+    });
+  }
+  if (!rows.length) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.innerHTML = `<div class="resource-allocation-title">资源分配与执行轨迹</div><div class="resource-allocation-list">${rows.map((row) => `
+    <div class="resource-allocation-row">
+      <div class="resource-allocation-main">${esc(row.title)} · ${esc(row.resource)}</div>
+      <div class="resource-allocation-meta">${esc(row.meta)}<span class="resource-allocation-state">${esc(row.status)}</span></div>
+    </div>`).join("")}</div>`;
+}
+
+// 用最近一次实际执行位置补充任务列表信息，排队任务显示其分配策略。
+function jobResourceLabel(job) {
+  if (job.current_attempt) return `资源 · ${resourceText(job.current_attempt)}`;
+  if (job.status === "queued" && job.retry_worker_id) return `重试目标 · ${job.retry_worker_id}`;
+  const segments = Array.isArray(job.segments) ? job.segments : [];
+  if (segments.length) return `最近资源 · ${resourceText(segments[segments.length - 1])}`;
+  if (job.status === "queued") return "资源 · 自动分配";
+  if (job.worker_id) return `最近资源 · ${resourceText(job)}`;
+  return "";
+}
+
+// 仅提供在线、已启用且满足 GPU/显存要求的槽位作为手动重试目标。
+function renderRetryControls(job) {
+  const select = $("retryResourceSelect");
+  if (!select) return;
+  if (!job || job.status !== "failed") {
+    $("retryPanel").hidden = true;
+    return;
+  }
+  $("retryPanel").hidden = false;
+  const hint = job.spec.resource_hint || {};
+  const minVram = Number(hint.min_vram_mb || 0);
+  const gpuRequired = Boolean(hint.require_gpu || minVram > 0);
+  const eligible = state.workerSlots.filter((worker) => {
+    const gpu = worker.gpu || {};
+    return worker.active && worker.enabled && worker.state !== "degraded"
+      && (!gpuRequired || gpu.available)
+      && (!minVram || Number(gpu.vram_mb || 0) >= minVram);
+  });
+  const selected = select.value;
+  const options = ['<option value="">自动分配 · 所有符合要求的资源</option>'];
+  for (const worker of eligible) {
+    const gpu = worker.gpu || {};
+    const device = gpu.available
+      ? `GPU · ${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB` : ""}`
+      : `CPU · ${worker.cpu && worker.cpu.cores ? `${worker.cpu.cores} 线程` : "资源"}`;
+    const stateText = worker.state === "running" ? "训练中，排队等待" : "在线";
+    const label = `${worker.machine_id || worker.worker_id} / ${worker.slot || "计算槽"} · ${device} · ${stateText}`;
+    options.push(`<option value="${esc(worker.worker_id)}">${esc(label)}</option>`);
+  }
+  select.innerHTML = options.join("");
+  if (eligible.some((worker) => worker.worker_id === selected)) select.value = selected;
+  $("retryHint").textContent = eligible.length
+    ? gpuRequired ? "此任务只能分配到满足 GPU / 显存要求的槽位。" : "CPU 与 GPU 槽位均可手动选择；自动分配会由队列选择空闲资源。"
+    : gpuRequired ? "当前没有在线且满足 GPU / 显存要求的槽位；自动分配会排队等待合适资源。"
+      : "当前没有在线计算槽；自动分配会排队等待资源上线。";
+  $("btnRetry").disabled = state.retrySubmitting;
+}
+
+// 将失败任务按所选策略重新放回队列并刷新资源执行信息。
+async function retryFailedJob(jobId) {
+  if (state.retrySubmitting) return;
+  const button = $("btnRetry");
+  state.retrySubmitting = true;
+  button.disabled = true;
+  try {
+    const workerId = $("retryResourceSelect").value || null;
+    const result = await apiJson(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    toast(result.assignment_mode === "worker" ? `已重新排队，等待 ${result.worker_id} 执行` : "已重新排队，由调度器自动分配资源", "ok");
+    await refreshJobs();
+  } catch (error) {
+    toast(`重试失败：${error.message}`, "err");
+  } finally {
+    state.retrySubmitting = false;
+    renderRetryControls(state.detailRecord);
+  }
+}
 const taskName = (task) => ({
   classification: "分类", regression: "回归", clustering: "KMeans 聚类",
   time_series_forecasting: "时间序列预测",
@@ -880,8 +1044,10 @@ function jobCard(j) {
       <span class="chip">${esc(j.spec.dataset_name || "")}</span>
       ${(j.spec.resource_hint || {}).require_gpu ? `<span class="chip" title="要求 GPU 训练">GPU</span>` : ""}
       ${j.retry_count ? `<span class="chip" title="环境性错误自动重试次数">↻ ${j.retry_count}</span>` : ""}
+      ${j.manual_retry_count ? `<span class="chip" title="失败后手动重新排队次数">手动重试 ${j.manual_retry_count}</span>` : ""}
     </div>
     <div class="chips">
+      ${jobResourceLabel(j) ? `<span class="chip">${esc(jobResourceLabel(j))}</span>` : ""}
       <span class="chip">${j.spec.task === "clustering" ? "最多迭代" : "ep"} ${m.epochs}</span>
       ${m.n_clusters ? `<span class="chip">${m.n_clusters} 簇</span>` : ""}
       ${m.lookback ? `<span class="chip">窗口 ${m.lookback} · 预测 ${m.forecast_horizon} 步</span>` : ""}
@@ -931,12 +1097,19 @@ async function loadDetail() {
   try { j = await apiJson(`/api/jobs/${state.jobId}`); }
   catch { state.jobId = null; $("detail").hidden = true; return; }
 
+  state.detailRecord = j;
   const taskLabel = taskName(j.spec.task);
   $("dName").textContent = `${j.spec.target || "无目标列"} · ${taskLabel}（${j.spec.dataset_name || ""}）`;
   const st = $("dStatus");
   st.textContent = statusText[j.status] || j.status;
   st.className = "chip st-" + j.status;
-  $("dDevice").textContent = j.device ? (j.device === "cuda" ? "GPU" : "CPU") : "设备待分配";
+  const latestSegment = (j.segments || []).slice(-1)[0];
+  const assignedResource = j.current_attempt || latestSegment || j;
+  $("dDevice").textContent = j.current_attempt || latestSegment || j.worker_id
+    ? resourceText(assignedResource) : (j.retry_worker_id ? `等待 ${j.retry_worker_id}` : "等待资源分配");
+  renderResourceAllocation(j);
+  renderRetryControls(j);
+  $("btnRetry").onclick = () => retryFailedJob(j.id);
 
   $("btnCancel").hidden = !(j.status === "queued" || j.status === "running");
   $("btnPause").hidden = !(j.status === "queued" || j.status === "running");
@@ -988,8 +1161,13 @@ function ensureCharts() {
     $("chartNote").textContent = "图表组件（Chart.js CDN）未加载，检查浏览器网络后刷新。";
     return false;
   }
-  Chart.defaults.color = "#9fb0c7";
-  Chart.defaults.borderColor = "rgba(45,51,59,.8)";
+  Chart.defaults.color = "#718096";
+  Chart.defaults.borderColor = "#e6ecf3";
+  Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif';
+  Chart.defaults.plugins.legend.labels.usePointStyle = true;
+  Chart.defaults.plugins.legend.labels.pointStyle = "line";
+  Chart.defaults.plugins.legend.labels.boxWidth = 22;
+  Chart.defaults.plugins.legend.labels.padding = 16;
   if (!state.charts.loss) {
     state.charts.loss = new Chart($("lossChart"), {
       type: "line",
@@ -997,12 +1175,28 @@ function ensureCharts() {
         { label: "train_loss", data: [], borderColor: "#58a6ff", pointRadius: 0, borderWidth: 2, tension: 0.25 },
         { label: "val_loss", data: [], borderColor: "#f0883e", pointRadius: 0, borderWidth: 2, tension: 0.25 },
       ]},
-      options: { animation: false, maintainAspectRatio: true, scales: { y: { beginAtZero: true } } },
+      options: {
+        animation: false,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "top", align: "end" } },
+        scales: {
+          x: { grid: { display: false }, ticks: { maxTicksLimit: 12, color: "#8796aa" } },
+          y: { beginAtZero: true, grid: { color: "#edf1f6" }, border: { display: false }, ticks: { padding: 8, color: "#8796aa" } },
+        },
+      },
     });
     state.charts.metric = new Chart($("metricChart"), {
       type: "line",
       data: { labels: [], datasets: [{ label: "metric", data: [], borderColor: "#3fb950", pointRadius: 0, borderWidth: 2, tension: 0.25 }] },
-      options: { animation: false, maintainAspectRatio: true, scales: { y: { beginAtZero: true } } },
+      options: {
+        animation: false,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { display: false }, ticks: { maxTicksLimit: 12, color: "#8796aa" } },
+          y: { beginAtZero: true, grid: { color: "#edf1f6" }, border: { display: false }, ticks: { padding: 8, color: "#8796aa" } },
+        },
+      },
     });
   }
   return true;
@@ -1333,6 +1527,8 @@ async function refreshWorkers() {
     const d = await apiJson("/api/workers");
     const grid = $("workerGrid");
     const workers = d.workers || [];
+    state.workerSlots = workers;
+    renderRetryControls(state.detailRecord);
     const remoteResult = await loadRemoteServers();
     const groups = new Map();
     for (const worker of workers) {

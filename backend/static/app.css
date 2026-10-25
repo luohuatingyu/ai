@@ -709,6 +709,82 @@ html { min-width: 320px; background: var(--bg); }
 .training-page .st-cancelled,
 .training-page .st-paused { color: #a16207; border-color: #fde68a; background: #fffbeb; }
 
+.training-page .jobcard {
+  margin: 0 0 10px;
+  padding: 13px 15px 12px;
+  border-color: #e1e8f1;
+  border-radius: 13px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(25, 42, 70, .035);
+}
+
+.training-page .jobcard:hover {
+  border-color: #b8cdf6;
+  background: #fcfdff;
+  box-shadow: 0 6px 16px rgba(37, 99, 235, .08);
+}
+
+.training-page .jobcard.active {
+  border-color: #7ca4f2;
+  background: linear-gradient(110deg, #f3f7ff, #fff 72%);
+  box-shadow: inset 3px 0 0 #3478f6, 0 3px 12px rgba(37, 99, 235, .07);
+}
+
+.training-page .jobline { gap: 7px 9px; }
+.training-page .jobname { color: #23344e; font-size: 13px; line-height: 1.45; }
+.training-page .jobcard .chips { gap: 6px; margin-top: 8px; }
+.training-page .jobcard .chip { min-height: 23px; padding: 2px 8px; font-weight: 550; }
+.training-page .jobcard .progress { height: 5px; margin-top: 10px; }
+.training-page .jobcard .progress.done > div { background: #159447; }
+
+.training-page #detailHead {
+  padding: 13px 15px;
+  border: 1px solid #e2e8f0;
+  border-radius: 13px;
+  background: #fbfcff;
+}
+
+.training-page #detailHead .jobname { color: #22334c; font-size: 14px; }
+.training-page #detailHead .actions { gap: 7px; }
+.training-page #detailHead .actions button { min-height: 34px; }
+.training-page #dProgressText { margin: 7px 2px 12px !important; }
+
+.training-page .resource-allocation,
+.training-page .retry-panel {
+  margin: 11px 0 14px;
+  padding: 13px 15px;
+  border: 1px solid #e1e8f1;
+  border-radius: 13px;
+  background: #f8faff;
+}
+
+.training-page .resource-allocation[hidden],
+.training-page .retry-panel[hidden] { display: none; }
+.training-page .resource-allocation-title { margin-bottom: 8px; color: #34445d; font-size: 12px; font-weight: 700; }
+.training-page .resource-allocation-list { display: grid; gap: 7px; }
+.training-page .resource-allocation-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 8px 10px;
+  border: 1px solid #e6ecf4;
+  border-radius: 9px;
+  background: #fff;
+}
+.training-page .resource-allocation-main { min-width: 0; color: #34445d; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.training-page .resource-allocation-meta { color: #718096; font-size: 11px; text-align: right; }
+.training-page .resource-allocation-state { margin-left: 6px; color: #1d4ed8; font-weight: 650; }
+
+.training-page .retry-panel { border-color: #d8e4f7; background: linear-gradient(120deg, #f5f8ff, #fff 75%); }
+.training-page .retry-panel-copy { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; margin-bottom: 9px; }
+.training-page .retry-panel-copy strong { color: #273b58; font-size: 13px; }
+.training-page .retry-panel-controls { display: flex; align-items: center; gap: 9px; }
+.training-page .retry-panel-controls select { min-width: 0; flex: 1; min-height: 38px; background-color: #fff; }
+.training-page .retry-panel-controls button { min-height: 38px; padding: 7px 16px; white-space: nowrap; }
+.training-page #retryHint { margin-top: 7px; }
+.training-page .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
 .training-page .compute-toolbar { align-items: flex-start; }
 .training-page .compute-actions { gap: 8px; }
 .training-page .compute-summary { gap: 8px; margin-top: 16px; }
@@ -798,6 +874,13 @@ html { min-width: 320px; background: var(--bg); }
 
 .training-page .chartbox { padding: 16px; }
 .training-page .chartbox h3 { color: #64748b; font-weight: 650; }
+.training-page .chartbox { position: relative; min-width: 0; }
+.training-page .chartbox canvas { width: 100% !important; height: clamp(200px, 24vw, 280px) !important; }
+.training-page .statgrid { grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap: 10px; }
+.training-page .stat { min-width: 0; transition: border-color var(--ease), box-shadow var(--ease), transform var(--ease); }
+.training-page .stat:hover { border-color: #c8d7ed; box-shadow: 0 5px 14px rgba(37, 99, 235, .07); transform: translateY(-1px); }
+.training-page .stat .v { overflow-wrap: anywhere; font-size: clamp(16px, 1.4vw, 20px); }
+.training-page table.report { display: block; max-width: 100%; overflow-x: auto; white-space: nowrap; border: 1px solid #e2e8f0; border-radius: 10px; }
 .training-page #logBox {
   border-color: #25334a;
   border-radius: 13px;
@@ -917,6 +1000,17 @@ html { min-width: 320px; background: var(--bg); }
   .training-page .server-form-actions button { width: 100%; }
   .training-page .tabs { overflow-x: auto; }
   .training-page .tabs button { flex: 0 0 auto; padding-right: 11px; padding-left: 11px; }
+  .training-page #detailHead { align-items: stretch; padding: 12px; }
+  .training-page #detailHead .jobline { width: 100%; }
+  .training-page #detailHead .actions { width: 100%; }
+  .training-page #detailHead .actions button { flex: 1 1 auto; }
+  .training-page .resource-allocation-row { grid-template-columns: minmax(0, 1fr); }
+  .training-page .resource-allocation-meta { text-align: left; }
+  .training-page .retry-panel { padding: 12px; }
+  .training-page .retry-panel-controls { align-items: stretch; flex-direction: column; }
+  .training-page .retry-panel-controls button { width: 100%; }
+  .training-page .chartbox { padding: 13px; }
+  .training-page .chartbox canvas { height: 220px !important; }
   .dataset-page .page-heading { gap: 12px; }
   .dataset-page .page-heading > .tag { white-space: nowrap; }
   .dataset-page .queued-operation { grid-template-columns: 1fr; }
