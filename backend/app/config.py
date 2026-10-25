@@ -36,7 +36,7 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "").strip()
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "localhost:9000").strip()
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin").strip()
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin").strip()
-MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "training-platform").strip()
+MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "mtp-artifacts").strip()
 MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").strip().lower() == "true"
 
 # Worker（计算单元）配置
