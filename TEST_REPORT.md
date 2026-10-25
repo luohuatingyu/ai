@@ -2,12 +2,61 @@
 
 ## Git基准点
 
-- **Commit Hash**: e43e7bf（本次测试覆盖代码的最新提交）
-- **提交信息**: Test Excel dataset imports
+- **Commit Hash**: 8403540（本次测试覆盖代码的提交）
+- **提交信息**: Add external compute server onboarding
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
-## 本次任务补充测试（2026-10-25）
+## 本次变更测试结果：外部计算服务器接入（2026-10-25）
+
+**变更范围**：用一次引导脚本把外部服务器接入计算集群；检测 CPU/GPU 槽位；在页面按槽位手动加入或停止接单；外部 worker 支持本机 start/stop/restart/status 操作。
+
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；本机无 NVIDIA GPU。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过；trainer、worker、frontend 已重建并运行，SeaweedFS healthy。
+- 定向测试：80 项收集，77 通过、3 跳过、0 失败、0 错误（45.61 秒）。
+- 完整测试：133 项收集，127 通过、6 跳过、0 失败、0 错误（53.92 秒）。
+- pytest 通过只读挂载当前 `backend/tests/` 和 `scripts/` 执行；工作区原有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 也参与全量测试，但不属于 `8403540` 提交。
+- 跳过项：3 个 Redis 协调集成、1 个 Redis Supervisor 集成、2 个 S3 集成；需要 `MTP_TEST_REDIS` / `MTP_TEST_S3` 配置。
+- 两条非失败警告：SQLAlchemy `declarative_base()` 弃用提示；Pandas 对 xlrd 引擎的未来弃用提示。
+- 静态检查通过：worker 脚本 `bash -n`、前端内嵌 JavaScript `node --check`、两份 Compose 配置解析、`git diff --check`。
+- 运行时 API 检查：`/api/workers` 返回在线 CPU 槽、CPU 线程/内存、稳定槽位标识及 `current_job: null`。
+- Safari 手动交互：添加服务器向导正常打开；GPU 默认命令正确；切换 CPU 后显示 `WORKER_COMPOSE_FILE=docker-compose.cpu.yml ./scripts/worker-node.sh add`；Escape 关闭向导并把焦点交回添加按钮。
+
+**定向和完整测试命令**：
+```bash
+docker compose run --rm --no-deps \
+  -v /Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p/backend/tests:/app/backend/tests:ro \
+  -v /Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p/scripts:/app/scripts:ro \
+  trainer python -m pytest backend/tests/test_worker.py backend/tests/test_coordination.py backend/tests/test_api.py backend/tests/test_worker_node_script.py -v
+
+docker compose run --rm --no-deps \
+  -v /Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p/backend/tests:/app/backend/tests:ro \
+  -v /Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p/scripts:/app/scripts:ro \
+  trainer python -m pytest backend/tests/ -v
+```
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级与用例 | 输入与预期 | 场景 |
+|---|---|---|---|
+| 一次脚本接入并安全保存服务器配置 | 脚本：`test_add_writes_private_worker_configuration`、`test_environment_file_is_not_executed_as_shell`、`test_add_rejects_newlines_in_environment_values` | 有效 Redis/S3/服务器标识写入权限 600 的 `.env.worker`；shell 表达式不执行；换行注入在启动前拒绝 | 正常、权限与安全、异常 |
+| 缺少接入配置时不启动 worker | 脚本：`test_add_requires_coordinator_and_storage_settings`、`test_add_requires_interactive_first_run_configuration` | 缺 Redis/S3 或非交互首次运行缺配置时返回错误，Docker 不启动 worker | 边界、异常 |
+| 自动发现 CPU/GPU 能力并保持稳定槽位标识 | Worker：`test_detect_capabilities_reports_cpu_and_stable_server_identity`、`test_probe_visible_gpu_never_raises` | 上报 CPU 核数/内存与稳定机器/槽位 ID；GPU 探测失败不导致 worker 崩溃 | 正常、异常、兼容 |
+| 外接槽默认待选，用户可加入或停止接单 | API/协调：`test_managed_worker_selection_api`、`test_worker_selection_is_saved_independently_of_heartbeat`、`test_redis_semantics_match_embedded` | 默认关闭；有效布尔值可切换且重连后保留；未知槽 404、内置槽 409、非法布尔值 422 | 正常、边界、异常、安全、兼容 |
+| 停止接单不打断正在运行的训练 | Worker：`test_managed_worker_waits_for_manual_selection` | 槽停用后当前任务完成，队列中的下一任务不由该槽领取 | 正常、状态冲突、回归 |
+| 在目标服务器启动、停止、重启及查看状态 | 脚本：`test_start_creates_worker_without_rebuilding`、`test_worker_lifecycle_commands`、`test_add_propagates_compose_failure` | 只操作 worker 服务；停止/重启等待 45 秒；Compose 错误向调用方返回 | 正常、异常、兼容 |
+| 页面按服务器分组，清晰展示资源并提供接入命令 | Safari 手动交互；运行中 `/api/workers` 检查 | 打开向导、切换 CPU/GPU 命令、Escape 关闭；槽卡展示资源状态和空任务值 | 正常、可用性、回归 |
+| 原有训练/API/存储功能不回归 | `docker compose ... pytest backend/tests/ -v` | 完整套件 127 通过、0 失败 | 回归、兼容 |
+
+**未验证内容和限制**：
+- 未在真实外部服务器上运行引导脚本；主节点 Redis/S3 连通与 Docker Compose 部署需在目标环境验收。
+- 本机无 NVIDIA GPU，未验证真实 GPU 型号、显存与训练执行；CPU 路径已覆盖。
+- Redis/S3 集成按门控跳过，无法在本轮证明外部 Redis 中的选择持久化及对象存储连通。
+- 现有应用没有 API 身份认证；新槽位开关沿用现有 API 访问模式，部署应限制在可信网络或由反向代理保护。
+
+## 上一轮补充测试：Excel 与数据集管理（2026-10-25）
 
 **变更范围**：训练台和数据集管理页统一视觉与响应式样式；数据集导入、处理、双布局兼容和压缩包安全；Excel `.xlsx/.xls` 运行依赖与接口回归；本次测试同时覆盖工作区中既有的计算节点管理改动。
 
@@ -44,7 +93,7 @@
 | 计算节点与 worker 脚本回归 | 全量 pytest 中 API、协调、worker 与脚本测试 | 通过；Redis 外部集成按门控跳过 |
 | 全量 API 与 Excel 引擎兼容 | 完整 pytest 套件 | 通过（127 通过、6 跳过） |
 
-## 本次变更测试结果（2026-10-25）
+## 历史测试结果：多机多卡训练架构（2026-10-25）
 
 **变更范围**：多机多卡无状态训练架构（四平面分离）+ 正式 pytest 测试套件 + 状态平面替换为 SeaweedFS + 前后端容器拆分 + **P0 框架治理重构**
 
