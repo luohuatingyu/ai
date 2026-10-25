@@ -319,7 +319,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     )
     assert credential.status_code == 200, credential.text
     credential_id = credential.json()["credentials"][0]["id"]
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
     monkeypatch.setattr(
         remote_workers,
         "run_remote_action",
@@ -333,6 +333,9 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
         "port": 2222,
         "mode": "gpu",
         "cpu_slots": 0,
+        "worker_image": "registry.example.net/remote/worker:v2",
+        "remote_redis_url": "rediss://worker:synthetic-redis-password@redis.example.net:6380/4",
+        "remote_s3_endpoint": "remote-storage.example.net:9000",
     }
     added = client.post("/api/remote-servers", json=payload, headers=headers)
     assert added.status_code == 202
@@ -342,12 +345,47 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     assert operation["output"] == "done"
     assert calls == [(machine_id, "install", "worker")]
 
+    stored_server = manager.lease.get_remote_server(machine_id)
+    assert stored_server["remote_redis_url_encrypted"] != payload["remote_redis_url"]
+    assert payload["remote_redis_url"] not in repr(stored_server)
+
     servers = client.get("/api/remote-servers", headers=headers).json()["servers"]
     server = next(item for item in servers if item["machine_id"] == machine_id)
     assert server["host"] == payload["host"]
     assert server["username_override"] == "worker"
     assert server["ssh_credential_id"] == credential_id
+    assert server["worker_image_override"] == payload["worker_image"]
+    assert server["remote_s3_endpoint_override"] == payload["remote_s3_endpoint"]
+    assert server["has_remote_redis_url_override"] is True
+    assert "remote_redis_url_encrypted" not in server
+    assert payload["remote_redis_url"] not in repr(server)
     assert "private_key" not in server and "token" not in server
+    assert client.patch(f"/api/remote-servers/{machine_id}", json={}).status_code == 401
+
+    edited = client.patch(
+        f"/api/remote-servers/{machine_id}",
+        headers=headers,
+        json={
+            "worker_image": "registry.example.net/remote/worker:v3",
+            "remote_redis_url": "",
+            "remote_s3_endpoint": "storage-v2.example.net:9000",
+        },
+    )
+    assert edited.status_code == 200, edited.text
+    edited_server = manager.lease.get_remote_server(machine_id)
+    assert edited_server["worker_image_override"] == "registry.example.net/remote/worker:v3"
+    assert edited_server["remote_s3_endpoint_override"] == "storage-v2.example.net:9000"
+    assert edited_server["remote_redis_url_encrypted"] == stored_server["remote_redis_url_encrypted"]
+    assert edited.json()["server"]["has_remote_redis_url_override"] is True
+
+    cleared = client.patch(
+        f"/api/remote-servers/{machine_id}",
+        headers=headers,
+        json={"clear_remote_redis_url_override": True},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert "remote_redis_url_encrypted" not in manager.lease.get_remote_server(machine_id)
+    assert cleared.json()["server"]["has_remote_redis_url_override"] is False
     assert client.post("/api/remote-servers", json=payload, headers=headers).status_code == 409
 
     for action in ("install", "start", "stop", "restart"):
@@ -373,7 +411,7 @@ def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatc
     token = "remote-admin-token-0123456789-abcd"
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
     response = client.post(
         "/api/remote-servers",
         headers={"X-Worker-Admin-Token": token},
@@ -417,7 +455,7 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
     )
     assert credential_response.status_code == 200, credential_response.text
     credential_id = credential_response.json()["credentials"][0]["id"]
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
     run_calls = []
     monkeypatch.setattr(
         remote_workers,
@@ -1174,3 +1212,24 @@ def test_remote_server_feedback_toasts_render_above_add_modal():
     toast_z_index = int(toast_css.split("z-index:", 1)[1].split(";", 1)[0])
 
     assert toast_z_index > modal_z_index
+
+
+def test_remote_server_form_exposes_host_overrides_and_edit_action():
+    """远程服务器页面提供镜像、Redis、S3 单机覆盖入口和现有服务器编辑动作。"""
+    backend_dir = Path(__file__).resolve().parents[1]
+    static_dir = backend_dir / "static"
+    if not static_dir.is_dir():
+        static_dir = backend_dir.parent / "static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    for marker in (
+        'id="remoteWorkerImage"',
+        'id="remoteRedisUrl"',
+        'id="remoteS3Endpoint"',
+        'id="clearRemoteRedisOverride"',
+        "data-edit-remote-machine-id",
+        'data-remote-action="install"',
+        "重新部署并应用配置",
+        "openEditRemoteServer",
+    ):
+        assert marker in html

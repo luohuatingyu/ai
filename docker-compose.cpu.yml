@@ -87,7 +87,6 @@ services:
       WORKER_REMOTE_REDIS_URL: ${WORKER_REMOTE_REDIS_URL:-}
       WORKER_REMOTE_S3_ENDPOINT: ${WORKER_REMOTE_S3_ENDPOINT:-}
       WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY: ${WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY:-}
-      WORKER_SSH_KNOWN_HOSTS_PATH: /run/remote-worker/known_hosts
     depends_on:
       redis:
         condition: service_healthy

@@ -27,8 +27,7 @@ def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     key = tmp_path / "worker_key"
     key.write_text("test-key", encoding="utf-8")
     key.chmod(0o600)
-    known_hosts = tmp_path / "known_hosts"
-    known_hosts.write_text("compute.example.net ssh-ed25519 AAAATEST\n", encoding="utf-8")
+    known_hosts = tmp_path / "remote_known_hosts"
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", "test-remote-admin-token-0123456789")
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/ml/worker:unit")
@@ -100,15 +99,15 @@ def test_remote_configuration_requires_page_credentials_and_registry(tmp_path, m
 
 
 def test_remote_configuration_supports_page_password_without_key_file(tmp_path, monkeypatch):
-    """页面密码认证不依赖私钥文件，但仍要求已核验的 known_hosts。"""
+    """页面密码认证不依赖私钥文件，主机密钥文件会在首次连接时自动建立。"""
     _, known_hosts = _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     credentials = {"auth_method": "password", "password": "page password", "passphrase": "", "private_key": ""}
 
     assert remote_workers.remote_configuration_errors(credentials) == []
 
-    known_hosts.unlink()
-    assert any("known_hosts" in item for item in remote_workers.remote_configuration_errors(credentials))
+    assert not known_hosts.exists()
+    assert remote_workers.remote_configuration_errors(credentials) == []
 
 
 def test_remote_configuration_requires_page_password_and_valid_auth_method(tmp_path, monkeypatch):
@@ -192,8 +191,107 @@ def test_render_remote_script_quotes_values_and_does_not_transfer_repository(tmp
     assert "docker-compose" not in rendered
 
 
-def test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv(tmp_path, monkeypatch):
-    """SSH 使用严格主机指纹校验，令牌和存储密钥只在标准输入脚本中出现。"""
+def test_remote_deployment_settings_apply_per_server_overrides_and_platform_fallback(tmp_path, monkeypatch):
+    """服务器覆盖值优先，未覆盖的配置回退到平台 WORKER_IMAGE、REDIS_URL 和 S3_ENDPOINT。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/platform/worker:default")
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
+    monkeypatch.setattr(config, "WORKER_REMOTE_S3_ENDPOINT", "")
+    monkeypatch.setattr(config, "REDIS_URL", "rediss://platform-redis.example.net:6380/0")
+    monkeypatch.setattr(config, "S3_ENDPOINT", "platform-s3.example.net:9000")
+
+    defaults = remote_workers.remote_deployment_settings({})
+    assert defaults == {
+        "worker_image": "registry.example.net/platform/worker:default",
+        "redis_url": "rediss://platform-redis.example.net:6380/0",
+        "s3_endpoint": "platform-s3.example.net:9000",
+    }
+
+    redis_url = "rediss://worker:private-pass@remote-redis.example.net:6380/4"
+    server = remote_workers.apply_remote_server_overrides(
+        _server(),
+        {
+            "worker_image": "registry.example.net/remote/worker:v5",
+            "remote_redis_url": redis_url,
+            "remote_s3_endpoint": "remote-s3.example.net:9000",
+        },
+    )
+    assert server["remote_redis_url_encrypted"] != redis_url
+    assert "remote_redis_url" not in server
+    assert remote_workers.remote_deployment_settings(server) == {
+        "worker_image": "registry.example.net/remote/worker:v5",
+        "redis_url": redis_url,
+        "s3_endpoint": "remote-s3.example.net:9000",
+    }
+    public = remote_workers.remote_server_public_view(server)
+    assert public["has_remote_redis_url_override"] is True
+    assert "remote_redis_url_encrypted" not in public
+    assert redis_url not in repr(public)
+
+
+def test_remote_configuration_accepts_complete_server_overrides_without_remote_env_values(tmp_path, monkeypatch):
+    """远程配置可由单机覆盖值补齐，避免要求 WORKER_REMOTE_* 重复配置。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "")
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
+    monkeypatch.setattr(config, "WORKER_REMOTE_S3_ENDPOINT", "")
+    server = remote_workers.apply_remote_server_overrides(
+        _server(),
+        {
+            "worker_image": "registry.example.net/server/worker:v1",
+            "remote_redis_url": "rediss://redis.example.net:6380/0",
+            "remote_s3_endpoint": "s3.example.net:9000",
+        },
+    )
+
+    assert remote_workers.remote_configuration_errors(server=server) == []
+    rendered = remote_workers.render_remote_script(server, "install")
+    assert "export MTP_WORKER_IMAGE=registry.example.net/server/worker:v1" in rendered
+    assert "export MTP_REDIS_URL=rediss://redis.example.net:6380/0" in rendered
+    assert "export MTP_S3_ENDPOINT=s3.example.net:9000" in rendered
+
+
+def test_remote_server_redis_override_can_be_preserved_replaced_or_cleared(tmp_path, monkeypatch):
+    """编辑时空 Redis 输入保留密文，重置选项清除覆盖值并回退到平台默认。"""
+    _remote_config(tmp_path, monkeypatch)
+    original = "redis://user:first-password@redis-one.example.net:6379/0"
+    replacement = "rediss://user:second-password@redis-two.example.net:6380/2"
+    server = remote_workers.apply_remote_server_overrides(
+        _server(), {"remote_redis_url": original}
+    )
+    encrypted_original = server["remote_redis_url_encrypted"]
+
+    preserved = remote_workers.apply_remote_server_overrides(
+        server, {"remote_redis_url": ""}, is_update=True
+    )
+    assert preserved["remote_redis_url_encrypted"] == encrypted_original
+    replaced = remote_workers.apply_remote_server_overrides(
+        preserved, {"remote_redis_url": replacement}, is_update=True
+    )
+    assert remote_workers.remote_deployment_settings(replaced)["redis_url"] == replacement
+    cleared = remote_workers.apply_remote_server_overrides(
+        replaced, {"clear_remote_redis_url_override": True}, is_update=True
+    )
+    assert "remote_redis_url_encrypted" not in cleared
+    assert remote_workers.remote_server_public_view(cleared)["has_remote_redis_url_override"] is False
+
+
+def test_server_redis_override_is_redacted_from_remote_output(tmp_path, monkeypatch):
+    """SSH 输出若意外回显服务器专属 Redis URL，API 错误和操作输出都必须脱敏。"""
+    _remote_config(tmp_path, monkeypatch)
+    secret_url = "rediss://worker:output-secret@remote-redis.example.net:6380/1"
+    server = remote_workers.apply_remote_server_overrides(
+        _server(), {"remote_redis_url": secret_url}
+    )
+    output = remote_workers._redact_output(f"redis={secret_url}", "", server=server)
+
+    assert secret_url not in output["stdout"]
+    assert "[redacted]" in output["stdout"]
+
+
+def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tmp_path, monkeypatch):
+    """SSH 首次自动信任并固定主机密钥，令牌和存储密钥只在标准输入脚本中出现。"""
     key, known_hosts = _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     calls = {}
@@ -213,8 +311,9 @@ def test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv(tmp_path,
     assert materialized_key.name.startswith("mtp-ssh-key-")
     assert not materialized_key.exists()
     assert command[command.index("-p") + 1] == "2222"
-    assert "StrictHostKeyChecking=yes" in command
+    assert "StrictHostKeyChecking=accept-new" in command
     assert f"UserKnownHostsFile={known_hosts}" in command
+    assert known_hosts.parent.is_dir()
     assert command[-2:] == ["worker@compute.example.net", "bash -s"]
     assert calls["timeout"] == 3600
     assert "secret-test" not in " ".join(command)
@@ -250,7 +349,7 @@ def test_run_remote_action_uses_password_from_platform_askpass(tmp_path, monkeyp
     assert "BatchMode=no" in command
     assert "PasswordAuthentication=yes" in command
     assert "PubkeyAuthentication=no" in command
-    assert "StrictHostKeyChecking=yes" in command
+    assert "StrictHostKeyChecking=accept-new" in command
     assert f"UserKnownHostsFile={known_hosts}" in command
     assert password not in " ".join(command)
     assert calls["prompt"] == password

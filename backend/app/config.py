@@ -69,9 +69,8 @@ WORKER_REMOTE_S3_ENDPOINT = os.environ.get("WORKER_REMOTE_S3_ENDPOINT", "").stri
 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY = os.environ.get(
     "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", ""
 ).strip()
-WORKER_SSH_KNOWN_HOSTS_PATH = os.environ.get(
-    "WORKER_SSH_KNOWN_HOSTS_PATH", "/run/remote-worker/known_hosts"
-).strip()
+# 首次 SSH 连接自动信任的主机密钥存入持久化数据目录，之后仍校验密钥是否变化。
+WORKER_SSH_KNOWN_HOSTS_PATH = str(DATA_DIR / "remote_known_hosts")
 
 # 任务失败分类重试：环境性错误（CUDA/OOM/网络瞬断等）带 checkpoint 自动续试，不影响整体完成
 JOB_MAX_AUTO_RETRY = int(os.environ.get("JOB_MAX_AUTO_RETRY", "5"))       # 自动重试上限（.env 可配，默认 5）

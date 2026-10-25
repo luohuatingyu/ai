@@ -23,13 +23,19 @@ from app.routers.schemas import (
     GenerateRequest,
     PredictRequest,
     RemoteServerRequest,
+    RemoteServerUpdateRequest,
     RetryJobRequest,
     TrainRequest,
     WorkerSelectionRequest,
 )
 from app.remote_workers import (
+    RemoteWorkerError,
+    apply_remote_server_overrides,
     execute_remote_operation,
     remote_configuration_errors,
+    remote_server_public_view,
+    resolve_remote_server_credentials,
+    validate_server_record,
 )
 
 router = APIRouter(prefix="/api", tags=["jobs"])
@@ -370,7 +376,7 @@ def list_remote_servers(
     """列出经 SSH 接入的远程服务器；管理元数据仅对令牌持有者可见。"""
     _require_remote_admin_token(x_worker_admin_token)
     servers = manager.lease.list_remote_servers()
-    return {"servers": servers}
+    return {"servers": [remote_server_public_view(server) for server in servers]}
 
 
 @router.get("/remote-ssh-settings")
@@ -565,15 +571,19 @@ def add_remote_server(
 ) -> dict:
     """经平台 SSH 远程安装 worker；目标主机只接收单文件脚本和容器镜像。"""
     _require_remote_admin_token(x_worker_admin_token)
-    from app.remote_workers import RemoteWorkerError, resolve_remote_server_credentials
+    from app.remote_workers import RemoteWorkerError
 
     server = request.model_dump()
     server["username_override"] = request.username
     try:
+        server = apply_remote_server_overrides(server, server)
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    try:
         credentials = resolve_remote_server_credentials(server)
     except RemoteWorkerError as exc:
         raise HTTPException(422, str(exc)) from exc
-    errors = remote_configuration_errors(credentials)
+    errors = remote_configuration_errors(credentials, server)
     if errors:
         raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
     if manager.lease.get_remote_server(request.machine_id):
@@ -582,6 +592,58 @@ def add_remote_server(
     server["ssh_credential_id"] = credentials["id"]
     server.update({"status": "provisioning", "created_at": time.time()})
     return _start_remote_operation(server, "install", background_tasks)
+
+
+@router.patch("/remote-servers/{machine_id}")
+def update_remote_server(
+    machine_id: str,
+    request: RemoteServerUpdateRequest,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """更新一台远程服务器的连接参数和部署覆盖值，不自动重启目标 worker。"""
+    _require_remote_admin_token(x_worker_admin_token)
+    _check_id(machine_id, "服务器")
+    server = manager.lease.get_remote_server(machine_id)
+    if server is None:
+        raise HTTPException(404, "远程服务器不存在")
+    previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
+    if previous and previous.get("status") in {"queued", "running"}:
+        raise HTTPException(409, "该服务器已有远程操作正在执行，暂时不能编辑")
+
+    updates = request.model_dump(exclude_unset=True)
+    if any(updates.get(key) is None for key in ("host", "port", "mode", "cpu_slots") if key in updates):
+        raise HTTPException(422, "SSH 主机、端口、计算类型和 CPU 槽不能设为空")
+    candidate = dict(server)
+    for key in ("host", "port", "mode", "cpu_slots"):
+        if key in updates:
+            candidate[key] = updates.pop(key)
+    if "username" in updates:
+        candidate["username_override"] = updates.pop("username")
+    if "ssh_credential_id" in updates:
+        if not updates["ssh_credential_id"]:
+            raise HTTPException(422, "必须选择 SSH 凭证")
+        candidate["ssh_credential_id"] = updates.pop("ssh_credential_id")
+
+    try:
+        candidate = apply_remote_server_overrides(candidate, updates, is_update=True)
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    try:
+        credentials = resolve_remote_server_credentials(candidate)
+    except RemoteWorkerError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    candidate["username"] = credentials["username"]
+    try:
+        validate_server_record(candidate)
+    except RemoteWorkerError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    errors = remote_configuration_errors(credentials, candidate)
+    if errors:
+        raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
+
+    candidate["updated_at"] = time.time()
+    manager.lease.set_remote_server(machine_id, candidate)
+    return {"server": remote_server_public_view(candidate)}
 
 
 @router.post("/remote-servers/{machine_id}/{action}", status_code=202)
@@ -597,13 +659,13 @@ def manage_remote_server(
     server = manager.lease.get_remote_server(machine_id)
     if server is None:
         raise HTTPException(404, "远程服务器不存在")
-    from app.remote_workers import RemoteWorkerError, resolve_remote_server_credentials
+    from app.remote_workers import RemoteWorkerError
 
     try:
         credentials = resolve_remote_server_credentials(server)
     except RemoteWorkerError as exc:
         raise HTTPException(409, str(exc)) from exc
-    errors = remote_configuration_errors(credentials)
+    errors = remote_configuration_errors(credentials, server)
     if errors:
         raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
     previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))

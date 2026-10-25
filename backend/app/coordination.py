@@ -386,7 +386,7 @@ class EmbeddedLeaseStore(LeaseStore):
             return self._worker_enabled.get(worker_id, bool(default))
 
     def set_remote_server(self, machine_id: str, info: Dict[str, object]) -> None:
-        """在进程内保存非敏感远程服务器元数据。"""
+        """在进程内保存服务器元数据；敏感 Redis URL 由调用方先加密。"""
         with self._lock:
             self._remote_servers[machine_id] = dict(info)
 
@@ -550,7 +550,7 @@ class RedisLeaseStore(LeaseStore):
         return str(value) == "1"
 
     def set_remote_server(self, machine_id: str, info: Dict[str, object]) -> None:
-        """将不含凭证的远程服务器配置写入 Redis。"""
+        """将远程服务器配置写入 Redis；可能含密码的 Redis URL 只保存加密密文。"""
         self._redis.hset(_REMOTE_SERVERS, machine_id, json.dumps(info, ensure_ascii=False))
 
     def get_remote_server(self, machine_id: str) -> Optional[Dict[str, object]]:
@@ -562,7 +562,7 @@ class RedisLeaseStore(LeaseStore):
         return parsed if isinstance(parsed, dict) else None
 
     def list_remote_servers(self) -> List[Dict[str, object]]:
-        """从 Redis 列出服务器配置，避免将 SSH 凭证放入协调存储。"""
+        """从 Redis 列出服务器配置；SSH 凭证不进入记录，Redis URL 覆盖值仅有密文。"""
         values = self._redis.hgetall(_REMOTE_SERVERS)
         out = []
         for machine_id, value in values.items():

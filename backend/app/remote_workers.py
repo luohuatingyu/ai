@@ -319,6 +319,76 @@ def resolve_remote_server_credentials(server: Dict[str, object]) -> Dict[str, st
     return _ssh_credentials_for_server(server)
 
 
+def apply_remote_server_overrides(
+    server: Dict[str, object], overrides: Dict[str, object], *, is_update: bool = False
+) -> Dict[str, object]:
+    """应用服务器级部署覆盖值，并将可能含密码的 Redis URL 加密后保存。"""
+    updated = dict(server)
+    for request_key, stored_key in (
+        ("worker_image", "worker_image_override"),
+        ("remote_s3_endpoint", "remote_s3_endpoint_override"),
+    ):
+        if request_key not in overrides:
+            continue
+        value = str(overrides.get(request_key) or "").strip()
+        updated[stored_key] = value or None
+
+    redis_was_sent = "remote_redis_url" in overrides
+    redis_url = str(overrides.get("remote_redis_url") or "").strip()
+    clear_redis = bool(overrides.get("clear_remote_redis_url_override"))
+    if clear_redis:
+        updated.pop("remote_redis_url_encrypted", None)
+    elif redis_was_sent and redis_url:
+        updated["remote_redis_url_encrypted"] = _credential_fernet().encrypt(
+            redis_url.encode("utf-8")
+        ).decode("ascii")
+    elif redis_was_sent and not is_update:
+        updated.pop("remote_redis_url_encrypted", None)
+
+    # 兼容请求构造时的临时字段，绝不把 Redis URL 明文留在服务器记录中。
+    updated.pop("remote_redis_url", None)
+    updated.pop("clear_remote_redis_url_override", None)
+    return updated
+
+
+def remote_server_public_view(server: Dict[str, object]) -> Dict[str, object]:
+    """返回服务器可公开配置，隐藏加密 Redis URL 并只暴露是否设置覆盖值。"""
+    public = dict(server)
+    encrypted_redis_url = public.pop("remote_redis_url_encrypted", None)
+    public.pop("remote_redis_url", None)
+    public.pop("clear_remote_redis_url_override", None)
+    public["has_remote_redis_url_override"] = bool(encrypted_redis_url)
+    return public
+
+
+def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[str, str]:
+    """解析单机覆盖值与平台默认值，返回远程 worker 所需的部署配置。"""
+    server = server or {}
+    encrypted_redis_url = str(server.get("remote_redis_url_encrypted", "") or "")
+    redis_override = ""
+    if encrypted_redis_url:
+        try:
+            redis_override = _credential_fernet().decrypt(
+                encrypted_redis_url.encode("ascii")
+            ).decode("utf-8")
+        except (InvalidToken, ValueError, UnicodeError) as exc:
+            raise RemoteWorkerError("服务器 Redis 覆盖配置无法解密；请检查平台加密主密钥") from exc
+    return {
+        "worker_image": str(
+            server.get("worker_image_override") or config.WORKER_REMOTE_IMAGE or ""
+        ).strip(),
+        "redis_url": str(
+            redis_override or config.WORKER_REMOTE_REDIS_URL or config.REDIS_URL or ""
+        ).strip(),
+        "s3_endpoint": str(
+            server.get("remote_s3_endpoint_override")
+            or config.WORKER_REMOTE_S3_ENDPOINT
+            or config.S3_ENDPOINT
+            or ""
+        ).strip(),
+    }
+
+
 def _platform_ssh_credentials() -> Dict[str, str]:
     """兼容旧调用方，读取页面凭证目录的默认凭证。"""
     return _get_ssh_credential()
@@ -384,7 +454,10 @@ def clear_platform_ssh_credentials() -> Dict[str, object]:
     return remote_ssh_settings_status()
 
 
-def remote_configuration_errors(credentials: Dict[str, str] | None = None) -> List[str]:
+def remote_configuration_errors(
+    credentials: Dict[str, str] | None = None,
+    server: Dict[str, object] | None = None,
+) -> List[str]:
     """列出远程执行缺少的配置，不读取或返回平台 SSH 凭证内容。"""
     errors: List[str] = []
     if credentials is None:
@@ -409,7 +482,6 @@ def remote_configuration_errors(credentials: Dict[str, str] | None = None) -> Li
         errors.append("平台必须使用共享 S3 存储，远程 worker 才能读取数据集和写入产物")
     if not shutil.which("ssh"):
         errors.append("平台后端容器未安装 OpenSSH 客户端")
-    known_hosts_path = Path(config.WORKER_SSH_KNOWN_HOSTS_PATH)
     auth_method = credentials["auth_method"]
     if auth_method not in {"key", "password", "key_password"}:
         errors.append("请先在页面配置 SSH 凭证")
@@ -418,27 +490,30 @@ def remote_configuration_errors(credentials: Dict[str, str] | None = None) -> Li
             errors.append("页面未配置 SSH 私钥")
     if auth_method in {"password", "key_password"} and not credentials.get("password"):
         errors.append("页面凭证缺少 SSH 登录密码")
-    if not known_hosts_path.is_file() or known_hosts_path.stat().st_size == 0:
-        errors.append("SSH known_hosts 文件不存在；请先登记并核验目标主机指纹")
-    image = config.WORKER_REMOTE_IMAGE
+    try:
+        settings = remote_deployment_settings(server)
+    except RemoteWorkerError as exc:
+        errors.append(str(exc))
+        settings = {"worker_image": "", "redis_url": "", "s3_endpoint": ""}
+    image = settings["worker_image"]
     if not image or "/" not in image or any(c.isspace() for c in image):
-        errors.append("WORKER_IMAGE 必须是目标服务器可拉取的镜像仓库引用")
-    if not config.WORKER_REMOTE_REDIS_URL.startswith(("redis://", "rediss://")):
-        errors.append("WORKER_REMOTE_REDIS_URL 必须是目标服务器可访问的 Redis URL")
-    if not config.WORKER_REMOTE_S3_ENDPOINT or any(
-        c.isspace() for c in config.WORKER_REMOTE_S3_ENDPOINT
+        errors.append("WORKER_IMAGE 或服务器镜像覆盖值必须是目标服务器可拉取的镜像仓库引用")
+    if not settings["redis_url"].startswith(("redis://", "rediss://")):
+        errors.append("平台或服务器必须配置目标服务器可访问的 Redis URL")
+    if not settings["s3_endpoint"] or any(
+        c.isspace() for c in settings["s3_endpoint"]
     ):
-        errors.append("WORKER_REMOTE_S3_ENDPOINT 必须是目标服务器可访问的 S3 地址")
+        errors.append("平台或服务器必须配置目标服务器可访问的 S3 地址")
     values = (
-        config.WORKER_REMOTE_IMAGE,
-        config.WORKER_REMOTE_REDIS_URL,
-        config.WORKER_REMOTE_S3_ENDPOINT,
+        settings["worker_image"],
+        settings["redis_url"],
+        settings["s3_endpoint"],
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
         config.S3_BUCKET,
     )
-    if any("\n" in value or "\r" in value for value in values):
-        errors.append("远程配置不能包含换行符")
+    if any(any(ord(char) < 32 for char in value) for value in values):
+        errors.append("远程配置不能包含控制字符")
     ssh_secrets = (credentials.get("password", ""), credentials.get("passphrase", ""))
     if any("\n" in secret or "\r" in secret or "\x00" in secret for secret in ssh_secrets):
         errors.append("SSH 凭证不能包含换行符")
@@ -480,14 +555,15 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
     if not 0 <= cpu_slots <= 256:
         raise RemoteWorkerError("CPU 执行槽数量必须在 0 到 256 之间")
 
+    deployment = remote_deployment_settings(server)
     settings = {
         "MTP_ACTION": action,
         "MTP_MACHINE_ID": str(server["machine_id"]),
         "MTP_MODE": mode,
         "MTP_CPU_SLOTS": str(cpu_slots),
-        "MTP_WORKER_IMAGE": config.WORKER_REMOTE_IMAGE,
-        "MTP_REDIS_URL": config.WORKER_REMOTE_REDIS_URL,
-        "MTP_S3_ENDPOINT": config.WORKER_REMOTE_S3_ENDPOINT,
+        "MTP_WORKER_IMAGE": deployment["worker_image"],
+        "MTP_REDIS_URL": deployment["redis_url"],
+        "MTP_S3_ENDPOINT": deployment["s3_endpoint"],
         "MTP_S3_ACCESS_KEY": config.S3_ACCESS_KEY,
         "MTP_S3_SECRET_KEY": config.S3_SECRET_KEY,
         "MTP_S3_BUCKET": config.S3_BUCKET,
@@ -507,9 +583,9 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
 
 
 def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
-    """用严格主机校验的 OpenSSH 执行脚本，并过滤输出中的平台 SSH 凭证。"""
+    """用首次连接自动信任的 OpenSSH 执行脚本，并过滤输出中的平台凭证。"""
     credentials = _ssh_credentials_for_server(server)
-    errors = remote_configuration_errors(credentials)
+    errors = remote_configuration_errors(credentials, server)
     if errors:
         raise RemoteWorkerError("；".join(errors))
     resolved_server = dict(server)
@@ -518,6 +594,10 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
     ssh_path = shutil.which("ssh")
     if not ssh_path:
         raise RemoteWorkerError("平台后端容器未安装 OpenSSH 客户端")
+    try:
+        Path(config.WORKER_SSH_KNOWN_HOSTS_PATH).parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RemoteWorkerError("无法创建持久化 SSH 主机密钥目录") from exc
     host = str(server["host"])
     ssh_host = f"[{host}]" if ":" in host else host
     target = f"{resolved_server['username']}@{ssh_host}"
@@ -564,7 +644,7 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
             "-p",
             str(server["port"]),
             "-o",
-            "StrictHostKeyChecking=yes",
+            "StrictHostKeyChecking=accept-new",
             "-o",
             f"UserKnownHostsFile={config.WORKER_SSH_KNOWN_HOSTS_PATH}",
             "-o",
@@ -614,7 +694,7 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
     finally:
         if temporary_key_path is not None:
             temporary_key_path.unlink(missing_ok=True)
-    output = _redact_output(result.stdout, result.stderr, credentials)
+    output = _redact_output(result.stdout, result.stderr, credentials, server)
     if result.returncode != 0:
         detail = (output["stderr"] or output["stdout"] or "远程脚本返回错误").strip()
         raise RemoteWorkerError(detail[-2000:])
@@ -659,12 +739,21 @@ def execute_remote_operation(
 
 
 def _redact_output(
-    stdout: str, stderr: str, credentials: Dict[str, str] | None = None
+    stdout: str,
+    stderr: str,
+    credentials: Dict[str, str] | None = None,
+    server: Dict[str, object] | None = None,
 ) -> Dict[str, str]:
     """从 SSH 输出中删除远程配置和平台 SSH 凭证。"""
     credentials = credentials or {}
+    try:
+        redis_url = remote_deployment_settings(server).get("redis_url", "")
+    except RemoteWorkerError:
+        redis_url = ""
     secrets = (
+        redis_url,
         config.WORKER_REMOTE_REDIS_URL,
+        config.REDIS_URL,
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
         credentials.get("password", ""),

@@ -1,12 +1,6 @@
-# 远程服务器管理覆盖配置：trainer 使用页面加密凭证，并严格校验 known_hosts。
-# WORKER_SSH_KNOWN_HOSTS_HOST_PATH 始终需要指向平台宿主机上已核验的只读文件。
+# 远程服务器管理覆盖配置：主机密钥首次连接时自动信任，并持久化在 DATA_DIR。
 
 services:
   trainer:
-    volumes:
-      - type: bind
-        source: ${WORKER_SSH_KNOWN_HOSTS_HOST_PATH:?请设置 WORKER_SSH_KNOWN_HOSTS_HOST_PATH}
-        target: /run/remote-worker/known_hosts
-        read_only: true
     environment:
       WORKER_REMOTE_ENABLED: "true"
