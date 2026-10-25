@@ -368,6 +368,36 @@ def test_process_dataset_supports_legacy_flat_layout(client, store):
     assert legacy_metadata["rows"] == 2
 
 
+def test_reprocessing_legacy_dataset_starts_from_original_file(client, store):
+    """兼容场景：旧扁平数据集重复处理仍从原始 CSV 开始。"""
+    import pandas as pd
+
+    dataset_id = "legacy-reprocess-test"
+    frame = pd.DataFrame({"feature": [1, 1, 2], "target": ["a", "a", "b"]})
+    frame.to_csv(config.DATASETS_DIR / f"{dataset_id}.csv", index=False)
+    config.DATASETS_DIR.joinpath(f"{dataset_id}.meta.json").write_text(
+        json.dumps({"id": dataset_id, "name": "legacy-reprocess.csv", "rows": 3,
+                    "columns": ["feature", "target"], "tags": [], "description": ""}),
+        encoding="utf-8",
+    )
+
+    first = client.post(
+        f"/api/datasets/{dataset_id}/process",
+        json={"operations": [{"type": "select_columns", "params": {"columns": ["feature"]}}]},
+    )
+    assert first.status_code == 200, first.text
+    assert client.get(f"/api/datasets/{dataset_id}").json()["columns"] == ["feature"]
+
+    second = client.post(
+        f"/api/datasets/{dataset_id}/process",
+        json={"operations": [{"type": "remove_duplicates", "params": {}}]},
+    )
+    assert second.status_code == 200, second.text
+    detail = client.get(f"/api/datasets/{dataset_id}").json()
+    assert detail["columns"] == ["feature", "target"]
+    assert detail["rows"] == 2
+
+
 def test_process_dataset_supports_structured_layout(client, store):
     """正常场景：新结构数据集处理后写入 processed/ 并同步详情。"""
     import pandas as pd
