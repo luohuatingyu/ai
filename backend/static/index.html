@@ -63,6 +63,22 @@
   .st-queued { color: var(--muted); } .st-running { color: var(--accent); }
   .st-completed { color: var(--ok); } .st-failed { color: var(--danger); }
   .st-cancelled { color: var(--warn); }
+  .st-paused { color: var(--warn); }
+
+  /* 计算槽（多机多卡）面板 */
+  .wgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+           gap: 8px; margin-top: 8px; }
+  .wcard { border: 1px solid var(--border); background: var(--panel2); border-radius: 10px;
+           padding: 8px 10px; font-size: 12px; }
+  .wcard .wtop { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+  .wcard .wid { font-weight: 600; word-break: break-all; }
+  .wcard .wmuted { color: var(--muted); font-size: 11px; }
+  .wstate { font-size: 11px; padding: 1px 8px; border-radius: 999px;
+            border: 1px solid var(--border); white-space: nowrap; }
+  .wstate.idle { color: var(--ok); }
+  .wstate.running { color: var(--accent); }
+  .wstate.degraded, .wstate.recovering { color: var(--warn); }
+  .wstate.offline { color: var(--danger); }
   .progress { height: 6px; background: var(--chip); border-radius: 4px; margin-top: 8px; overflow: hidden; }
   .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .4s; }
   .progress.done > div { background: var(--ok); }
@@ -145,15 +161,32 @@
         <div class="field"><label>隐藏层数</label><input id="p_hidden_layers" type="number" value="3" min="0" max="8"></div>
         <div class="field"><label>每层神经元</label><input id="p_hidden_size" type="number" value="128" min="1" max="2048"></div>
         <div class="field"><label>验证集比例</label><input id="p_test_split" type="number" value="0.2" step="0.05" min="0.05" max="0.5"></div>
+        <div class="field">
+          <label>资源提示</label>
+          <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-top:4px; color:var(--text);">
+            <input id="p_require_gpu" type="checkbox" style="width:auto;"> 要求在 GPU 上训练
+          </label>
+        </div>
+        <div class="field" id="minVramField" hidden>
+          <label>最低显存（MiB，可选）</label>
+          <input id="p_min_vram" type="number" value="0" min="0" step="1024">
+        </div>
       </div>
       <button id="btnStart" class="primary" disabled>🚀 开始训练</button>
       <div class="hint">提示：目标列为连续数值时请选择「回归」，否则选「分类」。</div>
     </form>
   </aside>
 
-  <!-- 右栏：任务列表 + 详情 -->
+  <!-- 右栏：计算槽 + 任务列表 + 详情 -->
   <section class="panel">
-    <h2 style="margin-top:0;">③ 训练任务</h2>
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <h2 style="margin:0;">🖥 计算槽（多机多卡）</h2>
+      <span id="queueDepth" class="chip">队列 0</span>
+    </div>
+    <div class="hint" style="margin-top:4px;">每张卡一个独立执行进程；某张卡不可用时任务自动由其它卡/服务器从断点接续。</div>
+    <div id="workerGrid" class="wgrid"><div class="empty">未发现计算槽</div></div>
+
+    <h2>③ 训练任务</h2>
     <div id="jobList"><div class="empty">暂无任务，先在左侧发起训练</div></div>
 
     <div id="detail" hidden>
@@ -161,6 +194,8 @@
         <div class="jobline"><span id="dName" class="jobname"></span><span id="dStatus" class="chip"></span><span id="dDevice" class="chip"></span></div>
         <div class="actions">
           <button id="btnCancel" hidden>⏹ 取消</button>
+          <button id="btnPause" hidden>⏸ 暂停</button>
+          <button id="btnResume" hidden>▶ 恢复训练</button>
           <button id="btnDownload" hidden>⬇ 下载模型</button>
           <button id="btnDelete" class="danger">🗑 删除</button>
         </div>
@@ -351,6 +386,7 @@ $("datasetSelect").onchange = (e) => { state.datasetId = e.target.value; loadPre
 
 /* ---------- 训练任务 ---------- */
 const taskSelect = $("taskSelect");
+$("p_require_gpu").onchange = () => { $("minVramField").hidden = !$("p_require_gpu").checked; };
 
 $("btnStart").onclick = async () => {
   if (!state.datasetId || !$("targetSelect").value) return;
@@ -365,6 +401,8 @@ $("btnStart").onclick = async () => {
     hidden_size: Number($("p_hidden_size").value),
     test_split: Number($("p_test_split").value),
     seed: 42,
+    require_gpu: $("p_require_gpu").checked,
+    min_vram_mb: $("p_require_gpu").checked ? Math.max(Number($("p_min_vram").value) || 0, 0) : 0,
   };
   $("btnStart").disabled = true;
   try {
@@ -377,7 +415,7 @@ $("btnStart").onclick = async () => {
   updateStart();
 };
 
-const statusText = { queued: "排队中", running: "训练中", completed: "已完成", failed: "失败", cancelled: "已取消" };
+const statusText = { queued: "排队中", running: "训练中", completed: "已完成", failed: "失败", cancelled: "已取消", paused: "已暂停" };
 
 function jobCard(j) {
   const m = j.spec.params || {};
@@ -393,6 +431,8 @@ function jobCard(j) {
       <span class="jobname">${esc(j.spec.target)} · ${taskLabel}</span>
       <span class="chip st-${esc(j.status)}">${statusText[j.status] || j.status}</span>
       <span class="chip">${esc(j.spec.dataset_name || "")}</span>
+      ${(j.spec.resource_hint || {}).require_gpu ? `<span class="chip" title="要求 GPU 训练">GPU</span>` : ""}
+      ${j.retry_count ? `<span class="chip" title="环境性错误自动重试次数">↻ ${j.retry_count}</span>` : ""}
     </div>
     <div class="chips">
       <span class="chip">ep ${m.epochs}</span><span class="chip">bs ${m.batch_size}</span>
@@ -449,6 +489,8 @@ async function loadDetail() {
   $("dDevice").textContent = j.device ? (j.device === "cuda" ? "GPU" : "CPU") : "设备待分配";
 
   $("btnCancel").hidden = !(j.status === "queued" || j.status === "running");
+  $("btnPause").hidden = !(j.status === "queued" || j.status === "running");
+  $("btnResume").hidden = j.status !== "paused";
   $("btnDownload").hidden = !j.summary;
   $("btnDelete").onclick = async () => {
     if (!confirm("确定删除该任务及其产物？")) return;
@@ -460,6 +502,18 @@ async function loadDetail() {
     try { await apiJson(`/api/jobs/${j.id}/cancel`, { method: "POST" }); toast("已发送取消请求"); }
     catch (e) { toast(e.message, "err"); }
   };
+  $("btnPause").onclick = async () => {
+    try {
+      await apiJson(`/api/jobs/${j.id}/pause`, { method: "POST" });
+      toast("暂停请求已发送：断点保存后可由任意卡/服务器恢复");
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("btnResume").onclick = async () => {
+    try {
+      await apiJson(`/api/jobs/${j.id}/resume`, { method: "POST" });
+      toast("已恢复排队：任意可用卡/服务器将从断点接续", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  };
 
   const bar = $("dProgress");
   bar.className = "progress" + (j.status === "completed" ? " done" : (j.status === "failed" || j.status === "cancelled" ? " failed" : ""));
@@ -469,6 +523,7 @@ async function loadDetail() {
   if (j.progress.epochs_total) ptxt = `epoch ${j.progress.epoch}/${j.progress.epochs_total}`;
   if (j.status === "failed" && j.error) ptxt += ` · ${esc(j.error)}`;
   if (j.summary && j.summary.duration_sec) ptxt += ` · 用时 ${j.summary.duration_sec}s`;
+  if ((j.segments || []).length > 1) ptxt += ` · 跨槽续训 ${j.segments.length} 段`;
   $("dProgressText").innerHTML = ptxt;
 
   j.metrics = j.metrics || [];
@@ -615,6 +670,36 @@ $("btnPredict").onclick = async () => {
   } catch (e) { toast(e.message, "err"); out.hidden = true; }
 };
 
+/* ---------- 计算槽面板（多机多卡） ---------- */
+const workerStateText = { idle: "空闲", running: "训练中", degraded: "卡降级", recovering: "恢复中", offline: "离线" };
+function workerCard(w) {
+  const gpu = w.gpu || {};
+  const device = gpu.available
+    ? `${gpu.name || "GPU"}${gpu.vram_mb ? " · " + gpu.vram_mb + "MiB" : ""}`
+    : "CPU";
+  const st = w.state || (w.active ? "idle" : "offline");
+  const job = w.current_job ? `${w.current_job}${w.epoch ? " · ep" + w.epoch : ""}` : "—";
+  const hb = w.heartbeat_age_sec != null ? `心跳 ${w.heartbeat_age_sec}s` : "";
+  return `<div class="wcard">
+    <div class="wtop">
+      <span class="wid" title="${esc(w.worker_id || "")}">${esc(w.worker_id || "?")}</span>
+      <span class="wstate ${esc(st)}">${workerStateText[st] || st}</span>
+    </div>
+    <div class="wmuted">${esc(w.machine_id || w.hostname || "")} · ${esc(device)}</div>
+    <div class="wmuted">任务: ${esc(job)} ${hb ? "· " + esc(hb) : ""}</div>
+  </div>`;
+}
+async function refreshWorkers() {
+  try {
+    const d = await apiJson("/api/workers");
+    const grid = $("workerGrid");
+    grid.innerHTML = (d.workers || []).length
+      ? d.workers.map(workerCard).join("")
+      : `<div class="empty">未发现计算槽（本地模式：任务由 API 内置线程执行）</div>`;
+    $("queueDepth").textContent = `队列 ${d.queue_depth ?? 0}`;
+  } catch { /* 轮询失败静默 */ }
+}
+
 /* ---------- Tab 切换 ---------- */
 document.querySelectorAll(".tabs button").forEach((b) => {
   b.onclick = () => {
@@ -633,6 +718,8 @@ $("btnDownload").onclick = () => { if (state.jobId) location.href = `/api/jobs/$
   loadSystem();
   setInterval(loadSystem, 15000);
   loadSamples();
+  refreshWorkers();
+  setInterval(refreshWorkers, 2000);
   try { await loadDatasets(); } catch (e) { toast("加载数据集失败: " + e.message, "err"); }
   await refreshJobs();
   setInterval(refreshJobs, 1500);
