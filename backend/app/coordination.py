@@ -11,6 +11,7 @@ REDIS_URL 为空时自动切换 Embedded 实现（进程内队列/锁，单机�
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import deque
@@ -403,18 +404,34 @@ class RedisLeaseStore(LeaseStore):
             info = self._redis.hgetall(_WORKER_INFO.format(worker_id=worker_id))
             if not info:
                 continue
-            item = {"worker_id": worker_id}
-            item.update(info)
+            item: Dict[str, object] = {"worker_id": worker_id}
+            # Redis 存储值全部为字符串：还原嵌套结构（gpu dict / 数值等）
+            item.update({k: unjsonable(v) for k, v in info.items()})
             item["active"] = bool(self._redis.exists(_WORKER_HB.format(worker_id=worker_id)))
             out.append(item)
         return out
 
 
 def jsonable(value: object) -> str:
-    """把任意标量转为 Redis 可存储的字符串。"""
+    """把任意值转为 Redis 可存储的字符串（嵌套结构 JSON 编码）。"""
     if isinstance(value, bool):
         return "1" if value else "0"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def unjsonable(value: object) -> object:
+    """把 Redis 读回的字符串还原为原始类型（嵌套结构 JSON 解码）。"""
+    if not isinstance(value, str):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+    if isinstance(parsed, (dict, list, bool, int, float)):
+        return parsed
+    return value
 
 
 # ---------------------------------------------------------------------------

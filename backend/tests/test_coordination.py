@@ -181,3 +181,40 @@ def test_redis_semantics_match_embedded():
     ls.register_worker("wr", {"gpu": {"available": False}}, ttl=5)
     assert ls.list_workers()[0]["worker_id"] == "wr"
     ls.deregister_worker("wr")
+
+
+def test_redis_worker_registry_roundtrip_nested_caps():
+    """Redis 注册往返：嵌套 gpu dict / 数值字段经序列化后类型还原（/api/workers 数据源）。"""
+    import os
+
+    if not os.environ.get("MTP_TEST_REDIS"):
+        import pytest
+
+        pytest.skip("未配置 MTP_TEST_REDIS，跳过 Redis 注册往返测试")
+    import redis as redislib
+
+    from app.coordination import RedisLeaseStore
+
+    client = redislib.Redis.from_url(os.environ["MTP_TEST_REDIS"], decode_responses=True)
+    client.flushdb()
+    ls = RedisLeaseStore(client)
+    caps = {
+        "worker_id": "w-nested", "machine_id": "m1", "slot": "gpu0",
+        "hostname": "h1", "gpu": {"available": True, "name": "TestGPU-8G",
+                                  "count": 1, "vram_mb": 8192},
+        "torch_version": "2.8.0", "cuda_version": None,
+        "python_version": "3", "started_at": 1700000000.5,
+    }
+    ls.register_worker("w-nested", caps, ttl=30)
+    ls.heartbeat_worker("w-nested", {"state": "running", "current_job": "job-x", "epoch": 42}, ttl=30)
+    workers = ls.list_workers()
+    assert len(workers) == 1
+    w = workers[0]
+    gpu = w["gpu"]
+    assert isinstance(gpu, dict), f"gpu 应还原为 dict: {gpu!r}"
+    assert gpu["available"] is True and gpu["vram_mb"] == 8192
+    assert w["epoch"] == 42 and isinstance(w["epoch"], int)
+    assert w["current_job"] == "job-x" and w["state"] == "running"
+    assert w["started_at"] == 1700000000.5
+    assert w["active"] is True
+    ls.deregister_worker("w-nested")
