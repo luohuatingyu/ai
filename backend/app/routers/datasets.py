@@ -1,18 +1,18 @@
-"""数据集领域路由：上传/导入/列表/详情/统计/删除/标签/描述/画像/处理。"""
+"""数据集领域路由：上传/导入/列表/详情/统计/删除/标签/描述/画像/处理。
+
+路由顺序注意：静态路径（如 /datasets/tags、/datasets/import-history）
+必须定义在 /datasets/{ds_id} 之前，否则会被参数路由遮蔽。
+"""
 from __future__ import annotations
 
-import json
 import time
-from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 import app.config as config
-from app.db_utils import get_dataset_from_db, save_dataset_to_db
 from app.database import db_session
-from app.state import data_processor, dataset_importer, dataset_manager
-from app.utils import safe_filename
+from app.db_utils import get_dataset_from_db, save_dataset_to_db
 from app.routers.common import (
     _check_id,
     _get_dataset_or_404,
@@ -21,9 +21,15 @@ from app.routers.common import (
     _write_metadata,
 )
 from app.routers.schemas import ProcessRequest
+from app.state import data_processor, dataset_importer, dataset_manager
+from app.utils import safe_filename
 
 router = APIRouter(prefix="/api", tags=["datasets"])
 
+
+# ---------------------------------------------------------------------------
+# 上传 / 示例导入 / 列表（静态路径）
+# ---------------------------------------------------------------------------
 
 @router.post("/datasets")
 async def upload_dataset(
@@ -104,6 +110,43 @@ def list_datasets(
     except Exception as e:
         raise HTTPException(500, f"获取数据集列表失败: {e}")
 
+
+# 静态路径必须位于 /datasets/{ds_id} 之前（否则被参数路由遮蔽）
+
+@router.get("/datasets/import-history")
+def get_import_history(limit: int = 100) -> dict:
+    """获取导入历史"""
+    try:
+        history = dataset_importer.get_import_history(limit)
+        return {
+            "history": history,
+            "total": len(history)
+        }
+    except Exception as e:
+        raise HTTPException(500, f"获取导入历史失败: {e}")
+
+
+@router.get("/datasets/tags")
+def get_all_tags() -> dict:
+    """获取所有标签"""
+    try:
+        all_tags = set()
+        _, total = dataset_manager.list_datasets(limit=10000)
+
+        # 获取所有数据集的标签
+        for offset in range(0, total, 100):
+            datasets, _ = dataset_manager.list_datasets(limit=100, offset=offset)
+            for dataset in datasets:
+                all_tags.update(dataset.get("tags", []))
+
+        return {"tags": sorted(list(all_tags))}
+    except Exception as e:
+        raise HTTPException(500, f"获取所有标签失败: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 单个数据集（参数路径）
+# ---------------------------------------------------------------------------
 
 @router.get("/datasets/{ds_id}")
 def dataset_detail(ds_id: str, rows: int = 5) -> dict:
@@ -211,24 +254,6 @@ def remove_dataset_tags(ds_id: str, tags: list[str]) -> dict:
         raise
     except Exception as e:
         raise HTTPException(500, f"删除数据集标签失败: {e}")
-
-
-@router.get("/datasets/tags")
-def get_all_tags() -> dict:
-    """获取所有标签"""
-    try:
-        all_tags = set()
-        _, total = dataset_manager.list_datasets(limit=10000)
-
-        # 获取所有数据集的标签
-        for offset in range(0, total, 100):
-            datasets, _ = dataset_manager.list_datasets(limit=100, offset=offset)
-            for dataset in datasets:
-                all_tags.update(dataset.get("tags", []))
-
-        return {"tags": sorted(list(all_tags))}
-    except Exception as e:
-        raise HTTPException(500, f"获取所有标签失败: {e}")
 
 
 @router.post("/datasets/{ds_id}/description")
@@ -388,7 +413,7 @@ def get_processing_operations() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 数据集导入（多格式/批量/校验/历史）
+# 数据集导入（多格式/批量/校验）
 # ---------------------------------------------------------------------------
 
 @router.post("/datasets/import")
@@ -442,16 +467,3 @@ async def validate_dataset_file(file: UploadFile = File(...)) -> dict:
         raise
     except Exception as e:
         raise HTTPException(500, f"验证数据集文件失败: {e}")
-
-
-@router.get("/datasets/import-history")
-def get_import_history(limit: int = 100) -> dict:
-    """获取导入历史"""
-    try:
-        history = dataset_importer.get_import_history(limit)
-        return {
-            "history": history,
-            "total": len(history)
-        }
-    except Exception as e:
-        raise HTTPException(500, f"获取导入历史失败: {e}")

@@ -48,6 +48,16 @@ def test_health_and_system(client):
     assert "device" in sysinfo
 
 
+def test_static_paths_not_shadowed_by_param_route(client):
+    """回归：/api/datasets/tags 与 import-history 不得被 /datasets/{ds_id} 遮蔽。"""
+    r = client.get("/api/datasets/tags")
+    assert r.status_code == 200, f"tags 端点应可达: {r.status_code}"
+    assert "tags" in r.json()
+    r = client.get("/api/datasets/import-history")
+    assert r.status_code == 200, f"import-history 端点应可达: {r.status_code}"
+    assert "history" in r.json()
+
+
 def test_train_e2e_classification(client, make_dataset):
     """正常场景：完整训练链路——提交/详情/进度/指标/summary/日志/产物。"""
     ds = make_dataset()
