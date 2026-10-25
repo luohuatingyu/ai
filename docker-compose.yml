@@ -56,7 +56,11 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    # MinIO 自 2025 年起已从 Docker Hub 迁移到 quay.io（AIStor）。
+    # 固定稳定版本（:latest 多架构清单在部分网络下拉取易挂起）。
+    # 国内网络拉取困难时，可在 .env 中把 MINIO_IMAGE 换成国内镜像源，
+    # 例如：MINIO_IMAGE=docker.m.daocloud.io/minio/minio:latest
+    image: ${MINIO_IMAGE:-quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z}
     container_name: mtp-minio
     command: server /data --console-address ":9001"
     environment:

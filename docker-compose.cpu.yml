@@ -39,7 +39,8 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    # 镜像源可通过 .env 的 MINIO_IMAGE 切换（国内网络可用国内镜像源）
+    image: ${MINIO_IMAGE:-quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z}
     container_name: mtp-minio-cpu
     command: server /data --console-address ":9001"
     environment:
