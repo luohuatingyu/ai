@@ -122,7 +122,10 @@ class RemoteServerRequest(BaseModel):
 
     machine_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     host: str = Field(min_length=1, max_length=253, pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
-    username: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z_][A-Za-z0-9_-]*$")
+    username: str | None = Field(default=None, max_length=32, pattern=r"^[A-Za-z_][A-Za-z0-9_-]*$")
+    ssh_credential_id: str | None = Field(
+        default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
     port: int = Field(default=22, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] = "gpu"
     cpu_slots: int = Field(default=2, ge=0, le=256)
@@ -160,6 +163,52 @@ class RemoteSSHCredentialsRequest(BaseModel):
                 raise ValueError("SSH 密码不能包含换行符")
             if self.private_key is not None or self.passphrase is not None:
                 raise ValueError("密码认证不能同时提交私钥或私钥口令")
+        if self.passphrase is not None and (
+            "\x00" in self.passphrase or "\n" in self.passphrase or "\r" in self.passphrase
+        ):
+            raise ValueError("私钥口令不能包含换行符或空字符")
+        return self
+
+
+class RemoteSSHCredentialRequest(BaseModel):
+    """页面新增或替换 SSH 凭证；认证秘密只存在于本次请求内。"""
+
+    name: str = Field(min_length=1, max_length=80)
+    username: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z_][A-Za-z0-9_-]*$")
+    auth_method: Literal["password", "key", "key_password"]
+    private_key: str | None = Field(default=None, max_length=256 * 1024)
+    password: str | None = Field(default=None, max_length=4096)
+    passphrase: str | None = Field(default=None, max_length=4096)
+    make_default: bool = False
+
+    @model_validator(mode="after")
+    def validate_credential(self) -> "RemoteSSHCredentialRequest":
+        """按凭证类型检查密钥、登录密码和私钥口令，并拒绝控制字符。"""
+        if not self.name.strip() or any(char in self.name for char in "\x00\r\n"):
+            raise ValueError("凭证名称不能为空或包含控制字符")
+        if self.auth_method in {"key", "key_password"}:
+            if not self.private_key or "\x00" in self.private_key:
+                raise ValueError("密钥认证需要有效的 SSH 私钥")
+            lines = self.private_key.strip().splitlines()
+            if (
+                len(lines) < 3
+                or not lines[0].startswith("-----BEGIN ")
+                or not lines[0].endswith(" PRIVATE KEY-----")
+                or not lines[-1].startswith("-----END ")
+                or not lines[-1].endswith(" PRIVATE KEY-----")
+            ):
+                raise ValueError("私钥格式无效；请粘贴完整的 OpenSSH / PEM 私钥")
+        elif self.private_key is not None or self.passphrase is not None:
+            raise ValueError("密码认证不能同时提交私钥或私钥口令")
+
+        if self.auth_method in {"password", "key_password"}:
+            if not self.password or "\x00" in self.password:
+                raise ValueError("密码认证需要填写 SSH 登录密码")
+            if "\n" in self.password or "\r" in self.password:
+                raise ValueError("SSH 密码不能包含换行符")
+        elif self.password is not None:
+            raise ValueError("密钥认证不能同时提交登录密码")
+
         if self.passphrase is not None and (
             "\x00" in self.passphrase or "\n" in self.passphrase or "\r" in self.passphrase
         ):

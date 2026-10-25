@@ -288,11 +288,12 @@ def test_remote_management_requires_an_enabled_admin_token(client, monkeypatch):
     ).status_code == 401
 
 
-def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, monkeypatch):
+def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, monkeypatch, request):
     """令牌保护的远程添加与生命周期 API 仅保存 SSH 目标元数据并记录异步操作。"""
     from app.routers import jobs as jobs_router
     from app import remote_workers
     from app.state import manager
+    from cryptography.fernet import Fernet
 
     token = "remote-admin-token-0123456789-abcd"
     headers = {"X-Worker-Admin-Token": token}
@@ -300,16 +301,34 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     calls = []
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda: [])
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(manager, "distributed", True)
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+    credential = client.post(
+        "/api/remote-ssh-credentials",
+        headers=headers,
+        json={
+            "name": "API test credential",
+            "username": "credential-user",
+            "auth_method": "password",
+            "password": "synthetic-test-password",
+        },
+    )
+    assert credential.status_code == 200, credential.text
+    credential_id = credential.json()["credentials"][0]["id"]
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None: [])
     monkeypatch.setattr(
         remote_workers,
         "run_remote_action",
-        lambda server, action: calls.append((server["machine_id"], action)) or {"stdout": "done"},
+        lambda server, action: calls.append((server["machine_id"], action, server["username"])) or {"stdout": "done"},
     )
     payload = {
         "machine_id": machine_id,
         "host": "compute.example.net",
         "username": "worker",
+        "ssh_credential_id": credential_id,
         "port": 2222,
         "mode": "gpu",
         "cpu_slots": 0,
@@ -320,11 +339,13 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     operation = client.get(f"/api/remote-operations/{operation_id}", headers=headers).json()
     assert operation["status"] == "completed"
     assert operation["output"] == "done"
-    assert calls == [(machine_id, "install")]
+    assert calls == [(machine_id, "install", "worker")]
 
     servers = client.get("/api/remote-servers", headers=headers).json()["servers"]
     server = next(item for item in servers if item["machine_id"] == machine_id)
     assert server["host"] == payload["host"]
+    assert server["username_override"] == "worker"
+    assert server["ssh_credential_id"] == credential_id
     assert "private_key" not in server and "token" not in server
     assert client.post("/api/remote-servers", json=payload, headers=headers).status_code == 409
 
@@ -335,7 +356,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
             f"/api/remote-operations/{result.json()['operation_id']}", headers=headers
         ).json()
         assert current["status"] == "completed"
-        assert calls[-1] == (machine_id, action)
+        assert calls[-1] == (machine_id, action, "worker")
 
     assert client.post(
         f"/api/remote-servers/missing-{machine_id}/start", headers=headers
@@ -351,7 +372,7 @@ def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatc
     token = "remote-admin-token-0123456789-abcd"
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None: [])
     response = client.post(
         "/api/remote-servers",
         headers={"X-Worker-Admin-Token": token},
@@ -365,6 +386,142 @@ def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatc
         },
     )
     assert response.status_code == 422
+
+
+def test_remote_server_uses_credential_username_when_server_username_is_blank(client, monkeypatch, request):
+    """未填写服务器用户名则使用凭证用户名，并在服务器记录中保存凭证引用。"""
+    from cryptography.fernet import Fernet
+    from app import remote_workers
+    from app.routers import jobs as jobs_router
+    from app.state import manager
+
+    token = "remote-admin-token-default-user-0123456789"
+    headers = {"X-Worker-Admin-Token": token}
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(manager, "distributed", True)
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+    credential_response = client.post(
+        "/api/remote-ssh-credentials",
+        headers=headers,
+        json={
+            "name": "default username test",
+            "username": "credential-user",
+            "auth_method": "password",
+            "password": "synthetic-password",
+        },
+    )
+    assert credential_response.status_code == 200, credential_response.text
+    credential_id = credential_response.json()["credentials"][0]["id"]
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None: [])
+    run_calls = []
+    monkeypatch.setattr(
+        remote_workers,
+        "run_remote_action",
+        lambda server, action: run_calls.append((server["username"], action)) or {"stdout": "done"},
+    )
+
+    machine_id = f"remote-default-user-{time.time_ns()}"
+    response = client.post(
+        "/api/remote-servers",
+        headers=headers,
+        json={
+            "machine_id": machine_id,
+            "host": "compute.example.net",
+            "ssh_credential_id": credential_id,
+            "port": 22,
+            "mode": "cpu",
+            "cpu_slots": 2,
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert run_calls == [("credential-user", "install")]
+    server = manager.lease.get_remote_server(machine_id)
+    assert server["username"] == "credential-user"
+    assert server["username_override"] is None
+    assert server["ssh_credential_id"] == credential_id
+    manager.lease.delete_remote_server(machine_id)
+
+
+def test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_echo(client, monkeypatch, request):
+    """页面可加密管理三类 SSH 凭证，目录接口不回传秘密且引用中的凭证不可删除。"""
+    from cryptography.fernet import Fernet
+    from app.state import manager
+
+    token = "remote-admin-token-credential-catalog-012345"
+    headers = {"X-Worker-Admin-Token": token}
+    encryption_key = Fernet.generate_key().decode()
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", encryption_key)
+    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(manager, "distributed", True)
+    manager.lease.delete_remote_ssh_credentials()
+    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+
+    secret_password = "synthetic-password-secret"
+    private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic-key-material\n-----END OPENSSH PRIVATE KEY-----"
+    payloads = [
+        {"name": "password-only", "username": "pw-user", "auth_method": "password", "password": secret_password},
+        {"name": "key-only", "username": "key-user", "auth_method": "key", "private_key": private_key},
+        {
+            "name": "key-then-password",
+            "username": "both-user",
+            "auth_method": "key_password",
+            "private_key": private_key,
+            "password": secret_password,
+            "passphrase": "synthetic-passphrase",
+            "make_default": True,
+        },
+    ]
+    created = []
+    for payload in payloads:
+        response = client.post("/api/remote-ssh-credentials", headers=headers, json=payload)
+        assert response.status_code == 200, response.text
+        created.append(response.json())
+        assert secret_password not in response.text
+        assert private_key not in response.text
+
+    listed = client.get("/api/remote-ssh-credentials", headers=headers)
+    assert listed.status_code == 200
+    catalog = listed.json()
+    assert [item["auth_method"] for item in catalog["credentials"]] == ["password", "key", "key_password"]
+    assert catalog["default_credential_id"] == catalog["credentials"][2]["id"]
+    assert secret_password not in listed.text and private_key not in listed.text
+    assert client.get("/api/remote-ssh-credentials").status_code == 401
+
+    ciphertext = manager.lease.get_remote_ssh_credentials()
+    decrypted = Fernet(encryption_key.encode()).decrypt(ciphertext.encode()).decode()
+    decrypted_catalog = json.loads(decrypted)
+    assert secret_password in decrypted
+    assert decrypted_catalog["credentials"][1]["private_key"].startswith(private_key.splitlines()[0])
+
+    referenced_id = catalog["credentials"][2]["id"]
+    machine_id = f"credential-reference-{time.time_ns()}"
+    manager.lease.set_remote_server(machine_id, {"machine_id": machine_id, "ssh_credential_id": referenced_id})
+    blocked = client.delete(f"/api/remote-ssh-credentials/{referenced_id}", headers=headers)
+    assert blocked.status_code == 409
+    manager.lease.delete_remote_server(machine_id)
+
+    updated = client.put(
+        f"/api/remote-ssh-credentials/{created[0]['credentials'][0]['id']}",
+        headers=headers,
+        json={
+            "name": "password-only-updated",
+            "username": "pw-user-new",
+            "auth_method": "password",
+            "password": "replacement-secret",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert "replacement-secret" not in updated.text
+    deleted = client.delete(f"/api/remote-ssh-credentials/{created[1]['credentials'][1]['id']}", headers=headers)
+    assert deleted.status_code == 200
+    assert len(deleted.json()["credentials"]) == 2
 
 
 def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client, monkeypatch, request):
@@ -412,7 +569,7 @@ def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client
     cleared = client.delete("/api/remote-ssh-settings", headers=headers)
     assert cleared.status_code == 200
     assert manager.lease.get_remote_ssh_credentials() is None
-    assert cleared.json()["source"] == "env"
+    assert cleared.json()["source"] == "none"
     assert password not in cleared.text
 
 
@@ -450,7 +607,7 @@ def test_remote_ssh_settings_save_private_key_without_echo(client, monkeypatch, 
     ciphertext = manager.lease.get_remote_ssh_credentials()
     assert ciphertext and private_key not in ciphertext
     stored = json.loads(Fernet(encryption_key.encode()).decrypt(ciphertext.encode()).decode())
-    assert stored["private_key"] == private_key + "\n"
+    assert stored["credentials"][0]["private_key"] == private_key + "\n"
 
 
 @pytest.mark.parametrize(

@@ -469,7 +469,7 @@
       <h3 id="addServerTitle">通过 SSH 添加服务器</h3>
       <button id="btnCloseAddServer" class="close-btn" aria-label="关闭">×</button>
     </div>
-    <p>平台会使用平台端配置的 SSH 密钥或密码连接目标机，远程执行单文件部署脚本并拉取 worker 镜像。不会同步项目源码。目标机需要 SSH 可达、安装 Docker，并能访问镜像仓库、Redis 和 S3。</p>
+    <p>平台会使用页面统一管理的 SSH 凭证连接目标机，远程执行单文件部署脚本并拉取 worker 镜像。不会同步项目源码。目标机需要 SSH 可达、安装 Docker，并能访问镜像仓库、Redis 和 S3。</p>
     <form id="remoteServerForm" class="server-form">
       <div class="field">
         <label for="remoteMachineId">服务器标识</label>
@@ -480,8 +480,15 @@
         <input id="remoteHost" name="host" required maxlength="253" pattern="[A-Za-z0-9][A-Za-z0-9.:-]*" placeholder="主机名或 IP 地址">
       </div>
       <div class="field">
-        <label for="remoteUsername">SSH 用户</label>
-        <input id="remoteUsername" name="username" required maxlength="32" pattern="[A-Za-z_][A-Za-z0-9_-]*" placeholder="有 Docker 权限的账号">
+        <label for="remoteCredentialSelect">SSH 凭证</label>
+        <select id="remoteCredentialSelect" name="ssh_credential_id" required>
+          <option value="">请先配置 SSH 凭证</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="remoteUsername">SSH 用户（可选覆盖）</label>
+        <input id="remoteUsername" name="username" maxlength="32" pattern="[A-Za-z_][A-Za-z0-9_-]*" placeholder="留空时使用所选凭证的用户名">
+        <div class="hint">填写后仅覆盖这台服务器的 SSH 用户名。</div>
       </div>
       <div class="field">
         <label for="remotePort">SSH 端口</label>
@@ -502,44 +509,55 @@
       <div class="field wide">
         <label for="remoteAdminToken">远程管理令牌</label>
         <input id="remoteAdminToken" type="password" autocomplete="current-password" required placeholder="平台配置的 WORKER_REMOTE_TOKEN">
-        <div class="hint">令牌只保存在当前浏览器标签页会话中。SSH 密钥或密码可在下方设置；known_hosts 和镜像/存储地址仍由平台部署配置提供。</div>
+        <div class="hint">令牌只保存在当前浏览器标签页会话中。SSH 凭证在页面统一配置；known_hosts 和镜像/存储地址由平台部署配置提供。</div>
       </div>
-      <details class="ssh-credential-settings" id="remoteSshSettings">
-        <summary>平台 SSH 凭证设置</summary>
-        <div id="remoteSshSettingsStatus" class="hint" aria-live="polite">正在读取凭证状态…</div>
-        <div class="ssh-credential-grid" style="margin-top:10px;">
-          <div class="field wide">
-            <label for="remoteSshAuthMethod">认证方式</label>
-            <select id="remoteSshAuthMethod">
-              <option value="key">SSH 私钥</option>
-              <option value="password">SSH 密码</option>
-            </select>
-          </div>
-          <div class="field wide" id="remoteSshKeyFields">
-            <label for="remoteSshPrivateKey">私钥内容</label>
-            <textarea id="remoteSshPrivateKey" autocomplete="off" spellcheck="false" placeholder="粘贴完整的 OpenSSH / PEM 私钥；支持 OpenSSH 可识别的密钥类型"></textarea>
-            <div class="hint">支持 OpenSSH 可识别的私钥格式；加密私钥可填写口令。保存后私钥不会再次显示。</div>
-          </div>
-          <div class="field wide" id="remoteSshPassphraseField">
-            <label for="remoteSshPassphrase">私钥口令（可选）</label>
-            <input id="remoteSshPassphrase" type="password" autocomplete="new-password">
-          </div>
-          <div class="field wide" id="remoteSshPasswordField" hidden>
-            <label for="remoteSshPassword">SSH 登录密码</label>
-            <input id="remoteSshPassword" type="password" autocomplete="new-password">
-            <div class="hint">此密码用于平台上登记的所有远程服务器账号。</div>
-          </div>
-        </div>
-        <div class="ssh-credential-actions">
-          <button type="button" id="btnSaveRemoteSshSettings" class="primary" disabled>加密保存凭证</button>
-          <button type="button" id="btnResetRemoteSshSettings" disabled>清除页面凭证，恢复 .env 配置</button>
-        </div>
-      </details>
       <div class="server-form-actions">
         <button type="button" id="btnCancelAddServer">取消</button>
         <button type="submit" id="btnSubmitRemoteServer" class="primary">远程添加并检测资源</button>
       </div>
     </form>
+    <details class="ssh-credential-settings" id="remoteSshSettings">
+      <summary>SSH 凭证管理</summary>
+      <div id="remoteSshSettingsStatus" class="hint" aria-live="polite">正在读取凭证状态…</div>
+      <div id="remoteSshCredentialList" class="ssh-credential-list" aria-live="polite"></div>
+      <form id="remoteSshCredentialForm" class="ssh-credential-grid" style="margin-top:10px;">
+        <input id="remoteSshCredentialId" type="hidden">
+        <div class="field">
+          <label for="remoteSshCredentialName">凭证名称</label>
+          <input id="remoteSshCredentialName" maxlength="80" required placeholder="例如：生产 GPU 用户">
+        </div>
+        <div class="field">
+          <label for="remoteSshCredentialUsername">凭证用户名</label>
+          <input id="remoteSshCredentialUsername" maxlength="32" pattern="[A-Za-z_][A-Za-z0-9_-]*" required placeholder="SSH 登录用户名">
+        </div>
+        <div class="field wide">
+          <label for="remoteSshAuthMethod">认证组合</label>
+          <select id="remoteSshAuthMethod">
+            <option value="password">用户名 + 密码</option>
+            <option value="key">用户名 + 密钥</option>
+            <option value="key_password">用户名 + 密钥 + 密码（先尝试密钥）</option>
+          </select>
+        </div>
+        <div class="field wide" id="remoteSshKeyFields" hidden>
+          <label for="remoteSshPrivateKey">私钥内容</label>
+          <textarea id="remoteSshPrivateKey" autocomplete="off" spellcheck="false" placeholder="粘贴完整的 OpenSSH / PEM 私钥；支持 OpenSSH 可识别的密钥类型"></textarea>
+          <div class="hint">支持 OpenSSH 可识别的 Ed25519、ECDSA、RSA 等格式。保存或编辑时不会回显私钥。</div>
+        </div>
+        <div class="field wide" id="remoteSshPassphraseField" hidden>
+          <label for="remoteSshPassphrase">私钥口令（可选）</label>
+          <input id="remoteSshPassphrase" type="password" autocomplete="new-password">
+        </div>
+        <div class="field wide" id="remoteSshPasswordField" hidden>
+          <label for="remoteSshPassword">SSH 登录密码</label>
+          <input id="remoteSshPassword" type="password" autocomplete="new-password">
+        </div>
+        <label class="field wide"><span><input id="remoteSshMakeDefault" type="checkbox"> 设为默认凭证</span></label>
+        <div class="ssh-credential-actions field wide">
+          <button type="submit" id="btnSaveRemoteSshSettings" class="primary" disabled>加密保存凭证</button>
+          <button type="button" id="btnCancelEditRemoteSshCredential" hidden>取消编辑</button>
+        </div>
+      </form>
+    </details>
     <div class="server-modal-note">GPU 服务器还需要 NVIDIA 驱动和 NVIDIA Container Toolkit。安装完成后，检测到的槽位默认不接收任务；请在服务器卡片中手动加入资源池。镜像拉取时间取决于镜像大小和网络。</div>
   </div>
 </div>
@@ -556,6 +574,7 @@ const state = {
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   charts: { loss: null, metric: null }, metricKind: null,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
+  remoteCredentials: [], remoteCredentialDefaultId: null, remoteCredentialsCanConfigure: false,
 };
 
 /* ---------- 基础工具 ---------- */
@@ -1366,81 +1385,130 @@ async function remoteApiJson(url, opt = {}) {
   return apiJson(url, { ...opt, headers });
 }
 
-// 按平台认证方式显示凭证输入项；隐藏的凭证不会被提交。
+// 按凭证认证组合显示秘密输入项，并只校验当前需要的字段。
 function updateRemoteSshCredentialFields(clearHidden = true) {
-  const useKey = $("remoteSshAuthMethod").value === "key";
+  const method = $("remoteSshAuthMethod").value;
+  const useKey = method === "key" || method === "key_password";
+  const usePassword = method === "password" || method === "key_password";
   $("remoteSshKeyFields").hidden = !useKey;
   $("remoteSshPassphraseField").hidden = !useKey;
-  $("remoteSshPasswordField").hidden = useKey;
-  $("remoteSshPrivateKey").required = false;
-  $("remoteSshPassword").required = false;
+  $("remoteSshPasswordField").hidden = !usePassword;
+  $("remoteSshPrivateKey").required = useKey;
+  $("remoteSshPassword").required = usePassword;
   if (clearHidden) {
-    if (useKey) $("remoteSshPassword").value = "";
-    else {
+    if (!usePassword) $("remoteSshPassword").value = "";
+    if (!useKey) {
       $("remoteSshPrivateKey").value = "";
       $("remoteSshPassphrase").value = "";
     }
   }
 }
 
-// 查询平台凭证状态，只展示认证方式与来源，绝不回填凭证明文。
+// 更新服务器凭证下拉框，保留选择并展示凭证公开元数据。
+function renderRemoteCredentialOptions() {
+  const select = $("remoteCredentialSelect");
+  const currentId = select.value;
+  const selectedId = state.remoteCredentials.some((item) => item.id === currentId)
+    ? currentId : state.remoteCredentialDefaultId;
+  const methodName = { password: "用户名 + 密码", key: "用户名 + 密钥", key_password: "用户名 + 密钥 + 密码" };
+  select.innerHTML = `<option value="">${state.remoteCredentials.length ? "选择 SSH 凭证" : "请先配置 SSH 凭证"}</option>`
+    + state.remoteCredentials.map((item) => `<option value="${esc(item.id)}">${esc(item.name)} · ${esc(item.username)} · ${esc(methodName[item.auth_method] || item.auth_method)}${item.is_default ? " · 默认" : ""}</option>`).join("");
+  select.value = selectedId || "";
+  select.disabled = state.remoteCredentials.length === 0;
+}
+
+// 绘制凭证目录操作项，不显示或缓存凭证明文。
+function renderRemoteCredentialList() {
+  const list = $("remoteSshCredentialList");
+  if (!state.remoteCredentials.length) {
+    list.innerHTML = `<div class="hint" style="margin-top:10px;">尚未配置 SSH 凭证。添加后可在服务器表单中选择。</div>`;
+    return;
+  }
+  const methodName = { password: "用户名 + 密码", key: "用户名 + 密钥", key_password: "密钥优先，密码回退" };
+  list.innerHTML = state.remoteCredentials.map((item) => `
+    <div class="ssh-credential-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid #e5ebf3;">
+      <div><strong>${esc(item.name)}</strong>${item.is_default ? ` <span class="hint">默认</span>` : ""}<div class="hint">${esc(item.username)} · ${esc(methodName[item.auth_method] || item.auth_method)}</div></div>
+      <div style="display:flex;gap:6px;flex-shrink:0;">
+        <button type="button" data-ssh-credential-action="edit" data-ssh-credential-id="${esc(item.id)}" ${state.remoteCredentialsCanConfigure ? "" : "disabled"}>编辑</button>
+        <button type="button" data-ssh-credential-action="delete" data-ssh-credential-id="${esc(item.id)}" ${state.remoteCredentialsCanConfigure ? "" : "disabled"}>删除</button>
+      </div>
+    </div>`).join("");
+}
+
+// 查询页面凭证目录；接口只返回名称、用户名、类型和默认状态。
 async function loadRemoteSshSettings() {
   const status = $("remoteSshSettingsStatus");
   if (!getRemoteAdminToken()) {
-    status.textContent = "先填写远程管理令牌，再查看或修改平台 SSH 凭证。";
+    status.textContent = "先填写远程管理令牌，再查看或管理 SSH 凭证。";
     $("btnSaveRemoteSshSettings").disabled = true;
-    $("btnResetRemoteSshSettings").disabled = true;
+    state.remoteCredentials = [];
+    state.remoteCredentialDefaultId = null;
+    state.remoteCredentialsCanConfigure = false;
+    renderRemoteCredentialOptions();
+    renderRemoteCredentialList();
     return;
   }
-  status.textContent = "正在读取凭证状态…";
+  status.textContent = "正在读取凭证目录…";
   try {
-    const settings = await remoteApiJson("/api/remote-ssh-settings");
-    const method = settings.auth_method === "key" ? "SSH 私钥" : settings.auth_method === "password" ? "SSH 密码" : "未配置";
-    const source = settings.source === "page" ? "页面加密配置" : ".env / 私钥挂载";
-    status.textContent = `${source} · ${method} · ${settings.configured ? "凭证已配置" : "凭证未配置"}。页面不会显示已保存的秘密。`;
-    $("remoteSshAuthMethod").value = settings.auth_method || "key";
-    updateRemoteSshCredentialFields();
-    $("btnSaveRemoteSshSettings").disabled = !settings.can_configure;
-    $("btnResetRemoteSshSettings").disabled = settings.source !== "page";
-    if (settings.status_error) status.textContent += ` ${settings.status_error}`;
-    if (!settings.can_configure) status.textContent += " 页面保存需要共享 Redis 和 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY。";
+    const catalog = await remoteApiJson("/api/remote-ssh-credentials");
+    state.remoteCredentials = catalog.credentials || [];
+    state.remoteCredentialDefaultId = catalog.default_credential_id || null;
+    state.remoteCredentialsCanConfigure = Boolean(catalog.can_configure);
+    renderRemoteCredentialOptions();
+    renderRemoteCredentialList();
+    status.textContent = `${state.remoteCredentials.length} 条凭证已加密保存在共享 Redis；页面不会显示已保存的秘密。`;
+    $("btnSaveRemoteSshSettings").disabled = !catalog.can_configure;
+    if (!catalog.can_configure) status.textContent += " 页面保存需要共享 Redis 和 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY。";
   } catch (error) {
     status.textContent = error.message;
     $("btnSaveRemoteSshSettings").disabled = true;
-    $("btnResetRemoteSshSettings").disabled = true;
+    state.remoteCredentials = [];
+    state.remoteCredentialDefaultId = null;
+    state.remoteCredentialsCanConfigure = false;
+    renderRemoteCredentialOptions();
+    renderRemoteCredentialList();
   }
 }
 
-// 保存凭证到令牌保护的接口；提交后清空浏览器输入框。
+// 清空凭证编辑表单和临时秘密输入值。
+function resetRemoteSshCredentialForm() {
+  $("remoteSshCredentialForm").reset();
+  $("remoteSshCredentialId").value = "";
+  $("btnSaveRemoteSshSettings").textContent = "加密保存凭证";
+  $("btnCancelEditRemoteSshCredential").hidden = true;
+  updateRemoteSshCredentialFields();
+}
+
+// 保存或更新凭证；请求完成后清空浏览器中的秘密。
 async function saveRemoteSshSettings() {
   const token = $("remoteAdminToken").value.trim();
   if (!token) { toast("请先填写平台远程管理令牌", "err"); $("remoteAdminToken").focus(); return; }
   try { sessionStorage.setItem("workerAdminToken", token); }
   catch { toast("当前浏览器无法保存标签页令牌，请检查隐私模式设置", "err"); return; }
+  const form = $("remoteSshCredentialForm");
+  updateRemoteSshCredentialFields(false);
+  if (!form.reportValidity()) return;
   const authMethod = $("remoteSshAuthMethod").value;
-  if (authMethod === "key" && !$("remoteSshPrivateKey").value.trim()) {
-    toast("请粘贴完整的 SSH 私钥", "err");
-    $("remoteSshPrivateKey").focus();
-    return;
+  const payload = {
+    name: $("remoteSshCredentialName").value.trim(),
+    username: $("remoteSshCredentialUsername").value.trim(),
+    auth_method: authMethod,
+    make_default: $("remoteSshMakeDefault").checked,
+  };
+  if (authMethod === "key" || authMethod === "key_password") {
+    payload.private_key = $("remoteSshPrivateKey").value;
+    payload.passphrase = $("remoteSshPassphrase").value || null;
   }
-  if (authMethod === "password" && !$("remoteSshPassword").value) {
-    toast("请填写 SSH 登录密码", "err");
-    $("remoteSshPassword").focus();
-    return;
-  }
-  const payload = authMethod === "key"
-    ? { auth_method: authMethod, private_key: $("remoteSshPrivateKey").value, passphrase: $("remoteSshPassphrase").value || null }
-    : { auth_method: authMethod, password: $("remoteSshPassword").value };
+  if (authMethod === "password" || authMethod === "key_password") payload.password = $("remoteSshPassword").value;
+  const credentialId = $("remoteSshCredentialId").value;
   const button = $("btnSaveRemoteSshSettings");
   button.disabled = true;
   try {
-    await remoteApiJson("/api/remote-ssh-settings", {
-      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    await remoteApiJson(credentialId ? `/api/remote-ssh-credentials/${encodeURIComponent(credentialId)}` : "/api/remote-ssh-credentials", {
+      method: credentialId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
-    $("remoteSshPrivateKey").value = "";
-    $("remoteSshPassphrase").value = "";
-    $("remoteSshPassword").value = "";
-    toast("平台 SSH 凭证已加密保存", "ok");
+    resetRemoteSshCredentialForm();
+    toast("SSH 凭证已加密保存", "ok");
     await loadRemoteSshSettings();
   } catch (error) {
     toast(error.message, "err");
@@ -1448,19 +1516,34 @@ async function saveRemoteSshSettings() {
   }
 }
 
-// 删除页面密文后恢复使用既有的 .env 或私钥挂载配置。
-async function resetRemoteSshSettings() {
+// 把凭证元数据载入编辑表单，秘密字段要求重新填写。
+function editRemoteSshCredential(credentialId) {
+  const credential = state.remoteCredentials.find((item) => item.id === credentialId);
+  if (!credential) return;
+  $("remoteSshCredentialId").value = credential.id;
+  $("remoteSshCredentialName").value = credential.name;
+  $("remoteSshCredentialUsername").value = credential.username;
+  $("remoteSshAuthMethod").value = credential.auth_method;
+  $("remoteSshMakeDefault").checked = credential.is_default;
+  $("btnSaveRemoteSshSettings").textContent = "加密保存修改";
+  $("btnCancelEditRemoteSshCredential").hidden = false;
+  updateRemoteSshCredentialFields();
+  $("remoteSshSettings").open = true;
+  $("remoteSshPrivateKey").focus();
+}
+
+// 删除未被服务器使用的凭证，被引用时由服务端阻止删除。
+async function deleteRemoteSshCredential(credentialId) {
   if (!getRemoteAdminToken()) { toast("请先填写平台远程管理令牌", "err"); return; }
-  if (!window.confirm("清除页面保存的 SSH 凭证并恢复使用 .env 配置？")) return;
-  const button = $("btnResetRemoteSshSettings");
-  button.disabled = true;
+  const credential = state.remoteCredentials.find((item) => item.id === credentialId);
+  if (!credential || !window.confirm(`确认删除 SSH 凭证“${credential.name}”？`)) return;
   try {
-    await remoteApiJson("/api/remote-ssh-settings", { method: "DELETE" });
-    toast("页面凭证已清除；平台现在使用 .env 配置", "ok");
+    await remoteApiJson(`/api/remote-ssh-credentials/${encodeURIComponent(credentialId)}`, { method: "DELETE" });
+    toast("SSH 凭证已删除", "ok");
+    resetRemoteSshCredentialForm();
     await loadRemoteSshSettings();
   } catch (error) {
     toast(error.message, "err");
-    button.disabled = false;
   }
 }
 
@@ -1468,10 +1551,7 @@ async function resetRemoteSshSettings() {
 function openAddServerModal() {
   const modal = $("addServerModal");
   $("remoteAdminToken").value = getRemoteAdminToken();
-  $("remoteSshPrivateKey").value = "";
-  $("remoteSshPassphrase").value = "";
-  $("remoteSshPassword").value = "";
-  updateRemoteSshCredentialFields(false);
+  resetRemoteSshCredentialForm();
   modal.hidden = false;
   modal.classList.add("open");
   loadRemoteSshSettings();
@@ -1483,9 +1563,7 @@ function closeAddServerModal() {
   const modal = $("addServerModal");
   modal.classList.remove("open");
   modal.hidden = true;
-  $("remoteSshPrivateKey").value = "";
-  $("remoteSshPassphrase").value = "";
-  $("remoteSshPassword").value = "";
+  resetRemoteSshCredentialForm();
   $("btnAddServer").focus();
 }
 
@@ -1499,6 +1577,7 @@ async function submitRemoteServer(event) {
   try { sessionStorage.setItem("workerAdminToken", token); }
   catch { toast("当前浏览器无法保存标签页令牌，请检查隐私模式设置", "err"); return; }
   const payload = Object.fromEntries(new FormData(form).entries());
+  payload.username = payload.username.trim() || null;
   payload.port = Number(payload.port);
   payload.cpu_slots = Number(payload.cpu_slots || 0);
   submit.disabled = true;
@@ -1560,9 +1639,17 @@ $("btnCloseAddServer").onclick = closeAddServerModal;
 $("btnCancelAddServer").onclick = closeAddServerModal;
 $("btnRefreshWorkers").onclick = refreshWorkers;
 $("remoteServerForm").addEventListener("submit", submitRemoteServer);
+$("remoteSshCredentialForm").addEventListener("submit", (event) => { event.preventDefault(); saveRemoteSshSettings(); });
 $("remoteSshAuthMethod").addEventListener("change", () => updateRemoteSshCredentialFields());
-$("btnSaveRemoteSshSettings").onclick = saveRemoteSshSettings;
-$("btnResetRemoteSshSettings").onclick = resetRemoteSshSettings;
+$("btnCancelEditRemoteSshCredential").onclick = resetRemoteSshCredentialForm;
+$("remoteSshCredentialList").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-ssh-credential-action]");
+  if (!button || button.disabled) return;
+  const credentialId = button.dataset.sshCredentialId;
+  if (button.dataset.sshCredentialAction === "edit") editRemoteSshCredential(credentialId);
+  if (button.dataset.sshCredentialAction === "delete") deleteRemoteSshCredential(credentialId);
+});
+updateRemoteSshCredentialFields(false);
 $("remoteAdminToken").addEventListener("change", () => {
   const token = $("remoteAdminToken").value.trim();
   if (token) {

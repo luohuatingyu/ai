@@ -14,8 +14,16 @@ import app.remote_workers as remote_workers
 from app.state import manager
 
 
+@pytest.fixture(autouse=True)
+def _clear_page_credentials_after_test():
+    """每个用例结束后清除测试写入的共享 SSH 凭证密文。"""
+    yield
+    manager.lease.delete_remote_ssh_credentials()
+
+
 def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
-    """配置隔离的 SSH 密钥与主机指纹文件，不读取真实部署凭证。"""
+    """配置远程执行环境并创建隔离的页面凭证，不读取真实凭证。"""
+    from cryptography.fernet import Fernet
     key = tmp_path / "worker_key"
     key.write_text("test-key", encoding="utf-8")
     key.chmod(0o600)
@@ -32,11 +40,18 @@ def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     monkeypatch.setattr(config, "S3_SECRET_KEY", "secret-test")
     monkeypatch.setattr(config, "S3_BUCKET", "models-test")
     monkeypatch.setattr(config, "S3_SECURE", True)
-    monkeypatch.setattr(config, "WORKER_SSH_KEY_PATH", str(key))
     monkeypatch.setattr(config, "WORKER_SSH_KNOWN_HOSTS_PATH", str(known_hosts))
-    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "key")
-    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", "")
-    monkeypatch.setattr(config, "WORKER_SSH_KEY_PASSPHRASE", "")
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(manager, "distributed", True)
+    manager.lease.delete_remote_ssh_credentials()
+    remote_workers.create_platform_ssh_credential({
+        "name": "test default",
+        "username": "worker",
+        "auth_method": "key",
+        "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n",
+        "password": "",
+        "passphrase": "",
+    })
     return key, known_hosts
 
 
@@ -55,55 +70,65 @@ def _server(**overrides) -> dict:
     return value
 
 
-def test_remote_configuration_requires_key_permissions_and_registry(tmp_path, monkeypatch):
-    """远程执行未启用、密钥权限过宽或镜像未指向仓库时均应被拒绝。"""
-    key, _ = _remote_config(tmp_path, monkeypatch)
+def _set_page_credential(auth_method: str, **overrides) -> dict:
+    """替换测试用默认页面凭证，覆盖三类认证组合。"""
+    manager.lease.delete_remote_ssh_credentials()
+    credential = {
+        "name": "test credential",
+        "username": "worker",
+        "auth_method": auth_method,
+        "private_key": "",
+        "password": "",
+        "passphrase": "",
+    }
+    credential.update(overrides)
+    return remote_workers.create_platform_ssh_credential(credential)
+
+
+def test_remote_configuration_requires_page_credentials_and_registry(tmp_path, monkeypatch):
+    """远程执行依赖页面凭证，未启用或镜像未指向仓库时均应被拒绝。"""
+    _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     assert remote_workers.remote_configuration_errors() == []
 
-    key.chmod(0o644)
-    assert any("权限必须限制为 600" in item for item in remote_workers.remote_configuration_errors())
-    key.chmod(0o600)
+    missing_key = {"auth_method": "key", "private_key": "", "password": "", "passphrase": ""}
+    assert any("页面未配置 SSH 私钥" in item for item in remote_workers.remote_configuration_errors(missing_key))
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "worker:latest")
     assert any("镜像仓库引用" in item for item in remote_workers.remote_configuration_errors())
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", False)
     assert any("尚未启用" in item for item in remote_workers.remote_configuration_errors())
 
 
-def test_remote_configuration_supports_platform_password_without_key_file(tmp_path, monkeypatch):
-    """平台密码认证不依赖私钥文件，但仍要求已核验的 known_hosts。"""
+def test_remote_configuration_supports_page_password_without_key_file(tmp_path, monkeypatch):
+    """页面密码认证不依赖私钥文件，但仍要求已核验的 known_hosts。"""
     _, known_hosts = _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
-    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", "platform password")
-    monkeypatch.setattr(config, "WORKER_SSH_KEY_PATH", str(tmp_path / "missing-key"))
+    credentials = {"auth_method": "password", "password": "page password", "passphrase": "", "private_key": ""}
 
-    assert remote_workers.remote_configuration_errors() == []
+    assert remote_workers.remote_configuration_errors(credentials) == []
 
     known_hosts.unlink()
-    assert any("known_hosts" in item for item in remote_workers.remote_configuration_errors())
+    assert any("known_hosts" in item for item in remote_workers.remote_configuration_errors(credentials))
 
 
-def test_remote_configuration_requires_password_and_valid_auth_method(tmp_path, monkeypatch):
-    """密码模式需要平台密码，未识别的认证模式应明确拒绝。"""
+def test_remote_configuration_requires_page_password_and_valid_auth_method(tmp_path, monkeypatch):
+    """密码模式需要页面密码，未识别的认证模式应明确拒绝。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
-    assert any("WORKER_SSH_PASSWORD" in item for item in remote_workers.remote_configuration_errors())
+    missing_password = {"auth_method": "password", "password": "", "passphrase": "", "private_key": ""}
+    assert any("登录密码" in item for item in remote_workers.remote_configuration_errors(missing_password))
+    errors = remote_workers.remote_configuration_errors(
+        {"auth_method": "unsupported", "password": "", "passphrase": "", "private_key": ""}
+    )
+    assert any("页面配置 SSH 凭证" in item for item in errors)
 
-    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "unsupported")
-    errors = remote_workers.remote_configuration_errors()
-    assert any("只能是 key 或 password" in item for item in errors)
 
-
-def test_remote_configuration_rejects_newline_in_platform_password(tmp_path, monkeypatch):
-    """平台统一密码不能包含换行，避免 askpass 凭证产生多行响应。"""
+def test_remote_configuration_rejects_newline_in_page_password(tmp_path, monkeypatch):
+    """页面密码不能包含换行，避免 askpass 凭证产生多行响应。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
-    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", "password\nsecond-line")
-
-    assert any("SSH 凭证不能包含换行符" in item for item in remote_workers.remote_configuration_errors())
+    newline_password = {"auth_method": "password", "password": "password\nsecond-line", "passphrase": "", "private_key": ""}
+    assert any("SSH 凭证不能包含换行符" in item for item in remote_workers.remote_configuration_errors(newline_password))
 
 
 @pytest.mark.parametrize(
@@ -184,7 +209,9 @@ def test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv(tmp_path,
 
     assert result["stdout"].strip() == "worker running"
     command = calls["command"]
-    assert command[command.index("-i") + 1] == str(key)
+    materialized_key = Path(command[command.index("-i") + 1])
+    assert materialized_key.name.startswith("mtp-ssh-key-")
+    assert not materialized_key.exists()
     assert command[command.index("-p") + 1] == "2222"
     assert "StrictHostKeyChecking=yes" in command
     assert f"UserKnownHostsFile={known_hosts}" in command
@@ -196,12 +223,10 @@ def test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv(tmp_path,
 
 
 def test_run_remote_action_uses_password_from_platform_askpass(tmp_path, monkeypatch):
-    """平台密码走 OpenSSH askpass 环境，严格校验主机且不进入参数或日志。"""
+    """页面密码走 OpenSSH askpass 环境，严格校验主机且不进入参数或日志。"""
     _, known_hosts = _remote_config(tmp_path, monkeypatch)
     password = "platform password ' with $(shell) text"
-    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
-    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", password)
-    monkeypatch.setattr(config, "WORKER_SSH_KEY_PATH", str(tmp_path / "missing-key"))
+    _set_page_credential("password", password=password)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     calls = {}
     real_subprocess_run = subprocess.run
@@ -238,8 +263,7 @@ def test_run_remote_action_redacts_password_from_ssh_error(tmp_path, monkeypatch
     """SSH 登录失败信息即使回显凭证也应脱敏后返回。"""
     _remote_config(tmp_path, monkeypatch)
     password = "platform-secret-for-error-test"
-    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
-    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", password)
+    _set_page_credential("password", password=password)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
 
     def fake_run(command, **_kwargs):
@@ -259,7 +283,7 @@ def test_run_remote_action_uses_key_passphrase_without_exposing_it(tmp_path, mon
     """加密私钥口令通过临时 askpass 辅助程序传递，不进入 SSH 参数。"""
     _remote_config(tmp_path, monkeypatch)
     passphrase = "key passphrase with spaces"
-    monkeypatch.setattr(config, "WORKER_SSH_KEY_PASSPHRASE", passphrase)
+    _set_page_credential("key", private_key="-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n", passphrase=passphrase)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     calls = {}
 
@@ -273,8 +297,62 @@ def test_run_remote_action_uses_key_passphrase_without_exposing_it(tmp_path, mon
 
     assert "BatchMode=no" in calls["command"]
     assert passphrase not in " ".join(calls["command"])
-    assert calls["environment"]["WORKER_SSH_ASKPASS_SECRET"] == passphrase
+    assert calls["environment"]["WORKER_SSH_ASKPASS_PASSPHRASE"] == passphrase
     assert Path(calls["environment"]["SSH_ASKPASS"]).name == "ssh_askpass.sh"
+
+
+def test_run_remote_action_combines_key_and_password_with_separate_prompts(tmp_path, monkeypatch):
+    """密钥 + 密码模式优先尝试密钥，且 askpass 能区分私钥口令和登录密码。"""
+    _remote_config(tmp_path, monkeypatch)
+    password = "combined login password"
+    passphrase = "combined key passphrase"
+    _set_page_credential(
+        "key_password",
+        private_key="-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n",
+        password=password,
+        passphrase=passphrase,
+    )
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    real_subprocess_run = subprocess.run
+    calls = {}
+
+    def fake_run(command, **kwargs):
+        calls["command"] = command
+        environment = kwargs["env"]
+        askpass = environment["SSH_ASKPASS"]
+        calls["passphrase_prompt"] = real_subprocess_run(
+            [askpass, "Enter passphrase for key '/tmp/key':"],
+            env=environment, capture_output=True, text=True,
+        ).stdout.rstrip("\n")
+        calls["password_prompt"] = real_subprocess_run(
+            [askpass, "worker@compute.example.net's password:"],
+            env=environment, capture_output=True, text=True,
+        ).stdout.rstrip("\n")
+        return subprocess.CompletedProcess(command, 0, stdout="connected", stderr="")
+
+    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    remote_workers.run_remote_action(_server(), "start")
+
+    command = calls["command"]
+    assert "PreferredAuthentications=publickey,password" in command
+    assert "PasswordAuthentication=yes" in command
+    assert "BatchMode=no" in command
+    assert calls["passphrase_prompt"] == passphrase
+    assert calls["password_prompt"] == password
+    assert password not in " ".join(command) and passphrase not in " ".join(command)
+
+
+def test_remote_ssh_credentials_do_not_fall_back_to_environment(tmp_path, monkeypatch):
+    """即使旧 SSH 密码环境变量存在，平台也必须要求页面凭证。"""
+    _remote_config(tmp_path, monkeypatch)
+    manager.lease.delete_remote_ssh_credentials()
+    monkeypatch.setenv("WORKER_SSH_PASSWORD", "legacy-environment-secret")
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+
+    errors = remote_workers.remote_configuration_errors()
+    assert any("页面配置 SSH 凭证" in item for item in errors)
+    with pytest.raises(remote_workers.RemoteWorkerError, match="页面配置 SSH 凭证"):
+        remote_workers.run_remote_action(_server(), "start")
 
 
 def test_run_remote_action_uses_page_password_and_redacts_it(tmp_path, monkeypatch, request):
@@ -284,14 +362,11 @@ def test_run_remote_action_uses_page_password_and_redacts_it(tmp_path, monkeypat
     _remote_config(tmp_path, monkeypatch)
     secret = "page-managed password with $ and spaces"
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
-    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", "")
     monkeypatch.setattr(manager, "distributed", True)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     manager.lease.delete_remote_ssh_credentials()
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
-    remote_workers.store_platform_ssh_credentials(
-        {"auth_method": "password", "password": secret}
-    )
+    _set_page_credential("password", password=secret)
     calls = {}
 
     def fake_run(command, **kwargs):
@@ -305,7 +380,7 @@ def test_run_remote_action_uses_page_password_and_redacts_it(tmp_path, monkeypat
 
     assert "-i" not in calls["command"]
     assert secret not in " ".join(calls["command"])
-    assert calls["environment"]["WORKER_SSH_ASKPASS_SECRET"] == secret
+    assert calls["environment"]["WORKER_SSH_ASKPASS_PASSWORD"] == secret
     assert secret not in str(exc_info.value)
     assert "[redacted]" in str(exc_info.value)
     manager.lease.delete_remote_ssh_credentials()
@@ -328,14 +403,11 @@ def test_run_remote_action_materializes_page_private_key_temporarily(tmp_path, m
     )
     private_key = key_path.read_text(encoding="utf-8")
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
-    monkeypatch.setattr(config, "WORKER_SSH_KEY_PATH", str(tmp_path / "missing-mounted-key"))
     monkeypatch.setattr(manager, "distributed", True)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     manager.lease.delete_remote_ssh_credentials()
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
-    remote_workers.store_platform_ssh_credentials(
-        {"auth_method": "key", "private_key": private_key, "passphrase": ""}
-    )
+    _set_page_credential("key", private_key=private_key)
     calls = {}
 
     def fake_run(command, **kwargs):

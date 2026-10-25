@@ -342,6 +342,124 @@ def get_remote_ssh_settings(
         raise HTTPException(503, "平台 SSH 凭证状态读取失败；请检查共享 Redis 连接") from exc
 
 
+@router.get("/remote-ssh-credentials")
+def get_remote_ssh_credentials(
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """列出平台 SSH 凭证目录元数据，不返回密码、私钥或私钥口令。"""
+    from app.remote_workers import RemoteWorkerError, list_platform_ssh_credentials
+
+    _require_remote_admin_token(x_worker_admin_token)
+    try:
+        return list_platform_ssh_credentials()
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, "SSH 凭证目录读取失败；请检查共享 Redis 连接") from exc
+
+
+@router.post("/remote-ssh-credentials")
+async def post_remote_ssh_credential(
+    http_request: Request,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """创建加密保存的 SSH 凭证；输入校验失败时不会回显用户提交的秘密。"""
+    from app.remote_workers import (
+        RemoteCredentialConflictError,
+        RemoteWorkerError,
+        create_platform_ssh_credential,
+    )
+    from app.routers.schemas import RemoteSSHCredentialRequest
+
+    _require_remote_admin_token(x_worker_admin_token)
+    try:
+        request = RemoteSSHCredentialRequest.model_validate(await http_request.json())
+    except (TypeError, ValueError):
+        raise HTTPException(422, "SSH 凭证输入无效；请检查名称、用户名和凭证内容") from None
+    credentials = request.model_dump()
+    credentials["private_key"] = (
+        credentials.get("private_key") or ""
+    ).replace("\r\n", "\n").replace("\r", "\n")
+    if credentials["private_key"] and not credentials["private_key"].endswith("\n"):
+        credentials["private_key"] += "\n"
+    for key in ("password", "passphrase"):
+        credentials[key] = credentials.get(key) or ""
+    try:
+        return create_platform_ssh_credential(credentials)
+    except RemoteCredentialConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, "SSH 凭证保存失败；请检查共享 Redis 连接") from exc
+
+
+@router.put("/remote-ssh-credentials/{credential_id}")
+async def put_remote_ssh_credential(
+    credential_id: str,
+    http_request: Request,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """完整替换 SSH 凭证；出于安全要求，编辑时需要重新提交全部秘密字段。"""
+    from app.remote_workers import (
+        RemoteCredentialConflictError,
+        RemoteCredentialNotFoundError,
+        RemoteWorkerError,
+        update_platform_ssh_credential,
+    )
+    from app.routers.schemas import RemoteSSHCredentialRequest
+
+    _require_remote_admin_token(x_worker_admin_token)
+    try:
+        request = RemoteSSHCredentialRequest.model_validate(await http_request.json())
+    except (TypeError, ValueError):
+        raise HTTPException(422, "SSH 凭证输入无效；请检查名称、用户名和凭证内容") from None
+    credentials = request.model_dump()
+    credentials["private_key"] = (
+        credentials.get("private_key") or ""
+    ).replace("\r\n", "\n").replace("\r", "\n")
+    if credentials["private_key"] and not credentials["private_key"].endswith("\n"):
+        credentials["private_key"] += "\n"
+    for key in ("password", "passphrase"):
+        credentials[key] = credentials.get(key) or ""
+    try:
+        return update_platform_ssh_credential(credential_id, credentials)
+    except RemoteCredentialNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RemoteCredentialConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, "SSH 凭证保存失败；请检查共享 Redis 连接") from exc
+
+
+@router.delete("/remote-ssh-credentials/{credential_id}")
+def delete_remote_ssh_credential(
+    credential_id: str,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """删除凭证；仍被服务器引用的凭证需先修改服务器关联后才能删除。"""
+    from app.remote_workers import (
+        RemoteCredentialConflictError,
+        RemoteCredentialNotFoundError,
+        RemoteWorkerError,
+        delete_platform_ssh_credential,
+    )
+
+    _require_remote_admin_token(x_worker_admin_token)
+    try:
+        return delete_platform_ssh_credential(credential_id)
+    except RemoteCredentialNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RemoteCredentialConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, "SSH 凭证删除失败；请检查共享 Redis 连接") from exc
+
+
 @router.put("/remote-ssh-settings")
 async def put_remote_ssh_settings(
     http_request: Request,
@@ -380,7 +498,7 @@ async def put_remote_ssh_settings(
 def delete_remote_ssh_settings(
     x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
 ) -> dict:
-    """清除页面保存的 SSH 凭证，并回退到平台 `.env` 配置。"""
+    """清除通过旧版接口迁移的默认凭证；服务器登录凭证不再读取环境变量。"""
     from app.remote_workers import RemoteWorkerError, clear_platform_ssh_credentials
 
     _require_remote_admin_token(x_worker_admin_token)
@@ -400,12 +518,21 @@ def add_remote_server(
 ) -> dict:
     """经平台 SSH 远程安装 worker；目标主机只接收单文件脚本和容器镜像。"""
     _require_remote_admin_token(x_worker_admin_token)
-    errors = remote_configuration_errors()
+    from app.remote_workers import RemoteWorkerError, resolve_remote_server_credentials
+
+    server = request.model_dump()
+    server["username_override"] = request.username
+    try:
+        credentials = resolve_remote_server_credentials(server)
+    except RemoteWorkerError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    errors = remote_configuration_errors(credentials)
     if errors:
         raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
     if manager.lease.get_remote_server(request.machine_id):
         raise HTTPException(409, "服务器标识已登记")
-    server = request.model_dump()
+    server["username"] = credentials["username"]
+    server["ssh_credential_id"] = credentials["id"]
     server.update({"status": "provisioning", "created_at": time.time()})
     return _start_remote_operation(server, "install", background_tasks)
 
@@ -419,13 +546,19 @@ def manage_remote_server(
 ) -> dict:
     """经 SSH 重装、启动、优雅停止或重启目标服务器上的 worker 容器。"""
     _require_remote_admin_token(x_worker_admin_token)
-    errors = remote_configuration_errors()
-    if errors:
-        raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
     _check_id(machine_id, "服务器")
     server = manager.lease.get_remote_server(machine_id)
     if server is None:
         raise HTTPException(404, "远程服务器不存在")
+    from app.remote_workers import RemoteWorkerError, resolve_remote_server_credentials
+
+    try:
+        credentials = resolve_remote_server_credentials(server)
+    except RemoteWorkerError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    errors = remote_configuration_errors(credentials)
+    if errors:
+        raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
     previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
     if previous and previous.get("status") in {"queued", "running"}:
         raise HTTPException(409, "该服务器已有远程操作正在执行")
