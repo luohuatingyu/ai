@@ -280,6 +280,24 @@ def test_import_rolls_back_when_object_store_sync_fails(client, store, monkeypat
     assert client.get("/api/datasets/import-history").json()["total"] == 0
 
 
+def test_batch_import_syncs_json_and_csv_datasets(client, store):
+    """正常场景：批量接口接受不同格式并为每个数据集建立可访问记录。"""
+    files = [
+        ("files", ("records.json", b'[{"feature": 1, "target": "a"}]', "application/json")),
+        ("files", ("records.csv", b"feature,target\n2,b\n", "text/csv")),
+    ]
+    response = client.post("/api/datasets/batch-import", files=files)
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert len(result["success"]) == 2
+    assert result["failed"] == []
+    for item in result["success"]:
+        detail = client.get(f"/api/datasets/{item['dataset_id']}")
+        assert detail.status_code == 200
+        assert detail.json()["rows"] == 1
+
+
 @pytest.mark.parametrize("archive_name,archive_kind", [("rows.zip", "zip"), ("rows.tar.gz", "tar.gz")])
 def test_import_archive_dataset(client, store, archive_name, archive_kind):
     """正常场景：ZIP 与 TAR.GZ 解包后导入 CSV，且返回可访问的数据集。"""
