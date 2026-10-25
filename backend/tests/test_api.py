@@ -1224,6 +1224,8 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
 
     for marker in (
         'id="remoteWorkerImage"',
+        "Worker 镜像（可选本地标签覆盖）",
+        "目标机通过 SSH 接收镜像，无需访问镜像仓库",
         'id="remoteRedisUrl"',
         'id="remoteS3Endpoint"',
         'id="clearRemoteRedisOverride"',

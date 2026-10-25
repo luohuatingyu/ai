@@ -85,16 +85,18 @@ def _set_page_credential(auth_method: str, **overrides) -> dict:
     return remote_workers.create_platform_ssh_credential(credential)
 
 
-def test_remote_configuration_requires_page_credentials_and_registry(tmp_path, monkeypatch):
-    """远程执行依赖页面凭证，未启用或镜像未指向仓库时均应被拒绝。"""
+def test_remote_configuration_requires_page_credentials_and_local_image_tag(tmp_path, monkeypatch):
+    """远程执行依赖页面凭证和平台本地镜像标签，不要求镜像仓库地址。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     assert remote_workers.remote_configuration_errors() == []
 
     missing_key = {"auth_method": "key", "private_key": "", "password": "", "passphrase": ""}
     assert any("页面未配置 SSH 私钥" in item for item in remote_workers.remote_configuration_errors(missing_key))
+    monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "")
+    assert any("平台本地 Docker 镜像标签" in item for item in remote_workers.remote_configuration_errors())
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "worker:latest")
-    assert any("镜像仓库引用" in item for item in remote_workers.remote_configuration_errors())
+    assert not any("镜像" in item for item in remote_workers.remote_configuration_errors())
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", False)
     assert any("尚未启用" in item for item in remote_workers.remote_configuration_errors())
 
@@ -181,13 +183,14 @@ def test_remote_configuration_requires_shared_queue_and_object_storage(tmp_path,
 
 
 def test_render_remote_script_quotes_values_and_does_not_transfer_repository(tmp_path, monkeypatch):
-    """特殊字符只作为 shell 字符串传递，脚本只运行容器而不克隆项目源码。"""
+    """特殊字符只作为 shell 字符串传递，脚本运行已加载镜像而不拉仓库或克隆源码。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "S3_SECRET_KEY", "secret$(touch /tmp/not-run) ' quoted")
     rendered = remote_workers.render_remote_script(_server(), "install")
 
     assert "export MTP_S3_SECRET_KEY='secret$(touch /tmp/not-run) '\"'\"' quoted'" in rendered
-    assert "docker pull \"$MTP_WORKER_IMAGE\"" in rendered
+    assert "docker pull" not in rendered
+    assert 'docker image inspect "$MTP_WORKER_IMAGE"' in rendered
     assert "git clone" not in rendered
     assert "docker-compose" not in rendered
 
@@ -298,15 +301,159 @@ def test_remote_image_config_does_not_inherit_local_compose_fallback(monkeypatch
 
 
 def test_compose_separates_local_worker_image_from_remote_default():
-    """GPU 与 CPU Compose 都只把显式 WORKER_IMAGE 传作远程默认值。"""
+    """GPU 与 CPU Compose 默认把本机 worker 镜像标签用于远程流式部署。"""
     repository_root = Path(__file__).resolve().parents[2]
     for filename, local_default in (
         ("docker-compose.yml", "mtp-worker:local"),
         ("docker-compose.cpu.yml", "mtp-worker-cpu:local"),
     ):
         compose = (repository_root / filename).read_text(encoding="utf-8")
-        assert "WORKER_REMOTE_IMAGE: ${WORKER_IMAGE:-}" in compose
+        assert f"WORKER_REMOTE_IMAGE: ${{WORKER_IMAGE:-{local_default}}}" in compose
         assert f"WORKER_IMAGE: ${{WORKER_IMAGE:-{local_default}}}" in compose
+    remote_compose = (repository_root / "docker-compose.remote.yml").read_text(encoding="utf-8")
+    assert "/var/run/docker.sock:/var/run/docker.sock" in remote_compose
+
+
+def test_local_docker_image_archive_uses_engine_api_version_and_tag_path(tmp_path, monkeypatch):
+    """本机镜像归档从 Docker Engine API 读取，并按 API 版本安全编码镜像标签。"""
+    socket_path = tmp_path / "docker.sock"
+    socket_path.touch()
+    monkeypatch.setattr(config, "WORKER_DOCKER_SOCKET_PATH", str(socket_path))
+    responses = [
+        type("VersionResponse", (), {"status": 200, "read": lambda self: b'{"ApiVersion":"1.45"}', "close": lambda self: None})(),
+        type("ImageResponse", (), {"status": 200, "read": lambda self, size=-1: b"image-tar", "close": lambda self: None})(),
+    ]
+    connections = []
+
+    class FakeConnection:
+        """模拟一个 HTTP over Unix socket 连接。"""
+
+        def __init__(self, path, timeout):
+            self.path = path
+            self.timeout = timeout
+            self.requests = []
+            self.closed = False
+            connections.append(self)
+
+        def request(self, method, target):
+            self.requests.append((method, target))
+
+        def getresponse(self):
+            return responses.pop(0)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(remote_workers, "_DockerSocketHTTPConnection", FakeConnection)
+    connection, response = remote_workers._open_local_docker_image_archive("registry.example/team/worker:tag")
+
+    assert connection is connections[1]
+    assert connections[0].requests == [("GET", "/version")]
+    assert connections[1].requests == [("GET", "/v1.45/images/registry.example%2Fteam%2Fworker%3Atag/get")]
+    assert response.read() == b"image-tar"
+    connection.close()
+    assert connection.closed
+
+
+def test_worker_image_archive_streams_over_ssh_without_saving_it(tmp_path, monkeypatch):
+    """Docker 镜像归档按块经 SSH stdin 传输，不落地临时 tar 文件。"""
+    archive = b"docker-image-archive-bytes" * 8192
+    capture = tmp_path / "received-image.tar"
+    fake_ssh = tmp_path / "ssh-receiver.sh"
+    fake_ssh.write_text(
+        "#!/bin/sh\ncat > \"$IMAGE_CAPTURE_PATH\"\nprintf 'Loaded image: worker:local\\n'\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    monkeypatch.setenv("IMAGE_CAPTURE_PATH", str(capture))
+
+    class FakeResponse:
+        """提供分块读取的镜像归档响应体。"""
+
+        def __init__(self):
+            self.offset = 0
+            self.closed = False
+
+        def read(self, size=-1):
+            if self.offset >= len(archive):
+                return b""
+            end = len(archive) if size < 0 else min(len(archive), self.offset + size)
+            chunk = archive[self.offset:end]
+            self.offset = end
+            return chunk
+
+        def close(self):
+            self.closed = True
+
+    class FakeConnection:
+        """记录 Docker Engine HTTP 连接是否被正确关闭。"""
+
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    response = FakeResponse()
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        remote_workers, "_open_local_docker_image_archive", lambda _image: (connection, response)
+    )
+
+    result = remote_workers._stream_worker_image_to_remote(
+        "worker:local", [str(fake_ssh), "docker load"], None, {}, _server(), timeout=30
+    )
+
+    assert result["stdout"].strip() == "Loaded image: worker:local"
+    assert capture.read_bytes() == archive
+    assert not list(tmp_path.glob("*.tar.tmp"))
+    assert response.closed and connection.closed
+
+
+def test_worker_image_transfer_failure_is_reported_and_redacted(tmp_path, monkeypatch):
+    """远端 docker load 失败时返回脱敏错误，且关闭镜像源连接。"""
+    fake_ssh = tmp_path / "ssh-receiver.sh"
+    fake_ssh.write_text("#!/bin/sh\ncat >/dev/null\nprintf 'failed secret-value\\n' >&2\nexit 1\n", encoding="utf-8")
+    fake_ssh.chmod(0o755)
+
+    class FakeResponse:
+        """返回最小镜像 tar 内容供传输失败用例消费。"""
+
+        def __init__(self):
+            self.sent = False
+            self.closed = False
+
+        def read(self, size=-1):
+            if self.sent:
+                return b""
+            self.sent = True
+            return b"image archive"
+
+        def close(self):
+            self.closed = True
+
+    class FakeConnection:
+        """记录失败路径是否释放 Docker Engine 连接。"""
+
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    response = FakeResponse()
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        remote_workers, "_open_local_docker_image_archive", lambda _image: (connection, response)
+    )
+    credentials = {"password": "secret-value", "passphrase": ""}
+
+    with pytest.raises(remote_workers.RemoteWorkerError) as exc_info:
+        remote_workers._stream_worker_image_to_remote(
+            "worker:local", [str(fake_ssh), "docker load"], None, credentials, _server(), timeout=30
+        )
+
+    assert "secret-value" not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
+    assert response.closed and connection.closed
 
 
 def test_server_redis_override_is_redacted_from_remote_output(tmp_path, monkeypatch):
@@ -323,10 +470,15 @@ def test_server_redis_override_is_redacted_from_remote_output(tmp_path, monkeypa
 
 
 def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tmp_path, monkeypatch):
-    """SSH 首次自动信任并固定主机密钥，令牌和存储密钥只在标准输入脚本中出现。"""
+    """安装前经 SSH 传输本机镜像，主机密钥固定且凭证不进入参数或日志。"""
     key, known_hosts = _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     calls = {}
+    transfers = []
+
+    def fake_transfer(image, command, environment, credentials, server, timeout):
+        transfers.append((image, command, environment, credentials, server, timeout))
+        return {"stdout": "Loaded image: worker:local", "stderr": ""}
 
     def fake_run(command, **kwargs):
         calls["command"] = command
@@ -335,6 +487,7 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
         return subprocess.CompletedProcess(command, 0, stdout="worker running\n", stderr="")
 
     monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_stream_worker_image_to_remote", fake_transfer)
     result = remote_workers.run_remote_action(_server(), "install")
 
     assert result["stdout"].strip() == "worker running"
@@ -348,6 +501,10 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     assert known_hosts.parent.is_dir()
     assert command[-2:] == ["worker@compute.example.net", "bash -s"]
     assert calls["timeout"] == 3600
+    assert len(transfers) == 1
+    assert transfers[0][0] == "registry.example.net/ml/worker:unit"
+    assert transfers[0][1][-2:] == ["worker@compute.example.net", "docker load"]
+    assert transfers[0][-1] == 3600
     assert "secret-test" not in " ".join(command)
     assert "secret-test" in calls["input"]
     assert config.WORKER_REMOTE_TOKEN not in calls["input"]
@@ -359,6 +516,11 @@ def test_run_remote_action_uses_password_from_platform_askpass(tmp_path, monkeyp
     password = "platform password ' with $(shell) text"
     _set_page_credential("password", password=password)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(
+        remote_workers,
+        "_stream_worker_image_to_remote",
+        lambda *_args, **_kwargs: pytest.fail("start 操作不应重新传输镜像"),
+    )
     calls = {}
     real_subprocess_run = subprocess.run
 
@@ -617,7 +779,7 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
 
 
 def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
-    """远程单文件脚本仅拉取镜像、写私有配置并按 CPU/GPU 模式启动容器。"""
+    """远程单文件脚本验证已加载镜像、写私有配置并按 CPU/GPU 模式启动容器。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
@@ -625,6 +787,7 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
     docker_stub.write_text(
         "#!/usr/bin/env bash\n"
         "printf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n"
+        "if [[ \"$1 $2\" == 'image inspect' && \"${DOCKER_MISSING:-false}\" == true ]]; then exit 1; fi\n"
         "if [[ \"$1\" == inspect && \"${DOCKER_MISSING:-false}\" == true ]]; then exit 1; fi\n"
         "exit \"${DOCKER_STUB_EXIT:-0}\"\n",
         encoding="utf-8",
@@ -661,7 +824,8 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
         assert "WORKER_MANAGED=true" in saved
         assert "S3_SECRET_KEY=secret-test" in saved
         commands = docker_log.read_text(encoding="utf-8")
-        assert "pull registry.example.net/ml/worker:unit" in commands
+        assert "image inspect registry.example.net/ml/worker:unit" in commands
+        assert "pull registry.example.net/ml/worker:unit" not in commands
         assert "git clone" not in commands
         assert ("--gpus all" in commands) is expected_gpu
         assert "mtp-worker-remote-" in commands
