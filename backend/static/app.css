@@ -247,6 +247,7 @@
   margin-top: 14px;
   color: var(--muted);
 }
+.upload-progress[hidden] { display: none; }
 
 .loading {
   width: 18px;
