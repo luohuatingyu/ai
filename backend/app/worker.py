@@ -293,41 +293,50 @@ class TrainingWorker:
         )
         try:
             while not self._shutdown.is_set():
-                healthy = self._self_probe()
-                if healthy == self._degraded:  # 状态翻转才打日志，避免刷屏
-                    self._degraded = not healthy
-                    if self._degraded:
-                        self._log(f"worker {self.worker_id}: GPU 探测失败，进入 degraded（暂停领取新任务，等待恢复）")
-                    else:
-                        self._log(f"worker {self.worker_id}: GPU 探测恢复，重新投入调度")
-                self.lease_store.heartbeat_worker(
-                    self.worker_id,
-                    {
-                        "state": "degraded" if self._degraded else "idle",
-                        "current_job": None,
-                        "machine_id": self.caps.get("machine_id"),
-                        "slot": self.caps.get("slot"),
-                    },
-                    hb_ttl,
-                )
-                if self._degraded:
-                    # 掉卡期间不领取新任务；已被其它节点重派的心跳丢失处理照常生效
-                    self._shutdown.wait(self._idle_poll)
-                    continue
                 try:
-                    job_id = self.queue.pop(timeout=self._idle_poll)
+                    self._run_forever_iteration(hb_ttl)
                 except Exception as exc:  # noqa: BLE001
                     # 协调面瞬断（Redis 网络抖动等）不得杀死 worker 进程：
                     # 退避后继续循环，任务由租约/watchdog 机制兜底
-                    self._log(f"worker {self.worker_id}: 队列领取异常，稍后重试: {exc}")
+                    self._log(f"worker {self.worker_id}: 协调面异常，稍后重试: {exc}")
                     self._shutdown.wait(self._idle_poll)
-                    continue
-                if job_id is None:
-                    continue
-                self._execute_job(job_id)
         finally:
             self.lease_store.deregister_worker(self.worker_id)
             self._log(f"worker {self.worker_id} 已退出")
+
+    def _run_forever_iteration(self, hb_ttl: float) -> None:
+        """单轮调度迭代：自探测 -> 心跳 -> 领取 -> 执行。"""
+        healthy = self._self_probe()
+        if healthy == self._degraded:  # 状态翻转才打日志，避免刷屏
+            self._degraded = not healthy
+            if self._degraded:
+                self._log(f"worker {self.worker_id}: GPU 探测失败，进入 degraded（暂停领取新任务，等待恢复）")
+            else:
+                self._log(f"worker {self.worker_id}: GPU 探测恢复，重新投入调度")
+        self.lease_store.heartbeat_worker(
+            self.worker_id,
+            {
+                "state": "degraded" if self._degraded else "idle",
+                "current_job": None,
+                "machine_id": self.caps.get("machine_id"),
+                "slot": self.caps.get("slot"),
+            },
+            hb_ttl,
+        )
+        if self._degraded:
+            # 掉卡期间不领取新任务；已被其它节点重派的心跳丢失处理照常生效
+            self._shutdown.wait(self._idle_poll)
+            return
+        try:
+            job_id = self.queue.pop(timeout=self._idle_poll)
+        except Exception as exc:  # noqa: BLE001
+            # 队列领取异常：退避后由外层循环重试
+            self._log(f"worker {self.worker_id}: 队列领取异常，稍后重试: {exc}")
+            self._shutdown.wait(self._idle_poll)
+            return
+        if job_id is None:
+            return
+        self._execute_job(job_id)
 
     # ------------------------------------------------------------------
     # 内部：领取与执行
