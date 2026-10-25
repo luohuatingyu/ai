@@ -369,3 +369,36 @@ MTP_TEST_S3=localhost:9000 python3 -m pytest tests/test_storage.py -q  # 22/22
 4. 在阿里云 OSS / 腾讯云 COS 端点跑 `MTP_TEST_S3` 集成测试
 5. SeaweedFS 多机集群模式（filer replication）验证
 6. 前端页面交互测试（Chart.js 曲线、计算槽面板轮询、暂停/恢复按钮链路）
+
+## 本次变更测试结果：LLM 训练与微调（2026-10-25）
+
+**变更范围**：新增 LLM 从零预训练、全参数 SFT、DPO、PPO/RLHF 任务；支持本地或 Hugging Face Hub 数据集、JSONL 上传、模型包下载和在线文本生成。
+
+**Git 基准点**：`ad1246c0fa7eaa4344fba9046a03a5772a9ec79e`（Add LLM training and fine-tuning tasks）；分支 `emdash/hot-boxes-clean-y9u6p`。测试报告提交单独记录，不改变此代码基准点。
+
+**测试环境**：Docker Compose，容器 Python 3.12.15；当前主机无可用 NVIDIA GPU。Hub 数据集/模型安全加载使用隔离测试验证，没有进行外网 Hub 下载或真实 GPU 训练。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过，服务镜像重建并启动。
+- `docker compose run --rm --no-deps -v ./backend/tests:/app/tests:ro -v ./scripts:/scripts:ro trainer python -m pytest /app/tests -v`：197 项收集，191 通过、6 跳过、0 失败、0 错误；2 个弃用警告（SQLAlchemy `declarative_base()`、Pandas `xlrd`）。
+- 前端内联 JavaScript 语法检查（Node `new Function`）：通过；`git diff --check`：通过。
+- 6 项跳过为 Redis、S3 和 Supervisor 外部服务门控用例。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 从随机初始化模型执行因果语言预训练，保存指标、模型包并可生成 | 训练器：`test_pretraining_from_scratch_saves_metrics_bundle_and_generates`；小型本地文本样本、固定 seed | 训练 loss/perplexity 有限，生成 `best_model.zip`，同 seed 结果稳定且可生成文本 | 正常、产物、可复现性 |
+| 对 Hub CausalLM 做全参数 SFT | 训练器：`test_full_parameter_sft_changes_weights_and_preserves_generation`；本地 mock 小模型与监督样本 | 模型参数发生更新，checkpoint 可加载并继续生成 | 正常、模型恢复 |
+| 根据偏好对执行 DPO | 训练器：`test_dpo_uses_preference_pairs_and_emits_finite_metrics`；prompt/chosen/rejected 样本 | loss 有限并输出偏好准确率 | 正常、指标 |
+| 基于标量奖励模型执行 PPO/RLHF | 训练器：`test_ppo_runs_reward_and_kl_update_and_restores_checkpoint`；小型 actor、reference 和 reward model | 产生 reward/KL 指标，保存并恢复 checkpoint | 正常、边界恢复 |
+| Hub 仓库 ID 校验，禁止加载自定义远程代码 | 数据加载安全：`test_hub_load_is_restricted_to_valid_ids_and_disables_remote_code`；mock Hub 加载器 | 非法仓库 ID 被拒绝，加载器不接收 token 且 `trust_remote_code=False` | 非法输入、权限与安全 |
+| LLM 任务 API 接受 Hub 参数并强制 GPU 资源提示 | API：`test_llm_api_accepts_hub_task_and_forces_single_gpu_resource_hint`；mock 队列管理器 | 提交任务保留数据源/模型参数并标记 GPU 需求 | 正常、接口契约 |
+| 从训练完成任务包生成文本，且非 LLM 任务不能误用生成接口 | API：`test_generate_api_returns_text_only_for_llm_tasks`；准备模型包与任务记录 | LLM 返回生成文本；非 LLM 请求返回 400 | 正常、状态冲突 |
+| Worker 端到端训练、断点与模型包持久化 | Worker/API：`test_worker_executes_llm_job_and_persists_model_and_checkpoint`；本地小型训练任务 | 任务完成，状态存储含模型包、日志、指标和 checkpoint | 训练链路、产物、回归 |
+| 上传 JSONL 文本/偏好数据集 | API：`test_jsonl_upload_imports_as_dataset_table`；上传有效 JSONL 文件 | 数据集可导入并按记录列预览 | 正常、数据格式兼容 |
+| 既有任务、数据格式和 API 行为保持兼容 | 完整 pytest 套件；包含既有分类/回归、KMeans、单序列预测、双存储布局与 SSH/API 测试 | 191 项通过，既有流程保持可用 | 兼容性、回归 |
+
+**覆盖范围与限制**：CPU 小模型覆盖训练、指标、checkpoint、产物、API 和 Worker 路径；尚未验证真实 GPU 显存表现、真实公网 Hub 下载及大型模型训练。首版限定 decoder-only CausalLM、单 GPU；PPO 需要 `num_labels=1` 的奖励模型。6 个外部服务门控测试本次未执行。
+
+**下次测试建议**：在带 NVIDIA GPU 的环境验证不同显存规模的模型/序列长度配置；用可公开访问的 Hub 数据集和模型做下载与短训练冒烟；部署前根据目标模型检查显存和数据样本格式。
