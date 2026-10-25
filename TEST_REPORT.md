@@ -2,10 +2,48 @@
 
 ## Git基准点
 
-- **Commit Hash**: 36103a0（本次测试覆盖代码与测试用例的提交）
-- **提交信息**: Fix dataset selection and CSV upload
+- **Commit Hash**: 0ac97b6（本次测试覆盖代码与测试用例的提交）
+- **提交信息**: Add training resource tracking and retry controls
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：训练资源轨迹与失败任务重试（2026-10-25）
+
+**变更范围**：训练任务详情和列表显示实际计算节点、worker 槽位、CPU/GPU、显存与每次执行分段；失败任务支持自动分配或手动指定在线计算槽重试，并继续遵守任务的 GPU 与最低显存要求；优化训练结果卡片、指标图表和移动端布局。
+
+**Git 基准点**：`0ac97b6`（Add training resource tracking and retry controls）；分支 `emdash/hot-boxes-clean-y9u6p`。本报告作为单独提交更新。
+
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；未连接真实 GPU。worker 资源选择、GPU 能力和显存边界由集成测试的计算槽注册数据覆盖。完整测试时工作区还含有未提交的存储层改动（`backend/app/storage.py`、`backend/tests/test_storage.py`），这些改动参与了测试，但未纳入本功能提交。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过，trainer、worker、frontend 镜像重建并启动，SeaweedFS healthy。
+- `docker compose run --rm --no-deps -v "$PWD/backend/tests:/app/backend/tests:ro" -v "$PWD/scripts:/app/scripts:ro" trainer python -m pytest backend/tests/ -v`：收集 202 项，196 通过、6 跳过、0 失败、0 错误（56.74 秒）。
+- 补充输入边界断言后，`docker compose run --rm --no-deps -v "$PWD/backend/tests:/app/backend/tests:ro" -v "$PWD/scripts:/app/scripts:ro" trainer python -m pytest backend/tests/test_api.py::test_failed_job_retry_api_checks_resource_requirements_and_assignment -v`：1 通过、0 失败（0.43 秒）。
+- 前端内联 JavaScript `node --check -`：通过；`git diff --check`：通过；Safari 桌面页面已核对资源轨迹、重试控件与浅色曲线布局。
+- 6 项跳过：3 项 Redis 协调集成、2 项 S3 集成、1 项 Supervisor 子进程集成，均受外部服务或环境门控。保留 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**前端脚本语法检查命令**：
+```bash
+set -o pipefail
+docker compose run --rm --no-deps trainer python -c 'import pathlib,sys; html=pathlib.Path("/app/static/index.html").read_text(); script=html.rsplit("<script", 1)[1].split(">", 1)[1].split("</script>", 1)[0]; sys.stdout.write(script)' | node --check -
+```
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 任务详情记录正在执行的节点、槽位、设备与 epoch 分段；暂停、失败、完成、自动重试和 watchdog 重派均保留实际执行轨迹 | Worker/任务管理器：`test_worker_completes_job`、`test_business_error_fails_without_retry`、`test_env_error_auto_retries_then_completes`、`test_env_error_exhausts_retry_then_failed`、`test_watchdog_redispatches_expired_running`；嵌入式队列和测试 worker | 运行/失败/重试任务；详情和 segments 含 machine、slot、device、状态与 epoch 范围，watchdog 关闭旧分段后重新排队 | 正常、异常、状态恢复、回归 |
+| 手动重试可指定在线槽或使用自动分配；只有失败任务可重试，重试计数和错误历史正确 | API/任务管理器：`test_failed_job_retry_api_checks_resource_requirements_and_assignment`、`test_manual_retry_requeues_failed_job_with_selected_assignment`；准备 failed、queued 记录及 CPU/GPU worker | 指定满足条件的 worker 后返回 queued 和 worker ID；空选择交由自动调度；非失败返回 409，缺失任务返回 404，手动计数加一且自动计数重置 | 正常、边界、状态冲突、兼容 |
+| 指定目标 worker 才能领取任务；GPU 勾选和最低显存要求在重试中继续生效 | Worker/API：`test_manual_retry_target_is_the_only_worker_that_claims_job`、`test_require_gpu_job_not_claimed_by_cpu_worker`、`test_min_vram_job_skipped_by_smaller_gpu`、`test_min_vram_job_claimed_by_big_gpu`、API 重试用例 | CPU、低显存 GPU、高显存 GPU、停用或离线槽；不兼容选择被拒绝/不能领取，兼容 GPU 槽可领取 | 正常、资源边界、异常、回归 |
+| 空/超长 worker ID 被校验；恶意格式只作为普通 ID 精确查找，未注册资源不能被分配 | API：`test_failed_job_retry_api_checks_resource_requirements_and_assignment`；对失败任务提交边界与注入样式 ID | 空字符串及 161 字符 ID 返回 422；`../../;rm -rf /` 返回 409，拒绝未注册资源 | 边界、非法输入、安全 |
+| 训练详情、任务卡片与图表有一致清晰的资源布局，重试选项只展示在线且满足资源约束的槽位 | 前端契约：`test_training_page_resource_retry_and_chart_style_contract`；前端内联脚本 `node --check -`；Safari 桌面页面检查 | 页面含资源轨迹、重试 API 与筛选逻辑；图表使用浅色网格/图例，详情和图表在桌面布局可读 | 正常、兼容、回归 |
+| 既有训练、预测、数据集双布局、LLM 与 SSH API 保持兼容 | 完整 `backend/tests/`；包含旧训练/预测、结构化数据、LLM 与远程管理回归用例 | 196 项通过、6 项环境门控跳过，无失败 | 兼容性、回归 |
+
+**已知限制**：未在真实 NVIDIA GPU 上执行训练，因此实际 GPU 驱动、显存占用和硬件调度未验证；若手动指定的槽位在排队期间离线，任务会继续等待该槽位上线。Redis/S3 集成需配置相应外部服务后执行。
+
+**下次测试建议**：在至少一个真实 GPU 节点上验证 GPU-only 重试、最低显存筛选和跨槽恢复；配置 `MTP_TEST_REDIS`、`MTP_TEST_S3` 后运行被跳过的集成用例。
+
+**重测触发条件**：修改任务状态机、worker 领取/重试分配、任务详情 API 或训练页面资源/图表交互时，重新运行相关用例和完整 `backend/tests/`，并更新本报告基准点。
 
 ## 本次变更测试结果：数据集选择与 CSV 上传修复（2026-10-25）
 
