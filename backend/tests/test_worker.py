@@ -284,3 +284,37 @@ def test_business_error_fails_without_retry(store, make_dataset, make_job, q, ls
     assert q.size() == 0, "业务性失败不应回队列"
     assert "任务失败" in jobstore.read_job_log(store, job)
     w.stop()
+
+
+def test_worker_survives_queue_pop_error(store, make_dataset, make_job, q, ls):
+    """异常场景：协调面瞬断（pop 抛异常）不得杀死 worker——退避后继续领取。"""
+    class FlakyQueue:
+        """包装队列：前 fail_times 次 pop 抛连接异常（模拟 Redis 抖动）。"""
+
+        def __init__(self, inner, fail_times=2):
+            self.inner = inner
+            self.fail_times = fail_times
+
+        def pop(self, timeout=1.0):
+            if self.fail_times > 0:
+                self.fail_times -= 1
+                raise ConnectionError("redis connection reset")
+            return self.inner.pop(timeout)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    ds = make_dataset()
+    job = make_job(ds, epochs=2)
+    from app.worker import TrainingWorker
+
+    w = TrainingWorker(store=store, queue=FlakyQueue(q), lease_store=ls,
+                       capabilities=detect_capabilities("w-flaky"),
+                       idle_poll=0.1, gpu_probe_enabled=False)
+    t = threading.Thread(target=w.run_forever, daemon=True)
+    t.start()
+    q.push(job)  # 前两次 pop 失败后第三次应领取成功
+    assert wait_until(lambda: job_status(store, job) == "completed", 40)
+    assert t.is_alive(), "worker 循环不应因 pop 异常退出"
+    w.request_shutdown()
+    t.join(timeout=5)
