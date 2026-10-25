@@ -402,3 +402,33 @@ MTP_TEST_S3=localhost:9000 python3 -m pytest tests/test_storage.py -q  # 22/22
 **覆盖范围与限制**：CPU 小模型覆盖训练、指标、checkpoint、产物、API 和 Worker 路径；尚未验证真实 GPU 显存表现、真实公网 Hub 下载及大型模型训练。首版限定 decoder-only CausalLM、单 GPU；PPO 需要 `num_labels=1` 的奖励模型。6 个外部服务门控测试本次未执行。
 
 **下次测试建议**：在带 NVIDIA GPU 的环境验证不同显存规模的模型/序列长度配置；用可公开访问的 Hub 数据集和模型做下载与短训练冒烟；部署前根据目标模型检查显存和数据样本格式。
+
+## 本次变更测试结果：页面统一管理 SSH 凭证（2026-10-25）
+
+**变更范围**：新增页面 SSH 凭证目录，支持用户名 + 密码、用户名 + 密钥、用户名 + 密钥 + 密码三种组合；添加服务器时选择凭证，用户名可按服务器覆盖；登录秘密加密保存到共享 Redis，不再从 `.env` 读取 SSH 登录凭证。
+
+**Git 基准点**：`024f234488c8af569dfce84a56fbbd8d3d1295de`（Manage SSH credentials in the page）；分支 `emdash/hot-boxes-clean-y9u6p`。完整测试在该功能代码提交对应的工作区运行；当时工作区还含其他未提交的 LLM、重试和数据相关改动，完整套件结果也覆盖了这些工作区改动。
+
+**测试环境**：Docker Compose 容器（Python 3.12）；未连接真实远程 SSH 主机，SSH 调用通过隔离的命令构造与凭证处理测试验证。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过，代码变更后重建并启动服务。
+- `docker compose run --rm --no-deps -v ./backend/tests:/app/tests:ro -v ./scripts:/scripts:ro trainer python -m pytest /app/tests/test_remote_workers.py /app/tests/test_api.py -k 'remote_ssh or remote_server' -v`：13 通过、61 跳过筛选、0 失败；1 个 SQLAlchemy 弃用警告。
+- `docker compose run --rm --no-deps -v ./backend/tests:/app/tests:ro -v ./scripts:/scripts:ro trainer python -m pytest /app/tests/test_remote_workers.py -v`：30 通过、0 失败。
+- `docker compose run --rm --no-deps -v ./backend/tests:/app/tests:ro -v ./scripts:/scripts:ro trainer python -m pytest /app/tests -v`：201 项收集，195 通过、6 跳过、0 失败、0 错误；2 个弃用警告。
+- 前端内联 JavaScript `node --check`：通过；CPU 与远程 Compose 配置解析：通过；`git diff --check`：通过。
+- 6 项跳过为外部服务门控测试：未配置 `MTP_TEST_REDIS` 的 Redis/Supervisor 集成用例，以及未配置 `MTP_TEST_S3` 的 2 项 S3 集成用例。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 页面可创建、查看、编辑和删除三种 SSH 凭证；密钥/密码不回显，Redis 中保存密文 | API：`test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_echo`、`test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets`；使用测试 Redis 适配层和 Fernet 密钥 | 三种认证组合均可保存并列出元数据；响应不包含秘密；目录密文可解密；被服务器引用的凭证拒绝删除 | 正常、CRUD、敏感数据保护、状态冲突 |
+| 创建服务器时选择凭证；省略服务器用户名时继承凭证用户名，填写时可覆盖 | API：`test_remote_server_api_installs_and_manages_with_nonsecret_records`、`test_remote_server_uses_credential_username_when_server_username_is_blank` | SSH 使用解析后的用户名；服务器记录只保存凭证 ID 和非敏感元数据 | 正常、默认行为、兼容 |
+| 密码、密钥及组合模式能正确执行认证，组合模式分别处理密钥口令与登录密码 | 远程执行器：`test_run_remote_action_uses_page_password_and_redacts_it`、`test_run_remote_action_materializes_page_private_key_temporarily`、`test_run_remote_action_combines_key_and_password_with_separate_prompts` | 使用页面凭证启动 SSH；组合模式配置密钥优先、密码回退；日志不泄露密码或密钥；临时私钥限制权限并在完成后清理 | 正常、异常认证、秘密脱敏、资源清理 |
+| SSH 登录凭证不能从 `.env` 回退；非法输入与未授权管理受到拒绝 | 单元/API：`test_remote_ssh_credentials_do_not_fall_back_to_environment`、`test_remote_ssh_settings_reject_invalid_credentials`、目录 API 的未授权断言、`test_remote_server_api_rejects_shell_injection_before_ssh` | 未配置页面凭证时不读取旧登录环境变量；未授权请求、非法凭证与 shell 注入输入被拒绝 | 安全、恶意输入、异常 |
+| 旧记录和既有远程服务器管理行为继续工作 | 完整 pytest 套件及旧单凭证兼容用例；覆盖已有远程配置/API 测试 | 既有 API、记录格式和远程 worker 管理保持可用 | 兼容性、回归 |
+
+**覆盖范围与限制**：覆盖凭证 CRUD、加密存储、三种认证组合、用户名继承/覆盖、秘密脱敏、引用保护、旧数据兼容及无 `.env` 回退。没有对真实 SSH 主机做端到端连接；6 项外部服务门控测试未执行。
+
+**下次测试建议**：在部署环境使用真实 SSH 主机验证 OpenSSH 密钥算法、加密私钥口令与密码回退行为；配置 `MTP_TEST_REDIS`、`MTP_TEST_S3` 后运行被门控的集成测试。
