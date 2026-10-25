@@ -2,8 +2,8 @@
 
 ## Git基准点
 
-- **Commit Hash**: cd6c986（本次测试覆盖代码与测试用例的提交）
-- **提交信息**: Add clustering and time series training tasks
+- **Commit Hash**: a1d852a（本次测试覆盖代码与测试用例的提交）
+- **提交信息**: Add page-managed SSH credentials
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
@@ -120,6 +120,44 @@ WORKER_SSH_AUTH_METHOD=password WORKER_SSH_PASSWORD=synthetic-check-secret \
 - Redis/S3 集成按门控跳过，无法在本轮证明外部 Redis 中的选择持久化及对象存储连通。
 - 私有镜像仓库需要先让目标机具备镜像拉取凭据；目标机不需要检出源码或手动运行项目脚本。
 - 现有应用没有通用 API 身份认证；本次远程管理路由单独使用令牌，页面与其他 API 仍应部署在可信网络或由反向代理保护。
+
+## 本次变更测试结果：页面统一 SSH 凭证管理（2026-10-25）
+
+**变更范围**：远程服务器管理对话框可配置平台统一 SSH 私钥或密码及可选私钥口令。页面只显示凭证来源、认证方式和状态；服务端使用 Fernet 加密后保存到共享 Redis。执行 SSH 时私钥通过权限为 `600` 的临时文件提供，密码/口令通过 askpass 环境传递，操作后删除临时私钥。清除页面凭证后继续使用既有 `.env` 配置。
+
+**测试环境**：Docker Compose；trainer 测试容器 Python 3.12.15；没有配置真实远程服务器或真实凭证。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过，trainer、worker 与 frontend 重建并启动。
+- 完整套件：184 项收集，178 通过、6 跳过、0 失败、0 错误（54.29 秒）。
+- 定向测试：`test_api.py` 中远程 SSH 设置用例 10 通过；`test_remote_workers.py` 28 通过；协调存储远程凭证用例 2 通过。
+- 前端内联 JavaScript `node --check -`：通过；GPU 与 CPU 两种远程 Compose 配置解析：通过。
+- 完整套件的 6 项跳过为 3 个 Redis 协调集成、1 个 Redis Supervisor 集成和 2 个 S3 集成；需要配置 `MTP_TEST_REDIS` / `MTP_TEST_S3`。两条 SQLAlchemy、Pandas 弃用警告，均非失败。
+- 页面 API 的 5 个用例（参数化后 10 项）已纳入测试：覆盖密文持久化与脱敏响应、密钥/密码校验、错误令牌、缺少 Redis/加密密钥及 Redis 异常脱敏。该测试代码随 `ade30cc` 提交进入当前历史；数据集修复也在该提交中。
+
+**完整测试命令**：
+```bash
+docker compose run --rm --no-deps \
+  -v ./backend/tests:/app/tests:ro \
+  -v ./scripts:/scripts:ro \
+  trainer python -m pytest /app/tests -v
+```
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 页面可保存平台统一密码或不同格式的私钥；凭证明文不回显，Redis 只保存密文 | API：`test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets`、`test_remote_ssh_settings_save_private_key_without_echo`；模型：`test_openssh_reads_supported_private_key_formats` | Fernet 密钥、密码或完整 OpenSSH/PEM 私钥；状态响应仅含来源/方式/配置状态，Redis 值不可直接读出凭证 | 正常、兼容、敏感数据保护 |
+| 页面密钥和密码可供远程 SSH 使用，临时密钥严格限权并清理，askpass 错误输出会脱敏 | 执行器：`test_run_remote_action_uses_page_password_and_redacts_it`、`test_run_remote_action_materializes_page_private_key_temporarily`；既有 `.env` 凭证测试在完整套件中回归 | 合成凭证；密码不进入命令参数或错误信息，私钥临时文件为 `0600` 且调用后不存在 | 正常、权限与安全、资源清理、兼容 |
+| 未授权、无 Redis、无有效加密密钥、无效凭证或 Redis 故障不能泄漏秘密或写入明文 | API：`test_remote_ssh_settings_require_redis_and_encryption_key`、`test_remote_ssh_settings_reject_invalid_credentials`、`test_remote_ssh_settings_redacts_redis_read_failure`，以及错误令牌断言 | 非法/缺失输入返回脱敏 422；后端能力缺失或 Redis 故障返回脱敏 503；未配置管理令牌返回 401 | 边界、异常、权限与安全 |
+| Redis 凭证存储使用独立 key，支持读取和清除；页面清除后回退到 `.env` | 协调层：`test_embedded_remote_ssh_credentials_store_opaque_ciphertext`、`test_redis_remote_ssh_credentials_use_dedicated_key`；API 清除断言 | 存取、删除 `mtp:remote:ssh_credentials`；清除后状态来源为 `env` | 正常、回归、兼容 |
+| 现有远程管理、训练、数据集和存储 API 不回归 | 完整 `backend/tests/`；GPU/CPU Compose 配置解析；前端内联脚本语法检查 | 184 项收集，178 通过、6 跳过、0 失败；两种 Compose 配置可解析，页面脚本可解析 | 回归、兼容 |
+
+**未验证内容和限制**：
+- 未对真实服务器发起 SSH 连接；当前执行器测试通过 fake SSH 覆盖认证参数、临时文件和输出脱敏。实际目标账号、主机指纹、网络与目标机 Docker 权限需部署环境验收。
+- 外部 Redis/S3 集成按环境变量门控跳过；本次页面持久化逻辑由存储单元测试和 API 测试验证，未连接生产 Redis。
+- 页面凭证是平台全局单份配置，会用于所有远程服务器账号。更换 `WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 后，旧密文无法解密，需恢复原密钥或清除并重新配置。
+- 本机无 NVIDIA GPU；本次修改不改变 GPU 训练逻辑。
 
 ## 上一轮补充测试：Excel 与数据集管理（2026-10-25）
 
