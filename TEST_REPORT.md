@@ -2,10 +2,39 @@
 
 ## Git基准点
 
-- **Commit Hash**: 2524386（远程服务器配置覆盖与 SSH 首次主机指纹信任测试）
-- **提交信息**: Isolate remote worker operation test state
+- **Commit Hash**: e1f5d1e（分离本机与远程 worker 镜像默认值）
+- **提交信息**: Separate remote and local worker image defaults
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：分离本机与远程 worker 镜像默认值（2026-10-25）
+
+**变更范围**：Compose 原先把本地构建用的 `mtp-worker:local` / `mtp-worker-cpu:local` 注入 `WORKER_IMAGE`，后端因此把不可供远程服务器拉取的本地标签误当成远程默认镜像。现在 Compose 将显式 `.env` 中的 `WORKER_IMAGE` 单独传给 `WORKER_REMOTE_IMAGE`；本机默认标签仍只供本机 worker 使用。若平台和服务器都没有配置远程镜像，远程管理继续明确报缺少可拉取镜像。
+
+**测试环境**：Docker Compose 与 Docker pytest 镜像 Python 3.12。当前 `.env` 未设置 `WORKER_IMAGE`；重新构建后运行中的 trainer 解析到的远程默认镜像为空，而非 `mtp-worker:local`。完整测试时共享工作区仍有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 改动，它们参与了测试但未纳入本次提交。
+
+**测试执行结果**：
+- 回归测试先失败复现问题：测试进程设置本机镜像 `mtp-worker:local` 且远程镜像为空时，旧配置仍解析出本机标签；GPU/CPU Compose 也都缺少独立 `WORKER_REMOTE_IMAGE` 映射。修复后两项回归测试通过。
+- 定向回归：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py::test_remote_image_config_does_not_inherit_local_compose_fallback tests/test_remote_workers.py::test_compose_separates_local_worker_image_from_remote_default -q -p no:cacheprovider`：2 通过。
+- `docker compose -f docker-compose.yml -f docker-compose.remote.yml config -q` 与 CPU Compose 等价命令：均通过。
+- `docker compose up --build -d`：通过；trainer、worker、frontend 镜像重建并启动，frontend 与 SeaweedFS healthy。
+- 运行容器检查：`docker compose exec -T trainer python -c 'from app import config; from app.remote_workers import remote_deployment_settings; print("WORKER_REMOTE_IMAGE_empty=", config.WORKER_REMOTE_IMAGE == ""); print("effective_remote_image=", repr(remote_deployment_settings({})["worker_image"]))'`：确认远程默认值为空，未再继承 `mtp-worker:local`。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：204 通过、6 跳过、0 失败、0 错误（58.75 秒）。6 项跳过为 3 项 Redis 集成、2 项 S3 集成、1 项 Supervisor 子进程集成，受外部服务或环境门控。
+- `git diff --check`：通过。保留 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 本机容器镜像默认值不会被当作远程可拉取镜像；显式平台 WORKER_IMAGE 仍成为远程默认值 | 配置回归：`test_remote_image_config_does_not_inherit_local_compose_fallback` | `WORKER_IMAGE=mtp-worker:local` 且 `WORKER_REMOTE_IMAGE` 为空时远程默认为空；显式远程默认值保持原样 | 默认值、边界、兼容 |
+| GPU 与 CPU Compose 都将平台镜像值映射到远程默认配置，同时保留本地镜像回退 | Compose 静态契约：`test_compose_separates_local_worker_image_from_remote_default`；两种 Compose `config -q` | 检查两份 Compose 中独立远程映射和本机默认镜像，配置文件可解析 | CPU/GPU 兼容、部署回归 |
+| 服务器镜像覆盖仍优先于平台默认，现有远程管理回归保持通过 | `test_remote_deployment_settings_apply_per_server_overrides_and_platform_fallback`；完整 `backend/tests/` | 单机覆盖值优先，平台值作为回退；204 通过、6 环境门控跳过 | 正常、回归 |
+
+**已知问题与限制**：没有可用仓库镜像时，若 `.env` 未设置可被目标服务器拉取的 `WORKER_IMAGE`，且服务器也未填写镜像覆盖，页面仍会提示镜像缺失；本轮不会把本机 `mtp-worker:local` 当作远程镜像。需要使用真实 registry 引用配置平台默认值或该服务器覆盖值。本轮未连接目标服务器验证实际拉取权限。
+
+**重测触发条件**：修改 worker 镜像配置来源、Compose 默认值或远程部署参数校验时，重新运行新增的两个镜像默认值回归用例、远程 worker 定向测试和完整 `backend/tests/`。
+
+**Git基准点**：`e1f5d1e`（Separate remote and local worker image defaults）；本报告作为单独提交更新。
 
 ## 本次变更测试结果：远程服务器部署配置覆盖与 SSH 首次主机指纹信任（2026-10-25）
 
