@@ -55,12 +55,6 @@ x-backend-env: &backend-env
   WORKER_CHECKPOINT_INTERVAL: ${WORKER_CHECKPOINT_INTERVAL:-5}
   WORKER_CHECKPOINT_KEEP: ${WORKER_CHECKPOINT_KEEP:-3}
   WORKER_IMAGE: ${WORKER_IMAGE:-mtp-worker:local}
-  WORKER_REMOTE_ENABLED: ${WORKER_REMOTE_ENABLED:-false}
-  WORKER_REMOTE_TOKEN: ${WORKER_REMOTE_TOKEN:-}
-  WORKER_REMOTE_REDIS_URL: ${WORKER_REMOTE_REDIS_URL:-}
-  WORKER_REMOTE_S3_ENDPOINT: ${WORKER_REMOTE_S3_ENDPOINT:-}
-  WORKER_SSH_KEY_PATH: /run/remote-worker/ssh_key
-  WORKER_SSH_KNOWN_HOSTS_PATH: /run/remote-worker/known_hosts
 
 services:
   seaweedfs:
@@ -101,6 +95,15 @@ services:
       # API 进程内嵌 worker 线程，协调平面为进程内实现
       USE_DATABASE: ${USE_DATABASE:-false}
       EMBEDDED_WORKERS: ${EMBEDDED_WORKERS:-0}   # 多机模式下训练交给 worker 服务
+      WORKER_REMOTE_ENABLED: ${WORKER_REMOTE_ENABLED:-false}
+      WORKER_REMOTE_TOKEN: ${WORKER_REMOTE_TOKEN:-}
+      WORKER_REMOTE_REDIS_URL: ${WORKER_REMOTE_REDIS_URL:-}
+      WORKER_REMOTE_S3_ENDPOINT: ${WORKER_REMOTE_S3_ENDPOINT:-}
+      WORKER_SSH_AUTH_METHOD: ${WORKER_SSH_AUTH_METHOD:-key}
+      WORKER_SSH_PASSWORD: ${WORKER_SSH_PASSWORD:-}
+      WORKER_SSH_KEY_PASSPHRASE: ${WORKER_SSH_KEY_PASSPHRASE:-}
+      WORKER_SSH_KEY_PATH: /run/remote-worker/ssh_key
+      WORKER_SSH_KNOWN_HOSTS_PATH: /run/remote-worker/known_hosts
     depends_on:
       seaweedfs:
         condition: service_healthy

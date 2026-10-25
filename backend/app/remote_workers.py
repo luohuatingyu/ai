@@ -1,6 +1,7 @@
 """远程 worker 管理：校验接入参数、经 SSH 执行单个部署脚本并保存操作状态。"""
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
@@ -36,7 +37,7 @@ _ENVIRONMENT_KEYS = (
 
 
 def remote_configuration_errors() -> List[str]:
-    """列出启用远程执行所需但尚未配置的项目，不读取或返回私钥内容。"""
+    """列出远程执行缺少的配置，不读取或返回平台 SSH 凭证内容。"""
     errors: List[str] = []
     if not config.WORKER_REMOTE_ENABLED:
         errors.append("远程服务器管理尚未启用")
@@ -48,12 +49,17 @@ def remote_configuration_errors() -> List[str]:
         errors.append("平台必须使用共享 S3 存储，远程 worker 才能读取数据集和写入产物")
     if not shutil.which("ssh"):
         errors.append("平台后端容器未安装 OpenSSH 客户端")
-    key_path = Path(config.WORKER_SSH_KEY_PATH)
     known_hosts_path = Path(config.WORKER_SSH_KNOWN_HOSTS_PATH)
-    if not key_path.is_file():
-        errors.append("平台 SSH 私钥文件不存在")
-    elif key_path.stat().st_mode & 0o077:
-        errors.append("平台 SSH 私钥权限必须限制为 600 或更严格")
+    if config.WORKER_SSH_AUTH_METHOD not in {"key", "password"}:
+        errors.append("WORKER_SSH_AUTH_METHOD 只能是 key 或 password")
+    elif config.WORKER_SSH_AUTH_METHOD == "key":
+        key_path = Path(config.WORKER_SSH_KEY_PATH)
+        if not key_path.is_file():
+            errors.append("平台 SSH 私钥文件不存在")
+        elif key_path.stat().st_mode & 0o077:
+            errors.append("平台 SSH 私钥权限必须限制为 600 或更严格")
+    elif not config.WORKER_SSH_PASSWORD:
+        errors.append("密码认证需要配置 WORKER_SSH_PASSWORD")
     if not known_hosts_path.is_file() or known_hosts_path.stat().st_size == 0:
         errors.append("SSH known_hosts 文件不存在；请先登记并核验目标主机指纹")
     image = config.WORKER_REMOTE_IMAGE
@@ -75,6 +81,13 @@ def remote_configuration_errors() -> List[str]:
     )
     if any("\n" in value or "\r" in value for value in values):
         errors.append("远程配置不能包含换行符")
+    ssh_secret = (
+        config.WORKER_SSH_PASSWORD
+        if config.WORKER_SSH_AUTH_METHOD == "password"
+        else config.WORKER_SSH_KEY_PASSPHRASE
+    )
+    if "\n" in ssh_secret or "\r" in ssh_secret:
+        errors.append("SSH 凭证不能包含换行符")
     return errors
 
 
@@ -140,7 +153,7 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
 
 
 def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
-    """用严格主机校验的 OpenSSH 执行脚本，并过滤输出中的连接密钥。"""
+    """用严格主机校验的 OpenSSH 执行脚本，并过滤输出中的平台 SSH 凭证。"""
     errors = remote_configuration_errors()
     if errors:
         raise RemoteWorkerError("；".join(errors))
@@ -151,39 +164,62 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
     host = str(server["host"])
     ssh_host = f"[{host}]" if ":" in host else host
     target = f"{server['username']}@{ssh_host}"
-    command = [
-        ssh_path,
-        "-i",
-        config.WORKER_SSH_KEY_PATH,
-        "-p",
-        str(server["port"]),
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "IdentitiesOnly=yes",
-        "-o",
-        "PasswordAuthentication=no",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        f"UserKnownHostsFile={config.WORKER_SSH_KNOWN_HOSTS_PATH}",
-        "-o",
-        "ConnectTimeout=10",
-        "-o",
-        "LogLevel=ERROR",
-        target,
-        "bash -s",
-    ]
+    command = [ssh_path]
+    if config.WORKER_SSH_AUTH_METHOD == "key":
+        command.extend(["-i", config.WORKER_SSH_KEY_PATH])
+        command.extend(["-o", "IdentitiesOnly=yes"])
+        command.extend(["-o", "PubkeyAuthentication=yes"])
+        command.extend(["-o", "PasswordAuthentication=no"])
+        command.extend(["-o", "KbdInteractiveAuthentication=no"])
+        ssh_secret = config.WORKER_SSH_KEY_PASSPHRASE
+        command.extend(["-o", "BatchMode=no" if ssh_secret else "BatchMode=yes"])
+    else:
+        command.extend(["-o", "PubkeyAuthentication=no"])
+        command.extend(["-o", "PasswordAuthentication=yes"])
+        command.extend(["-o", "KbdInteractiveAuthentication=no"])
+        command.extend(["-o", "PreferredAuthentications=password"])
+        command.extend(["-o", "NumberOfPasswordPrompts=1"])
+        command.extend(["-o", "BatchMode=no"])
+        ssh_secret = config.WORKER_SSH_PASSWORD
+    command.extend(
+        [
+            "-p",
+            str(server["port"]),
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={config.WORKER_SSH_KNOWN_HOSTS_PATH}",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "LogLevel=ERROR",
+        ]
+    )
+    command.extend([target, "bash -s"])
     timeout = 3600 if action == "install" else 120
     try:
-        result = subprocess.run(
-            command,
-            input=render_remote_script(server, action),
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
+        run_options = {
+            "input": render_remote_script(server, action),
+            "text": True,
+            "capture_output": True,
+            "timeout": timeout,
+            "check": False,
+        }
+        if ssh_secret:
+            askpass_path = Path(__file__).with_name("ssh_askpass.sh")
+            if not askpass_path.is_file() or not os.access(askpass_path, os.X_OK):
+                raise RemoteWorkerError("SSH askpass 辅助程序未打包或不可执行")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "DISPLAY": environment.get("DISPLAY") or ":0",
+                    "SSH_ASKPASS": str(askpass_path),
+                    "SSH_ASKPASS_REQUIRE": "force",
+                    "WORKER_SSH_ASKPASS_SECRET": ssh_secret,
+                }
+            )
+            run_options["env"] = environment
+        result = subprocess.run(command, **run_options)
     except subprocess.TimeoutExpired as exc:
         raise RemoteWorkerError("远程 SSH 操作超时") from exc
     except OSError as exc:
@@ -233,11 +269,13 @@ def execute_remote_operation(
 
 
 def _redact_output(stdout: str, stderr: str) -> Dict[str, str]:
-    """从 SSH 输出中删除远程环境变量，防止服务端错误响应暴露存储凭据。"""
+    """从 SSH 输出中删除远程配置和平台 SSH 凭证。"""
     secrets = (
         config.WORKER_REMOTE_REDIS_URL,
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
+        config.WORKER_SSH_PASSWORD,
+        config.WORKER_SSH_KEY_PASSPHRASE,
     )
     for secret in secrets:
         if secret:

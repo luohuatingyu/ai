@@ -393,7 +393,7 @@
       <h3 id="addServerTitle">通过 SSH 添加服务器</h3>
       <button id="btnCloseAddServer" class="close-btn" aria-label="关闭">×</button>
     </div>
-    <p>平台会通过预配置的 SSH 密钥连接目标机，远程执行单文件部署脚本并拉取 worker 镜像。不会同步项目源码。目标机需要 SSH 可达、安装 Docker，并能访问镜像仓库、Redis 和 S3。</p>
+    <p>平台会使用平台端配置的 SSH 密钥或密码连接目标机，远程执行单文件部署脚本并拉取 worker 镜像。不会同步项目源码。目标机需要 SSH 可达、安装 Docker，并能访问镜像仓库、Redis 和 S3。</p>
     <form id="remoteServerForm" class="server-form">
       <div class="field">
         <label for="remoteMachineId">服务器标识</label>
@@ -426,7 +426,7 @@
       <div class="field wide">
         <label for="remoteAdminToken">远程管理令牌</label>
         <input id="remoteAdminToken" type="password" autocomplete="current-password" required placeholder="平台配置的 WORKER_REMOTE_TOKEN">
-        <div class="hint">只保存在当前浏览器标签页会话中；平台端需预先配置 SSH 私钥、known_hosts 和镜像/存储地址。</div>
+        <div class="hint">只保存在当前浏览器标签页会话中；平台端需预先配置 SSH 认证方式、凭证、known_hosts 和镜像/存储地址。</div>
       </div>
       <div class="server-form-actions">
         <button type="button" id="btnCancelAddServer">取消</button>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -33,6 +34,9 @@ def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     monkeypatch.setattr(config, "S3_SECURE", True)
     monkeypatch.setattr(config, "WORKER_SSH_KEY_PATH", str(key))
     monkeypatch.setattr(config, "WORKER_SSH_KNOWN_HOSTS_PATH", str(known_hosts))
+    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "key")
+    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", "")
+    monkeypatch.setattr(config, "WORKER_SSH_KEY_PASSPHRASE", "")
     return key, known_hosts
 
 
@@ -64,6 +68,64 @@ def test_remote_configuration_requires_key_permissions_and_registry(tmp_path, mo
     assert any("镜像仓库引用" in item for item in remote_workers.remote_configuration_errors())
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", False)
     assert any("尚未启用" in item for item in remote_workers.remote_configuration_errors())
+
+
+def test_remote_configuration_supports_platform_password_without_key_file(tmp_path, monkeypatch):
+    """平台密码认证不依赖私钥文件，但仍要求已核验的 known_hosts。"""
+    _, known_hosts = _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
+    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", "platform password")
+    monkeypatch.setattr(config, "WORKER_SSH_KEY_PATH", str(tmp_path / "missing-key"))
+
+    assert remote_workers.remote_configuration_errors() == []
+
+    known_hosts.unlink()
+    assert any("known_hosts" in item for item in remote_workers.remote_configuration_errors())
+
+
+def test_remote_configuration_requires_password_and_valid_auth_method(tmp_path, monkeypatch):
+    """密码模式需要平台密码，未识别的认证模式应明确拒绝。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
+    assert any("WORKER_SSH_PASSWORD" in item for item in remote_workers.remote_configuration_errors())
+
+    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "unsupported")
+    errors = remote_workers.remote_configuration_errors()
+    assert any("只能是 key 或 password" in item for item in errors)
+
+
+@pytest.mark.parametrize(
+    ("key_type", "key_options"),
+    [
+        ("ed25519", []),
+        ("ecdsa", ["-b", "256"]),
+        ("rsa", ["-b", "2048"]),
+        ("rsa", ["-b", "2048", "-m", "PEM"]),
+    ],
+)
+def test_openssh_reads_supported_private_key_formats(tmp_path, key_type, key_options):
+    """OpenSSH 自行识别常见密钥格式，平台不强制转换或限定密钥算法。"""
+    ssh_keygen = shutil.which("ssh-keygen")
+    if not ssh_keygen:
+        pytest.skip("测试环境没有 ssh-keygen")
+    key = tmp_path / "platform_key"
+    subprocess.run(
+        [ssh_keygen, "-q", "-t", key_type, *key_options, "-N", "", "-f", str(key)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    parsed = subprocess.run(
+        [ssh_keygen, "-y", "-f", str(key)], check=True, capture_output=True, text=True
+    )
+
+    assert parsed.stdout.startswith({
+        "ed25519": "ssh-ed25519 ",
+        "ecdsa": "ecdsa-sha2-nistp256 ",
+        "rsa": "ssh-rsa ",
+    }[key_type])
 
 
 def test_remote_configuration_requires_shared_queue_and_object_storage(tmp_path, monkeypatch):
@@ -115,6 +177,67 @@ def test_run_remote_action_pins_host_key_and_keeps_secrets_out_of_argv(tmp_path,
     assert "secret-test" not in " ".join(command)
     assert "secret-test" in calls["input"]
     assert config.WORKER_REMOTE_TOKEN not in calls["input"]
+
+
+def test_run_remote_action_uses_password_from_platform_askpass(tmp_path, monkeypatch):
+    """平台密码走 OpenSSH askpass 环境，严格校验主机且不进入参数或日志。"""
+    _, known_hosts = _remote_config(tmp_path, monkeypatch)
+    password = "platform password ' with $(shell) text"
+    monkeypatch.setattr(config, "WORKER_SSH_AUTH_METHOD", "password")
+    monkeypatch.setattr(config, "WORKER_SSH_PASSWORD", password)
+    monkeypatch.setattr(config, "WORKER_SSH_KEY_PATH", str(tmp_path / "missing-key"))
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    calls = {}
+    real_subprocess_run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        calls["command"] = command
+        calls["environment"] = kwargs["env"]
+        askpass = Path(kwargs["env"]["SSH_ASKPASS"])
+        calls["askpass_mode"] = stat.S_IMODE(askpass.stat().st_mode)
+        prompt = real_subprocess_run(
+            [str(askpass)], env=kwargs["env"], capture_output=True, text=True
+        )
+        calls["prompt"] = prompt.stdout.rstrip("\n")
+        return subprocess.CompletedProcess(command, 0, stdout=f"connected {password}", stderr="")
+
+    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    result = remote_workers.run_remote_action(_server(), "start")
+
+    command = calls["command"]
+    assert "-i" not in command
+    assert "BatchMode=no" in command
+    assert "PasswordAuthentication=yes" in command
+    assert "PubkeyAuthentication=no" in command
+    assert "StrictHostKeyChecking=yes" in command
+    assert f"UserKnownHostsFile={known_hosts}" in command
+    assert password not in " ".join(command)
+    assert calls["prompt"] == password
+    assert calls["askpass_mode"] == 0o755
+    assert "[redacted]" in result["stdout"]
+    assert Path(calls["environment"]["SSH_ASKPASS"]).name == "ssh_askpass.sh"
+
+
+def test_run_remote_action_uses_key_passphrase_without_exposing_it(tmp_path, monkeypatch):
+    """加密私钥口令通过临时 askpass 辅助程序传递，不进入 SSH 参数。"""
+    _remote_config(tmp_path, monkeypatch)
+    passphrase = "key passphrase with spaces"
+    monkeypatch.setattr(config, "WORKER_SSH_KEY_PASSPHRASE", passphrase)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    calls = {}
+
+    def fake_run(command, **kwargs):
+        calls["command"] = command
+        calls["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, stdout="worker running", stderr="")
+
+    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    remote_workers.run_remote_action(_server(), "start")
+
+    assert "BatchMode=no" in calls["command"]
+    assert passphrase not in " ".join(calls["command"])
+    assert calls["environment"]["WORKER_SSH_ASKPASS_SECRET"] == passphrase
+    assert Path(calls["environment"]["SSH_ASKPASS"]).name == "ssh_askpass.sh"
 
 
 def test_run_remote_action_brackets_ipv6_ssh_destination(tmp_path, monkeypatch):
