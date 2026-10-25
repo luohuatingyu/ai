@@ -63,7 +63,10 @@ WORKER_CPU_SLOTS = int(os.environ.get("WORKER_CPU_SLOTS", "1"))  # Supervisor �
 # 远程计算服务器管理：默认关闭；SSH 登录凭证只在页面统一加密管理。
 WORKER_REMOTE_ENABLED = os.environ.get("WORKER_REMOTE_ENABLED", "false").strip().lower() == "true"
 WORKER_REMOTE_TOKEN = os.environ.get("WORKER_REMOTE_TOKEN", "").strip()
-WORKER_REMOTE_IMAGE = os.environ.get("WORKER_IMAGE", "").strip()
+# Compose 将平台显式配置与本机容器镜像默认值分开传递，避免本机镜像被远程主机误用。
+WORKER_REMOTE_IMAGE = os.environ.get(
+    "WORKER_REMOTE_IMAGE", os.environ.get("WORKER_IMAGE", "")
+).strip()
 WORKER_REMOTE_REDIS_URL = os.environ.get("WORKER_REMOTE_REDIS_URL", "").strip()
 WORKER_REMOTE_S3_ENDPOINT = os.environ.get("WORKER_REMOTE_S3_ENDPOINT", "").strip()
 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY = os.environ.get(
