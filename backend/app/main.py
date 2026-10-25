@@ -250,10 +250,20 @@ def dataset_stats(ds_id: str) -> dict:
 
 @app.delete("/api/datasets/{ds_id}")
 def delete_dataset(ds_id: str) -> dict:
-    """删除数据集"""
+    """删除数据集（本地文件 + S3 状态平面同步副本一并清理）"""
     try:
         success = dataset_manager.delete_dataset(ds_id)
         if success:
+            # S3 模式下尽力清理状态平面的数据集副本（local 模式为 no-op）
+            try:
+                from app.storage import get_store
+
+                store = get_store()
+                key = f"datasets/{ds_id}.csv"
+                if store.exists(key):
+                    store.delete(key)
+            except Exception:
+                pass
             # 从数据库删除（如果可用）
             if config.DB_AVAILABLE:
                 try:
