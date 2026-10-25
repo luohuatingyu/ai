@@ -2,8 +2,8 @@
 
 ## Git基准点
 
-- **Commit Hash**: 2c9b101（本次重测基于分支 emdash/hot-boxes-clean-y9u6p 最新提交）
-- **提交信息**: Clean up dataset CSV copy in object store on dataset deletion
+- **Commit Hash**: f8abfb4（本次重测基于分支 emdash/hot-boxes-clean-y9u6p 最新提交）
+- **提交信息**: Split frontend into its own Node container (no nginx)
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
@@ -88,11 +88,12 @@ MTP_TEST_S3=localhost:8333 python3 -m pytest tests/test_storage.py -q  # 19/19�
 
 **验证结果**：
 - ✅ 镜像构建成功：trainer / worker 两镜像（容器内 Python 3.12 + torch 2.14.1+cu130）
-- ✅ 四服务启动健康：redis（healthy）、seaweedfs（healthy，wget 健康检查；`-ip=0.0.0.0` 使 S3 监听全部接口）、trainer、worker（supervisor 拉起 2 个 CPU 槽子进程）
+- ✅ 五服务启动健康：seaweedfs（healthy，wget 健康检查；`-ip=0.0.0.0` 使 S3 监听全部接口）、trainer、worker（supervisor 拉起 2 个 CPU 槽子进程）、frontend（healthy）、Redis/MySQL 走宿主机外部容器（localhost 网关映射）
 - ✅ S3 状态平面：宿主 9000 → 容器 8333（S3 API）、9001 → 8888（控制台）
 - ✅ 计算槽面板：`/api/workers` 返回 2 个在线 CPU 槽（idle/active，含 gpu 能力结构）
 - ✅ 全链路端到端：示例数据集导入（自动同步 S3）→ 训练提交 → worker 槽领取 → completed（6 epochs，acc 0.833，segments 记录执行槽）→ 单条预测（返回"否"）→ best.pt 下载（8497 bytes）→ 任务日志 21 行
 - ✅ S3 状态平面产物核验：datasets/*.csv、jobs/*/job.json、metrics.jsonl、best.pt/last.pt、preprocessor.json、summary.json、版本化 checkpoint（ckpt-e0005/e0006.pt）全部落库
+- ✅ **前后端容器拆分验证**：页面由 frontend（Node 零依赖静态服务）托管（`/` 返回 index.html、`/healthz` 健康检查 healthy）；`/api/*` 经同源反代到 trainer（workers 面板/导入/训练/预测/模型下载全链路通过，无需 CORS）；trainer 仅内网
 - ✅ 验证后清理：任务/数据集经 API 删除，S3 对象清空；容器栈保留运行
 
 **已知噪音**：容器日志中 `/health` 404 来自外部监控探测（应用路由为 `/api/health`），对功能无影响；宿主机系统代理（127.0.0.1:12334）会劫持本地 API 请求导致间歇 502——验证脚本已显式禁用代理（与平台代码无关）。
