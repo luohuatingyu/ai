@@ -109,28 +109,26 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
 
 ### 2. 追加计算服务器（CPU / GPU 均可）
 
-外接服务器由平台直接通过 SSH 管理。目标服务器不需要检出或接收本项目源码；平台经 SSH stdin 发送一个部署脚本，目标机从镜像仓库拉取已构建的 worker 镜像。开始前准备：
+外接服务器由平台直接通过 SSH 管理。目标服务器不需要检出或接收本项目源码，也不需要访问镜像仓库；平台通过 Docker socket 导出本机 worker 镜像，经 SSH 流式传输到目标机。开始前准备：
 
 1. 无需手工准备 `known_hosts`。平台首次连接目标主机时会自动信任并持久化其主机密钥；之后检测到密钥变化会拒绝连接。首次连接采用自动信任，需确保目标主机地址正确。
 2. 在项目 `.env` 中设置平台默认配置：
    ```dotenv
-   WORKER_IMAGE=registry.example.com/your-project/mtp-worker:tag
+   WORKER_IMAGE=mtp-worker:local
    WORKER_REMOTE_TOKEN=替换为至少32位的随机令牌
    REDIS_URL=redis://目标服务器可访问的Redis主机:6379/0
    S3_ENDPOINT=目标服务器可访问的S3主机:8333
    WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY=使用Fernet生成的稳定密钥
    ```
-   `WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 仅用于页面凭证加密，可用 `python3.12 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'` 生成并长期保管。更换此密钥后，Redis 中已有的页面凭证无法解密，需要重新保存。打开「添加服务器」并输入管理令牌，在「SSH 凭证管理」中添加用户名 + 密码、用户名 + 密钥或用户名 + 密钥 + 密码凭证。第三种方式先尝试密钥认证，失败后再尝试密码。私钥、登录密码和可选私钥口令都由页面提交并加密保存到共享 Redis；登录凭证无需写入 `.env`，页面不会回显已保存的秘密。添加服务器时选择凭证；SSH 用户名留空时使用凭证用户名，填写后则覆盖该服务器的凭证用户名。OpenSSH 会按密钥内容识别其支持的 Ed25519、ECDSA、RSA OpenSSH/PEM 格式。建议将 `.env` 权限限制为 `600`。`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 可单独设置为平台默认值；未设置时分别回退到 `REDIS_URL` 和 `S3_ENDPOINT`。目标机必须能访问同一 Redis 和 S3 存储。添加或编辑服务器时可填写该服务器自己的镜像、Redis URL 和 S3 地址；留空时继承平台默认值。服务器级 Redis URL 使用页面 SSH 凭证加密密钥加密保存，不会在列表中回显。修改后需点击服务器卡片上的“重新部署并应用配置”，目标 worker 才会使用新设置。`WORKER_REMOTE_TOKEN` 用于保护页面的远程管理 API，`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 是服务端加密密钥，两者都不是目标 SSH 登录凭证。
-3. 登录镜像仓库，构建并推送 worker 镜像。GPU 平台使用默认 Compose 文件；纯 CPU 平台使用 CPU 文件：
+   `WORKER_IMAGE` 是平台 Docker 中 worker 镜像的本地标签，默认镜像由 Compose 构建；无需配置仓库地址。添加或编辑服务器时可用本机镜像标签覆盖平台默认值。远程安装或重新部署时，平台通过 Docker socket 导出镜像，再通过 SSH 流式传输到目标机执行 `docker load`；目标机不需要访问镜像仓库或执行 `docker pull`。目标机必须能访问同一 Redis 和 S3 存储。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 仅用于页面凭证加密，可用 `python3.12 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'` 生成并长期保管。更换此密钥后，Redis 中已有的页面凭证无法解密，需要重新保存。打开「添加服务器」并输入管理令牌，在「SSH 凭证管理」中添加用户名 + 密码、用户名 + 密钥或用户名 + 密钥 + 密码凭证。第三种方式先尝试密钥认证，失败后再尝试密码。私钥、登录密码和可选私钥口令都由页面提交并加密保存到共享 Redis；登录凭证无需写入 `.env`，页面不会回显已保存的秘密。添加服务器时选择凭证；SSH 用户名留空时使用凭证用户名，填写后则覆盖该服务器的凭证用户名。OpenSSH 会按密钥内容识别其支持的 Ed25519、ECDSA、RSA OpenSSH/PEM 格式。建议将 `.env` 权限限制为 `600`。`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 可单独设置为平台默认值；未设置时分别回退到 `REDIS_URL` 和 `S3_ENDPOINT`。服务器级 Redis URL 使用页面 SSH 凭证加密密钥加密保存，不会在列表中回显。修改后需点击服务器卡片上的“重新部署并应用配置”，目标 worker 才会使用新设置。`WORKER_REMOTE_TOKEN` 用于保护页面的远程管理 API，`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 是服务端加密密钥，两者都不是目标 SSH 登录凭证。
+3. 构建平台 worker 镜像。GPU 平台使用默认 Compose 文件；纯 CPU 平台使用 CPU 文件：
    ```bash
-   docker login registry.example.com
    docker compose build worker
-   docker compose push worker
 
    # CPU 版
    docker compose -f docker-compose.cpu.yml build worker
-   docker compose -f docker-compose.cpu.yml push worker
    ```
+   远程管理覆盖文件会将 `/var/run/docker.sock` 挂载到 trainer，以便导出平台本地镜像。Docker socket 可控制宿主 Docker，权限接近宿主 root；应限制平台管理 API 的网络访问。镜像会在每次安装或重新部署时通过 SSH 传输，传输耗时取决于镜像大小和网络带宽。
 4. 使用远程管理 Compose 覆盖文件启动平台。GPU / CPU 两种启动方式如下：
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.remote.yml up --build -d
@@ -140,7 +138,7 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
    ```
 5. 打开主页面「添加服务器」，填写 `WORKER_REMOTE_TOKEN`，在同一对话框的「平台 SSH 凭证设置」中配置全平台共用的密钥或密码，再填写目标主机、SSH 用户/端口、服务器标识及 CPU/GPU 类型。平台会执行安装并启动 worker；资源心跳出现后，CPU/GPU 槽默认处于待选择状态，手动点击「加入资源池」才会接收训练任务。服务器卡片还可通过 SSH 启动、停止或重启 worker。
 
-页面配置私钥时，平台仅将加密密文保存到 Redis；执行 SSH 时在平台临时创建权限为 `600` 的密钥文件，操作完成后立即删除。SSH 用户需要有 Docker 权限。目标服务器需要运行 Docker Engine；私有镜像仓库需确保目标机已经具备 `docker login` 凭据。GPU 目标机还需要 NVIDIA 驱动和 NVIDIA Container Toolkit。`stop` 和 `restart` 会给予 worker 最多 45 秒优雅停机时间，运行中的任务会保存断点，再由其它在线计算槽接续。
+页面配置私钥时，平台仅将加密密文保存到 Redis；执行 SSH 时在平台临时创建权限为 `600` 的密钥文件，操作完成后立即删除。SSH 用户需要有 Docker 权限。目标服务器需要运行 Docker Engine。GPU 目标机还需要 NVIDIA 驱动和 NVIDIA Container Toolkit。`stop` 和 `restart` 会给予 worker 最多 45 秒优雅停机时间，运行中的任务会保存断点，再由其它在线计算槽接续。
 
 私钥格式和认证算法由平台容器内的 OpenSSH 自动协商；旧服务器若只支持已禁用的弱算法（例如 RSA/SHA-1 `ssh-rsa` 签名），连接会失败，不会自动降低安全设置。
 

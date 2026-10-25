@@ -36,7 +36,7 @@ write_worker_env() {
   chmod 600 "$ENV_FILE"
 }
 
-# 从仓库拉取镜像后启动单台远程 worker。
+# 使用平台经 SSH 流式加载的镜像启动单台远程 worker。
 install_worker() {
   if [[ "$MODE" != cpu && "$MODE" != gpu ]]; then
     printf '资源类型必须是 cpu 或 gpu。\n' >&2
@@ -46,8 +46,11 @@ install_worker() {
     printf '目标服务器未安装 Docker。\n' >&2
     exit 127
   fi
+  if ! docker image inspect "$MTP_WORKER_IMAGE" >/dev/null 2>&1; then
+    printf '目标服务器尚未收到 worker 镜像，请从平台重新部署。\n' >&2
+    exit 1
+  fi
   write_worker_env
-  docker pull "$MTP_WORKER_IMAGE"
   if docker inspect "$CONTAINER" >/dev/null 2>&1; then
     docker rm --force "$CONTAINER" >/dev/null
   fi

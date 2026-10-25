@@ -1,17 +1,21 @@
 """远程 worker 管理：校验接入参数、经 SSH 执行单个部署脚本并保存操作状态。"""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import quote
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -29,6 +33,121 @@ class RemoteCredentialNotFoundError(RemoteWorkerError):
 
 class RemoteCredentialConflictError(RemoteWorkerError):
     """SSH 凭证名称冲突，或仍被服务器引用而不能删除。"""
+
+
+class _DockerSocketHTTPConnection(http.client.HTTPConnection):
+    """通过 Unix socket 访问平台 Docker Engine API。"""
+
+    def __init__(self, socket_path: str, timeout: float = 60.0):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -> None:
+        """建立到宿主 Docker socket 的 HTTP 连接。"""
+        docker_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        docker_socket.settimeout(self.timeout)
+        try:
+            docker_socket.connect(self.socket_path)
+        except OSError:
+            docker_socket.close()
+            raise
+        self.sock = docker_socket
+
+
+def _local_docker_image_platform(image: str) -> str:
+    """读取平台 Docker 中镜像的操作系统与 CPU 架构。"""
+    socket_path = config.WORKER_DOCKER_SOCKET_PATH
+    if not socket_path or not Path(socket_path).exists():
+        raise RemoteWorkerError(
+            "无法访问平台 Docker socket；请使用远程管理 Compose 配置启动 trainer"
+        )
+    version_connection = _DockerSocketHTTPConnection(socket_path)
+    try:
+        version_connection.request("GET", "/version")
+        version_response = version_connection.getresponse()
+        if version_response.status != 200:
+            raise RemoteWorkerError("无法读取平台 Docker Engine API 版本")
+        version_data = json.loads(version_response.read().decode("utf-8"))
+        api_version = str(version_data.get("ApiVersion", ""))
+    except RemoteWorkerError:
+        raise
+    except (OSError, http.client.HTTPException, ValueError, UnicodeError) as exc:
+        raise RemoteWorkerError("无法连接平台 Docker Engine；请检查 Docker socket 挂载") from exc
+    finally:
+        version_connection.close()
+    if not re.fullmatch(r"\d+\.\d+", api_version):
+        raise RemoteWorkerError("平台 Docker Engine 返回了无效的 API 版本")
+
+    image_connection = _DockerSocketHTTPConnection(socket_path)
+    target = f"/v{api_version}/images/{quote(image, safe='')}/json"
+    try:
+        image_connection.request("GET", target)
+        image_response = image_connection.getresponse()
+        if image_response.status == 404:
+            raise RemoteWorkerError(f"平台 Docker 中不存在镜像标签 {image}")
+        if image_response.status != 200:
+            raise RemoteWorkerError("无法读取平台 worker 镜像的平台信息")
+        image_data = json.loads(image_response.read().decode("utf-8"))
+        operating_system = str(image_data.get("Os", ""))
+        architecture = str(image_data.get("Architecture", ""))
+        if not operating_system or not architecture:
+            raise RemoteWorkerError("平台 worker 镜像缺少操作系统或 CPU 架构信息")
+        return f"{operating_system}/{architecture}"
+    except RemoteWorkerError:
+        raise
+    except (OSError, http.client.HTTPException, ValueError, UnicodeError) as exc:
+        raise RemoteWorkerError("读取平台 worker 镜像平台信息失败") from exc
+    finally:
+        image_connection.close()
+
+
+def _canonical_docker_platform(platform: str) -> str:
+    """规范化 Docker 操作系统和架构名称，兼容常见系统别名。"""
+    parts = platform.strip().lower().split("/")
+    if len(parts) != 2 or not all(re.fullmatch(r"[a-z0-9_.-]+", part) for part in parts):
+        raise RemoteWorkerError("Docker 返回了无效的平台标识")
+    operating_system, architecture = parts
+    architecture_aliases = {
+        "x86_64": "amd64",
+        "x64": "amd64",
+        "aarch64": "arm64",
+        "armv7l": "arm",
+    }
+    architecture = architecture_aliases.get(architecture, architecture)
+    return f"{operating_system}/{architecture}"
+
+
+def _remote_docker_image_platform(
+    ssh_command: List[str],
+    environment: Dict[str, str] | None,
+    credentials: Dict[str, str],
+    server: Dict[str, object],
+    timeout: int,
+) -> str:
+    """通过 SSH 读取目标 Docker 平台，并对错误输出做凭证脱敏。"""
+    command = ssh_command[:-1] + ["docker info --format '{{.OSType}}/{{.Architecture}}'"]
+    try:
+        result = subprocess.run(
+            command,
+            input="",
+            text=True,
+            capture_output=True,
+            timeout=min(timeout, 60),
+            check=False,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RemoteWorkerError("读取目标 Docker 平台信息超时") from exc
+    except OSError as exc:
+        raise RemoteWorkerError("无法启动 SSH 客户端读取目标 Docker 平台") from exc
+
+    output = _redact_output(result.stdout, result.stderr, credentials, server)
+    if result.returncode != 0:
+        detail = (output["stderr"] or output["stdout"] or "目标 Docker 平台检查失败").strip()
+        raise RemoteWorkerError(detail[-1000:])
+    platform = output["stdout"].strip()
+    _canonical_docker_platform(platform)
+    return platform
 
 
 _MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -389,6 +508,140 @@ def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[
     }
 
 
+def _open_local_docker_image_archive(
+    image: str,
+) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+    """通过宿主 Docker Engine API 打开指定本地镜像的 tar 流。"""
+    socket_path = config.WORKER_DOCKER_SOCKET_PATH
+    if not socket_path or not Path(socket_path).exists():
+        raise RemoteWorkerError(
+            "无法访问平台 Docker socket；请使用远程管理 Compose 配置启动 trainer"
+        )
+
+    version_connection = _DockerSocketHTTPConnection(socket_path)
+    try:
+        version_connection.request("GET", "/version")
+        version_response = version_connection.getresponse()
+        if version_response.status != 200:
+            detail = version_response.read(1024).decode("utf-8", "replace").strip()
+            raise RemoteWorkerError(f"无法读取平台 Docker Engine API 版本：{detail[:300]}")
+        version_data = json.loads(version_response.read().decode("utf-8"))
+        api_version = str(version_data.get("ApiVersion", ""))
+    except RemoteWorkerError:
+        raise
+    except (OSError, http.client.HTTPException, ValueError, UnicodeError) as exc:
+        raise RemoteWorkerError("无法连接平台 Docker Engine；请检查 Docker socket 挂载") from exc
+    finally:
+        version_connection.close()
+    if not re.fullmatch(r"\d+\.\d+", api_version):
+        raise RemoteWorkerError("平台 Docker Engine 返回了无效的 API 版本")
+
+    archive_connection = _DockerSocketHTTPConnection(socket_path)
+    target = f"/v{api_version}/images/{quote(image, safe='')}/get"
+    try:
+        archive_connection.request("GET", target)
+        archive_response = archive_connection.getresponse()
+        if archive_response.status != 200:
+            detail = archive_response.read(2048).decode("utf-8", "replace").strip()
+            archive_connection.close()
+            if archive_response.status == 404:
+                raise RemoteWorkerError(f"平台 Docker 中不存在镜像标签 {image}")
+            raise RemoteWorkerError(
+                f"平台 Docker 无法导出镜像标签 {image}：{detail[:500]}"
+            )
+        return archive_connection, archive_response
+    except RemoteWorkerError:
+        raise
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        archive_connection.close()
+        raise RemoteWorkerError("从平台 Docker 导出 worker 镜像失败") from exc
+
+
+def _stream_worker_image_to_remote(
+    image: str,
+    ssh_command: List[str],
+    environment: Dict[str, str] | None,
+    credentials: Dict[str, str],
+    server: Dict[str, object],
+    timeout: int,
+) -> Dict[str, str]:
+    """把 Docker Engine 镜像 tar 流经 SSH stdin 传给目标机 docker load。"""
+    docker_connection, image_response = _open_local_docker_image_archive(image)
+    read_fd = -1
+    write_fd = -1
+    process: subprocess.Popen[bytes] | None = None
+    writer_errors: List[Exception] = []
+    timed_out = False
+    try:
+        read_fd, write_fd = os.pipe()
+        try:
+            process = subprocess.Popen(
+                ssh_command,
+                stdin=read_fd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+        except OSError as exc:
+            raise RemoteWorkerError("无法启动 SSH 镜像传输") from exc
+        os.close(read_fd)
+        read_fd = -1
+
+        def pump_image_archive(pipe_fd: int) -> None:
+            """按块复制 Docker Engine 响应到 SSH 管道，避免缓存整个镜像。"""
+            try:
+                with os.fdopen(pipe_fd, "wb") as destination:
+                    while True:
+                        chunk = image_response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+            except (OSError, http.client.HTTPException, ValueError) as exc:
+                writer_errors.append(exc)
+
+        writer = threading.Thread(
+            target=pump_image_archive, args=(write_fd,), name="remote-image-stream", daemon=True
+        )
+        writer.start()
+        write_fd = -1
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            stdout, stderr = process.communicate()
+        writer.join(timeout=65)
+        if writer.is_alive():
+            image_response.close()
+            docker_connection.close()
+            writer.join(timeout=5)
+
+        output = _redact_output(
+            stdout.decode("utf-8", "replace"),
+            stderr.decode("utf-8", "replace"),
+            credentials,
+            server,
+        )
+        if timed_out:
+            raise RemoteWorkerError("经 SSH 传输 worker 镜像超时")
+        if process.returncode != 0:
+            detail = (output["stderr"] or output["stdout"] or "远端 docker load 失败").strip()
+            raise RemoteWorkerError(detail[-2000:])
+        if writer_errors:
+            raise RemoteWorkerError("读取平台 worker 镜像归档失败")
+        return output
+    finally:
+        if read_fd >= 0:
+            os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        image_response.close()
+        docker_connection.close()
+
+
 def _platform_ssh_credentials() -> Dict[str, str]:
     """兼容旧调用方，读取页面凭证目录的默认凭证。"""
     return _get_ssh_credential()
@@ -496,8 +749,8 @@ def remote_configuration_errors(
         errors.append(str(exc))
         settings = {"worker_image": "", "redis_url": "", "s3_endpoint": ""}
     image = settings["worker_image"]
-    if not image or "/" not in image or any(c.isspace() for c in image):
-        errors.append("WORKER_IMAGE 或服务器镜像覆盖值必须是目标服务器可拉取的镜像仓库引用")
+    if not image or any(c.isspace() for c in image):
+        errors.append("WORKER_IMAGE 或服务器镜像覆盖值必须是平台本地 Docker 镜像标签")
     if not settings["redis_url"].startswith(("redis://", "rediss://")):
         errors.append("平台或服务器必须配置目标服务器可访问的 Redis URL")
     if not settings["s3_endpoint"] or any(
@@ -656,6 +909,7 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
     command.extend([target, "bash -s"])
     timeout = 3600 if action == "install" else 120
     try:
+        environment: Dict[str, str] | None = None
         run_options = {
             "input": render_remote_script(resolved_server, action),
             "text": True,
@@ -686,6 +940,23 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
                 }
             )
             run_options["env"] = environment
+        if action == "install":
+            image_command = command[:-1] + ["docker load"]
+            image = remote_deployment_settings(server)["worker_image"]
+            local_platform = _local_docker_image_platform(image)
+            remote_platform = _remote_docker_image_platform(
+                command, environment, credentials, server, timeout
+            )
+            if _canonical_docker_platform(local_platform) != _canonical_docker_platform(
+                remote_platform
+            ):
+                raise RemoteWorkerError(
+                    f"平台镜像架构 {local_platform} 与目标 Docker 架构 {remote_platform} 不一致；"
+                    "请先在平台 Docker 中准备目标架构的 WORKER_IMAGE"
+                )
+            _stream_worker_image_to_remote(
+                image, image_command, environment, credentials, server, timeout
+            )
         result = subprocess.run(command, **run_options)
     except subprocess.TimeoutExpired as exc:
         raise RemoteWorkerError("远程 SSH 操作超时") from exc

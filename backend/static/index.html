@@ -482,7 +482,7 @@
       <h3 id="addServerTitle">通过 SSH 添加服务器</h3>
       <button id="btnCloseAddServer" class="close-btn" aria-label="关闭">×</button>
     </div>
-    <p>平台会使用页面统一管理的 SSH 凭证连接目标机，远程执行单文件部署脚本并拉取 worker 镜像。不会同步项目源码。目标机需要 SSH 可达、安装 Docker，并能访问镜像仓库、Redis 和 S3。</p>
+    <p>平台会使用页面统一管理的 SSH 凭证连接目标机，将本机 worker 镜像流式传输到目标机并执行单文件部署脚本。不会同步项目源码，也不要求目标机访问镜像仓库。目标机需要 SSH 可达、安装 Docker，并能访问 Redis 和 S3。</p>
     <form id="remoteServerForm" class="server-form">
       <div class="field">
         <label for="remoteMachineId">服务器标识</label>
@@ -520,8 +520,9 @@
         <div class="hint">设为 0 可只运行管理容器，不提供 CPU 槽。</div>
       </div>
       <div class="field wide">
-        <label for="remoteWorkerImage">Worker 镜像（可选覆盖）</label>
-        <input id="remoteWorkerImage" name="worker_image" maxlength="512" placeholder="留空时使用平台 WORKER_IMAGE">
+        <label for="remoteWorkerImage">Worker 镜像（可选本地标签覆盖）</label>
+        <input id="remoteWorkerImage" name="worker_image" maxlength="512" placeholder="留空时使用平台本地默认镜像">
+        <div class="hint">填写平台 Docker 中已存在的镜像标签。安装或重新部署时平台会通过 SSH 发送镜像，目标机无需访问镜像仓库。</div>
       </div>
       <div class="field wide">
         <label for="remoteRedisUrl">远程 Redis URL（可选覆盖）</label>

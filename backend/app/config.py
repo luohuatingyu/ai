@@ -67,6 +67,9 @@ WORKER_REMOTE_TOKEN = os.environ.get("WORKER_REMOTE_TOKEN", "").strip()
 WORKER_REMOTE_IMAGE = os.environ.get(
     "WORKER_REMOTE_IMAGE", os.environ.get("WORKER_IMAGE", "")
 ).strip()
+WORKER_DOCKER_SOCKET_PATH = os.environ.get(
+    "WORKER_DOCKER_SOCKET_PATH", "/var/run/docker.sock"
+).strip()
 WORKER_REMOTE_REDIS_URL = os.environ.get("WORKER_REMOTE_REDIS_URL", "").strip()
 WORKER_REMOTE_S3_ENDPOINT = os.environ.get("WORKER_REMOTE_S3_ENDPOINT", "").strip()
 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY = os.environ.get(

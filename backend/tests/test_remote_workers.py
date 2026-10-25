@@ -355,6 +355,51 @@ def test_local_docker_image_archive_uses_engine_api_version_and_tag_path(tmp_pat
     assert connection.closed
 
 
+def test_local_docker_image_platform_reads_engine_image_metadata(tmp_path, monkeypatch):
+    """通过 Docker Engine 镜像详情读取本地镜像平台，并编码镜像标签路径。"""
+    socket_path = tmp_path / "docker.sock"
+    socket_path.touch()
+    monkeypatch.setattr(config, "WORKER_DOCKER_SOCKET_PATH", str(socket_path))
+    responses = [
+        type("VersionResponse", (), {"status": 200, "read": lambda self: b'{"ApiVersion":"1.45"}', "close": lambda self: None})(),
+        type(
+            "ImageResponse",
+            (),
+            {
+                "status": 200,
+                "read": lambda self: b'{"Os":"linux","Architecture":"arm64"}',
+                "close": lambda self: None,
+            },
+        )(),
+    ]
+    connections = []
+
+    class FakeConnection:
+        """记录镜像平台查询所发出的 Engine API 请求。"""
+
+        def __init__(self, path, timeout=60.0):
+            self.path = path
+            self.requests = []
+            connections.append(self)
+
+        def request(self, method, target):
+            self.requests.append((method, target))
+
+        def getresponse(self):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_workers, "_DockerSocketHTTPConnection", FakeConnection)
+
+    assert remote_workers._local_docker_image_platform("worker/team:tag") == "linux/arm64"
+    assert connections[0].requests == [("GET", "/version")]
+    assert connections[1].requests == [
+        ("GET", "/v1.45/images/worker%2Fteam%3Atag/json")
+    ]
+
+
 def test_worker_image_archive_streams_over_ssh_without_saving_it(tmp_path, monkeypatch):
     """Docker 镜像归档按块经 SSH stdin 传输，不落地临时 tar 文件。"""
     archive = b"docker-image-archive-bytes" * 8192
@@ -473,6 +518,7 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     """安装前经 SSH 传输本机镜像，主机密钥固定且凭证不进入参数或日志。"""
     key, known_hosts = _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/amd64")
     calls = {}
     transfers = []
 
@@ -481,6 +527,9 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
         return {"stdout": "Loaded image: worker:local", "stderr": ""}
 
     def fake_run(command, **kwargs):
+        calls.setdefault("commands", []).append(command)
+        if command[-1].startswith("docker info"):
+            return subprocess.CompletedProcess(command, 0, stdout="linux/x86_64\n", stderr="")
         calls["command"] = command
         calls["input"] = kwargs["input"]
         calls["timeout"] = kwargs["timeout"]
@@ -501,6 +550,7 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     assert known_hosts.parent.is_dir()
     assert command[-2:] == ["worker@compute.example.net", "bash -s"]
     assert calls["timeout"] == 3600
+    assert calls["commands"][0][-1] == "docker info --format '{{.OSType}}/{{.Architecture}}'"
     assert len(transfers) == 1
     assert transfers[0][0] == "registry.example.net/ml/worker:unit"
     assert transfers[0][1][-2:] == ["worker@compute.example.net", "docker load"]
@@ -508,6 +558,64 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     assert "secret-test" not in " ".join(command)
     assert "secret-test" in calls["input"]
     assert config.WORKER_REMOTE_TOKEN not in calls["input"]
+
+
+def test_run_remote_action_rejects_mismatched_image_architecture_before_transfer(tmp_path, monkeypatch):
+    """本机镜像与目标 Docker 架构不一致时，在传输大镜像前明确失败。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/arm64")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="linux/amd64\n", stderr="")
+
+    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        remote_workers,
+        "_stream_worker_image_to_remote",
+        lambda *_args, **_kwargs: pytest.fail("架构不匹配时不应传输镜像"),
+    )
+
+    with pytest.raises(
+        remote_workers.RemoteWorkerError,
+        match="平台镜像架构 linux/arm64 与目标 Docker 架构 linux/amd64 不一致",
+    ):
+        remote_workers.run_remote_action(_server(), "install")
+
+    assert len(calls) == 1
+    assert calls[0][-1].startswith("docker info")
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "message"),
+    [
+        (1, "", "docker access denied for secret-value", "access denied"),
+        (0, "platform unavailable\n", "", "无效的平台标识"),
+    ],
+)
+def test_remote_docker_platform_rejects_errors_and_redacts_credentials(
+    monkeypatch, returncode, stdout, stderr, message
+):
+    """目标 Docker 平台检查拒绝失败或非法响应，错误详情不得泄露 SSH 密码。"""
+    secret = "secret-value"
+    credentials = {"auth_method": "password", "password": secret, "private_key": ""}
+    command = ["ssh", "worker@compute.example.net", "bash -s"]
+    monkeypatch.setattr(
+        remote_workers.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            command, returncode, stdout=stdout, stderr=stderr
+        ),
+    )
+
+    with pytest.raises(remote_workers.RemoteWorkerError, match=message) as exc_info:
+        remote_workers._remote_docker_image_platform(
+            command, None, credentials, _server(), timeout=120
+        )
+
+    assert secret not in str(exc_info.value)
 
 
 def test_run_remote_action_uses_password_from_platform_askpass(tmp_path, monkeypatch):
