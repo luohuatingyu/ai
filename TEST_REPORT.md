@@ -2,10 +2,39 @@
 
 ## Git基准点
 
-- **Commit Hash**: a1d852a（本次测试覆盖代码与测试用例的提交）
-- **提交信息**: Add page-managed SSH credentials
+- **Commit Hash**: 36103a0（本次测试覆盖代码与测试用例的提交）
+- **提交信息**: Fix dataset selection and CSV upload
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：数据集选择与 CSV 上传修复（2026-10-25）
+
+**变更范围**：修正前端把 `/api/datasets` 响应对象误当数组的问题；空列表时清除旧预览并禁用选择；移除示例数据快捷导入；修复 CSV 数值列上传时 NumPy 整数无法 JSON 序列化的问题。
+
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15。完整测试运行在当前工作区，因此也覆盖了其他尚未提交的 LLM 与任务重试改动。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过；trainer、worker、frontend 重建并启动，SeaweedFS healthy。
+- `docker compose run --rm --no-deps -v ./backend:/app -v ./scripts:/scripts:ro -w /app --entrypoint python trainer -m pytest tests/test_api.py::test_upload_csv_with_integer_columns_is_serializable_and_listed -v`：1 通过。
+- `docker compose run --rm --no-deps -v ./backend:/app -v ./scripts:/scripts:ro -w /app --entrypoint python trainer -m pytest tests/test_api.py::test_remote_ssh_settings_redacts_redis_read_failure -v`：1 通过。修正了该既有测试的 monkeypatch 目标，使其指向实际定义状态读取函数的 `app.remote_workers` 模块。
+- `docker compose run --rm --no-deps -v ./backend:/app -v ./scripts:/scripts:ro -w /app --entrypoint python trainer -m pytest tests/ -v`：197 项收集，190 通过、6 跳过、1 失败。
+- 完整测试的失败是工作区未提交的 `tests/test_llm_trainer.py::test_hub_load_is_restricted_to_valid_ids_and_disables_remote_code`：测试期望 `train`，当前代码按 `max_samples=5000` 传入 `train[:5000]`。这项失败与本次数据集选择和 CSV 上传修复无关。
+- 6 项跳过：3 个 Redis 集成、2 个 S3 集成、1 个 Supervisor 集成；需要对应的外部服务或环境配置。
+- Node 内联脚本冒烟：通过；验证空列表提示及禁用状态、`{datasets: [...]}` 正确读取后选择器启用并载入选项、示例按钮加载器已移除。
+- 前端内联 JavaScript `node --check`：通过；`git diff --check`：通过。
+- 保留的弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| API 返回的数据集列表可在页面显示并选择 | 前端 Node 内联脚本冒烟；浏览器页面人工核对 | `{datasets: [...]}` 响应被解析为列表，选择器启用并显示数据集 | 正常、接口格式兼容 |
+| 没有数据集时显示上传提示，清空旧预览并禁用选择；不显示 demo 快捷导入 | 前端 Node 内联脚本冒烟；内联脚本语法检查 | 空集合时选择器禁用、预览清空；`loadSamples` 和 `sampleBox` 不再存在 | 空集合、回归 |
+| 整数 CSV 上传后可序列化，并能在列表和预览中读取 | API：`test_upload_csv_with_integer_columns_is_serializable_and_listed` | 上传含整数特征列的 CSV 返回 200，内存大小为原生整数，列表与预览内容正确 | 正常、异常回归、API 副作用 |
+
+**已知问题**：当前工作区完整测试仍有上述 1 项 LLM split 断言失败；数据集 CSV 回归测试和前端冒烟均通过。未修改其他未提交的 LLM 工作区文件。
+
+**Git基准点**：36103a0（Fix dataset selection and CSV upload）。
 
 ## 本次变更测试结果：KMeans 聚类与单序列时间序列预测（2026-10-25）
 
