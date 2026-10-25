@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import json
+import io
+import tarfile
 import time
+import zipfile
 
 import pytest
 
@@ -222,3 +225,166 @@ def test_structured_layout_dataset_trains(client, store):
     assert r.status_code == 200, "新结构数据集应可发起训练"
     job = r.json()["job_id"]
     assert wait_until(lambda: job_status(get_store(), job) == "completed", 60)
+
+
+# ---------------------------------------------------------------------------
+# 数据集管理导入 / 处理链路
+# ---------------------------------------------------------------------------
+
+def test_import_json_dataset(client, store):
+    """正常场景：JSON 记录数组导入后可预览，并保留列值。"""
+    content = b'[{"feature": 1, "target": "a"}, {"feature": 2, "target": "b"}]'
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("records.json", content, "application/json")},
+    )
+
+    assert response.status_code == 200, response.text
+    dataset_id = response.json()["id"]
+    detail = client.get(f"/api/datasets/{dataset_id}").json()
+    assert detail["columns"] == ["feature", "target"]
+    assert detail["rows"] == 2
+    assert detail["preview"][1]["feature"] == 2
+
+
+@pytest.mark.parametrize("archive_name,archive_kind", [("rows.zip", "zip"), ("rows.tar.gz", "tar.gz")])
+def test_import_archive_dataset(client, store, archive_name, archive_kind):
+    """正常场景：ZIP 与 TAR.GZ 解包后导入 CSV，且返回可访问的数据集。"""
+    csv_bytes = b"feature,target\n1,a\n2,b\n"
+    payload = io.BytesIO()
+    if archive_kind == "zip":
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("nested/records.csv", csv_bytes)
+    else:
+        info = tarfile.TarInfo("nested/records.csv")
+        info.size = len(csv_bytes)
+        with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+            archive.addfile(info, io.BytesIO(csv_bytes))
+
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": (archive_name, payload.getvalue(), "application/octet-stream")},
+    )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["imported_count"] == 1
+    dataset_id = result["datasets"][0]["id"]
+    assert client.get(f"/api/datasets/{dataset_id}").json()["rows"] == 2
+
+
+def test_import_archive_rejects_unsafe_member_path(client, store):
+    """安全场景：压缩包成员不能通过路径穿越写出导入临时目录。"""
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("../outside.csv", "feature,target\n1,a\n")
+
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("unsafe.zip", payload.getvalue(), "application/zip")},
+    )
+
+    assert response.status_code == 400
+    assert "路径" in response.json()["detail"]
+    assert client.get("/api/datasets").json()["total"] == 0
+
+
+def test_process_dataset_supports_legacy_flat_layout(client, store):
+    """兼容场景：旧扁平布局也能处理，结果元数据和预览同步更新。"""
+    import pandas as pd
+
+    dataset_id = "legacy-process-test"
+    frame = pd.DataFrame({"feature": [1, 1, 2], "target": ["a", "a", "b"]})
+    frame.to_csv(config.DATASETS_DIR / f"{dataset_id}.csv", index=False)
+    config.DATASETS_DIR.joinpath(f"{dataset_id}.meta.json").write_text(
+        json.dumps({"id": dataset_id, "name": "legacy.csv", "rows": 3,
+                    "columns": ["feature", "target"], "tags": [], "description": ""}),
+        encoding="utf-8",
+    )
+
+    response = client.post(
+        f"/api/datasets/{dataset_id}/process",
+        json={"operations": [{"type": "remove_duplicates", "params": {}}]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["original_rows"] == 3
+    assert response.json()["processed_rows"] == 2
+    assert client.get(f"/api/datasets/{dataset_id}").json()["rows"] == 2
+
+
+def test_process_dataset_supports_structured_layout(client, store):
+    """正常场景：新结构数据集处理后写入 processed/ 并同步详情。"""
+    import pandas as pd
+
+    from app.dataset_manager import DatasetManager
+
+    manager = DatasetManager(config.DATASETS_DIR)
+    frame = pd.DataFrame({"feature": [1, 1, 2], "target": ["a", "a", "b"]})
+    metadata = {
+        "original_filename": "structured.csv",
+        "rows": len(frame),
+        "columns": list(frame.columns),
+        "column_types": {column: str(dtype) for column, dtype in frame.dtypes.items()},
+        "created_at": time.time(),
+    }
+    dataset = manager.save_dataset(frame, metadata)
+
+    response = client.post(
+        f"/api/datasets/{dataset['id']}/process",
+        json={"operations": [{"type": "remove_duplicates", "params": {}}]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["processed_rows"] == 2
+    assert (config.DATASETS_DIR / "processed" / f"{dataset['id']}.csv").exists()
+    assert client.get(f"/api/datasets/{dataset['id']}").json()["rows"] == 2
+
+
+def test_process_dataset_returns_clear_error_for_unknown_operation(client, store):
+    """异常场景：非法操作返回 400，原始数据不变。"""
+    import pandas as pd
+
+    dataset_id = "invalid-operation-test"
+    frame = pd.DataFrame({"feature": [1, 2], "target": ["a", "b"]})
+    frame.to_csv(config.DATASETS_DIR / f"{dataset_id}.csv", index=False)
+    config.DATASETS_DIR.joinpath(f"{dataset_id}.meta.json").write_text(
+        json.dumps({"id": dataset_id, "name": "invalid.csv", "rows": 2,
+                    "columns": ["feature", "target"], "tags": [], "description": ""}),
+        encoding="utf-8",
+    )
+
+    response = client.post(
+        f"/api/datasets/{dataset_id}/process",
+        json={"operations": [{"type": "missing_operation", "params": {}}]},
+    )
+
+    assert response.status_code == 400
+    assert len(pd.read_csv(config.DATASETS_DIR / f"{dataset_id}.csv")) == 2
+
+
+def test_process_dataset_rolls_back_when_object_store_sync_fails(client, store, monkeypatch):
+    """异常场景：对象存储同步失败时，不暴露未同步的处理结果。"""
+    import pandas as pd
+
+    dataset_id = "sync-failure-process-test"
+    frame = pd.DataFrame({"feature": [1, 1, 2], "target": ["a", "a", "b"]})
+    frame.to_csv(config.DATASETS_DIR / f"{dataset_id}.csv", index=False)
+    config.DATASETS_DIR.joinpath(f"{dataset_id}.meta.json").write_text(
+        json.dumps({"id": dataset_id, "name": "sync-failure.csv", "rows": 3,
+                    "columns": ["feature", "target"], "tags": [], "description": ""}),
+        encoding="utf-8",
+    )
+
+    def fail_sync(_dataset_id):
+        raise OSError("对象存储不可用")
+
+    monkeypatch.setattr("app.routers.datasets._sync_dataset_csv_to_store", fail_sync)
+    response = client.post(
+        f"/api/datasets/{dataset_id}/process",
+        json={"operations": [{"type": "remove_duplicates", "params": {}}]},
+    )
+
+    assert response.status_code == 503
+    assert not (config.DATASETS_DIR / "processed" / f"{dataset_id}.csv").exists()
+    assert client.get(f"/api/datasets/{dataset_id}").json()["rows"] == 3
