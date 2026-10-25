@@ -344,6 +344,10 @@ def test_process_dataset_supports_legacy_flat_layout(client, store):
     assert response.json()["original_rows"] == 3
     assert response.json()["processed_rows"] == 2
     assert client.get(f"/api/datasets/{dataset_id}").json()["rows"] == 2
+    legacy_metadata = json.loads(
+        config.DATASETS_DIR.joinpath(f"{dataset_id}.meta.json").read_text(encoding="utf-8")
+    )
+    assert legacy_metadata["rows"] == 2
 
 
 def test_process_dataset_supports_structured_layout(client, store):
