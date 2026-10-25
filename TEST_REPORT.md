@@ -2,10 +2,42 @@
 
 ## Git基准点
 
-- **Commit Hash**: 9085e9b（远程添加提示层级修复代码与测试）
-- **提交信息**: Show remote server feedback above modal
+- **Commit Hash**: 2524386（远程服务器配置覆盖与 SSH 首次主机指纹信任测试）
+- **提交信息**: Isolate remote worker operation test state
 - **测试日期**: 2026-10-25
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：远程服务器部署配置覆盖与 SSH 首次主机指纹信任（2026-10-25）
+
+**变更范围**：远程服务器可分别覆盖 WORKER_IMAGE、Redis URL 和 S3 地址；未填写时回退到平台 `.env` 配置。Redis 覆盖值加密存储并在 API 中脱敏，添加和编辑服务器时均可配置。SSH known_hosts 改为持久化到 DATA_DIR 并使用 `StrictHostKeyChecking=accept-new`：首次连接自动登记主机指纹，后续连接仍校验指纹变化。部署配置变更后通过“重新部署并应用配置”动作生效。
+
+**测试环境**：Docker 测试镜像 Python 3.12；完整测试使用只读挂载的 `backend/` 和 `scripts/`。当前共享工作区另有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 改动，这些既有改动参与了完整测试，但未包含在本功能提交中。
+
+**测试执行结果**：
+- `docker compose up --build -d`：通过；frontend、trainer、worker 已重建并运行，frontend 与 SeaweedFS healthy。
+- GPU 与 CPU Compose 配置检查：`docker compose -f docker-compose.yml -f docker-compose.remote.yml config -q` 和 `docker compose -f docker-compose.yml -f docker-compose.cpu.yml config -q` 均通过。
+- 定向测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py tests/test_api.py -q -p no:cacheprovider`：81 通过、0 失败。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：202 通过、6 跳过、0 失败、0 错误（52.99 秒）。6 项跳过为 3 项 Redis 集成、2 项 S3 集成、1 项 Supervisor 子进程集成，受外部服务或环境门控。
+- 前端内联脚本 `node -e 'const fs=require("fs"),vm=require("vm"); const html=fs.readFileSync("backend/static/index.html","utf8"); const tail=html.slice(html.lastIndexOf("<script")); const script=tail.slice(tail.indexOf(">")+1,tail.indexOf("</script>")); new vm.Script(script); console.log("inline script syntax: passed")'`：通过。
+- `curl -sS http://127.0.0.1:8000/ | rg -o 'remoteWorkerImage|remoteRedisUrl|remoteS3Endpoint|重新部署并应用配置' | sort -u`：页面返回三个覆盖字段和重新部署入口。
+- `git diff --check`：通过。保留 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+- 测试准备中的首次尝试：Compose trainer 镜像未包含测试目录，直接运行 pytest 未发现测试；只挂载 backend 的完整测试有 13 项因未挂载 `scripts/worker-node.sh` 失败。随后将 `scripts/` 也挂载后重跑完整套件通过。定向用例倒序首次运行暴露一个用例未清理合成服务器状态的问题；增加 pytest finalizer 后倒序定向测试通过。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 服务器覆盖值优先，空覆盖回退平台默认；完整单机配置不要求重复设置 WORKER_REMOTE_* | 远程 worker：`test_remote_deployment_settings_apply_per_server_overrides_and_platform_fallback`、`test_remote_configuration_accepts_complete_server_overrides_without_remote_env_values` | 分别提供/省略镜像、Redis、S3 覆盖；得到服务器值或平台 `.env` 值，完整覆盖时配置检查通过 | 正常、空值边界、兼容 |
+| 添加、编辑和清除服务器覆盖值有效，编辑期间 Redis 密文不回显，未授权编辑被拒绝 | API：`test_remote_server_api_installs_and_manages_with_nonsecret_records`；页面契约：`test_remote_server_form_exposes_host_overrides_and_edit_action` | 创建服务器并覆盖三个值；编辑镜像/S3、保留或清除 Redis；响应不包含密文或 Redis URL，缺少管理令牌返回 401 | 正常、权限、敏感信息安全、回归 |
+| 第一次 SSH 连接自动登记主机密钥，后续仍使用 known_hosts 校验；SSH 参数不泄漏密钥 | SSH 执行：`test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv`、`test_run_remote_action_uses_password_from_platform_askpass` | 验证 `accept-new`、持久 known_hosts 路径、密钥/密码不进入命令行，凭证从输出脱敏 | 正常、权限与安全、兼容 |
+| 配置表单提供覆盖项及重新部署入口，Compose 不再要求人工提供 known_hosts 宿主机路径 | 前端契约、GPU/CPU Compose `config -q`、页面 HTTP 冒烟 | 表单包含镜像、Redis、S3 字段和重新部署动作；两种 Compose 配置均可解析 | 兼容、部署回归 |
+| 既有训练、数据、存储和远程 API 回归通过 | 完整 `backend/tests/` | 202 通过、6 项环境门控跳过，无失败 | 兼容、回归 |
+
+**已知问题与限制**：本轮未连接真实远程 SSH 主机，主机指纹握手及镜像/Redis/S3 在目标服务器上的实际可达性未做端到端验证。首次连接采用 TOFU（首次连接信任），因此需要确保首次连接时目标地址确实指向预期主机；已登记主机后指纹变更会被拒绝。
+
+**重测触发条件**：修改远程服务器配置字段、配置优先级、凭证加密/脱敏、known_hosts 路径或 SSH 校验策略时，运行远程 worker/API 定向测试和完整 `backend/tests/`，并检查 GPU/CPU Compose 配置。
+
+**Git基准点**：`2524386`（Isolate remote worker operation test state）；本报告作为单独提交更新。
 
 ## 本次变更测试结果：远程添加问题提示层级修复（2026-10-25）
 
