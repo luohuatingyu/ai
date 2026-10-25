@@ -116,6 +116,7 @@ def _save_dataset_from_frame(df: pd.DataFrame, name: str) -> dict:
     
     # 通过 DatasetManager 保存（写入 raw/processed/metadata 及数据集目录）
     meta = dataset_manager.save_dataset(df, metadata, description="内置示例数据集")
+    _sync_dataset_csv_to_store(str(meta["id"]))
     
     # 镜像保存到数据库（数据库不可用时仅保存文件，不影响主流程）
     if config.DB_AVAILABLE:
@@ -134,6 +135,22 @@ def _save_dataset_from_frame(df: pd.DataFrame, name: str) -> dict:
     return meta
 
 
+def _sync_dataset_csv_to_store(ds_id: str) -> None:
+    """S3 模式下把数据集 CSV 同步到状态平面（多机 worker 自行拉取）。
+
+    尽力而为：local 模式无需同步（本地即权威）；S3 同步失败不阻塞
+    数据集入库主流程（sync_dataset_to_store 内部吞异常返回 False）。
+    """
+    try:
+        from app.storage import resolve_dataset_csv_local, sync_dataset_to_store
+
+        csv_path = resolve_dataset_csv_local(ds_id)
+        if csv_path.exists():
+            sync_dataset_to_store(ds_id, csv_path)
+    except Exception:
+        pass  # 同步失败不阻塞导入；S3 模式下 worker 拉取时会有明确报错
+
+
 @app.post("/api/datasets")
 async def upload_dataset(
     file: UploadFile = File(...),
@@ -147,6 +164,7 @@ async def upload_dataset(
         
         # 保存数据集
         result = dataset_manager.save_dataset(df, metadata, description, tags)
+        _sync_dataset_csv_to_store(str(result["id"]))
         
         # 保存到数据库（如果可用）
         if config.DB_AVAILABLE:

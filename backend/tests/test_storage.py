@@ -209,6 +209,33 @@ def test_job_log_helpers(store):
 # S3 后端集成（需 MTP_TEST_S3 指向 S3 兼容端点，如 SeaweedFS；默认跳过）
 # ---------------------------------------------------------------------------
 
+def test_s3_dataset_sync_and_worker_resolve(store, monkeypatch, tmp_path):
+    """S3 模式数据集同步链路：入库 CSV → sync_dataset_to_store → worker 拉取（需 MTP_TEST_S3）。"""
+    import os
+
+    endpoint = os.environ.get("MTP_TEST_S3")
+    if not endpoint:
+        pytest.skip("未配置 MTP_TEST_S3（S3 兼容端点），跳过 S3 数据集同步测试")
+    from app.storage import (
+        S3ArtifactStore,
+        resolve_dataset_for_worker,
+        sync_dataset_to_store,
+    )
+
+    s3 = S3ArtifactStore(endpoint=endpoint, access_key="minioadmin",
+                         secret_key="minioadmin", bucket="mtp-pytest-s3", secure=False)
+    monkeypatch.setattr("app.storage.get_store", lambda: s3)
+    ds_id = "ds-sync-test"
+    csv = config.DATASETS_DIR / f"{ds_id}.csv"
+    csv.write_text("a,target\n1,0\n2,1\n", encoding="utf-8")
+    try:
+        assert sync_dataset_to_store(ds_id, csv) is True
+        pulled = resolve_dataset_for_worker(ds_id, tmp_path)
+        assert pulled.read_text(encoding="utf-8") == "a,target\n1,0\n2,1\n"
+    finally:
+        s3.delete(f"datasets/{ds_id}.csv")
+
+
 def test_s3_backend_roundtrip():
     """S3 兼容对象存储：写/读/存在性/列表/删除往返（SeaweedFS / OSS / COS 通用）。"""
     import os
