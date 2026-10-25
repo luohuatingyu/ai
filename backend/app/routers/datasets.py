@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 
 import pandas as pd
@@ -25,6 +26,62 @@ from app.state import data_processor, dataset_importer, dataset_manager
 from app.utils import safe_filename
 
 router = APIRouter(prefix="/api", tags=["datasets"])
+
+
+def _imported_items(result: dict) -> list[dict]:
+    """统一取得单文件与压缩包导入结果中的数据集条目。"""
+    if isinstance(result.get("datasets"), list):
+        return [item for item in result["datasets"] if isinstance(item, dict) and item.get("id")]
+    if result.get("id"):
+        return [result]
+    return []
+
+
+def _rollback_imported_items(items: list[dict]) -> None:
+    """对象存储同步失败时回滚本地数据、导入历史和已写入的远端对象。"""
+    from app.storage import get_store
+
+    try:
+        store = get_store()
+    except Exception:
+        store = None
+
+    for item in items:
+        dataset_id = str(item.get("id", ""))
+        if not dataset_id:
+            continue
+        dataset_manager.delete_dataset(dataset_id)
+        history_path = config.DATASETS_DIR / "import_records" / f"import_{dataset_id}.json"
+        try:
+            history_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if store is not None:
+            try:
+                store.delete(f"datasets/{dataset_id}.csv")
+            except Exception:
+                pass
+
+
+def _sync_imported_items(items: list[dict]) -> None:
+    """同步本次导入的数据集，并更新可选数据库镜像。"""
+    for item in items:
+        _sync_dataset_csv_to_store(str(item["id"]))
+
+    if not config.DB_AVAILABLE:
+        return
+    for item in items:
+        try:
+            with db_session() as db:
+                save_dataset_to_db(
+                    db=db,
+                    ds_id=str(item["id"]),
+                    name=str(item.get("name", item["id"])),
+                    rows=int(item.get("rows", 0)),
+                    columns=[str(column) for column in item.get("columns", [])],
+                )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -291,24 +348,69 @@ def get_data_profile(ds_id: str) -> dict:
 def process_dataset(ds_id: str, request: ProcessRequest) -> dict:
     """处理数据集"""
     try:
+        _check_id(ds_id, "数据集")
         dataset = _get_dataset_or_404(ds_id)
 
-        # 读取原始数据
-        df = pd.read_csv(config.DATASETS_DIR / "raw" / f"{ds_id}.csv")
+        # 新结构优先读取 raw；旧扁平数据和目录副本通过管理器解析。
+        raw_path = config.DATASETS_DIR / "raw" / f"{ds_id}.csv"
+        source_path = raw_path if raw_path.exists() else dataset_manager._resolve_csv(ds_id)
+        if source_path is None:
+            raise HTTPException(404, f"数据集文件不存在: {ds_id}.csv")
+        df = pd.read_csv(source_path)
 
         # 处理数据
         processed_df = data_processor.process_dataset(df, request.operations)
 
-        # 保存处理后的数据
+        # 写入处理版本前留存本地快照，远端同步失败时可以恢复原状态。
         processed_path = config.DATASETS_DIR / "processed" / f"{ds_id}.csv"
-        processed_df.to_csv(processed_path, index=False)
+        metadata_path = config.DATASETS_DIR / "metadata" / f"{ds_id}.json"
+        legacy_metadata_path = config.DATASETS_DIR / f"{ds_id}.meta.json"
+        prior_processed = processed_path.read_bytes() if processed_path.exists() else None
+        metadata_paths = [metadata_path]
+        if legacy_metadata_path.exists():
+            metadata_paths.append(legacy_metadata_path)
+        prior_metadata = {
+            path: path.read_bytes() if path.exists() else None
+            for path in metadata_paths
+        }
 
-        # 更新元数据
-        dataset["rows"] = len(processed_df)
-        dataset["columns"] = list(processed_df.columns)
-        dataset["column_types"] = {col: str(dtype) for col, dtype in processed_df.dtypes.items()}
-        dataset["processed_at"] = time.time()
-        _write_metadata(ds_id, dataset)
+        config.DATASETS_DIR.joinpath("processed").mkdir(parents=True, exist_ok=True)
+        try:
+            processed_df.to_csv(processed_path, index=False)
+
+            # 更新元数据并通过统一辅助函数同步新旧布局。
+            dataset["rows"] = len(processed_df)
+            dataset["columns"] = [str(column) for column in processed_df.columns]
+            dataset["column_types"] = {
+                str(column): str(dtype) for column, dtype in processed_df.dtypes.items()
+            }
+            dataset["processed_at"] = time.time()
+            _write_metadata(ds_id, dataset)
+        except Exception as exc:
+            _restore_processing_snapshot(processed_path, prior_processed, prior_metadata)
+            raise HTTPException(500, f"保存处理结果失败: {exc}") from exc
+
+        try:
+            _sync_dataset_csv_to_store(ds_id)
+        except Exception as exc:
+            _restore_processing_snapshot(processed_path, prior_processed, prior_metadata)
+            # 恢复远端旧版本；服务持续不可用时保留本地权威副本并返回明确错误。
+            try:
+                _sync_dataset_csv_to_store(ds_id)
+            except Exception:
+                pass
+            raise HTTPException(503, "对象存储暂不可用，处理结果已回滚") from exc
+
+        if config.DB_AVAILABLE:
+            try:
+                with db_session() as db:
+                    row = get_dataset_from_db(db, ds_id)
+                    if row is not None:
+                        row.rows = len(processed_df)
+                        row.columns = [str(column) for column in processed_df.columns]
+                        db.commit()
+            except Exception:
+                pass
 
         return {
             "original_rows": len(df),
@@ -320,6 +422,24 @@ def process_dataset(ds_id: str, request: ProcessRequest) -> dict:
         raise
     except Exception as e:
         raise HTTPException(500, f"处理数据集失败: {e}")
+
+
+def _restore_processing_snapshot(processed_path, prior_processed, prior_metadata) -> None:
+    """在保存或同步失败时恢复处理 CSV 与两种元数据副本。"""
+    try:
+        if prior_processed is None:
+            processed_path.unlink(missing_ok=True)
+        else:
+            processed_path.parent.mkdir(parents=True, exist_ok=True)
+            processed_path.write_bytes(prior_processed)
+        for path, content in prior_metadata.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+    except OSError:
+        pass
 
 
 @router.get("/processing/operations")
@@ -425,7 +545,14 @@ async def import_dataset(
 ) -> dict:
     """导入数据集（支持多种格式）"""
     try:
-        return dataset_importer.import_dataset(file, description, tags, auto_validate)
+        result = dataset_importer.import_dataset(file, description, tags, auto_validate)
+        items = _imported_items(result)
+        try:
+            _sync_imported_items(items)
+        except Exception as exc:
+            _rollback_imported_items(items)
+            raise HTTPException(503, "对象存储暂不可用，数据集导入已回滚") from exc
+        return result
     except HTTPException:
         raise
     except Exception as e:
