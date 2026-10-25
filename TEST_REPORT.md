@@ -11,7 +11,7 @@
 
 **变更范围**：增加无目标列的 CPU KMeans 聚类任务，以及按时间列排序、使用数值目标和历史窗口的单序列时间序列预测任务；补齐任务参数校验、训练指标/模型产物、checkpoint 恢复、预测 API 和训练页面配置。
 
-**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；本机无可用 NVIDIA GPU。新任务 API 端到端用例使用旧扁平数据集布局，现有新结构数据集训练回归用例和数据格式回归用例也包含在完整套件中。
+**测试环境**：Docker Compose；pytest 容器 Python 3.12.15；本机无可用 NVIDIA GPU。新任务 API 端到端用例使用旧扁平数据集布局，现有新结构数据集训练回归用例和数据格式回归用例也包含在完整套件中。测试镜像基于当时工作区构建，因此工作区原有未提交的 `backend/app/storage.py`、`backend/tests/test_storage.py` 和 `backend/static/index.html` 改动也参与了验证，但未包含在本次功能提交。
 
 **测试执行结果**：
 - `docker compose up --build -d`：通过；镜像构建完成，服务启动，SeaweedFS healthy。
