@@ -351,9 +351,15 @@ def process_dataset(ds_id: str, request: ProcessRequest) -> dict:
         _check_id(ds_id, "数据集")
         dataset = _get_dataset_or_404(ds_id)
 
-        # 新结构优先读取 raw；旧扁平数据和目录副本通过管理器解析。
-        raw_path = config.DATASETS_DIR / "raw" / f"{ds_id}.csv"
-        source_path = raw_path if raw_path.exists() else dataset_manager._resolve_csv(ds_id)
+        # 优先读取原始数据；旧扁平布局必须排在 processed 文件之前，避免重复处理累积覆盖。
+        source_candidates = [
+            config.DATASETS_DIR / "raw" / f"{ds_id}.csv",
+            config.DATASETS_DIR / ds_id / f"{ds_id}.csv",
+            config.DATASETS_DIR / f"{ds_id}.csv",
+        ]
+        source_path = next((path for path in source_candidates if path.exists()), None)
+        if source_path is None:
+            source_path = dataset_manager._resolve_csv(ds_id)
         if source_path is None:
             raise HTTPException(404, f"数据集文件不存在: {ds_id}.csv")
         df = pd.read_csv(source_path)
