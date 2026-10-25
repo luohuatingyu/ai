@@ -21,6 +21,7 @@
 - 跳过项：3 个 Redis 协调集成、1 个 Redis Supervisor 集成、2 个 S3 集成；分别需要 `MTP_TEST_REDIS` / `MTP_TEST_S3` 配置。
 - 两条非失败警告：SQLAlchemy `declarative_base()` 弃用提示；Pandas 对 xlrd 引擎的未来弃用提示。
 - GPU/CPU 两种远程 Compose 配置解析通过；密码环境检查确认 SSH 密码只进入 trainer 环境，不进入 worker 环境。
+- 密码模式远程 Compose 一次性容器验证通过：平台密码在 trainer 环境可见、私钥占位不作为密钥文件、只读 `known_hosts` 正常挂载；使用合成密码，没有发起真实 SSH 连接。
 - `git diff --check` 通过；OpenSSH `ssh-keygen` 解析测试覆盖 Ed25519、ECDSA、RSA OpenSSH 与 RSA PEM 私钥。
 - 首轮本机定向测试的 mock 曾递归调用被替换的 `subprocess.run`；修正后在 Python 3.12 容器定向测试 26 项通过。首轮完整测试未把 `scripts/` 挂载到 `/scripts`，导致 13 项节点脚本用例找不到脚本；改正挂载路径后完整套件通过。这两项均为测试调用问题，不是产品失败。
 
@@ -43,6 +44,12 @@ WORKER_SSH_KNOWN_HOSTS_HOST_PATH=/etc/hosts WORKER_SSH_KEY_HOST_PATH=/dev/null \
   docker compose -f docker-compose.yml -f docker-compose.remote.yml config --services
 WORKER_SSH_KNOWN_HOSTS_HOST_PATH=/etc/hosts WORKER_SSH_KEY_HOST_PATH=/dev/null \
   docker compose -f docker-compose.cpu.yml -f docker-compose.remote.yml config --services
+
+# 项目根目录：密码模式容器冒烟（合成密码，不连接目标机）
+WORKER_SSH_AUTH_METHOD=password WORKER_SSH_PASSWORD=synthetic-check-secret \
+  WORKER_SSH_KNOWN_HOSTS_HOST_PATH=/etc/hosts \
+  docker compose -f docker-compose.yml -f docker-compose.remote.yml \
+  run --rm --no-deps trainer python -c 'import os; print("auth=" + os.environ.get("WORKER_SSH_AUTH_METHOD", "") + " password_present=" + str(bool(os.environ.get("WORKER_SSH_PASSWORD"))) + " key_file=" + str(os.path.isfile("/run/remote-worker/ssh_key")) + " known_hosts=" + str(os.path.isfile("/run/remote-worker/known_hosts")))'
 ```
 
 **验收标准—测试用例映射**：
