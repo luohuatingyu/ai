@@ -18,3 +18,8 @@ minio>=7.2          # S3 兼容对象存储客户端（SeaweedFS / 阿里云 OSS
 
 # 测试（正式套件 backend/tests/）
 pytest>=8.0
+httpx2>=2.0
+
+# Excel 数据集导入（.xlsx / .xls）
+openpyxl>=3.1
+xlrd>=2.0
