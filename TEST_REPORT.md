@@ -2,10 +2,43 @@
 
 ## Git基准点
 
-- **Commit Hash**: 0a60685（修复 SSH 凭证保存按钮禁用问题）
-- **提交信息**: Keep SSH credential save button interactive
+- **Commit Hash**: d261d53（增加远程 worker 操作中断）
+- **提交信息**: Add cancellation for remote worker operations
 - **测试日期**: 2026-10-26
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：支持中断远程 SSH 操作（2026-10-26）
+
+**变更范围**：远程 worker 卡片为排队中或执行中的 SSH 操作提供“中断操作”入口。受保护的取消 API 将请求写入协调存储；执行线程轮询请求并终止本机 SSH 子进程，随后记录 `cancelled` 状态并重新开放服务器控制。排队任务可在 SSH 启动前取消。页面说明取消不会回滚 Linux 上已经完成的部分变更。现有 SSH 保护超时保持不变。
+
+**测试环境**：Docker Compose；测试容器 Python 3.12.15。测试时工作区还包含未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 改动；它们参与完整测试，但未纳入本次功能提交。
+
+**测试执行结果**：
+- 定向协调存储、远程 worker 和 API 测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_coordination.py tests/test_remote_workers.py tests/test_api.py -q -p no:cacheprovider`：119 通过、3 跳过、0 失败（20.09 秒）。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：225 通过、6 跳过、0 失败、0 错误（51.53 秒）。6 项跳过为 Redis、S3 和 Supervisor 子进程集成的环境门控项。
+- 首次定向运行有 1 项前端契约断言失败：断言引用了旧变量名 `cancel_requested`，页面实现使用 `cancelRequested`。修正断言后，定向测试和完整测试均通过。
+- `docker compose up --build -d`：通过；trainer、worker、frontend 均启动，SeaweedFS healthy。运行中的 trainer OpenAPI 包含 `/api/remote-operations/{operation_id}/cancel`。
+- 前端 HTTP 冒烟：通过运行中的 frontend 获取页面，确认响应包含“中断操作”和“正在中断远程操作…”；内联 JavaScript `sed -n '599,2033p' backend/static/index.html | node --check`：通过。
+- `git diff --check`：通过。保留 SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 两条既有弃用警告。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 授权管理员可取消排队操作；未授权请求不能改变状态 | API：`test_remote_operation_cancel_requires_admin_and_cancels_queued_operation`；执行器：`test_execute_remote_operation_honors_cancel_before_ssh` | 先无令牌请求，再提交排队操作取消；未授权返回 401 且状态不变，授权后为 `cancelled`，SSH 不启动 | 权限、安全、正常、状态边界 |
+| 执行中可以中断 SSH；执行器确认前仍保持忙碌状态 | 子进程：`test_remote_subprocess_stops_when_operation_is_cancelled`；API：`test_remote_operation_cancel_marks_active_operation_as_cancelling` | 对运行中的子进程设置取消信号；子进程退出，API 返回中断请求中，最终操作进入 `cancelled` | 正常、资源清理、并发状态 |
+| 后端执行线程已消失时，可以清除遗留的 running 状态 | API：`test_remote_operation_cancel_clears_stale_running_state` | 管理员取消无活动执行线程的 running 记录；操作变为 `cancelled`，服务器控制重新开放 | 异常、恢复、回归 |
+| Embedded 与 Redis 协调存储都能传递并清除取消信号 | 协调：`test_remote_operation_cancel_request_isolated_and_clearable`、`test_redis_remote_operation_cancel_signal_is_shared_and_clearable` | 写入后仅对应操作可观察信号；清除后信号消失 | 多实例协调、隔离、兼容 |
+| 页面提供取消入口、取消状态和部分变更提示 | API 静态契约：`test_remote_server_cards_expose_interrupt_action_for_active_operations`；运行中 frontend HTTP 与 Node 语法检查 | 卡片显示中断按钮，取消期间显示处理中，确认提示说明远端部分变更不自动回滚 | UI 回归、错误反馈、安全提示 |
+| 正常成功、失败和既有远程管理逻辑继续工作 | `tests/test_remote_workers.py`、`tests/test_api.py` 与完整 `backend/tests/` | 远程 SSH、服务器管理、训练、数据和存储测试无新增失败 | 兼容、回归 |
+
+**已知问题与限制**：中断会终止平台侧 SSH 客户端并关闭 SSH 会话，不能撤销 Linux 上已经完成的镜像加载或容器操作。目标机完全卡死或网络故障时，平台无法保证远端进程立即收到断连；页面会提示可能存在部分变更。未连接真实 Linux 服务器执行端到端取消测试。
+
+**下次测试建议**：在 staging Linux 服务器分别于镜像传输、worker 启动阶段点击中断，检查远端 Docker 状态并确认页面状态、服务器控制恢复情况。
+
+**重测触发条件**：修改远程操作协调信号、SSH 子进程生命周期、取消 API 鉴权或页面取消按钮时，运行协调/远程 worker/API 定向测试、完整 `backend/tests/` 并重建 Compose 服务。
+
+**Git基准点**：`d261d53`（Add cancellation for remote worker operations）；本报告作为单独提交更新。
 
 ## 本次变更测试结果：修复 SSH 凭证保存按钮不可点击（2026-10-26）
 
