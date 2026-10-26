@@ -551,7 +551,7 @@
       <summary>SSH 凭证管理</summary>
       <div id="remoteSshSettingsStatus" class="hint" aria-live="polite">正在读取凭证状态…</div>
       <div id="remoteSshCredentialList" class="ssh-credential-list" aria-live="polite"></div>
-      <form id="remoteSshCredentialForm" class="ssh-credential-grid" style="margin-top:10px;">
+      <form id="remoteSshCredentialForm" class="ssh-credential-grid" style="margin-top:10px;" novalidate>
         <input id="remoteSshCredentialId" type="hidden">
         <div class="field">
           <label for="remoteSshCredentialName">凭证名称</label>
@@ -584,7 +584,7 @@
         </div>
         <label class="field wide"><span><input id="remoteSshMakeDefault" type="checkbox"> 设为默认凭证</span></label>
         <div class="ssh-credential-actions field wide">
-          <button type="submit" id="btnSaveRemoteSshSettings" class="primary" disabled>加密保存凭证</button>
+          <button type="submit" id="btnSaveRemoteSshSettings" class="primary">加密保存凭证</button>
           <button type="button" id="btnCancelEditRemoteSshCredential" hidden>取消编辑</button>
         </div>
       </form>
@@ -1656,7 +1656,6 @@ async function loadRemoteSshSettings() {
   const status = $("remoteSshSettingsStatus");
   if (!getRemoteAdminToken()) {
     status.textContent = "先填写远程管理令牌，再查看或管理 SSH 凭证。";
-    $("btnSaveRemoteSshSettings").disabled = true;
     state.remoteCredentials = [];
     state.remoteCredentialDefaultId = null;
     state.remoteCredentialsCanConfigure = false;
@@ -1672,12 +1671,10 @@ async function loadRemoteSshSettings() {
     state.remoteCredentialsCanConfigure = Boolean(catalog.can_configure);
     renderRemoteCredentialOptions();
     renderRemoteCredentialList();
-    status.textContent = `${state.remoteCredentials.length} 条凭证已加密保存在共享 Redis；页面不会显示已保存的秘密。`;
-    $("btnSaveRemoteSshSettings").disabled = !catalog.can_configure;
-    if (!catalog.can_configure) status.textContent += " 页面保存需要共享 Redis 和 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY。";
+    status.textContent = `${state.remoteCredentials.length} 条凭证已加密保存在 MySQL；页面不会显示已保存的秘密。`;
+    if (!catalog.can_configure) status.textContent += " 保存需要启用 MySQL，并配置 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY。";
   } catch (error) {
     status.textContent = error.message;
-    $("btnSaveRemoteSshSettings").disabled = true;
     state.remoteCredentials = [];
     state.remoteCredentialDefaultId = null;
     state.remoteCredentialsCanConfigure = false;
@@ -1703,7 +1700,10 @@ async function saveRemoteSshSettings() {
   catch { toast("当前浏览器无法保存标签页令牌，请检查隐私模式设置", "err"); return; }
   const form = $("remoteSshCredentialForm");
   updateRemoteSshCredentialFields(false);
-  if (!form.reportValidity()) return;
+  if (!form.reportValidity()) {
+    toast("请填写凭证名称、用户名和当前认证方式要求的凭证内容", "err");
+    return;
+  }
   const authMethod = $("remoteSshAuthMethod").value;
   const payload = {
     name: $("remoteSshCredentialName").value.trim(),

@@ -1238,6 +1238,32 @@ def test_remote_server_feedback_toasts_render_above_add_modal():
     assert toast_z_index > modal_z_index
 
 
+def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads():
+    """保存按钮不应因目录或令牌状态锁死；缺少配置时由点击处理器解释原因。"""
+    backend_dir = Path(__file__).resolve().parents[1]
+    static_dir = backend_dir / "static"
+    if not static_dir.is_dir():
+        static_dir = backend_dir.parent / "static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    button = html.split('id="btnSaveRemoteSshSettings"', 1)[1].split(">", 1)[0]
+    credential_form = html.split('id="remoteSshCredentialForm"', 1)[1].split(">", 1)[0]
+    catalog_loader = html.split("async function loadRemoteSshSettings()", 1)[1].split(
+        "// 清空凭证编辑表单", 1
+    )[0]
+    save_handler = html.split("async function saveRemoteSshSettings()", 1)[1].split(
+        "// 把凭证元数据载入编辑表单", 1
+    )[0]
+
+    assert "disabled" not in button
+    assert "novalidate" in credential_form
+    assert '先填写远程管理令牌，再查看或管理 SSH 凭证。' in catalog_loader
+    assert "共享 Redis" not in catalog_loader
+    assert "MySQL" in catalog_loader
+    assert "if (!token)" in save_handler
+    assert "button.disabled = true" in save_handler
+    assert "button.disabled = false" in save_handler
+
+
 def test_remote_server_form_exposes_host_overrides_and_edit_action():
     """远程服务器页面提供镜像、Redis、S3 单机覆盖入口和现有服务器编辑动作。"""
     backend_dir = Path(__file__).resolve().parents[1]
