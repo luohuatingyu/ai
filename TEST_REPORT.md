@@ -2,10 +2,44 @@
 
 ## Git基准点
 
-- **Commit Hash**: 8493fac（SSH 流式传输本机 worker 镜像）
-- **提交信息**: Stream worker images over SSH
+- **Commit Hash**: 9b3ba84（远程服务器与 SSH 凭证 MySQL 持久化）
+- **提交信息**: Persist remote management config in MySQL
 - **测试日期**: 2026-10-26
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：远程服务器和 SSH 凭证持久化到 MySQL（2026-10-26）
+
+**变更范围**：新增远程服务器配置、SSH 凭证密文和 Redis 迁移标记三张 MySQL 表。服务器新增、编辑、列表、部署状态更新均使用 MySQL；SSH 凭证目录以 Fernet 密文保存在 MySQL，页面仍只收到凭证元数据。远程操作轮询状态继续放在 Redis。启动及首次读取时将旧 Redis 配置幂等迁入 MySQL，不覆盖已有 MySQL 值；迁移标记可避免已删除凭证在重启后复活。远程 Compose 默认启用 MySQL，数据库不可用时接口明确返回错误，不回退写入 Redis 或进程内存。
+
+**测试环境**：pytest 使用 Docker Python 3.12.15；仓储行为测试使用隔离 SQLite；另用已连接的真实 MySQL 检查新增表、`LONGTEXT` 密文列、服务器配置增删改查和迁移标记。全量测试同时包含工作区原有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 改动；这两个文件未纳入本次功能提交。
+
+**测试执行结果**：
+- 定向远程仓储、worker 与 API 测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_config_repository.py tests/test_remote_workers.py tests/test_api.py -q -p no:cacheprovider`：94 通过、0 失败（17.31 秒）。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：215 通过、6 跳过、0 失败、0 错误（47.03 秒）。跳过项为 3 项 Redis 集成、2 项 S3 集成和 1 项 Supervisor 子进程集成，受外部服务或环境门控。
+- 关键模块：MySQL 仓储持久化与迁移测试、远程 worker 凭证和操作测试、远程管理 API 安全/脱敏测试合计 94/94 通过；完整套件 215/215 非跳过用例通过。
+- `docker compose up --build -d` 与 `docker compose -f docker-compose.yml -f docker-compose.remote.yml up --build -d`：均通过；trainer、worker 与 frontend 启动。trainer Python 版本为 3.12.15。
+- GPU/CPU 远程覆盖 Compose 配置检查：`docker compose -f docker-compose.yml -f docker-compose.remote.yml config -q` 与 `docker compose -f docker-compose.cpu.yml -f docker-compose.remote.yml config -q` 均通过。
+- 真实 MySQL 冒烟：连接成功；`remote_servers`、`remote_ssh_credentials`、`remote_config_migrations` 表存在；凭证密文列类型为 `LONGTEXT`；服务器配置新增、读取、删除通过；Redis 迁移标记存在。MySQL 中已有 SSH 凭证记录，因此冒烟脚本保留该记录并跳过凭证单例写入；凭证密文 CRUD 与加密断言由隔离 SQLite 测试覆盖。
+- `git diff --check`：通过。保留 SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 两条既有弃用警告。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 服务器配置和加密凭证跨数据库会话持久化；MySQL 模型表及密文大字段可用 | 仓储：`test_remote_server_and_credential_ciphertext_persist_in_database`；真实 MySQL 服务器配置 CRUD 冒烟、表结构检查 | 保存服务器 JSON 与 Fernet 密文，再开新会话读取相同内容；真实 MySQL 服务器记录可新增、读取、删除，凭证密文列为 LONGTEXT | 正常、持久化、MySQL 方言 |
+| 旧 Redis 配置仅迁移一次、不覆盖 MySQL，删除后不复活 | 仓储：`test_legacy_redis_remote_config_migrates_once_without_overwriting_mysql`、`test_legacy_migration_marker_is_written_after_success` | Redis 与 MySQL 对同一服务器值不同时保留 MySQL 值；凭证迁移后删除并重跑迁移仍为空 | 兼容、幂等、删除边界 |
+| 三种页面 SSH 凭证可加密管理，API 不回传秘密且受管理令牌保护 | API：`test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_echo`、`test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets`、`test_remote_ssh_settings_save_private_key_without_echo` | 密码、密钥、密钥加密码保存为 Fernet 密文；未授权请求拒绝；响应只含状态和元数据 | 正常、权限、安全、敏感信息保护 |
+| 禁用 MySQL 或数据库读取失败时给出明确错误，不回退存储 | 仓储/API：`test_remote_mysql_repository_rejects_disabled_database`、`test_remote_ssh_settings_require_mysql_and_encryption_key`、`test_remote_ssh_settings_redacts_mysql_read_failure` | `USE_DATABASE=false` 或 MySQL 读取异常时请求失败并脱敏，不写 Redis；缺少 Fernet key 时拒绝凭证保存 | 异常、安全、配置边界 |
+| 远程服务器生命周期配置持久化，操作轮询状态仍兼容 Redis | API/worker：`test_remote_server_api_installs_and_manages_with_nonsecret_records`、`test_execute_remote_operation_persists_success_and_failure` | 添加/编辑服务器与完成/失败状态落在 MySQL；操作状态可通过协调存储查询；Redis URL 不明文返回 | 正常、失败、兼容、回归 |
+| 既有训练、数据、存储和 API 功能继续工作 | 完整 `backend/tests/` | 215 通过、6 环境门控跳过、0 失败 | 回归、兼容 |
+
+**已知问题与限制**：未连接真实 SSH 目标验证远程安装。真实 MySQL 冒烟未覆盖凭证单例写入，因为数据库已有记录，避免覆盖平台凭证；该行为由隔离 SQLite 仓储测试和 API 加密测试覆盖。外部 Redis、S3 和 Supervisor 子进程集成仍受测试环境门控。
+
+**下次测试建议**：在 staging 环境使用新建且隔离的 SSH 凭证记录验证 MySQL 凭证写入/读取/删除，再连接真实 SSH 目标跑通远程安装、重新部署和 worker 状态轮询。
+
+**重测触发条件**：修改远程配置模型、MySQL 仓储、Redis 迁移、远程管理 API 或凭证加密时，运行远程仓储/worker/API 定向测试、完整 `backend/tests/`、GPU/CPU Compose 检查，并验证 MySQL schema 和连接。
+
+**Git基准点**：`9b3ba84`（Persist remote management config in MySQL）；本报告作为单独提交更新。
 
 ## 本次变更测试结果：经 SSH 流式传输本机 worker 镜像（2026-10-26）
 
