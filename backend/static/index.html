@@ -1471,23 +1471,25 @@ function workerServerCard(machineId, slots, remoteServer = null) {
     .filter(Boolean).join(" · ") || "未发现计算槽";
   const operation = remoteServer && remoteServer.operation;
   const operationBusy = operation && ["queued", "running"].includes(operation.status);
+  const cancelRequested = Boolean(operation && operation.cancel_requested);
   const remoteStatus = remoteServer ? {
     provisioning: "正在安装并检测资源", starting: "正在启动 worker", stopping: "正在停止 worker",
     restarting: "正在重启 worker", online: "worker 已启动", stopped: "worker 已停止", error: "上次远程操作失败",
   }[remoteServer.status] || "SSH 服务器已登记" : "";
   const operationLabel = operation ? {
-    queued: "操作排队中", running: operation.action === "install" ? "正在远程安装并检测…" : `正在远程${operation.action}…`,
-    completed: "最近操作已完成", failed: "最近操作失败",
-  }[operation.status] : remoteStatus;
+    queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "install" ? "正在远程安装并检测…" : `正在远程${operation.action}…`,
+    completed: "最近操作已完成", failed: "最近操作失败", cancelled: "最近操作已中断",
+  }[operation.status] || remoteStatus : remoteStatus;
   const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
       <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>编辑</button>
       <button data-remote-machine-id="${esc(machineId)}" data-remote-action="install" ${operationBusy ? "disabled" : ""}>重新部署并应用配置</button>
       <button data-remote-machine-id="${esc(machineId)}" data-remote-action="start" ${operationBusy ? "disabled" : ""}>启动</button>
       <button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop" ${operationBusy ? "disabled" : ""}>停止</button>
       <button data-remote-machine-id="${esc(machineId)}" data-remote-action="restart" ${operationBusy ? "disabled" : ""}>重启</button>
+      ${operationBusy ? `<button data-cancel-remote-operation="${esc(operation.operation_id)}" ${cancelRequested ? "disabled" : ""}>${cancelRequested ? "正在中断…" : "中断操作"}</button>` : ""}
     </div>` : "";
   const endpoint = remoteServer ? `${remoteServer.username}@${remoteServer.host}:${remoteServer.port} · ${remoteServer.mode.toUpperCase()}` : "";
-  const operationDetails = operation && operation.status === "failed" && operation.error
+  const operationDetails = operation && ["failed", "cancelled"].includes(operation.status) && operation.error
     ? `${operationLabel}：${operation.error}` : operationLabel;
   return `<article class="server-card">
     <header class="server-head">
@@ -1520,10 +1522,14 @@ async function loadRemoteServers() {
         try {
           operation = await remoteApiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`);
           state.remoteOperations.set(server.operation_id, operation);
-          if (["completed", "failed"].includes(operation.status) && !state.remoteOperationNotified.has(server.operation_id)) {
+          if (["completed", "failed", "cancelled"].includes(operation.status) && !state.remoteOperationNotified.has(server.operation_id)) {
             state.remoteOperationNotified.add(server.operation_id);
-            toast(operation.status === "completed" ? `${server.machine_id}：远程操作完成` : `${server.machine_id}：${operation.error || "远程操作失败"}`,
-              operation.status === "completed" ? "ok" : "err");
+            const message = operation.status === "completed"
+              ? `${server.machine_id}：远程操作完成`
+              : operation.status === "cancelled"
+                ? `${server.machine_id}：远程操作已中断`
+                : `${server.machine_id}：${operation.error || "远程操作失败"}`;
+            toast(message, operation.status === "completed" ? "ok" : operation.status === "cancelled" ? "" : "err");
           }
         } catch (error) {
           operation = { status: "failed", error: error.message };
@@ -1894,6 +1900,28 @@ async function manageRemoteServer(button) {
   }
 }
 
+// 中断当前 SSH 操作；远端已经产生的部分变更不会自动回滚。
+async function cancelRemoteOperation(button) {
+  const operationId = button.dataset.cancelRemoteOperation;
+  if (!getRemoteAdminToken()) { openAddServerModal(); toast("请先填写平台远程管理令牌", "err"); return; }
+  if (!window.confirm("确认中断这项远程操作？Linux 上已经完成的部分变更不会自动回滚。")) return;
+  button.disabled = true;
+  button.textContent = "正在中断…";
+  try {
+    const result = await remoteApiJson(`/api/remote-operations/${encodeURIComponent(operationId)}/cancel`, { method: "POST" });
+    const operation = state.remoteOperations.get(operationId) || { operation_id: operationId };
+    if (result.status === "cancelled") operation.status = "cancelled";
+    operation.cancel_requested = result.status === "cancelling";
+    state.remoteOperations.set(operationId, operation);
+    toast(result.status === "cancelled" ? "远程操作已中断" : "已发送中断请求，正在停止 SSH 操作", "ok");
+    await refreshWorkers();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
+    button.textContent = "中断操作";
+  }
+}
+
 // 修改一个外接槽位是否接收新任务，并立即刷新状态。
 async function toggleWorkerSelection(button) {
   const workerId = button.dataset.workerId;
@@ -1951,6 +1979,11 @@ $("workerGrid").addEventListener("click", (event) => {
   const editRemoteButton = event.target.closest("[data-edit-remote-machine-id]");
   if (editRemoteButton && !editRemoteButton.disabled) {
     openEditRemoteServer(editRemoteButton.dataset.editRemoteMachineId);
+    return;
+  }
+  const cancelRemoteButton = event.target.closest("[data-cancel-remote-operation]");
+  if (cancelRemoteButton && !cancelRemoteButton.disabled) {
+    cancelRemoteOperation(cancelRemoteButton);
     return;
   }
   const button = event.target.closest("[data-worker-id]");

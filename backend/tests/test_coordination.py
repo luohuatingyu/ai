@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 
-from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore
+from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore, RedisLeaseStore
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +106,41 @@ def test_signals_per_job_isolated():
     ls.set_signal("job-b", "pause")
     assert ls.get_signals("job-a") == {"cancel"}
     assert ls.get_signals("job-b") == {"pause"}
+
+
+def test_remote_operation_cancel_request_isolated_and_clearable():
+    """远程操作中断信号按操作隔离，并可在操作结束时清除。"""
+    ls = EmbeddedLeaseStore()
+    ls.request_remote_operation_cancel("operation-a")
+
+    assert ls.is_remote_operation_cancel_requested("operation-a") is True
+    assert ls.is_remote_operation_cancel_requested("operation-b") is False
+    ls.clear_remote_operation_cancel("operation-a")
+    assert ls.is_remote_operation_cancel_requested("operation-a") is False
+
+
+def test_redis_remote_operation_cancel_signal_is_shared_and_clearable():
+    """Redis 协调实现保存共享中断信号，并在操作结束后删除信号。"""
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, key, value, ex=None):
+            self.values[key] = value
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+    redis_client = FakeRedis()
+    lease = RedisLeaseStore(redis_client)
+    lease.request_remote_operation_cancel("operation-a")
+
+    assert lease.is_remote_operation_cancel_requested("operation-a") is True
+    lease.clear_remote_operation_cancel("operation-a")
+    assert lease.is_remote_operation_cancel_requested("operation-a") is False
 
 
 # ---------------------------------------------------------------------------

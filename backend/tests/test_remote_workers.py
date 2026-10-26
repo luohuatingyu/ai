@@ -6,6 +6,8 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -537,8 +539,8 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     calls = {}
     transfers = []
 
-    def fake_transfer(image, command, environment, credentials, server, timeout):
-        transfers.append((image, command, environment, credentials, server, timeout))
+    def fake_transfer(image, command, environment, credentials, server, timeout, operation_id=None):
+        transfers.append((image, command, environment, credentials, server, timeout, operation_id))
         return {"stdout": "Loaded image: worker:local", "stderr": ""}
 
     def fake_run(command, **kwargs):
@@ -546,11 +548,11 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
         if command[-1].startswith("docker info"):
             return subprocess.CompletedProcess(command, 0, stdout="linux/x86_64\n", stderr="")
         calls["command"] = command
-        calls["input"] = kwargs["input"]
+        calls["input"] = kwargs["input_data"]
         calls["timeout"] = kwargs["timeout"]
         return subprocess.CompletedProcess(command, 0, stdout="worker running\n", stderr="")
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     monkeypatch.setattr(remote_workers, "_stream_worker_image_to_remote", fake_transfer)
     result = remote_workers.run_remote_action(_server(), "install")
 
@@ -569,7 +571,7 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     assert len(transfers) == 1
     assert transfers[0][0] == "registry.example.net/ml/worker:unit"
     assert transfers[0][1][-2:] == ["worker@compute.example.net", "docker load"]
-    assert transfers[0][-1] == 3600
+    assert transfers[0][-2] == 3600
     assert "secret-test" not in " ".join(command)
     assert "secret-test" in calls["input"]
     assert config.WORKER_REMOTE_TOKEN not in calls["input"]
@@ -586,7 +588,7 @@ def test_run_remote_action_rejects_mismatched_image_architecture_before_transfer
         calls.append(command)
         return subprocess.CompletedProcess(command, 0, stdout="linux/amd64\n", stderr="")
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     monkeypatch.setattr(
         remote_workers,
         "_stream_worker_image_to_remote",
@@ -618,8 +620,8 @@ def test_remote_docker_platform_rejects_errors_and_redacts_credentials(
     credentials = {"auth_method": "password", "password": secret, "private_key": ""}
     command = ["ssh", "worker@compute.example.net", "bash -s"]
     monkeypatch.setattr(
-        remote_workers.subprocess,
-        "run",
+        remote_workers,
+        "_run_remote_subprocess",
         lambda *_args, **_kwargs: subprocess.CompletedProcess(
             command, returncode, stdout=stdout, stderr=stderr
         ),
@@ -649,16 +651,16 @@ def test_run_remote_action_uses_password_from_platform_askpass(tmp_path, monkeyp
 
     def fake_run(command, **kwargs):
         calls["command"] = command
-        calls["environment"] = kwargs["env"]
-        askpass = Path(kwargs["env"]["SSH_ASKPASS"])
+        calls["environment"] = kwargs["environment"]
+        askpass = Path(kwargs["environment"]["SSH_ASKPASS"])
         calls["askpass_mode"] = stat.S_IMODE(askpass.stat().st_mode)
         prompt = real_subprocess_run(
-            [str(askpass)], env=kwargs["env"], capture_output=True, text=True
+            [str(askpass)], env=kwargs["environment"], capture_output=True, text=True
         )
         calls["prompt"] = prompt.stdout.rstrip("\n")
         return subprocess.CompletedProcess(command, 0, stdout=f"connected {password}", stderr="")
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     result = remote_workers.run_remote_action(_server(), "start")
 
     command = calls["command"]
@@ -687,7 +689,7 @@ def test_run_remote_action_redacts_password_from_ssh_error(tmp_path, monkeypatch
             command, 255, stdout="", stderr=f"SSH rejected credential {password}"
         )
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     with pytest.raises(remote_workers.RemoteWorkerError) as exc_info:
         remote_workers.run_remote_action(_server(), "start")
 
@@ -705,10 +707,10 @@ def test_run_remote_action_uses_key_passphrase_without_exposing_it(tmp_path, mon
 
     def fake_run(command, **kwargs):
         calls["command"] = command
-        calls["environment"] = kwargs["env"]
+        calls["environment"] = kwargs["environment"]
         return subprocess.CompletedProcess(command, 0, stdout="worker running", stderr="")
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     remote_workers.run_remote_action(_server(), "start")
 
     assert "BatchMode=no" in calls["command"]
@@ -734,7 +736,7 @@ def test_run_remote_action_combines_key_and_password_with_separate_prompts(tmp_p
 
     def fake_run(command, **kwargs):
         calls["command"] = command
-        environment = kwargs["env"]
+        environment = kwargs["environment"]
         askpass = environment["SSH_ASKPASS"]
         calls["passphrase_prompt"] = real_subprocess_run(
             [askpass, "Enter passphrase for key '/tmp/key':"],
@@ -746,7 +748,7 @@ def test_run_remote_action_combines_key_and_password_with_separate_prompts(tmp_p
         ).stdout.rstrip("\n")
         return subprocess.CompletedProcess(command, 0, stdout="connected", stderr="")
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     remote_workers.run_remote_action(_server(), "start")
 
     command = calls["command"]
@@ -789,10 +791,10 @@ def test_run_remote_action_uses_page_password_and_redacts_it(tmp_path, monkeypat
 
     def fake_run(command, **kwargs):
         calls["command"] = command
-        calls["environment"] = kwargs["env"]
+        calls["environment"] = kwargs["environment"]
         return subprocess.CompletedProcess(command, 255, stdout="", stderr=f"rejected {secret}")
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     with pytest.raises(remote_workers.RemoteWorkerError) as exc_info:
         remote_workers.run_remote_action(_server(), "start")
 
@@ -835,7 +837,7 @@ def test_run_remote_action_materializes_page_private_key_temporarily(tmp_path, m
         calls["key_mode"] = stat.S_IMODE(temporary_key.stat().st_mode)
         return subprocess.CompletedProcess(command, 0, stdout="worker running", stderr="")
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     remote_workers.run_remote_action(_server(), "start")
 
     assert calls["key_text"] == private_key
@@ -854,7 +856,7 @@ def test_run_remote_action_brackets_ipv6_ssh_destination(tmp_path, monkeypatch):
         calls["command"] = command
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(remote_workers.subprocess, "run", fake_run)
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     remote_workers.run_remote_action(_server(host="2001:db8::12"), "start")
     assert calls["command"][-2] == "worker@[2001:db8::12]"
 
@@ -904,6 +906,78 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     assert result["status"] == "failed"
     assert result["error"] == "SSH 登录失败"
     assert remote_config_repository.get_remote_server(machine_id)["status"] == "error"
+
+
+def test_remote_subprocess_stops_when_operation_is_cancelled():
+    """中断信号会终止正在等待的本机 SSH 子进程并返回已中断状态。"""
+    operation_id = "a" * 32
+    manager.lease.clear_remote_operation_cancel(operation_id)
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    manager.lease.request_remote_operation_cancel(operation_id)
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(remote_workers.RemoteWorkerCancelledError, match="远端可能已有部分变更"):
+            remote_workers._communicate_remote_process(process, operation_id, timeout=30)
+        assert process.poll() is not None
+        assert time.monotonic() - started_at < 5
+    finally:
+        manager.lease.clear_remote_operation_cancel(operation_id)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_execute_remote_operation_honors_cancel_before_ssh(monkeypatch):
+    """排队阶段收到中断时不启动 SSH，并将操作记录收敛为已中断。"""
+    operation_id = "b" * 32
+    server = _server(machine_id="remote-cancel-before-start")
+    manager.lease.set_remote_operation(
+        operation_id,
+        {"operation_id": operation_id, "machine_id": server["machine_id"], "action": "start", "status": "queued"},
+    )
+    manager.lease.request_remote_operation_cancel(operation_id)
+    monkeypatch.setattr(remote_workers.remote_config_repository, "save_remote_server", lambda _server: None)
+    monkeypatch.setattr(
+        remote_workers,
+        "run_remote_action",
+        lambda *_args: pytest.fail("排队操作取消后不应启动 SSH"),
+    )
+
+    remote_workers.execute_remote_operation(operation_id, server, "start")
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert result["status"] == "cancelled"
+    assert "部分变更" in result["error"]
+    assert manager.lease.is_remote_operation_cancel_requested(operation_id) is False
+    assert remote_workers.is_remote_operation_active(operation_id) is False
+
+
+def test_execute_remote_operation_records_running_cancel(monkeypatch):
+    """执行期间收到中断时保存 cancelled 终态并标记服务器状态待检查。"""
+    operation_id = "c" * 32
+    server = _server(machine_id="remote-cancel-running")
+    manager.lease.set_remote_operation(
+        operation_id,
+        {"operation_id": operation_id, "machine_id": server["machine_id"], "action": "restart", "status": "queued"},
+    )
+    monkeypatch.setattr(remote_workers.remote_config_repository, "save_remote_server", lambda _server: None)
+
+    def cancel_during_remote_action(_server, _action, current_operation_id):
+        manager.lease.request_remote_operation_cancel(current_operation_id)
+        raise remote_workers.RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
+
+    monkeypatch.setattr(remote_workers, "run_remote_action", cancel_during_remote_action)
+    remote_workers.execute_remote_operation(operation_id, server, "restart")
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert result["status"] == "cancelled"
+    assert server["status"] == "error"
+    assert manager.lease.is_remote_operation_cancel_requested(operation_id) is False
 
 
 def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):

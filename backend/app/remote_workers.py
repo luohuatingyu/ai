@@ -28,12 +28,137 @@ class RemoteWorkerError(RuntimeError):
     """远程配置或 SSH 操作失败。"""
 
 
+class RemoteWorkerCancelledError(RemoteWorkerError):
+    """远程 SSH 操作已被用户中断。"""
+
+
 class RemoteCredentialNotFoundError(RemoteWorkerError):
     """页面指定的 SSH 凭证不存在。"""
 
 
 class RemoteCredentialConflictError(RemoteWorkerError):
     """SSH 凭证名称冲突，或仍被服务器引用而不能删除。"""
+
+
+_ACTIVE_REMOTE_OPERATIONS: Dict[str, threading.Event] = {}
+_ACTIVE_REMOTE_OPERATIONS_LOCK = threading.Lock()
+
+
+def request_remote_operation_cancel(operation_id: str) -> bool:
+    """登记远程操作的中断请求，并唤醒当前进程中的执行线程。"""
+    manager.lease.request_remote_operation_cancel(operation_id)
+    with _ACTIVE_REMOTE_OPERATIONS_LOCK:
+        cancellation_event = _ACTIVE_REMOTE_OPERATIONS.get(operation_id)
+        if cancellation_event is not None:
+            cancellation_event.set()
+            return True
+    return False
+
+
+def is_remote_operation_active(operation_id: str) -> bool:
+    """检查当前 API 进程是否正在执行指定的远程操作。"""
+    with _ACTIVE_REMOTE_OPERATIONS_LOCK:
+        return operation_id in _ACTIVE_REMOTE_OPERATIONS
+
+
+def _register_remote_operation(operation_id: str) -> threading.Event:
+    """登记远程操作执行上下文，并接收此前已经到达的中断请求。"""
+    cancellation_event = threading.Event()
+    with _ACTIVE_REMOTE_OPERATIONS_LOCK:
+        _ACTIVE_REMOTE_OPERATIONS[operation_id] = cancellation_event
+        if manager.lease.is_remote_operation_cancel_requested(operation_id):
+            cancellation_event.set()
+    return cancellation_event
+
+
+def _unregister_remote_operation(operation_id: str, cancellation_event: threading.Event) -> None:
+    """移除已结束操作的执行上下文，并清除中断信号。"""
+    with _ACTIVE_REMOTE_OPERATIONS_LOCK:
+        if _ACTIVE_REMOTE_OPERATIONS.get(operation_id) is cancellation_event:
+            _ACTIVE_REMOTE_OPERATIONS.pop(operation_id, None)
+    manager.lease.clear_remote_operation_cancel(operation_id)
+
+
+def _remote_operation_cancel_requested(operation_id: str | None) -> bool:
+    """检查进程内事件和共享协调存储中的远程操作中断信号。"""
+    if not operation_id:
+        return False
+    with _ACTIVE_REMOTE_OPERATIONS_LOCK:
+        cancellation_event = _ACTIVE_REMOTE_OPERATIONS.get(operation_id)
+        if cancellation_event is not None and cancellation_event.is_set():
+            return True
+    return manager.lease.is_remote_operation_cancel_requested(operation_id)
+
+
+def _terminate_remote_process(process: subprocess.Popen) -> None:
+    """终止本机 SSH 客户端并收集管道输出，避免遗留子进程。"""
+    if process.poll() is not None:
+        process.communicate()
+        return
+    process.terminate()
+    try:
+        process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteWorkerError("无法停止本机 SSH 客户端") from exc
+
+
+def _communicate_remote_process(
+    process: subprocess.Popen,
+    operation_id: str | None,
+    timeout: int | None,
+    input_data: str | None = None,
+):
+    """轮询 SSH 子进程，响应用户中断并保留原有命令超时语义。"""
+    started_at = time.monotonic()
+    pending_input = input_data
+    while True:
+        if _remote_operation_cancel_requested(operation_id):
+            _terminate_remote_process(process)
+            raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
+        remaining = None if timeout is None else timeout - (time.monotonic() - started_at)
+        if remaining is not None and remaining <= 0:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                process.args, timeout, output=stdout, stderr=stderr
+            )
+        poll_interval = 0.25 if remaining is None else min(0.25, remaining)
+        try:
+            return process.communicate(input=pending_input, timeout=poll_interval)
+        except subprocess.TimeoutExpired:
+            pending_input = None
+
+
+def _run_remote_subprocess(
+    command: List[str],
+    *,
+    input_data: str,
+    timeout: int,
+    environment: Dict[str, str] | None,
+    operation_id: str | None,
+) -> subprocess.CompletedProcess:
+    """启动可中断的 SSH 命令，并返回与 subprocess.run 一致的结果对象。"""
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    try:
+        stdout, stderr = _communicate_remote_process(
+            process, operation_id, timeout, input_data=input_data
+        )
+    except BaseException:
+        if process.poll() is None:
+            _terminate_remote_process(process)
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 class _DockerSocketHTTPConnection(http.client.HTTPConnection):
@@ -124,18 +249,17 @@ def _remote_docker_image_platform(
     credentials: Dict[str, str],
     server: Dict[str, object],
     timeout: int,
+    operation_id: str | None = None,
 ) -> str:
     """通过 SSH 读取目标 Docker 平台，并对错误输出做凭证脱敏。"""
     command = ssh_command[:-1] + ["docker info --format '{{.OSType}}/{{.Architecture}}'"]
     try:
-        result = subprocess.run(
+        result = _run_remote_subprocess(
             command,
-            input="",
-            text=True,
-            capture_output=True,
+            input_data="",
             timeout=min(timeout, 60),
-            check=False,
-            env=environment,
+            environment=environment,
+            operation_id=operation_id,
         )
     except subprocess.TimeoutExpired as exc:
         raise RemoteWorkerError("读取目标 Docker 平台信息超时") from exc
@@ -581,14 +705,15 @@ def _stream_worker_image_to_remote(
     credentials: Dict[str, str],
     server: Dict[str, object],
     timeout: int,
+    operation_id: str | None = None,
 ) -> Dict[str, str]:
     """把 Docker Engine 镜像 tar 流经 SSH stdin 传给目标机 docker load。"""
     docker_connection, image_response = _open_local_docker_image_archive(image)
     read_fd = -1
     write_fd = -1
     process: subprocess.Popen[bytes] | None = None
+    writer: threading.Thread | None = None
     writer_errors: List[Exception] = []
-    timed_out = False
     try:
         read_fd, write_fd = os.pipe()
         try:
@@ -622,11 +747,9 @@ def _stream_worker_image_to_remote(
         writer.start()
         write_fd = -1
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            stdout, stderr = process.communicate()
+            stdout, stderr = _communicate_remote_process(process, operation_id, timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteWorkerError("经 SSH 传输 worker 镜像超时") from exc
         writer.join(timeout=65)
         if writer.is_alive():
             image_response.close()
@@ -639,8 +762,6 @@ def _stream_worker_image_to_remote(
             credentials,
             server,
         )
-        if timed_out:
-            raise RemoteWorkerError("经 SSH 传输 worker 镜像超时")
         if process.returncode != 0:
             detail = (output["stderr"] or output["stdout"] or "远端 docker load 失败").strip()
             raise RemoteWorkerError(detail[-2000:])
@@ -657,6 +778,8 @@ def _stream_worker_image_to_remote(
             process.wait()
         image_response.close()
         docker_connection.close()
+        if writer is not None:
+            writer.join(timeout=5)
 
 
 def _platform_ssh_credentials() -> Dict[str, str]:
@@ -852,7 +975,9 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
     return f"{prelude}\n{script_body}"
 
 
-def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
+def run_remote_action(
+    server: Dict[str, object], action: str, operation_id: str | None = None
+) -> Dict[str, str]:
     """用首次连接自动信任的 OpenSSH 执行脚本，并过滤输出中的平台凭证。"""
     credentials = _ssh_credentials_for_server(server)
     errors = remote_configuration_errors(credentials, server)
@@ -962,7 +1087,7 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
             image = remote_deployment_settings(server)["worker_image"]
             local_platform = _local_docker_image_platform(image)
             remote_platform = _remote_docker_image_platform(
-                command, environment, credentials, server, timeout
+                command, environment, credentials, server, timeout, operation_id
             )
             if _canonical_docker_platform(local_platform) != _canonical_docker_platform(
                 remote_platform
@@ -972,9 +1097,15 @@ def run_remote_action(server: Dict[str, object], action: str) -> Dict[str, str]:
                     "请先在平台 Docker 中准备目标架构的 WORKER_IMAGE"
                 )
             _stream_worker_image_to_remote(
-                image, image_command, environment, credentials, server, timeout
+                image, image_command, environment, credentials, server, timeout, operation_id
             )
-        result = subprocess.run(command, **run_options)
+        result = _run_remote_subprocess(
+            command,
+            input_data=str(run_options["input"]),
+            timeout=int(run_options["timeout"]),
+            environment=run_options.get("env"),
+            operation_id=operation_id,
+        )
     except subprocess.TimeoutExpired as exc:
         raise RemoteWorkerError("远程 SSH 操作超时") from exc
     except OSError as exc:
@@ -993,37 +1124,50 @@ def execute_remote_operation(
     operation_id: str, server: Dict[str, object], action: str
 ) -> None:
     """在后台执行 SSH 操作并将可轮询状态写入协调存储。"""
-    now = time.time()
-    operation = manager.lease.get_remote_operation(operation_id) or {
-        "operation_id": operation_id,
-        "machine_id": str(server.get("machine_id", "")),
-        "action": action,
-        "created_at": now,
-    }
-    operation.update({"status": "running", "updated_at": now, "error": None})
-    manager.lease.set_remote_operation(operation_id, operation)
-    server.update({"status": "running", "operation_id": operation_id})
-    remote_config_repository.save_remote_server(server)
+    cancellation_event = _register_remote_operation(operation_id)
     try:
-        result = run_remote_action(server, action)
-        operation.update(
-            {
-                "status": "completed",
-                "updated_at": time.time(),
-                "output": result.get("stdout", "")[-2000:],
-            }
-        )
-        server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"
-    except RemoteWorkerError as exc:
-        operation.update({"status": "failed", "updated_at": time.time(), "error": str(exc)})
-        server["status"] = "error"
-    except Exception:
-        operation.update(
-            {"status": "failed", "updated_at": time.time(), "error": "远程操作发生未预期错误"}
-        )
-        server["status"] = "error"
-    manager.lease.set_remote_operation(operation_id, operation)
-    remote_config_repository.save_remote_server(server)
+        operation = manager.lease.get_remote_operation(operation_id) or {
+            "operation_id": operation_id,
+            "machine_id": str(server.get("machine_id", "")),
+            "action": action,
+            "created_at": time.time(),
+        }
+        if operation.get("status") in {"completed", "failed", "cancelled"}:
+            return
+        try:
+            if _remote_operation_cancel_requested(operation_id):
+                raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
+            now = time.time()
+            operation.update({"status": "running", "updated_at": now, "error": None})
+            manager.lease.set_remote_operation(operation_id, operation)
+            server.update({"status": "running", "operation_id": operation_id})
+            remote_config_repository.save_remote_server(server)
+            result = run_remote_action(server, action, operation_id)
+            if _remote_operation_cancel_requested(operation_id):
+                raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
+            operation.update(
+                {
+                    "status": "completed",
+                    "updated_at": time.time(),
+                    "output": result.get("stdout", "")[-2000:],
+                }
+            )
+            server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"
+        except RemoteWorkerCancelledError as exc:
+            operation.update({"status": "cancelled", "updated_at": time.time(), "error": str(exc)})
+            server["status"] = "error"
+        except RemoteWorkerError as exc:
+            operation.update({"status": "failed", "updated_at": time.time(), "error": str(exc)})
+            server["status"] = "error"
+        except Exception:
+            operation.update(
+                {"status": "failed", "updated_at": time.time(), "error": "远程操作发生未预期错误"}
+            )
+            server["status"] = "error"
+        manager.lease.set_remote_operation(operation_id, operation)
+        remote_config_repository.save_remote_server(server)
+    finally:
+        _unregister_remote_operation(operation_id, cancellation_event)
 
 
 def _redact_output(

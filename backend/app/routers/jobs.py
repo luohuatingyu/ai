@@ -33,6 +33,7 @@ from app.remote_workers import (
     RemoteWorkerError,
     apply_remote_server_overrides,
     execute_remote_operation,
+    request_remote_operation_cancel,
     remote_configuration_errors,
     remote_server_public_view,
     resolve_remote_server_credentials,
@@ -700,7 +701,58 @@ def get_remote_operation(
     operation = manager.lease.get_remote_operation(operation_id)
     if operation is None:
         raise HTTPException(404, "远程操作不存在")
+    operation["cancel_requested"] = manager.lease.is_remote_operation_cancel_requested(
+        operation_id
+    )
     return operation
+
+
+@router.post("/remote-operations/{operation_id}/cancel", status_code=202)
+def cancel_remote_operation(
+    operation_id: str,
+    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
+) -> dict:
+    """向排队中或执行中的远程 SSH 操作发送中断请求。"""
+    _require_remote_admin_token(x_worker_admin_token)
+    if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+        raise HTTPException(404, "远程操作不存在")
+    operation = manager.lease.get_remote_operation(operation_id)
+    if operation is None:
+        raise HTTPException(404, "远程操作不存在")
+    if operation.get("status") == "cancelled":
+        return {"ok": True, "operation_id": operation_id, "status": "cancelled"}
+    if operation.get("status") not in {"queued", "running"}:
+        raise HTTPException(409, "远程操作已结束，无法中断")
+
+    active = request_remote_operation_cancel(operation_id)
+    if active:
+        return {"ok": True, "operation_id": operation_id, "status": "cancelling"}
+
+    latest = manager.lease.get_remote_operation(operation_id) or operation
+    if latest.get("status") in {"completed", "failed", "cancelled"}:
+        manager.lease.clear_remote_operation_cancel(operation_id)
+        if latest.get("status") == "cancelled":
+            return {"ok": True, "operation_id": operation_id, "status": "cancelled"}
+        raise HTTPException(409, "远程操作已结束，无法中断")
+
+    was_queued = latest.get("status") == "queued"
+    latest.update(
+        {
+            "status": "cancelled",
+            "updated_at": time.time(),
+            "error": "操作已中断；远端可能已有部分变更",
+        }
+    )
+    manager.lease.set_remote_operation(operation_id, latest)
+    machine_id = str(latest.get("machine_id", ""))
+    if machine_id:
+        server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
+        if server:
+            server["status"] = "error"
+            _remote_config_db_call(remote_config_repository.save_remote_server, server)
+    if was_queued:
+        manager.lease.clear_remote_operation_cancel(operation_id)
+    return {"ok": True, "operation_id": operation_id, "status": "cancelled"}
 
 
 @router.get("/jobs/{job_id}/model")

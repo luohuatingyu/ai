@@ -300,6 +300,133 @@ def test_remote_management_requires_an_enabled_admin_token(client, monkeypatch):
     ).status_code == 401
 
 
+def test_remote_operation_cancel_requires_admin_and_cancels_queued_operation(
+    client, monkeypatch
+):
+    """排队操作可由授权管理员中断，未授权请求不能改变操作状态。"""
+    from app.routers import jobs as jobs_router
+    from app.state import manager
+
+    token = "remote-admin-token-cancel-0123456789"
+    operation_id = "d" * 32
+    server = {"machine_id": "remote-cancel-api", "status": "provisioning"}
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    monkeypatch.setattr(
+        jobs_router.remote_config_repository,
+        "get_remote_server",
+        lambda _machine_id: dict(server),
+    )
+    monkeypatch.setattr(
+        jobs_router.remote_config_repository,
+        "save_remote_server",
+        lambda updated: server.update(updated),
+    )
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": server["machine_id"],
+            "action": "install",
+            "status": "queued",
+        },
+    )
+
+    denied = client.post(f"/api/remote-operations/{operation_id}/cancel")
+    assert denied.status_code == 401
+    assert manager.lease.get_remote_operation(operation_id)["status"] == "queued"
+
+    cancelled = client.post(
+        f"/api/remote-operations/{operation_id}/cancel",
+        headers={"X-Worker-Admin-Token": token},
+    )
+    assert cancelled.status_code == 202
+    assert cancelled.json()["status"] == "cancelled"
+    assert manager.lease.get_remote_operation(operation_id)["status"] == "cancelled"
+    assert manager.lease.is_remote_operation_cancel_requested(operation_id) is False
+    assert server["status"] == "error"
+
+
+def test_remote_operation_cancel_marks_active_operation_as_cancelling(client, monkeypatch):
+    """执行中的操作收到取消请求后保留忙碌状态，直到 SSH 执行器确认退出。"""
+    from app import remote_workers
+    from app.state import manager
+
+    token = "remote-admin-token-active-cancel-012345"
+    operation_id = "e" * 32
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": "remote-active-cancel-api",
+            "action": "restart",
+            "status": "running",
+        },
+    )
+    cancellation_event = remote_workers._register_remote_operation(operation_id)
+    try:
+        response = client.post(
+            f"/api/remote-operations/{operation_id}/cancel",
+            headers={"X-Worker-Admin-Token": token},
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "cancelling"
+        status = client.get(
+            f"/api/remote-operations/{operation_id}",
+            headers={"X-Worker-Admin-Token": token},
+        ).json()
+        assert status["status"] == "running"
+        assert status["cancel_requested"] is True
+        assert cancellation_event.is_set()
+    finally:
+        remote_workers._unregister_remote_operation(operation_id, cancellation_event)
+
+
+def test_remote_operation_cancel_clears_stale_running_state(client, monkeypatch):
+    """原执行线程已消失时，管理员仍可中断遗留 running 状态并解锁服务器。"""
+    from app.routers import jobs as jobs_router
+    from app.state import manager
+
+    token = "remote-admin-token-stale-cancel-0123456"
+    operation_id = "f" * 32
+    server = {"machine_id": "remote-stale-cancel-api", "status": "running"}
+    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
+    monkeypatch.setattr(
+        jobs_router.remote_config_repository,
+        "get_remote_server",
+        lambda _machine_id: dict(server),
+    )
+    monkeypatch.setattr(
+        jobs_router.remote_config_repository,
+        "save_remote_server",
+        lambda updated: server.update(updated),
+    )
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": server["machine_id"],
+            "action": "restart",
+            "status": "running",
+        },
+    )
+
+    response = client.post(
+        f"/api/remote-operations/{operation_id}/cancel",
+        headers={"X-Worker-Admin-Token": token},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "cancelled"
+    assert manager.lease.get_remote_operation(operation_id)["status"] == "cancelled"
+    assert manager.lease.is_remote_operation_cancel_requested(operation_id) is True
+    assert server["status"] == "error"
+    manager.lease.clear_remote_operation_cancel(operation_id)
+
+
 def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, monkeypatch, request):
     """令牌保护的远程添加与生命周期 API 仅保存 SSH 目标元数据并记录异步操作。"""
     from app.routers import jobs as jobs_router
@@ -336,7 +463,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     monkeypatch.setattr(
         remote_workers,
         "run_remote_action",
-        lambda server, action: calls.append((server["machine_id"], action, server["username"])) or {"stdout": "done"},
+        lambda server, action, _operation_id=None: calls.append((server["machine_id"], action, server["username"])) or {"stdout": "done"},
     )
     payload = {
         "machine_id": machine_id,
@@ -475,7 +602,7 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
     monkeypatch.setattr(
         remote_workers,
         "run_remote_action",
-        lambda server, action: run_calls.append((server["username"], action)) or {"stdout": "done"},
+        lambda server, action, _operation_id=None: run_calls.append((server["username"], action)) or {"stdout": "done"},
     )
 
     machine_id = f"remote-default-user-{time.time_ns()}"
@@ -1285,3 +1412,25 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
         "openEditRemoteServer",
     ):
         assert marker in html
+
+
+def test_remote_server_cards_expose_interrupt_action_for_active_operations():
+    """远程操作卡片提供中断入口并提示远端部分变更不会自动回滚。"""
+    backend_dir = Path(__file__).resolve().parents[1]
+    static_dir = backend_dir / "static"
+    if not static_dir.is_dir():
+        static_dir = backend_dir.parent / "static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    card_renderer = html.split("function workerServerCard(", 1)[1].split(
+        "// 读取仅在当前会话授权的远程服务器状态", 1
+    )[0]
+    cancel_handler = html.split("async function cancelRemoteOperation(", 1)[1].split(
+        "// 修改一个外接槽位是否接收新任务", 1
+    )[0]
+
+    assert 'data-cancel-remote-operation=' in card_renderer
+    assert "const cancelRequested = Boolean(operation && operation.cancel_requested);" in card_renderer
+    assert 'cancelRequested ? "正在中断…" : "中断操作"' in card_renderer
+    assert 'cancelled: "最近操作已中断"' in card_renderer
+    assert "不会自动回滚" in cancel_handler
+    assert "/cancel" in cancel_handler

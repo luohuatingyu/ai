@@ -31,6 +31,7 @@ _WORKER_ENABLED = "mtp:workers:enabled"
 _REMOTE_SERVERS = "mtp:remote:servers"
 _REMOTE_SSH_CREDENTIALS = "mtp:remote:ssh_credentials"
 _REMOTE_OPERATION = "mtp:remote:operation:{operation_id}"
+_REMOTE_OPERATION_CANCEL = "mtp:remote:operation:cancel:{operation_id}"
 _REMOTE_OPERATION_TTL = 7 * 24 * 3600
 
 # 信号 TTL：控制信号 1 小时后自动清理，避免遗留脏信号影响后续轮次
@@ -273,6 +274,18 @@ class LeaseStore:
         """读取远程 SSH 操作进度。"""
         raise NotImplementedError
 
+    def request_remote_operation_cancel(self, operation_id: str) -> None:
+        """请求中断远程 SSH 操作，供操作执行器轮询。"""
+        raise NotImplementedError
+
+    def is_remote_operation_cancel_requested(self, operation_id: str) -> bool:
+        """检查远程 SSH 操作是否收到中断请求。"""
+        raise NotImplementedError
+
+    def clear_remote_operation_cancel(self, operation_id: str) -> None:
+        """清除远程 SSH 操作的中断请求。"""
+        raise NotImplementedError
+
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的 worker 注册条目（崩溃/未优雅退出残留），返回清除数量。"""
         raise NotImplementedError
@@ -289,6 +302,7 @@ class EmbeddedLeaseStore(LeaseStore):
         self._worker_enabled: Dict[str, bool] = {}  # worker_id -> 是否允许接单
         self._remote_servers: Dict[str, Dict[str, object]] = {}
         self._remote_operations: Dict[str, Dict[str, object]] = {}
+        self._remote_operation_cancellations: Set[str] = set()
         self._remote_ssh_credentials: Optional[str] = None
 
     def healthy(self) -> bool:
@@ -431,6 +445,21 @@ class EmbeddedLeaseStore(LeaseStore):
         with self._lock:
             info = self._remote_operations.get(operation_id)
             return dict(info) if info is not None else None
+
+    def request_remote_operation_cancel(self, operation_id: str) -> None:
+        """在进程内登记远程 SSH 操作的中断请求。"""
+        with self._lock:
+            self._remote_operation_cancellations.add(operation_id)
+
+    def is_remote_operation_cancel_requested(self, operation_id: str) -> bool:
+        """检查进程内是否登记了远程 SSH 操作的中断请求。"""
+        with self._lock:
+            return operation_id in self._remote_operation_cancellations
+
+    def clear_remote_operation_cancel(self, operation_id: str) -> None:
+        """清除进程内远程 SSH 操作的中断请求。"""
+        with self._lock:
+            self._remote_operation_cancellations.discard(operation_id)
 
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的注册条目（存活 worker 心跳远短于宽限期）。"""
@@ -587,6 +616,22 @@ class RedisLeaseStore(LeaseStore):
             return None
         parsed = unjsonable(value)
         return parsed if isinstance(parsed, dict) else None
+
+    def request_remote_operation_cancel(self, operation_id: str) -> None:
+        """将中断请求写入 Redis，供执行操作的 API 实例轮询。"""
+        self._redis.set(
+            _REMOTE_OPERATION_CANCEL.format(operation_id=operation_id),
+            "1",
+            ex=_REMOTE_OPERATION_TTL,
+        )
+
+    def is_remote_operation_cancel_requested(self, operation_id: str) -> bool:
+        """从 Redis 检查远程操作是否收到中断请求。"""
+        return bool(self._redis.get(_REMOTE_OPERATION_CANCEL.format(operation_id=operation_id)))
+
+    def clear_remote_operation_cancel(self, operation_id: str) -> None:
+        """清除 Redis 中远程操作的中断请求。"""
+        self._redis.delete(_REMOTE_OPERATION_CANCEL.format(operation_id=operation_id))
 
     def delete_remote_server(self, machine_id: str) -> None:
         """从 Redis 删除远程服务器元数据，不访问目标服务器。"""
