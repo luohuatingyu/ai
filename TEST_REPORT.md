@@ -2,10 +2,41 @@
 
 ## Git基准点
 
-- **Commit Hash**: 9b3ba84（远程服务器与 SSH 凭证 MySQL 持久化）
-- **提交信息**: Persist remote management config in MySQL
+- **Commit Hash**: 0a60685（修复 SSH 凭证保存按钮禁用问题）
+- **提交信息**: Keep SSH credential save button interactive
 - **测试日期**: 2026-10-26
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：修复 SSH 凭证保存按钮不可点击（2026-10-26）
+
+**变更范围**：移除 SSH 凭证保存按钮在页面加载、令牌验证和目录请求期间的初始禁用状态；由提交处理器校验令牌与表单，并在保存期间防止重复提交。缺少令牌或凭证字段不完整时点击会显示明确反馈。凭证状态说明改为 MySQL，与实际存储一致。
+
+**测试环境**：Docker Python 3.12.15；前端通过 Docker Compose 构建并运行。
+
+**测试执行结果**：
+- 新增回归测试先失败复现：按钮 HTML 含 `disabled` 属性。修复后执行 `docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_api.py::test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads -q -p no:cacheprovider`：1 通过。
+- API 定向测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_api.py -q -p no:cacheprovider`：48 通过、0 失败（20.56 秒）。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：216 通过、6 跳过、0 失败、0 错误（60.06 秒）。6 项跳过为 Redis、S3 和 Supervisor 子进程集成环境门控。
+- `node` 内联 JavaScript 语法检查：通过。
+- `docker compose up --build -d` 与远程覆盖 Compose 重建：均通过；容器内确认保存按钮无 `disabled` 属性、状态提示显示 MySQL 且不再显示旧 Redis 文案。远程 Compose `config -q` 和服务状态检查通过。
+- `git diff --check`：通过；保留 SQLAlchemy 和 Pandas 两条既有弃用警告。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 页面加载和凭证目录刷新期间保存按钮仍可点击 | 前端契约：`test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads` | 按钮无初始禁用属性，目录状态变化不禁用按钮；新测试先复现失败，再通过 | 回归、异步加载 |
+| 缺少令牌或表单字段时不静默拦截 | 前端契约：同上；API：完整 `test_api.py` | 点击处理器提示令牌要求；表单用 `reportValidity()` 检查，字段不完整时给出提示 | 边界、错误反馈 |
+| 页面说明与 MySQL 实际凭证存储一致 | 前端契约：同上；运行容器静态资源检查 | 显示凭证加密保存在 MySQL，不再显示共享 Redis | 状态提示、部署回归 |
+| 现有远程管理、训练、数据和存储功能回归通过 | 完整 `backend/tests/` | 216 通过、6 环境门控跳过、0 失败 | 兼容、回归 |
+
+**已知问题与限制**：未在真实浏览器中输入凭证完成保存；页面行为由静态契约、API 回归测试及重建后容器资源检查覆盖。缺少管理令牌或 MySQL/加密配置时按钮仍可点击，但服务端会拒绝保存并显示具体错误。
+
+**下次测试建议**：刷新页面后展开“SSH 凭证管理”，确认按钮可点击；在测试环境配置新 SSH 凭证并验证保存后列表出现凭证元数据。
+
+**重测触发条件**：修改 SSH 凭证表单、目录加载状态、表单校验或凭证 API 时，运行新增前端契约、`tests/test_api.py` 和完整 `backend/tests/`，并重建前端容器。
+
+**Git基准点**：`0a60685`（Keep SSH credential save button interactive）；本报告作为单独提交更新。
 
 ## 本次变更测试结果：远程服务器和 SSH 凭证持久化到 MySQL（2026-10-26）
 
