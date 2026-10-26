@@ -8,7 +8,14 @@ from __future__ import annotations
 from app.database import engine, Base
 
 # 导入模型类以完成 Base.metadata 注册
-from app.models import Dataset, TrainingJob, JobLog  # noqa: F401
+from app.models import (  # noqa: F401
+    Dataset,
+    JobLog,
+    RemoteConfigMigration,
+    RemoteServerConfig,
+    RemoteSSHCredentialStore,
+    TrainingJob,
+)
 
 
 def create_tables() -> None:
@@ -18,7 +25,11 @@ def create_tables() -> None:
 
 
 def init_database() -> None:
+    """创建表并将已存在的 Redis 远程管理配置幂等迁入 MySQL。"""
     create_tables()
+    from app.remote_config_repository import migrate_remote_config_from_redis
+
+    migrate_remote_config_from_redis()
     print("数据库初始化完成")
 
 

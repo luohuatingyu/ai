@@ -5,4 +5,5 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      USE_DATABASE: ${USE_DATABASE:-true}
       WORKER_REMOTE_ENABLED: "true"

@@ -20,6 +20,7 @@ from urllib.parse import quote
 from cryptography.fernet import Fernet, InvalidToken
 
 import app.config as config
+from app import remote_config_repository
 from app.state import manager
 
 
@@ -184,7 +185,10 @@ def _credential_fernet() -> Fernet:
 
 def _credential_store() -> Dict[str, object]:
     """解密页面凭证目录，并把旧版单凭证格式映射为默认目录项。"""
-    encrypted = manager.lease.get_remote_ssh_credentials()
+    try:
+        encrypted = remote_config_repository.get_ssh_credentials_ciphertext()
+    except remote_config_repository.RemoteConfigPersistenceError as exc:
+        raise RemoteWorkerError(str(exc)) from exc
     if not encrypted:
         return {"version": _CREDENTIAL_STORE_VERSION, "default_credential_id": None, "credentials": []}
     try:
@@ -251,17 +255,18 @@ def _credential_store() -> Dict[str, object]:
 
 
 def _save_credential_store(store: Dict[str, object]) -> None:
-    """加密完整凭证目录后写入专用共享 Redis key。"""
-    if not config.REDIS_URL or not manager.distributed:
-        raise RemoteWorkerError("页面保存 SSH 凭证需要启用共享 Redis")
+    """加密完整凭证目录后写入 MySQL 专用密文记录。"""
     serialized = json.dumps(store, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     encrypted = _credential_fernet().encrypt(serialized).decode("ascii")
-    manager.lease.set_remote_ssh_credentials(encrypted)
+    try:
+        remote_config_repository.save_ssh_credentials_ciphertext(encrypted)
+    except remote_config_repository.RemoteConfigPersistenceError as exc:
+        raise RemoteWorkerError(str(exc)) from exc
 
 
 def _credentials_configurable() -> bool:
-    """判断共享 Redis 与加密主密钥是否齐备。"""
-    if not config.REDIS_URL or not manager.distributed:
+    """判断 MySQL 持久化与 Fernet 加密主密钥是否已启用。"""
+    if not config.USE_DATABASE:
         return False
     try:
         _credential_fernet()
@@ -300,8 +305,8 @@ def _write_page_ssh_credential(
     credential: Dict[str, str], credential_id: str | None = None, make_default: bool = False
 ) -> Dict[str, object]:
     """新增或替换凭证目录项，存储时只写入 Fernet 密文。"""
-    if not config.REDIS_URL or not manager.distributed:
-        raise RemoteWorkerError("页面保存 SSH 凭证需要启用共享 Redis")
+    if not config.USE_DATABASE:
+        raise RemoteWorkerError("页面保存 SSH 凭证需要启用 MySQL（USE_DATABASE=true）")
     fernet = _credential_fernet()
     store = _credential_store()
     current = store["credentials"]
@@ -344,7 +349,12 @@ def _write_page_ssh_credential(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    manager.lease.set_remote_ssh_credentials(fernet.encrypt(serialized).decode("ascii"))
+    try:
+        remote_config_repository.save_ssh_credentials_ciphertext(
+            fernet.encrypt(serialized).decode("ascii")
+        )
+    except remote_config_repository.RemoteConfigPersistenceError as exc:
+        raise RemoteWorkerError(str(exc)) from exc
     return list_platform_ssh_credentials()
 
 
@@ -368,16 +378,20 @@ def update_platform_ssh_credential(
 
 def delete_platform_ssh_credential(credential_id: str) -> Dict[str, object]:
     """删除未被服务器显式引用的凭证，并在必要时重新选择默认项。"""
-    if not config.REDIS_URL or not manager.distributed:
-        raise RemoteWorkerError("页面管理 SSH 凭证需要启用共享 Redis")
+    if not config.USE_DATABASE:
+        raise RemoteWorkerError("页面管理 SSH 凭证需要启用 MySQL（USE_DATABASE=true）")
     _credential_fernet()
     store = _credential_store()
     credentials = store["credentials"]
     if not any(item["id"] == credential_id for item in credentials):
         raise RemoteCredentialNotFoundError("SSH 凭证不存在")
+    try:
+        servers = remote_config_repository.list_remote_servers()
+    except remote_config_repository.RemoteConfigPersistenceError as exc:
+        raise RemoteWorkerError(str(exc)) from exc
     references = [
         str(server.get("machine_id", ""))
-        for server in manager.lease.list_remote_servers()
+        for server in servers
         if str(server.get("ssh_credential_id", "")) == credential_id
         or (
             not server.get("ssh_credential_id")
@@ -401,7 +415,10 @@ def delete_platform_ssh_credential(credential_id: str) -> Dict[str, object]:
             }
         )
     else:
-        manager.lease.delete_remote_ssh_credentials()
+        try:
+            remote_config_repository.delete_ssh_credentials()
+        except remote_config_repository.RemoteConfigPersistenceError as exc:
+            raise RemoteWorkerError(str(exc)) from exc
     return list_platform_ssh_credentials()
 
 
@@ -655,13 +672,13 @@ def remote_ssh_settings_status() -> Dict[str, object]:
         credentials = next(
             (item for item in store["credentials"] if item["id"] == default_id), None
         )
-    except RemoteWorkerError:
+    except RemoteWorkerError as exc:
         return {
-            "source": "page" if manager.lease.get_remote_ssh_credentials() else "none",
+            "source": "page" if "无法解密" in str(exc) else "none",
             "auth_method": None,
             "configured": False,
             "can_configure": _credentials_configurable(),
-            "status_error": "页面凭证无法解密；请检查平台加密主密钥。",
+            "status_error": str(exc),
         }
     if credentials is None:
         return {
@@ -986,7 +1003,7 @@ def execute_remote_operation(
     operation.update({"status": "running", "updated_at": now, "error": None})
     manager.lease.set_remote_operation(operation_id, operation)
     server.update({"status": "running", "operation_id": operation_id})
-    manager.lease.set_remote_server(str(server["machine_id"]), server)
+    remote_config_repository.save_remote_server(server)
     try:
         result = run_remote_action(server, action)
         operation.update(
@@ -1006,7 +1023,7 @@ def execute_remote_operation(
         )
         server["status"] = "error"
     manager.lease.set_remote_operation(operation_id, operation)
-    manager.lease.set_remote_server(str(server["machine_id"]), server)
+    remote_config_repository.save_remote_server(server)
 
 
 def _redact_output(

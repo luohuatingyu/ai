@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import Column, Integer, String, Text, Float, DateTime, JSON, ForeignKey
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -60,3 +61,29 @@ class JobLog(Base):
     
     # 关联的训练任务
     job = relationship("TrainingJob")
+
+
+class RemoteServerConfig(Base):
+    """MySQL 中持久化的远程服务器配置记录。"""
+    __tablename__ = "remote_servers"
+
+    machine_id = Column(String(64), primary_key=True)
+    config_data = Column(JSON, nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class RemoteSSHCredentialStore(Base):
+    """MySQL 中加密保存的平台 SSH 凭证目录。"""
+    __tablename__ = "remote_ssh_credentials"
+
+    store_id = Column(String(32), primary_key=True, default="platform")
+    encrypted_credentials = Column(Text().with_variant(LONGTEXT(), "mysql"), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class RemoteConfigMigration(Base):
+    """记录旧 Redis 远程配置是否已经导入 MySQL。"""
+    __tablename__ = "remote_config_migrations"
+
+    migration_id = Column(String(64), primary_key=True)
+    completed_at = Column(DateTime, default=func.now(), nullable=False)

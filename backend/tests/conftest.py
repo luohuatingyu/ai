@@ -19,6 +19,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 # ---- 环境先于一切 app 导入 ----
 _TMP = Path(tempfile.mkdtemp(prefix="mtp-pytest-"))
@@ -52,6 +55,44 @@ if sys_path_added not in sys.path:
 from app import config, jobstore, worker as worker_mod  # noqa: E402
 from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore  # noqa: E402
 from app.storage import get_store, job_key  # noqa: E402
+
+
+@pytest.fixture
+def remote_mysql_db(monkeypatch):
+    """用隔离的 SQLite 会话验证远程配置仓储的关系数据库行为。"""
+    from app import database
+    from app.models import Base
+    from app.state import manager
+
+    # 隔离旧 Redis 迁移源，避免其他远程配置用例的记录影响本测试。
+    for server in manager.lease.list_remote_servers():
+        machine_id = str(server.get("machine_id", ""))
+        if machine_id:
+            manager.lease.delete_remote_server(machine_id)
+    manager.lease.delete_remote_ssh_credentials()
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    test_session_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(database, "SessionLocal", test_session_factory)
+    try:
+        yield engine
+    finally:
+        for server in manager.lease.list_remote_servers():
+            machine_id = str(server.get("machine_id", ""))
+            if machine_id:
+                manager.lease.delete_remote_server(machine_id)
+        manager.lease.delete_remote_ssh_credentials()
+        engine.dispose()
 
 
 def wait_until(pred, timeout: float = 30.0, step: float = 0.1) -> bool:

@@ -24,6 +24,12 @@ from app.storage import job_key  # noqa: E402
 from tests.conftest import job_status, wait_until  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_remote_management_mysql(remote_mysql_db):
+    """为 API 测试提供独立 SQLite 会话，覆盖 MySQL 远程配置仓储。"""
+    yield
+
+
 @pytest.fixture(scope="module")
 def client():
     """FastAPI TestClient（嵌入式模式：manager 内嵌 worker 线程）。"""
@@ -40,6 +46,11 @@ def _train_payload(ds_id: str, epochs: int = 4, **extra) -> dict:
             "hidden_layers": 1, "test_split": 0.2, "seed": 42}
     body.update(extra)
     return body
+
+
+def _enable_remote_mysql(monkeypatch) -> None:
+    """为当前远程管理用例开启 MySQL 配置仓储。"""
+    monkeypatch.setattr(config, "USE_DATABASE", True)
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +304,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     """令牌保护的远程添加与生命周期 API 仅保存 SSH 目标元数据并记录异步操作。"""
     from app.routers import jobs as jobs_router
     from app import remote_workers
+    from app import remote_config_repository
     from app.state import manager
     from cryptography.fernet import Fernet
 
@@ -300,6 +312,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     headers = {"X-Worker-Admin-Token": token}
     machine_id = f"remote-api-{time.time_ns()}"
     calls = []
+    _enable_remote_mysql(monkeypatch)
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
@@ -345,7 +358,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     assert operation["output"] == "done"
     assert calls == [(machine_id, "install", "worker")]
 
-    stored_server = manager.lease.get_remote_server(machine_id)
+    stored_server = remote_config_repository.get_remote_server(machine_id)
     assert stored_server["remote_redis_url_encrypted"] != payload["remote_redis_url"]
     assert payload["remote_redis_url"] not in repr(stored_server)
 
@@ -372,7 +385,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
         },
     )
     assert edited.status_code == 200, edited.text
-    edited_server = manager.lease.get_remote_server(machine_id)
+    edited_server = remote_config_repository.get_remote_server(machine_id)
     assert edited_server["worker_image_override"] == "registry.example.net/remote/worker:v3"
     assert edited_server["remote_s3_endpoint_override"] == "storage-v2.example.net:9000"
     assert edited_server["remote_redis_url_encrypted"] == stored_server["remote_redis_url_encrypted"]
@@ -384,7 +397,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
         json={"clear_remote_redis_url_override": True},
     )
     assert cleared.status_code == 200, cleared.text
-    assert "remote_redis_url_encrypted" not in manager.lease.get_remote_server(machine_id)
+    assert "remote_redis_url_encrypted" not in remote_config_repository.get_remote_server(machine_id)
     assert cleared.json()["server"]["has_remote_redis_url_override"] is False
     assert client.post("/api/remote-servers", json=payload, headers=headers).status_code == 409
 
@@ -401,7 +414,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
         f"/api/remote-servers/missing-{machine_id}/start", headers=headers
     ).status_code == 404
     assert client.get(f"/api/remote-operations/{operation_id}").status_code == 401
-    manager.lease.delete_remote_server(machine_id)
+    remote_config_repository.delete_remote_server(machine_id)
 
 
 def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatch):
@@ -431,11 +444,13 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
     """未填写服务器用户名则使用凭证用户名，并在服务器记录中保存凭证引用。"""
     from cryptography.fernet import Fernet
     from app import remote_workers
+    from app import remote_config_repository
     from app.routers import jobs as jobs_router
     from app.state import manager
 
     token = "remote-admin-token-default-user-0123456789"
     headers = {"X-Worker-Admin-Token": token}
+    _enable_remote_mysql(monkeypatch)
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
@@ -479,20 +494,22 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
 
     assert response.status_code == 202, response.text
     assert run_calls == [("credential-user", "install")]
-    server = manager.lease.get_remote_server(machine_id)
+    server = remote_config_repository.get_remote_server(machine_id)
     assert server["username"] == "credential-user"
     assert server["username_override"] is None
     assert server["ssh_credential_id"] == credential_id
-    manager.lease.delete_remote_server(machine_id)
+    remote_config_repository.delete_remote_server(machine_id)
 
 
 def test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_echo(client, monkeypatch, request):
     """页面可加密管理三类 SSH 凭证，目录接口不回传秘密且引用中的凭证不可删除。"""
     from cryptography.fernet import Fernet
+    from app import remote_config_repository
     from app.state import manager
 
     token = "remote-admin-token-credential-catalog-012345"
     headers = {"X-Worker-Admin-Token": token}
+    _enable_remote_mysql(monkeypatch)
     encryption_key = Fernet.generate_key().decode()
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
@@ -533,7 +550,7 @@ def test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_ec
     assert secret_password not in listed.text and private_key not in listed.text
     assert client.get("/api/remote-ssh-credentials").status_code == 401
 
-    ciphertext = manager.lease.get_remote_ssh_credentials()
+    ciphertext = remote_config_repository.get_ssh_credentials_ciphertext()
     decrypted = Fernet(encryption_key.encode()).decrypt(ciphertext.encode()).decode()
     decrypted_catalog = json.loads(decrypted)
     assert secret_password in decrypted
@@ -541,10 +558,12 @@ def test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_ec
 
     referenced_id = catalog["credentials"][2]["id"]
     machine_id = f"credential-reference-{time.time_ns()}"
-    manager.lease.set_remote_server(machine_id, {"machine_id": machine_id, "ssh_credential_id": referenced_id})
+    remote_config_repository.save_remote_server(
+        {"machine_id": machine_id, "ssh_credential_id": referenced_id}
+    )
     blocked = client.delete(f"/api/remote-ssh-credentials/{referenced_id}", headers=headers)
     assert blocked.status_code == 409
-    manager.lease.delete_remote_server(machine_id)
+    remote_config_repository.delete_remote_server(machine_id)
 
     updated = client.put(
         f"/api/remote-ssh-credentials/{created[0]['credentials'][0]['id']}",
@@ -568,10 +587,12 @@ def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client
     from cryptography.fernet import Fernet
 
     from app.remote_workers import _platform_ssh_credentials
+    from app import remote_config_repository
     from app.state import manager
 
     token = "remote-admin-token-settings-0123456789"
     headers = {"X-Worker-Admin-Token": token}
+    _enable_remote_mysql(monkeypatch)
     password = "platform SSH password with spaces and $ chars"
     encryption_key = Fernet.generate_key().decode("ascii")
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
@@ -589,7 +610,7 @@ def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client
 
     saved = client.put("/api/remote-ssh-settings", json=payload, headers=headers)
     assert saved.status_code == 200, saved.text
-    ciphertext = manager.lease.get_remote_ssh_credentials()
+    ciphertext = remote_config_repository.get_ssh_credentials_ciphertext()
     assert ciphertext and password not in ciphertext
     assert password.encode() not in ciphertext.encode()
     assert Fernet(encryption_key.encode()).decrypt(ciphertext.encode()).decode().find(password) >= 0
@@ -606,20 +627,22 @@ def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client
     assert _platform_ssh_credentials()["password"] == password
 
     cleared = client.delete("/api/remote-ssh-settings", headers=headers)
-    assert cleared.status_code == 200
-    assert manager.lease.get_remote_ssh_credentials() is None
+    assert cleared.status_code == 200, cleared.text
+    assert remote_config_repository.get_ssh_credentials_ciphertext() is None
     assert cleared.json()["source"] == "none"
     assert password not in cleared.text
 
 
 def test_remote_ssh_settings_save_private_key_without_echo(client, monkeypatch, request):
-    """页面密钥保存后返回状态而非私钥文本，Redis 中只保留加密内容。"""
+    """页面密钥保存后返回状态而非私钥文本，MySQL 中只保留加密内容。"""
     from cryptography.fernet import Fernet
+    from app import remote_config_repository
 
     from app.state import manager
 
     token = "remote-admin-token-private-key-0123456789"
     headers = {"X-Worker-Admin-Token": token}
+    _enable_remote_mysql(monkeypatch)
     private_key = (
         "-----BEGIN OPENSSH PRIVATE KEY-----\n"
         "test-key-material-that-must-not-be-echoed\n"
@@ -643,7 +666,7 @@ def test_remote_ssh_settings_save_private_key_without_echo(client, monkeypatch, 
     assert response.status_code == 200, response.text
     assert private_key not in response.text
     assert "test-key-material-that-must-not-be-echoed" not in response.text
-    ciphertext = manager.lease.get_remote_ssh_credentials()
+    ciphertext = remote_config_repository.get_ssh_credentials_ciphertext()
     assert ciphertext and private_key not in ciphertext
     stored = json.loads(Fernet(encryption_key.encode()).decrypt(ciphertext.encode()).decode())
     assert stored["credentials"][0]["private_key"] == private_key + "\n"
@@ -660,13 +683,14 @@ def test_remote_ssh_settings_save_private_key_without_echo(client, monkeypatch, 
 )
 def test_remote_ssh_settings_reject_invalid_credentials(client, monkeypatch, request, payload):
     """空密码、多行密码及不完整/非法密钥在保存前拒绝。"""
-    from app.state import manager
+    from app import remote_config_repository
 
     token = "remote-admin-token-invalid-settings-012345"
+    _enable_remote_mysql(monkeypatch)
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
-    manager.lease.delete_remote_ssh_credentials()
-    request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
+    from cryptography.fernet import Fernet
+    monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
     response = client.put(
         "/api/remote-ssh-settings",
@@ -677,11 +701,11 @@ def test_remote_ssh_settings_reject_invalid_credentials(client, monkeypatch, req
     attempted_secret = payload.get("password") or payload.get("private_key") or ""
     if attempted_secret:
         assert attempted_secret not in response.text
-    assert manager.lease.get_remote_ssh_credentials() is None
+    assert remote_config_repository.get_ssh_credentials_ciphertext() is None
 
 
-def test_remote_ssh_settings_require_redis_and_encryption_key(client, monkeypatch, request):
-    """未启用共享 Redis 或未设置有效加密密钥时页面不能持久化凭证。"""
+def test_remote_ssh_settings_require_mysql_and_encryption_key(client, monkeypatch, request):
+    """未启用 MySQL 或未设置有效加密密钥时页面不能持久化凭证。"""
     from app.state import manager
 
     token = "remote-admin-token-storage-settings-012345"
@@ -692,23 +716,23 @@ def test_remote_ssh_settings_require_redis_and_encryption_key(client, monkeypatc
     manager.lease.delete_remote_ssh_credentials()
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
 
-    monkeypatch.setattr(config, "REDIS_URL", "")
+    monkeypatch.setattr(config, "USE_DATABASE", False)
     monkeypatch.setattr(manager, "distributed", False)
-    no_redis = client.put("/api/remote-ssh-settings", headers=headers, json=payload)
-    assert no_redis.status_code == 503
-    assert "共享 Redis" in no_redis.text
+    no_database = client.put("/api/remote-ssh-settings", headers=headers, json=payload)
+    assert no_database.status_code == 503
+    assert "MySQL" in no_database.text
 
-    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
-    monkeypatch.setattr(manager, "distributed", True)
+    monkeypatch.setattr(config, "USE_DATABASE", True)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", "")
     no_key = client.put("/api/remote-ssh-settings", headers=headers, json=payload)
     assert no_key.status_code == 503
     assert "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY" in no_key.text
-    manager.lease.delete_remote_ssh_credentials()
+    from app import remote_config_repository
+    remote_config_repository.delete_ssh_credentials()
 
 
-def test_remote_ssh_settings_redacts_redis_read_failure(client, monkeypatch):
-    """共享 Redis 读取异常以脱敏 503 返回，不泄漏底层错误内容。"""
+def test_remote_ssh_settings_redacts_mysql_read_failure(client, monkeypatch):
+    """MySQL 读取异常以脱敏 503 返回，不泄漏底层错误内容。"""
     from app import remote_workers
 
     token = "remote-admin-token-redis-error-012345678"
@@ -726,7 +750,7 @@ def test_remote_ssh_settings_redacts_redis_read_failure(client, monkeypatch):
 
     assert response.status_code == 503
     assert "redis password leaked" not in response.text
-    assert "共享 Redis" in response.text
+    assert "MySQL" in response.text
 
 
 def test_pause_resume_via_http(client, make_dataset):

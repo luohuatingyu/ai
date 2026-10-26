@@ -17,9 +17,19 @@ from app.state import manager
 
 @pytest.fixture(autouse=True)
 def _clear_page_credentials_after_test():
-    """每个用例结束后清除测试写入的共享 SSH 凭证密文。"""
+    """每个用例结束后清除测试写入的 SSH 凭证密文。"""
     yield
     manager.lease.delete_remote_ssh_credentials()
+    if config.USE_DATABASE:
+        from app.remote_config_repository import delete_ssh_credentials
+
+        delete_ssh_credentials()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_remote_mysql_test_store(remote_mysql_db):
+    """为远程 worker 用例提供独立关系数据库会话。"""
+    yield
 
 
 def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
@@ -30,6 +40,7 @@ def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     key.chmod(0o600)
     known_hosts = tmp_path / "remote_known_hosts"
     monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
+    monkeypatch.setattr(config, "USE_DATABASE", True)
     monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", "test-remote-admin-token-0123456789")
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/ml/worker:unit")
     monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "rediss://redis.example.net:6380/0")
@@ -73,6 +84,9 @@ def _server(**overrides) -> dict:
 def _set_page_credential(auth_method: str, **overrides) -> dict:
     """替换测试用默认页面凭证，覆盖三类认证组合。"""
     manager.lease.delete_remote_ssh_credentials()
+    from app.remote_config_repository import delete_ssh_credentials
+
+    delete_ssh_credentials()
     credential = {
         "name": "test credential",
         "username": "worker",
@@ -312,6 +326,7 @@ def test_compose_separates_local_worker_image_from_remote_default():
         assert f"WORKER_IMAGE: ${{WORKER_IMAGE:-{local_default}}}" in compose
     remote_compose = (repository_root / "docker-compose.remote.yml").read_text(encoding="utf-8")
     assert "/var/run/docker.sock:/var/run/docker.sock" in remote_compose
+    assert "USE_DATABASE: ${USE_DATABASE:-true}" in remote_compose
 
 
 def test_local_docker_image_archive_uses_engine_api_version_and_tag_path(tmp_path, monkeypatch):
@@ -745,8 +760,10 @@ def test_run_remote_action_combines_key_and_password_with_separate_prompts(tmp_p
 
 def test_remote_ssh_credentials_do_not_fall_back_to_environment(tmp_path, monkeypatch):
     """即使旧 SSH 密码环境变量存在，平台也必须要求页面凭证。"""
+    from app import remote_config_repository
+
     _remote_config(tmp_path, monkeypatch)
-    manager.lease.delete_remote_ssh_credentials()
+    remote_config_repository.delete_ssh_credentials()
     monkeypatch.setenv("WORKER_SSH_PASSWORD", "legacy-environment-secret")
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
 
@@ -856,12 +873,15 @@ def test_render_remote_script_rejects_shell_and_path_injection(invalid_server):
 
 
 def test_execute_remote_operation_persists_success_and_failure(monkeypatch, request):
-    """远程执行结果更新 Redis/嵌入式状态，异常不写入密钥或堆栈信息。"""
+    """远程操作状态留在协调存储，服务器最终状态持久化到 MySQL。"""
+    from app import remote_config_repository
+
+    monkeypatch.setattr(config, "USE_DATABASE", True)
     machine_id = "remote-operation-test"
     operation_id = "operation-test"
     server = _server(machine_id=machine_id)
-    request.addfinalizer(lambda: manager.lease.delete_remote_server(machine_id))
-    manager.lease.set_remote_server(machine_id, server)
+    request.addfinalizer(lambda: remote_config_repository.delete_remote_server(machine_id))
+    remote_config_repository.save_remote_server(server)
     manager.lease.set_remote_operation(
         operation_id,
         {"operation_id": operation_id, "machine_id": machine_id, "action": "start", "status": "queued"},
@@ -872,7 +892,7 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     result = manager.lease.get_remote_operation(operation_id)
     assert result["status"] == "completed"
     assert result["output"] == "container started"
-    assert manager.lease.get_remote_server(machine_id)["status"] == "online"
+    assert remote_config_repository.get_remote_server(machine_id)["status"] == "online"
 
     def fail_remote(*_args):
         raise remote_workers.RemoteWorkerError("SSH 登录失败")
@@ -883,7 +903,7 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     result = manager.lease.get_remote_operation(operation_id)
     assert result["status"] == "failed"
     assert result["error"] == "SSH 登录失败"
-    assert manager.lease.get_remote_server(machine_id)["status"] == "error"
+    assert remote_config_repository.get_remote_server(machine_id)["status"] == "error"
 
 
 def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):

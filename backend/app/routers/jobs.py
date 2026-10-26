@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 
 import app.config as config
 from app import jobstore
+from app import remote_config_repository
 from app.database import db_session
 from app.db_utils import get_job_logs
 from app.jobs import api_view
@@ -339,6 +340,14 @@ def _require_remote_admin_token(
         raise HTTPException(401, "远程管理令牌无效")
 
 
+def _remote_config_db_call(function, *args):
+    """将 MySQL 远程配置仓储错误转换为受控的 503 API 响应。"""
+    try:
+        return function(*args)
+    except remote_config_repository.RemoteConfigPersistenceError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
 def _start_remote_operation(
     server: dict, action: str, background_tasks: BackgroundTasks
 ) -> dict:
@@ -363,7 +372,7 @@ def _start_remote_operation(
         "restart": "restarting",
     }[action]
     server["operation_id"] = operation_id
-    manager.lease.set_remote_server(str(server["machine_id"]), server)
+    _remote_config_db_call(remote_config_repository.save_remote_server, server)
     manager.lease.set_remote_operation(operation_id, operation)
     background_tasks.add_task(execute_remote_operation, operation_id, server, action)
     return {"ok": True, "operation_id": operation_id, "status": "queued"}
@@ -375,7 +384,7 @@ def list_remote_servers(
 ) -> dict:
     """列出经 SSH 接入的远程服务器；管理元数据仅对令牌持有者可见。"""
     _require_remote_admin_token(x_worker_admin_token)
-    servers = manager.lease.list_remote_servers()
+    servers = _remote_config_db_call(remote_config_repository.list_remote_servers)
     return {"servers": [remote_server_public_view(server) for server in servers]}
 
 
@@ -388,11 +397,16 @@ def get_remote_ssh_settings(
 
     _require_remote_admin_token(x_worker_admin_token)
     try:
-        return remote_ssh_settings_status()
+        status = remote_ssh_settings_status()
+        if status.get("status_error"):
+            raise HTTPException(503, str(status["status_error"]))
+        return status
+    except HTTPException:
+        raise
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, "平台 SSH 凭证状态读取失败；请检查共享 Redis 连接") from exc
+        raise HTTPException(503, "平台 SSH 凭证状态读取失败；请检查 MySQL 连接") from exc
 
 
 @router.get("/remote-ssh-credentials")
@@ -408,7 +422,7 @@ def get_remote_ssh_credentials(
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, "SSH 凭证目录读取失败；请检查共享 Redis 连接") from exc
+        raise HTTPException(503, "SSH 凭证目录读取失败；请检查 MySQL 连接") from exc
 
 
 @router.post("/remote-ssh-credentials")
@@ -444,7 +458,7 @@ async def post_remote_ssh_credential(
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, "SSH 凭证保存失败；请检查共享 Redis 连接") from exc
+        raise HTTPException(503, "SSH 凭证保存失败；请检查 MySQL 连接") from exc
 
 
 @router.put("/remote-ssh-credentials/{credential_id}")
@@ -484,7 +498,7 @@ async def put_remote_ssh_credential(
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, "SSH 凭证保存失败；请检查共享 Redis 连接") from exc
+        raise HTTPException(503, "SSH 凭证保存失败；请检查 MySQL 连接") from exc
 
 
 @router.delete("/remote-ssh-credentials/{credential_id}")
@@ -510,7 +524,7 @@ def delete_remote_ssh_credential(
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, "SSH 凭证删除失败；请检查共享 Redis 连接") from exc
+        raise HTTPException(503, "SSH 凭证删除失败；请检查 MySQL 连接") from exc
 
 
 @router.put("/remote-ssh-settings")
@@ -544,7 +558,7 @@ async def put_remote_ssh_settings(
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, "平台 SSH 凭证保存失败；请检查共享 Redis 连接") from exc
+        raise HTTPException(503, "平台 SSH 凭证保存失败；请检查 MySQL 连接") from exc
 
 
 @router.delete("/remote-ssh-settings")
@@ -560,7 +574,7 @@ def delete_remote_ssh_settings(
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, "平台 SSH 凭证清除失败；请检查共享 Redis 连接") from exc
+        raise HTTPException(503, "平台 SSH 凭证清除失败；请检查 MySQL 连接") from exc
 
 
 @router.post("/remote-servers", status_code=202)
@@ -586,7 +600,7 @@ def add_remote_server(
     errors = remote_configuration_errors(credentials, server)
     if errors:
         raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
-    if manager.lease.get_remote_server(request.machine_id):
+    if _remote_config_db_call(remote_config_repository.get_remote_server, request.machine_id):
         raise HTTPException(409, "服务器标识已登记")
     server["username"] = credentials["username"]
     server["ssh_credential_id"] = credentials["id"]
@@ -603,7 +617,7 @@ def update_remote_server(
     """更新一台远程服务器的连接参数和部署覆盖值，不自动重启目标 worker。"""
     _require_remote_admin_token(x_worker_admin_token)
     _check_id(machine_id, "服务器")
-    server = manager.lease.get_remote_server(machine_id)
+    server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
         raise HTTPException(404, "远程服务器不存在")
     previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
@@ -642,7 +656,7 @@ def update_remote_server(
         raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
 
     candidate["updated_at"] = time.time()
-    manager.lease.set_remote_server(machine_id, candidate)
+    _remote_config_db_call(remote_config_repository.save_remote_server, candidate)
     return {"server": remote_server_public_view(candidate)}
 
 
@@ -656,7 +670,7 @@ def manage_remote_server(
     """经 SSH 重装、启动、优雅停止或重启目标服务器上的 worker 容器。"""
     _require_remote_admin_token(x_worker_admin_token)
     _check_id(machine_id, "服务器")
-    server = manager.lease.get_remote_server(machine_id)
+    server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
         raise HTTPException(404, "远程服务器不存在")
     from app.remote_workers import RemoteWorkerError
