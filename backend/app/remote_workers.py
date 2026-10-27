@@ -85,6 +85,25 @@ def _append_remote_operation_log(
         return
 
 
+def clear_remote_operation_log(operation_id: str) -> bool:
+    """清除远程操作的可见输出，保留状态和阶段等操作元数据。"""
+    with _REMOTE_OPERATION_LOG_LOCK:
+        operation = manager.lease.get_remote_operation(operation_id)
+        if operation is None:
+            return False
+        operation.update(
+            {
+                "log": "",
+                "output": "",
+                "stderr": "",
+                "error": None,
+                "updated_at": time.time(),
+            }
+        )
+        manager.lease.set_remote_operation(operation_id, operation)
+    return True
+
+
 def _emit_progress(
     callback: Callable[[str, str], None] | None,
     phase: str,
@@ -1481,7 +1500,9 @@ def render_remote_script(
 ) -> str:
     """把经过校验的配置作为 shell 字面量前缀，拼接随镜像打包的单文件脚本。"""
     validate_server_record(server)
-    allowed_actions = {"install", "update", "start", "stop", "restart", "status"}
+    allowed_actions = {
+        "install", "config", "deploy", "update", "start", "stop", "restart", "status"
+    }
     if action not in allowed_actions:
         raise RemoteWorkerError("不支持的远程操作")
     mode = str(server.get("mode", "cpu"))
@@ -1618,7 +1639,7 @@ def run_remote_action(
         environment: Dict[str, str] | None = None
         code_archive = (
             base64.b64encode(_worker_code_archive()).decode("ascii")
-            if action in {"install", "update"}
+            if action in {"install", "deploy", "update"}
             else None
         )
         run_options = {
@@ -1679,11 +1700,17 @@ def run_remote_action(
                 operation_id,
                 **progress_options,
             )
-        elif action == "update":
+        elif action in {"deploy", "update"}:
             _emit_progress(
                 progress_callback,
                 "同步 worker 代码",
-                "同步最新 worker Python 代码并复用目标机现有镜像。",
+                "同步最新 worker Python 代码，不修改远端配置或容器。",
+            )
+        elif action == "config":
+            _emit_progress(
+                progress_callback,
+                "覆盖 worker 配置",
+                "覆盖目标机 worker 配置，不上传代码或操作容器。",
             )
         _emit_progress(progress_callback, "执行远程部署脚本", f"开始执行远端 {action} 脚本。")
         progress_options = (
@@ -1713,7 +1740,7 @@ def run_remote_action(
         detail = (output["stderr"] or output["stdout"] or "远程脚本返回错误").strip()
         raise RemoteWorkerError(detail[-2000:])
     _emit_progress(progress_callback, "执行远程部署脚本", "远端脚本已成功返回。")
-    if action in {"install", "update"} and operation_id:
+    if action == "install" and operation_id:
         _wait_for_remote_worker_heartbeat(
             operation_id,
             str(server.get("machine_id", "")),
@@ -1765,8 +1792,14 @@ def execute_remote_operation(
                 "stderr": result.get("stderr", "")[-2000:],
                 "phase": "操作完成",
             }
-            server["status"] = "online" if action in {"install", "update", "start", "restart"} else "stopped"
-            if action in {"install", "update"}:
+            if action in {"config", "deploy", "update"}:
+                previous_status = str(operation.get("previous_server_status", ""))
+                server["status"] = previous_status if previous_status in {
+                    "online", "stopped", "error", "not_deployed"
+                } else "online"
+            else:
+                server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"
+            if action in {"install", "deploy", "update"}:
                 server["deployed"] = True
             terminal_log = ("操作完成", "远程操作已成功完成。")
         except RemoteWorkerCancelledError as exc:
