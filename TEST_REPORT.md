@@ -2,10 +2,40 @@
 
 ## Git基准点
 
-- **Commit Hash**: a0ebcd6（移除远程管理令牌配置与校验）
-- **提交信息**: Remove remote management token requirements
+- **Commit Hash**: c21da75（校验远程 worker 镜像构建上下文）
+- **提交信息**: Validate worker Docker build context
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：校验并选择有效的 worker Docker 构建上下文（2026-10-27）
+
+**变更范围**：自动构建前从应用目录、容器固定目录和模块目录中选择完整后端上下文；校验 Dockerfile 是 worker 项目文件，并跳过包含 `dict(os.environ)` 这类无效指令的同名文件。避免将错误目录里的 Dockerfile 打包发送给平台 Docker Engine。
+
+**测试环境**：Docker 测试镜像 Python 3.12。工作区既有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动被完整测试覆盖，但不属于本次提交。
+
+**测试执行结果**：
+- 构建上下文定向测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py::test_builds_worker_image_for_requested_platform_with_minimal_context tests/test_remote_workers.py::test_worker_build_context_skips_invalid_same_named_dockerfile tests/test_remote_workers.py::test_target_platform_worker_build_failure_is_reported -q -p no:cacheprovider`：3 通过。
+- 远程 worker 定向测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q -p no:cacheprovider`：53 通过、0 失败。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：232 通过、6 跳过、0 失败、0 错误。6 项为 Redis、S3 与 Supervisor 子进程的环境门控测试。
+- `docker compose up --build -d`：通过；远程覆盖 Compose 重建启动也通过。远程 Compose `config -q` 通过。
+- 运行容器实际调用 `_worker_build_context()` 检查：打包出 42 项，Dockerfile 不含错误表达式且包含 worker 构建指令。
+- `git diff --check`：通过。保留 SQLAlchemy 与 Pandas 两条既有弃用警告。
+- 未执行真实 `linux/amd64` Engine 自动构建。独立的 Docker BuildKit 验证未能拉取 `python:3.12-slim`，Docker Hub token 请求网络超时；Compose 重建使用已缓存镜像成功。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 错误目录中的同名 Dockerfile 不会进入 Engine 构建包 | 单元：`test_worker_build_context_skips_invalid_same_named_dockerfile` | 候选目录先提供含 `ENV dict(os.environ)` 的无效文件，后提供有效 worker 目录；归档采用有效 Dockerfile | 错误输入、回归 |
+| 正常构建包包含正确 Dockerfile 且不含运行数据 | 单元：`test_builds_worker_image_for_requested_platform_with_minimal_context` | 检查 Engine 请求包含项目 Dockerfile、依赖和 worker 代码，不含数据与测试目录 | 正常、数据隔离 |
+| 构建错误继续中止部署并展示 Docker Engine 原因 | 单元：`test_target_platform_worker_build_failure_is_reported` | 模拟 Engine 返回构建错误，接口抛出可读错误 | 异常 |
+| 现有远程安装和全平台行为回归通过 | `tests/test_remote_workers.py` 与完整 `tests/` | 53 项远程 worker 测试通过；全套 232 通过、6 环境门控跳过 | 兼容、回归 |
+
+**已知问题与限制**：本环境未能访问 Docker Hub，无法验证真实 AMD64 基础镜像拉取和目标架构构建；需要在 Docker Hub 可达的部署环境触发重新部署验证。
+
+**下次测试建议**：重新部署当前 trainer 版本后再次执行目标为 `linux/amd64` 的远程重部署；确认构建成功并将镜像通过 SSH 传到 Linux 服务器。
+
+**Git基准点**：`c21da75`（Validate worker Docker build context）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：移除远程管理令牌并默认启用（2026-10-27）
 
