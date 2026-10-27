@@ -1780,6 +1780,11 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     from app import remote_config_repository
 
     monkeypatch.setattr(config, "USE_DATABASE", True)
+    monkeypatch.setattr(
+        config,
+        "WORKER_REMOTE_REDIS_URL",
+        "rediss://:redis-secret@redis.example.net:6380/0",
+    )
     machine_id = "remote-operation-test"
     operation_id = "operation-test"
     server = _server(machine_id=machine_id, deployed=True)
@@ -1802,6 +1807,11 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     assert result["stderr"] == "worker boot warning"
     assert result["phase"] == "操作完成"
     assert result["duration_sec"] >= 0
+    assert "[远程服务器启动配置]" in result["log"]
+    assert '"action":"start"' in result["log"]
+    assert '"mode":"cpu"' in result["log"]
+    assert "redis.example.net:6380/0" in result["log"]
+    assert "redis-secret" not in result["log"]
     assert "远程操作已成功完成" in result["log"]
     assert remote_config_repository.get_remote_server(machine_id)["status"] == "online"
     assert remote_config_repository.get_remote_server(machine_id)["deployed"] is True

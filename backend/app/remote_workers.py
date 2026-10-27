@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Callable, Dict, List
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -47,6 +47,51 @@ _REMOTE_OPERATION_LOG_LOCK = threading.Lock()
 _REMOTE_OPERATION_LOG_LIMIT = 24_000
 _REMOTE_BUILD_IDLE_PROGRESS_INTERVAL = 30.0
 _WORKER_STARTUP_HEARTBEAT_TIMEOUT = 15.0
+
+
+def _safe_startup_endpoint(value: object) -> str:
+    """仅保留连接地址的非敏感部分，避免启动日志输出凭证或查询参数。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return "(未配置)"
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme and parsed.hostname:
+            hostname = parsed.hostname
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            port = f":{parsed.port}" if parsed.port else ""
+            path = parsed.path or ""
+            return f"{parsed.scheme}://{hostname}{port}{path}"
+    except ValueError:
+        pass
+    # 非 URL 形式的 endpoint 不含认证时可直接展示；含 @ 时只显示已配置状态。
+    return "[已配置]" if "@" in raw else raw
+
+
+def format_remote_startup_config(server: Dict[str, object], action: str) -> str:
+    """生成远程服务器操作的脱敏启动配置日志，和训练任务日志明确区分。"""
+    deployment = remote_deployment_settings(server)
+    try:
+        cpu_slots = int(server.get("cpu_slots", 2))
+    except (TypeError, ValueError):
+        cpu_slots = server.get("cpu_slots")
+    summary = {
+        "action": action,
+        "machine_id": server.get("machine_id"),
+        "host": server.get("host"),
+        "port": server.get("port"),
+        "mode": server.get("mode", "cpu"),
+        "cpu_slots": cpu_slots,
+        "worker_image": deployment.get("worker_image") or "(未配置)",
+        "redis_url": _safe_startup_endpoint(deployment.get("redis_url")),
+        "s3_endpoint": _safe_startup_endpoint(deployment.get("s3_endpoint")),
+        "s3_bucket": config.S3_BUCKET,
+        "s3_secure": config.S3_SECURE,
+    }
+    return "[远程服务器启动配置] " + json.dumps(
+        summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    )
 
 
 def _append_remote_operation_log(
@@ -1778,6 +1823,17 @@ def execute_remote_operation(
                 operation_id,
                 "准备远程操作",
                 f"开始执行 {action} 操作。",
+                server=server,
+            )
+            try:
+                startup_config = format_remote_startup_config(server, action)
+            except RemoteWorkerError as exc:
+                # 配置解密失败时仍保留可识别的启动日志，实际校验由远程动作继续负责。
+                startup_config = f"[远程服务器启动配置] 配置解析失败：{exc}"
+            _append_remote_operation_log(
+                operation_id,
+                "启动配置",
+                startup_config,
                 server=server,
             )
             server.update({"status": "running", "operation_id": operation_id})

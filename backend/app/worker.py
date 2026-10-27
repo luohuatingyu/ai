@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -152,6 +153,58 @@ _RETRYABLE_PATTERNS = (
 
 # 业务性错误类型（不可重试）：重试也无法改变结果，直接判 FAILED
 _FATAL_EXCEPTION_TYPES = (FileNotFoundError, ValueError, KeyError)
+
+_SENSITIVE_CONFIG_KEY_PARTS = (
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "access_key",
+    "private_key",
+    "credential",
+)
+
+
+def _redact_startup_config(value, key: str = ""):
+    """递归清理启动配置中的凭证字段，避免任务日志泄露敏感值。"""
+    normalized_key = key.lower().replace("-", "_")
+    if any(part in normalized_key for part in _SENSITIVE_CONFIG_KEY_PARTS):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _redact_startup_config(item_value, str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_startup_config(item, key) for item in value]
+    return value
+
+
+def format_training_startup_config(
+    job_id: str, record: dict, capabilities: dict
+) -> str:
+    """生成可读且脱敏的训练任务启动配置日志。"""
+    spec = record.get("spec") or {}
+    gpu = capabilities.get("gpu") or {}
+    device = f"cuda({gpu.get('name')})" if gpu.get("available") else "cpu"
+    summary = {
+        "job_id": job_id,
+        "dataset_id": spec.get("dataset_id"),
+        "dataset_name": spec.get("dataset_name"),
+        "task": spec.get("task"),
+        "target": spec.get("target"),
+        "params": _redact_startup_config(spec.get("params") or {}),
+        "resource_hint": _redact_startup_config(spec.get("resource_hint") or {}),
+        "worker_id": capabilities.get("worker_id"),
+        "machine_id": capabilities.get("machine_id"),
+        "slot": capabilities.get("slot"),
+        "device": device,
+        "torch_version": capabilities.get("torch_version"),
+        "cuda_version": capabilities.get("cuda_version"),
+    }
+    return "[训练任务启动配置] " + json.dumps(
+        summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    )
 
 
 def classify_retryable(exc: BaseException) -> bool:
@@ -517,6 +570,9 @@ class TrainingWorker:
                 key = job_key(job_id, name)
                 if store.exists(key):
                     store.read_file(key, scratch / name)
+
+            # 任务日志先记录本次执行的脱敏启动配置，便于区分任务参数与运行节点。
+            joblog(format_training_startup_config(job_id, record, self.caps))
 
             # ---- 恢复训练上下文：优先最新 checkpoint，损坏则回退更早版本 ----
             resume_state = None

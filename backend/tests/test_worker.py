@@ -57,7 +57,7 @@ def test_detect_capabilities_reports_cpu_and_stable_server_identity(monkeypatch)
 
 def test_worker_completes_job(store, make_dataset, make_job, q, ls, spawn_worker):
     ds = make_dataset()
-    job = make_job(ds, epochs=4)
+    job = make_job(ds, epochs=4, api_token="training-secret")
     q.push(job)
     w = spawn_worker("srv-a")
     ok = wait_until(lambda: job_status(store, job) == "completed", 40)
@@ -71,6 +71,11 @@ def test_worker_completes_job(store, make_dataset, make_job, q, ls, spawn_worker
     assert rec["segments"][0]["machine_id"] == w.worker.caps["machine_id"]
     assert rec["segments"][0]["slot"] == w.worker.caps["slot"]
     assert rec["segments"][0]["from_epoch"] == 1 and rec["segments"][0]["to_epoch"] == 4
+    log = jobstore.read_job_log(store, job)
+    assert "[训练任务启动配置]" in log
+    assert '"dataset_id":"' + ds + '"' in log
+    assert '"api_token":"[redacted]"' in log
+    assert "training-secret" not in log
     w.stop()
 
 
