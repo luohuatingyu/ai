@@ -2,10 +2,72 @@
 
 ## Git基准点
 
-- **Commit Hash**: 9485de8（补充传统 Dockerfile 回退边界测试）
-- **提交信息**: Cover incompatible legacy Dockerfile
+- **Commit Hash**: 63bc551（修复阿里云 OSS region 自动识别）
+- **提交信息**: Fix Aliyun OSS region detection
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：阿里云 OSS region 自动识别（2026-10-27）
+
+**变更范围**：S3ArtifactStore 从标准阿里云 OSS endpoint（含 S3 网关域名）提取 region 并传给 MinIO 客户端，跳过不兼容 OSS 的路径式 GetBucketLocation 探测；其他 S3 endpoint 继续使用 SDK 默认行为。代码提交为 `63bc551`。
+
+**测试环境**：Docker Compose；容器 Python 3.12、MinIO Python SDK 7.2.20。OSS 回环使用当前 `.env` 中配置的 endpoint、bucket 和凭证；不记录凭证值。完整测试包含工作区中预先存在的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 未提交改动，这些改动未纳入本次代码提交。
+
+**测试执行结果**：
+- 存储定向测试：29 项；27 通过、0 失败、0 错误、2 跳过。跳过项需要显式设置 S3 测试端点。
+- 完整测试：264 项；258 通过、0 失败、0 错误、6 跳过。6 项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- 当前 OSS bucket 启动检查通过；临时对象写入、读取、存在性检查、列表、删除及清理回环通过。
+- `docker compose up --build -d`：镜像构建成功；trainer 启动，frontend 与 SeaweedFS healthy；`/api/health` 返回 `{"ok":true}`。
+- worker 尚未通过运行验证：外部 Redis 返回 `Authentication required`，且容器中的 `REDIS_PASSWORD` 为空。需在本地 `.env` 配置有效 Redis 凭证后重启并复测 worker；本次未执行端到端训练。
+- `git diff --check`：通过。pytest 有两条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 标准 OSS endpoint 自动提供正确 region，非 OSS endpoint 不改变默认行为 | 单元：`test_s3_store_infers_region_only_for_regional_oss_endpoints`，7 组参数 | 上海/杭州、内外网及 S3 网关域名传入对应 region；SeaweedFS 与加速域名不传 region | 正常、边界、兼容 |
+| OSS bucket 初始化及对象存储基本操作可用 | 集成：当前 `.env` OSS bucket 上执行临时对象回环 | bucket 检查、写/读/exists/list/delete 均成功，最后确认对象已清理 | 正常、回归、资源清理 |
+| Compose 应用入口可用 | 容器/API：`docker compose up --build -d`、`curl /api/health` | trainer 启动且 API 返回 `ok=true`；frontend 与 SeaweedFS healthy | 启动、接口回归 |
+| worker 可接入协调服务 | 容器集成：Compose worker | 未通过；外部 Redis 要求认证，而当前容器没有 Redis 密码，未执行训练链路 | 外部依赖阻塞；修复凭证后需复测 |
+
+**实际执行命令**：
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_storage.py -q -p no:cacheprovider
+```
+
+结果：27 passed、2 skipped。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider
+```
+
+结果：258 passed、6 skipped、0 failed。
+
+```bash
+docker run --rm --env-file .env --entrypoint python emdash-hot-boxes-clean-y9u6p-trainer:latest -c 'from app.storage import S3ArtifactStore; import uuid; st=S3ArtifactStore(); prefix="jobs/it-oss-region-fix/"; key=prefix+uuid.uuid4().hex+".txt"; value=b"oss-region-roundtrip"; wrote=False
+try:
+ st.write_bytes(key,value); wrote=True
+ assert st.read_bytes(key)==value
+ assert st.exists(key)
+ assert key in st.list_keys(prefix)
+ print("oss_roundtrip=passed")
+finally:
+ if wrote: st.delete(key)
+assert not st.exists(key)
+print("oss_cleanup=passed")'
+docker compose up --build -d
+curl -fsS --max-time 5 http://127.0.0.1:8000/api/health
+docker compose ps --all
+docker compose logs --tail=25 trainer worker
+git diff --check
+```
+
+结果：OSS 回环与清理通过；Compose 构建通过，API 健康检查通过；worker 因 Redis 缺少有效认证而重启。
+
+**已知问题与下次测试建议**：填写有效 `REDIS_PASSWORD` 后重新运行 Compose，确认 worker 稳定加入 Redis；随后运行一次真实训练任务，验证队列领取、日志、完成状态及产物。修改 S3 endpoint 识别或对象存储客户端初始化时，重新运行 `tests/test_storage.py`、完整 `tests/`、真实 OSS 回环及 `docker compose up --build -d`。
+
+**Git基准点**：`63bc551`（Fix Aliyun OSS region detection）；测试报告单独提交。
 
 ## 本次变更测试结果：远程 Docker 缺少 buildx 时兼容构建（2026-10-27）
 
