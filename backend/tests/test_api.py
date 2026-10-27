@@ -287,31 +287,25 @@ def test_managed_worker_selection_api(client):
         manager.lease.deregister_worker(worker_id)
 
 
-def test_remote_management_requires_an_enabled_admin_token(client, monkeypatch):
-    """SSH 管理接口默认关闭，启用后未提供或提供错误令牌均不得访问。"""
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", False)
-    assert client.get("/api/remote-servers").status_code == 503
+def test_remote_management_is_enabled_without_admin_token(client, monkeypatch):
+    """远程管理默认启用，页面可直接读取服务器目录，无需管理令牌。"""
+    from app.routers import jobs as jobs_router
 
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", "remote-admin-token-0123456789-abcd")
-    assert client.get("/api/remote-servers").status_code == 401
-    assert client.get(
-        "/api/remote-servers", headers={"X-Worker-Admin-Token": "incorrect-token"}
-    ).status_code == 401
+    monkeypatch.setattr(jobs_router.remote_config_repository, "list_remote_servers", lambda: [])
+    response = client.get("/api/remote-servers")
+    assert response.status_code == 200
+    assert response.json() == {"servers": []}
 
 
-def test_remote_operation_cancel_requires_admin_and_cancels_queued_operation(
+def test_remote_operation_cancel_cancels_queued_operation(
     client, monkeypatch
 ):
-    """排队操作可由授权管理员中断，未授权请求不能改变操作状态。"""
+    """无管理令牌时也可中断排队操作，且状态和服务器锁正确更新。"""
     from app.routers import jobs as jobs_router
     from app.state import manager
 
-    token = "remote-admin-token-cancel-0123456789"
     operation_id = "d" * 32
     server = {"machine_id": "remote-cancel-api", "status": "provisioning"}
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(
         jobs_router.remote_config_repository,
         "get_remote_server",
@@ -332,14 +326,7 @@ def test_remote_operation_cancel_requires_admin_and_cancels_queued_operation(
         },
     )
 
-    denied = client.post(f"/api/remote-operations/{operation_id}/cancel")
-    assert denied.status_code == 401
-    assert manager.lease.get_remote_operation(operation_id)["status"] == "queued"
-
-    cancelled = client.post(
-        f"/api/remote-operations/{operation_id}/cancel",
-        headers={"X-Worker-Admin-Token": token},
-    )
+    cancelled = client.post(f"/api/remote-operations/{operation_id}/cancel")
     assert cancelled.status_code == 202
     assert cancelled.json()["status"] == "cancelled"
     assert manager.lease.get_remote_operation(operation_id)["status"] == "cancelled"
@@ -352,10 +339,7 @@ def test_remote_operation_cancel_marks_active_operation_as_cancelling(client, mo
     from app import remote_workers
     from app.state import manager
 
-    token = "remote-admin-token-active-cancel-012345"
     operation_id = "e" * 32
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     manager.lease.set_remote_operation(
         operation_id,
         {
@@ -367,16 +351,10 @@ def test_remote_operation_cancel_marks_active_operation_as_cancelling(client, mo
     )
     cancellation_event = remote_workers._register_remote_operation(operation_id)
     try:
-        response = client.post(
-            f"/api/remote-operations/{operation_id}/cancel",
-            headers={"X-Worker-Admin-Token": token},
-        )
+        response = client.post(f"/api/remote-operations/{operation_id}/cancel")
         assert response.status_code == 202
         assert response.json()["status"] == "cancelling"
-        status = client.get(
-            f"/api/remote-operations/{operation_id}",
-            headers={"X-Worker-Admin-Token": token},
-        ).json()
+        status = client.get(f"/api/remote-operations/{operation_id}").json()
         assert status["status"] == "running"
         assert status["cancel_requested"] is True
         assert cancellation_event.is_set()
@@ -389,11 +367,8 @@ def test_remote_operation_cancel_clears_stale_running_state(client, monkeypatch)
     from app.routers import jobs as jobs_router
     from app.state import manager
 
-    token = "remote-admin-token-stale-cancel-0123456"
     operation_id = "f" * 32
     server = {"machine_id": "remote-stale-cancel-api", "status": "running"}
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(
         jobs_router.remote_config_repository,
         "get_remote_server",
@@ -414,10 +389,7 @@ def test_remote_operation_cancel_clears_stale_running_state(client, monkeypatch)
         },
     )
 
-    response = client.post(
-        f"/api/remote-operations/{operation_id}/cancel",
-        headers={"X-Worker-Admin-Token": token},
-    )
+    response = client.post(f"/api/remote-operations/{operation_id}/cancel")
 
     assert response.status_code == 202
     assert response.json()["status"] == "cancelled"
@@ -428,20 +400,16 @@ def test_remote_operation_cancel_clears_stale_running_state(client, monkeypatch)
 
 
 def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, monkeypatch, request):
-    """令牌保护的远程添加与生命周期 API 仅保存 SSH 目标元数据并记录异步操作。"""
+    """无需令牌的远程添加与生命周期 API 仅保存 SSH 目标元数据并记录异步操作。"""
     from app.routers import jobs as jobs_router
     from app import remote_workers
     from app import remote_config_repository
     from app.state import manager
     from cryptography.fernet import Fernet
 
-    token = "remote-admin-token-0123456789-abcd"
-    headers = {"X-Worker-Admin-Token": token}
     machine_id = f"remote-api-{time.time_ns()}"
     calls = []
     _enable_remote_mysql(monkeypatch)
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
     monkeypatch.setattr(manager, "distributed", True)
@@ -449,7 +417,6 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
     credential = client.post(
         "/api/remote-ssh-credentials",
-        headers=headers,
         json={
             "name": "API test credential",
             "username": "credential-user",
@@ -477,10 +444,10 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
         "remote_redis_url": "rediss://worker:synthetic-redis-password@redis.example.net:6380/4",
         "remote_s3_endpoint": "remote-storage.example.net:9000",
     }
-    added = client.post("/api/remote-servers", json=payload, headers=headers)
+    added = client.post("/api/remote-servers", json=payload)
     assert added.status_code == 202
     operation_id = added.json()["operation_id"]
-    operation = client.get(f"/api/remote-operations/{operation_id}", headers=headers).json()
+    operation = client.get(f"/api/remote-operations/{operation_id}").json()
     assert operation["status"] == "completed"
     assert operation["output"] == "done"
     assert calls == [(machine_id, "install", "worker")]
@@ -489,7 +456,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     assert stored_server["remote_redis_url_encrypted"] != payload["remote_redis_url"]
     assert payload["remote_redis_url"] not in repr(stored_server)
 
-    servers = client.get("/api/remote-servers", headers=headers).json()["servers"]
+    servers = client.get("/api/remote-servers").json()["servers"]
     server = next(item for item in servers if item["machine_id"] == machine_id)
     assert server["host"] == payload["host"]
     assert server["username_override"] == "worker"
@@ -500,11 +467,9 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     assert "remote_redis_url_encrypted" not in server
     assert payload["remote_redis_url"] not in repr(server)
     assert "private_key" not in server and "token" not in server
-    assert client.patch(f"/api/remote-servers/{machine_id}", json={}).status_code == 401
 
     edited = client.patch(
         f"/api/remote-servers/{machine_id}",
-        headers=headers,
         json={
             "worker_image": "registry.example.net/remote/worker:v3",
             "remote_redis_url": "",
@@ -520,27 +485,25 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
 
     cleared = client.patch(
         f"/api/remote-servers/{machine_id}",
-        headers=headers,
         json={"clear_remote_redis_url_override": True},
     )
     assert cleared.status_code == 200, cleared.text
     assert "remote_redis_url_encrypted" not in remote_config_repository.get_remote_server(machine_id)
     assert cleared.json()["server"]["has_remote_redis_url_override"] is False
-    assert client.post("/api/remote-servers", json=payload, headers=headers).status_code == 409
+    assert client.post("/api/remote-servers", json=payload).status_code == 409
 
     for action in ("install", "start", "stop", "restart"):
-        result = client.post(f"/api/remote-servers/{machine_id}/{action}", headers=headers)
+        result = client.post(f"/api/remote-servers/{machine_id}/{action}")
         assert result.status_code == 202
         current = client.get(
-            f"/api/remote-operations/{result.json()['operation_id']}", headers=headers
+            f"/api/remote-operations/{result.json()['operation_id']}"
         ).json()
         assert current["status"] == "completed"
         assert calls[-1] == (machine_id, action, "worker")
 
     assert client.post(
-        f"/api/remote-servers/missing-{machine_id}/start", headers=headers
+        f"/api/remote-servers/missing-{machine_id}/start"
     ).status_code == 404
-    assert client.get(f"/api/remote-operations/{operation_id}").status_code == 401
     remote_config_repository.delete_remote_server(machine_id)
 
 
@@ -548,13 +511,9 @@ def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatc
     """非法主机字段由请求模型拒绝，不进入 SSH 执行器。"""
     from app.routers import jobs as jobs_router
 
-    token = "remote-admin-token-0123456789-abcd"
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
     response = client.post(
         "/api/remote-servers",
-        headers={"X-Worker-Admin-Token": token},
         json={
             "machine_id": "remote-injection-test",
             "host": "compute.example.net;touch /tmp/pwned",
@@ -575,11 +534,7 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
     from app.routers import jobs as jobs_router
     from app.state import manager
 
-    token = "remote-admin-token-default-user-0123456789"
-    headers = {"X-Worker-Admin-Token": token}
     _enable_remote_mysql(monkeypatch)
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
     monkeypatch.setattr(manager, "distributed", True)
@@ -587,7 +542,6 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
     credential_response = client.post(
         "/api/remote-ssh-credentials",
-        headers=headers,
         json={
             "name": "default username test",
             "username": "credential-user",
@@ -608,7 +562,6 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
     machine_id = f"remote-default-user-{time.time_ns()}"
     response = client.post(
         "/api/remote-servers",
-        headers=headers,
         json={
             "machine_id": machine_id,
             "host": "compute.example.net",
@@ -634,12 +587,8 @@ def test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_ec
     from app import remote_config_repository
     from app.state import manager
 
-    token = "remote-admin-token-credential-catalog-012345"
-    headers = {"X-Worker-Admin-Token": token}
     _enable_remote_mysql(monkeypatch)
     encryption_key = Fernet.generate_key().decode()
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", encryption_key)
     monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
     monkeypatch.setattr(manager, "distributed", True)
@@ -663,19 +612,18 @@ def test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_ec
     ]
     created = []
     for payload in payloads:
-        response = client.post("/api/remote-ssh-credentials", headers=headers, json=payload)
+        response = client.post("/api/remote-ssh-credentials", json=payload)
         assert response.status_code == 200, response.text
         created.append(response.json())
         assert secret_password not in response.text
         assert private_key not in response.text
 
-    listed = client.get("/api/remote-ssh-credentials", headers=headers)
+    listed = client.get("/api/remote-ssh-credentials")
     assert listed.status_code == 200
     catalog = listed.json()
     assert [item["auth_method"] for item in catalog["credentials"]] == ["password", "key", "key_password"]
     assert catalog["default_credential_id"] == catalog["credentials"][2]["id"]
     assert secret_password not in listed.text and private_key not in listed.text
-    assert client.get("/api/remote-ssh-credentials").status_code == 401
 
     ciphertext = remote_config_repository.get_ssh_credentials_ciphertext()
     decrypted = Fernet(encryption_key.encode()).decrypt(ciphertext.encode()).decode()
@@ -688,13 +636,12 @@ def test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_ec
     remote_config_repository.save_remote_server(
         {"machine_id": machine_id, "ssh_credential_id": referenced_id}
     )
-    blocked = client.delete(f"/api/remote-ssh-credentials/{referenced_id}", headers=headers)
+    blocked = client.delete(f"/api/remote-ssh-credentials/{referenced_id}")
     assert blocked.status_code == 409
     remote_config_repository.delete_remote_server(machine_id)
 
     updated = client.put(
         f"/api/remote-ssh-credentials/{created[0]['credentials'][0]['id']}",
-        headers=headers,
         json={
             "name": "password-only-updated",
             "username": "pw-user-new",
@@ -704,26 +651,22 @@ def test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_ec
     )
     assert updated.status_code == 200, updated.text
     assert "replacement-secret" not in updated.text
-    deleted = client.delete(f"/api/remote-ssh-credentials/{created[1]['credentials'][1]['id']}", headers=headers)
+    deleted = client.delete(f"/api/remote-ssh-credentials/{created[1]['credentials'][1]['id']}")
     assert deleted.status_code == 200
     assert len(deleted.json()["credentials"]) == 2
 
 
 def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client, monkeypatch, request):
-    """令牌保护的 SSH 设置加密持久化，并且读取/清除接口不回传秘密。"""
+    """SSH 设置无需管理令牌即可加密持久化，读取/清除接口不回传秘密。"""
     from cryptography.fernet import Fernet
 
     from app.remote_workers import _platform_ssh_credentials
     from app import remote_config_repository
     from app.state import manager
 
-    token = "remote-admin-token-settings-0123456789"
-    headers = {"X-Worker-Admin-Token": token}
     _enable_remote_mysql(monkeypatch)
     password = "platform SSH password with spaces and $ chars"
     encryption_key = Fernet.generate_key().decode("ascii")
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", encryption_key)
     monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
     monkeypatch.setattr(manager, "distributed", True)
@@ -731,11 +674,7 @@ def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
 
     payload = {"auth_method": "password", "password": password}
-    assert client.get("/api/remote-ssh-settings").status_code == 401
-    assert client.put("/api/remote-ssh-settings", json=payload).status_code == 401
-    assert client.delete("/api/remote-ssh-settings").status_code == 401
-
-    saved = client.put("/api/remote-ssh-settings", json=payload, headers=headers)
+    saved = client.put("/api/remote-ssh-settings", json=payload)
     assert saved.status_code == 200, saved.text
     ciphertext = remote_config_repository.get_ssh_credentials_ciphertext()
     assert ciphertext and password not in ciphertext
@@ -748,12 +687,12 @@ def test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets(client
         "can_configure": True,
     }
 
-    readback = client.get("/api/remote-ssh-settings", headers=headers)
+    readback = client.get("/api/remote-ssh-settings")
     assert readback.status_code == 200
     assert password not in readback.text
     assert _platform_ssh_credentials()["password"] == password
 
-    cleared = client.delete("/api/remote-ssh-settings", headers=headers)
+    cleared = client.delete("/api/remote-ssh-settings")
     assert cleared.status_code == 200, cleared.text
     assert remote_config_repository.get_ssh_credentials_ciphertext() is None
     assert cleared.json()["source"] == "none"
@@ -767,8 +706,6 @@ def test_remote_ssh_settings_save_private_key_without_echo(client, monkeypatch, 
 
     from app.state import manager
 
-    token = "remote-admin-token-private-key-0123456789"
-    headers = {"X-Worker-Admin-Token": token}
     _enable_remote_mysql(monkeypatch)
     private_key = (
         "-----BEGIN OPENSSH PRIVATE KEY-----\n"
@@ -776,8 +713,6 @@ def test_remote_ssh_settings_save_private_key_without_echo(client, monkeypatch, 
         "-----END OPENSSH PRIVATE KEY-----"
     )
     encryption_key = Fernet.generate_key().decode("ascii")
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", encryption_key)
     monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
     monkeypatch.setattr(manager, "distributed", True)
@@ -786,7 +721,6 @@ def test_remote_ssh_settings_save_private_key_without_echo(client, monkeypatch, 
 
     response = client.put(
         "/api/remote-ssh-settings",
-        headers=headers,
         json={"auth_method": "key", "private_key": private_key},
     )
 
@@ -812,16 +746,12 @@ def test_remote_ssh_settings_reject_invalid_credentials(client, monkeypatch, req
     """空密码、多行密码及不完整/非法密钥在保存前拒绝。"""
     from app import remote_config_repository
 
-    token = "remote-admin-token-invalid-settings-012345"
     _enable_remote_mysql(monkeypatch)
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     from cryptography.fernet import Fernet
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
     response = client.put(
         "/api/remote-ssh-settings",
-        headers={"X-Worker-Admin-Token": token},
         json=payload,
     )
     assert response.status_code == 422
@@ -835,23 +765,19 @@ def test_remote_ssh_settings_require_mysql_and_encryption_key(client, monkeypatc
     """未启用 MySQL 或未设置有效加密密钥时页面不能持久化凭证。"""
     from app.state import manager
 
-    token = "remote-admin-token-storage-settings-012345"
-    headers = {"X-Worker-Admin-Token": token}
     payload = {"auth_method": "password", "password": "test-password"}
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
     manager.lease.delete_remote_ssh_credentials()
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
 
     monkeypatch.setattr(config, "USE_DATABASE", False)
     monkeypatch.setattr(manager, "distributed", False)
-    no_database = client.put("/api/remote-ssh-settings", headers=headers, json=payload)
+    no_database = client.put("/api/remote-ssh-settings", json=payload)
     assert no_database.status_code == 503
     assert "MySQL" in no_database.text
 
     monkeypatch.setattr(config, "USE_DATABASE", True)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", "")
-    no_key = client.put("/api/remote-ssh-settings", headers=headers, json=payload)
+    no_key = client.put("/api/remote-ssh-settings", json=payload)
     assert no_key.status_code == 503
     assert "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY" in no_key.text
     from app import remote_config_repository
@@ -862,18 +788,11 @@ def test_remote_ssh_settings_redacts_mysql_read_failure(client, monkeypatch):
     """MySQL 读取异常以脱敏 503 返回，不泄漏底层错误内容。"""
     from app import remote_workers
 
-    token = "remote-admin-token-redis-error-012345678"
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", token)
-
     def fail_status():
         raise OSError("redis password leaked")
 
     monkeypatch.setattr(remote_workers, "remote_ssh_settings_status", fail_status)
-    response = client.get(
-        "/api/remote-ssh-settings",
-        headers={"X-Worker-Admin-Token": token},
-    )
+    response = client.get("/api/remote-ssh-settings")
 
     assert response.status_code == 503
     assert "redis password leaked" not in response.text
@@ -1366,7 +1285,7 @@ def test_remote_server_feedback_toasts_render_above_add_modal():
 
 
 def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads():
-    """保存按钮不应因目录或令牌状态锁死；缺少配置时由点击处理器解释原因。"""
+    """保存按钮保持可用，页面不再要求远程管理令牌。"""
     backend_dir = Path(__file__).resolve().parents[1]
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
@@ -1383,10 +1302,12 @@ def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads()
 
     assert "disabled" not in button
     assert "novalidate" in credential_form
-    assert '先填写远程管理令牌，再查看或管理 SSH 凭证。' in catalog_loader
+    assert '先填写远程管理令牌，再查看或管理 SSH 凭证。' not in catalog_loader
     assert "共享 Redis" not in catalog_loader
     assert "MySQL" in catalog_loader
-    assert "if (!token)" in save_handler
+    assert 'remoteAdminToken' not in html
+    assert 'X-Worker-Admin-Token' not in html
+    assert "if (!token)" not in save_handler
     assert "button.disabled = true" in save_handler
     assert "button.disabled = false" in save_handler
 

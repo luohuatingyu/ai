@@ -42,9 +42,7 @@ def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     key.write_text("test-key", encoding="utf-8")
     key.chmod(0o600)
     known_hosts = tmp_path / "remote_known_hosts"
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", True)
     monkeypatch.setattr(config, "USE_DATABASE", True)
-    monkeypatch.setattr(config, "WORKER_REMOTE_TOKEN", "test-remote-admin-token-0123456789")
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/ml/worker:unit")
     monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "rediss://redis.example.net:6380/0")
     monkeypatch.setattr(config, "WORKER_REMOTE_S3_ENDPOINT", "storage.example.net:9000")
@@ -114,8 +112,6 @@ def test_remote_configuration_requires_page_credentials_and_local_image_tag(tmp_
     assert any("平台本地 Docker 镜像标签" in item for item in remote_workers.remote_configuration_errors())
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "worker:latest")
     assert not any("镜像" in item for item in remote_workers.remote_configuration_errors())
-    monkeypatch.setattr(config, "WORKER_REMOTE_ENABLED", False)
-    assert any("尚未启用" in item for item in remote_workers.remote_configuration_errors())
 
 
 def test_remote_configuration_supports_page_password_without_key_file(tmp_path, monkeypatch):
@@ -814,7 +810,6 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     assert transfers[0][-2] == 3600
     assert "secret-test" not in " ".join(command)
     assert "secret-test" in calls["input"]
-    assert config.WORKER_REMOTE_TOKEN not in calls["input"]
 
 
 def test_run_remote_action_builds_target_architecture_before_transfer(tmp_path, monkeypatch):

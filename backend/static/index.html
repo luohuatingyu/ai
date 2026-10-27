@@ -537,11 +537,7 @@
         <input id="remoteS3Endpoint" name="remote_s3_endpoint" maxlength="512" placeholder="留空时使用平台默认 S3_ENDPOINT">
       </div>
       <div class="field wide hint">保存后点击服务器卡片上的“重新部署并应用配置”，让目标 worker 使用新设置。</div>
-      <div class="field wide">
-        <label for="remoteAdminToken">远程管理令牌</label>
-        <input id="remoteAdminToken" type="password" autocomplete="current-password" required placeholder="平台配置的 WORKER_REMOTE_TOKEN">
-        <div class="hint">令牌只保存在当前浏览器标签页会话中。SSH 凭证在页面统一配置；主机密钥首次连接时自动信任并持久化。</div>
-      </div>
+      <div class="field wide hint">SSH 凭证在页面统一配置；主机密钥首次连接时自动信任并持久化。</div>
       <div class="server-form-actions">
         <button type="button" id="btnCancelAddServer">取消</button>
         <button type="submit" id="btnSubmitRemoteServer" class="primary">远程添加并检测资源</button>
@@ -1510,17 +1506,15 @@ function workerServerCard(machineId, slots, remoteServer = null) {
 
 // 读取仅在当前会话授权的远程服务器状态，缓存操作结果以减少重复请求。
 async function loadRemoteServers() {
-  const token = getRemoteAdminToken();
-  if (!token) return { servers: [], error: null, authorized: false };
   try {
-    const result = await remoteApiJson("/api/remote-servers");
+    const result = await apiJson("/api/remote-servers");
     const servers = result.servers || [];
     for (const server of servers) {
       if (!server.operation_id) continue;
       let operation = state.remoteOperations.get(server.operation_id);
       if (!operation || ["queued", "running"].includes(operation.status)) {
         try {
-          operation = await remoteApiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`);
+          operation = await apiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`);
           state.remoteOperations.set(server.operation_id, operation);
           if (["completed", "failed", "cancelled"].includes(operation.status) && !state.remoteOperationNotified.has(server.operation_id)) {
             state.remoteOperationNotified.add(server.operation_id);
@@ -1594,19 +1588,6 @@ async function refreshWorkers() {
   }
 }
 
-// 从标签页会话读取 SSH 管理令牌，不把令牌写入长期浏览器存储。
-function getRemoteAdminToken() {
-  try { return sessionStorage.getItem("workerAdminToken") || ""; }
-  catch { return ""; }
-}
-
-// 为受保护的远程管理接口附加当前标签页令牌。
-async function remoteApiJson(url, opt = {}) {
-  const headers = new Headers(opt.headers || {});
-  headers.set("X-Worker-Admin-Token", getRemoteAdminToken());
-  return apiJson(url, { ...opt, headers });
-}
-
 // 按凭证认证组合显示秘密输入项，并只校验当前需要的字段。
 function updateRemoteSshCredentialFields(clearHidden = true) {
   const method = $("remoteSshAuthMethod").value;
@@ -1660,18 +1641,9 @@ function renderRemoteCredentialList() {
 // 查询页面凭证目录；接口只返回名称、用户名、类型和默认状态。
 async function loadRemoteSshSettings() {
   const status = $("remoteSshSettingsStatus");
-  if (!getRemoteAdminToken()) {
-    status.textContent = "先填写远程管理令牌，再查看或管理 SSH 凭证。";
-    state.remoteCredentials = [];
-    state.remoteCredentialDefaultId = null;
-    state.remoteCredentialsCanConfigure = false;
-    renderRemoteCredentialOptions();
-    renderRemoteCredentialList();
-    return;
-  }
   status.textContent = "正在读取凭证目录…";
   try {
-    const catalog = await remoteApiJson("/api/remote-ssh-credentials");
+    const catalog = await apiJson("/api/remote-ssh-credentials");
     state.remoteCredentials = catalog.credentials || [];
     state.remoteCredentialDefaultId = catalog.default_credential_id || null;
     state.remoteCredentialsCanConfigure = Boolean(catalog.can_configure);
@@ -1700,10 +1672,6 @@ function resetRemoteSshCredentialForm() {
 
 // 保存或更新凭证；请求完成后清空浏览器中的秘密。
 async function saveRemoteSshSettings() {
-  const token = $("remoteAdminToken").value.trim();
-  if (!token) { toast("请先填写平台远程管理令牌", "err"); $("remoteAdminToken").focus(); return; }
-  try { sessionStorage.setItem("workerAdminToken", token); }
-  catch { toast("当前浏览器无法保存标签页令牌，请检查隐私模式设置", "err"); return; }
   const form = $("remoteSshCredentialForm");
   updateRemoteSshCredentialFields(false);
   if (!form.reportValidity()) {
@@ -1726,7 +1694,7 @@ async function saveRemoteSshSettings() {
   const button = $("btnSaveRemoteSshSettings");
   button.disabled = true;
   try {
-    await remoteApiJson(credentialId ? `/api/remote-ssh-credentials/${encodeURIComponent(credentialId)}` : "/api/remote-ssh-credentials", {
+    await apiJson(credentialId ? `/api/remote-ssh-credentials/${encodeURIComponent(credentialId)}` : "/api/remote-ssh-credentials", {
       method: credentialId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     resetRemoteSshCredentialForm();
@@ -1756,11 +1724,10 @@ function editRemoteSshCredential(credentialId) {
 
 // 删除未被服务器使用的凭证，被引用时由服务端阻止删除。
 async function deleteRemoteSshCredential(credentialId) {
-  if (!getRemoteAdminToken()) { toast("请先填写平台远程管理令牌", "err"); return; }
   const credential = state.remoteCredentials.find((item) => item.id === credentialId);
   if (!credential || !window.confirm(`确认删除 SSH 凭证“${credential.name}”？`)) return;
   try {
-    await remoteApiJson(`/api/remote-ssh-credentials/${encodeURIComponent(credentialId)}`, { method: "DELETE" });
+    await apiJson(`/api/remote-ssh-credentials/${encodeURIComponent(credentialId)}`, { method: "DELETE" });
     toast("SSH 凭证已删除", "ok");
     resetRemoteSshCredentialForm();
     await loadRemoteSshSettings();
@@ -1781,7 +1748,6 @@ function openAddServerModal() {
   $("clearRemoteRedisOverride").checked = false;
   $("remoteRedisUrl").disabled = false;
   $("remoteRedisUrl").placeholder = "留空时使用平台默认 Redis";
-  $("remoteAdminToken").value = getRemoteAdminToken();
   resetRemoteSshCredentialForm();
   modal.hidden = false;
   modal.classList.add("open");
@@ -1793,12 +1759,10 @@ function openAddServerModal() {
 async function openEditRemoteServer(machineId) {
   const server = state.remoteServers.find((item) => item.machine_id === machineId);
   if (!server) return;
-  if (!getRemoteAdminToken()) { openAddServerModal(); toast("请先填写远程管理令牌", "err"); return; }
   await loadRemoteSshSettings();
   const modal = $("addServerModal");
   $("remoteServerForm").reset();
   state.editingRemoteMachineId = machineId;
-  $("remoteAdminToken").value = getRemoteAdminToken();
   $("remoteMachineId").value = server.machine_id;
   $("remoteMachineId").readOnly = true;
   $("remoteHost").value = server.host || "";
@@ -1823,7 +1787,6 @@ async function openEditRemoteServer(machineId) {
   $("remoteS3Endpoint").value = server.remote_s3_endpoint_override || "";
   $("addServerTitle").textContent = `编辑服务器 ${machineId}`;
   $("btnSubmitRemoteServer").textContent = "保存服务器配置";
-  $("remoteAdminToken").value = getRemoteAdminToken();
   modal.hidden = false;
   modal.classList.add("open");
   $("remoteHost").focus();
@@ -1841,15 +1804,11 @@ function closeAddServerModal() {
   $("btnAddServer").focus();
 }
 
-// 用令牌提交 SSH 服务器配置，后台接入完成后继续读取自动检测到的资源。
+// 提交 SSH 服务器配置，后台接入完成后继续读取自动检测到的资源。
 async function submitRemoteServer(event) {
   event.preventDefault();
   const form = $("remoteServerForm");
   const submit = $("btnSubmitRemoteServer");
-  const token = $("remoteAdminToken").value;
-  if (!token) { toast("请填写平台远程管理令牌", "err"); $("remoteAdminToken").focus(); return; }
-  try { sessionStorage.setItem("workerAdminToken", token); }
-  catch { toast("当前浏览器无法保存标签页令牌，请检查隐私模式设置", "err"); return; }
   const payload = Object.fromEntries(new FormData(form).entries());
   payload.username = payload.username.trim() || null;
   payload.port = Number(payload.port);
@@ -1863,7 +1822,7 @@ async function submitRemoteServer(event) {
   submit.disabled = true;
   submit.textContent = "正在提交…";
   try {
-    await remoteApiJson(editingMachineId
+    await apiJson(editingMachineId
       ? `/api/remote-servers/${encodeURIComponent(editingMachineId)}`
       : "/api/remote-servers", {
       method: editingMachineId ? "PATCH" : "POST",
@@ -1886,12 +1845,11 @@ async function submitRemoteServer(event) {
 async function manageRemoteServer(button) {
   const machineId = button.dataset.remoteMachineId;
   const action = button.dataset.remoteAction;
-  if (!getRemoteAdminToken()) { openAddServerModal(); toast("请先填写远程管理令牌", "err"); return; }
   const actionText = { install: "重新部署", start: "启动", stop: "停止", restart: "重启" }[action];
   if (action !== "start" && !window.confirm(`确认${actionText} ${machineId} 上的 worker？`)) return;
   button.disabled = true;
   try {
-    await remoteApiJson(`/api/remote-servers/${encodeURIComponent(machineId)}/${action}`, { method: "POST" });
+    await apiJson(`/api/remote-servers/${encodeURIComponent(machineId)}/${action}`, { method: "POST" });
     toast(`${machineId}：已提交${actionText}操作`, "ok");
     await refreshWorkers();
   } catch (error) {
@@ -1903,12 +1861,11 @@ async function manageRemoteServer(button) {
 // 中断当前 SSH 操作；远端已经产生的部分变更不会自动回滚。
 async function cancelRemoteOperation(button) {
   const operationId = button.dataset.cancelRemoteOperation;
-  if (!getRemoteAdminToken()) { openAddServerModal(); toast("请先填写平台远程管理令牌", "err"); return; }
   if (!window.confirm("确认中断这项远程操作？Linux 上已经完成的部分变更不会自动回滚。")) return;
   button.disabled = true;
   button.textContent = "正在中断…";
   try {
-    const result = await remoteApiJson(`/api/remote-operations/${encodeURIComponent(operationId)}/cancel`, { method: "POST" });
+    const result = await apiJson(`/api/remote-operations/${encodeURIComponent(operationId)}/cancel`, { method: "POST" });
     const operation = state.remoteOperations.get(operationId) || { operation_id: operationId };
     if (result.status === "cancelled") operation.status = "cancelled";
     operation.cancel_requested = result.status === "cancelling";
@@ -1960,13 +1917,6 @@ $("remoteSshCredentialList").addEventListener("click", (event) => {
   if (button.dataset.sshCredentialAction === "delete") deleteRemoteSshCredential(credentialId);
 });
 updateRemoteSshCredentialFields(false);
-$("remoteAdminToken").addEventListener("change", () => {
-  const token = $("remoteAdminToken").value.trim();
-  if (token) {
-    try { sessionStorage.setItem("workerAdminToken", token); } catch { /* 保存配置时提示 */ }
-  }
-  loadRemoteSshSettings();
-});
 ["remoteSshPassphrase", "remoteSshPassword"].forEach((id) => {
   $(id).addEventListener("keydown", (event) => {
     if (event.key === "Enter") event.preventDefault();

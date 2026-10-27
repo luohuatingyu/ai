@@ -1022,10 +1022,6 @@ def remote_configuration_errors(
                 "passphrase": "",
                 "private_key": "",
             }
-    if not config.WORKER_REMOTE_ENABLED:
-        errors.append("远程服务器管理尚未启用")
-    if len(config.WORKER_REMOTE_TOKEN) < 32:
-        errors.append("WORKER_REMOTE_TOKEN 至少需要 32 个字符")
     if not config.REDIS_URL:
         errors.append("平台必须配置共享 REDIS_URL，远程 worker 才能加入同一任务队列")
     if config.STORAGE_BACKEND != "s3":

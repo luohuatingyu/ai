@@ -115,12 +115,11 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
 2. 在项目 `.env` 中设置平台默认配置：
    ```dotenv
    WORKER_IMAGE=mtp-worker:local
-   WORKER_REMOTE_TOKEN=替换为至少32位的随机令牌
    REDIS_URL=redis://目标服务器可访问的Redis主机:6379/0
    S3_ENDPOINT=目标服务器可访问的S3主机:8333
    WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY=使用Fernet生成的稳定密钥
    ```
-   `WORKER_IMAGE` 是平台 Docker 中 worker 镜像的本地标签，默认镜像由 Compose 构建；无需配置仓库地址。添加或编辑服务器时可用本机镜像标签覆盖平台默认值。远程安装或重新部署时，平台通过 Docker socket 导出镜像，再通过 SSH 流式传输到目标机执行 `docker load`；目标机不需要访问镜像仓库或执行 `docker pull`。目标机必须能访问同一 Redis 和 S3 存储。远程服务器和 SSH 凭证目录保存到 MySQL；远程管理 Compose 默认启用 MySQL，需在 `.env` 配置可从 trainer 容器访问的 `DB_HOST`、`DB_USER`、`DB_PASSWORD`、`DB_NAME` 等连接参数。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 仅用于页面凭证加密，可用 `python3.12 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'` 生成并长期保管。更换此密钥后，MySQL 中已有的页面凭证无法解密，需要重新保存。打开「添加服务器」并输入管理令牌，在「SSH 凭证管理」中添加用户名 + 密码、用户名 + 密钥或用户名 + 密钥 + 密码凭证。第三种方式先尝试密钥认证，失败后再尝试密码。私钥、登录密码和可选私钥口令都由页面提交并加密保存到 MySQL；登录凭证无需写入 `.env`，页面不会回显已保存的秘密。添加服务器时选择凭证；SSH 用户名留空时使用凭证用户名，填写后则覆盖该服务器的凭证用户名。OpenSSH 会按密钥内容识别其支持的 Ed25519、ECDSA、RSA OpenSSH/PEM 格式。建议将 `.env` 权限限制为 `600`。`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 可单独设置为平台默认值；未设置时分别回退到 `REDIS_URL` 和 `S3_ENDPOINT`。服务器级 Redis URL 使用页面 SSH 凭证加密密钥加密保存，不会在列表中回显。修改后需点击服务器卡片上的“重新部署并应用配置”，目标 worker 才会使用新设置。`WORKER_REMOTE_TOKEN` 用于保护页面的远程管理 API，`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 是服务端加密密钥，两者都不是目标 SSH 登录凭证。
+   `WORKER_IMAGE` 是平台 Docker 中 worker 镜像的本地标签，默认镜像由 Compose 构建；无需配置仓库地址。添加或编辑服务器时可用本机镜像标签覆盖平台默认值。远程安装或重新部署时，平台通过 Docker socket 导出镜像，再通过 SSH 流式传输到目标机执行 `docker load`；目标机不需要访问镜像仓库或执行 `docker pull`。目标机必须能访问同一 Redis 和 S3 存储。远程服务器和 SSH 凭证目录保存到 MySQL；远程管理 Compose 默认启用 MySQL，需在 `.env` 配置可从 trainer 容器访问的 `DB_HOST`、`DB_USER`、`DB_PASSWORD`、`DB_NAME` 等连接参数。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 用于页面凭证加密，可用 `python3.12 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'` 生成并长期保管。更换此密钥后，MySQL 中已有的页面凭证无法解密，需要重新保存。在「SSH 凭证管理」中添加用户名 + 密码、用户名 + 密钥或用户名 + 密钥 + 密码凭证。第三种方式先尝试密钥认证，失败后再尝试密码。私钥、登录密码和可选私钥口令都由页面提交并加密保存到 MySQL；登录凭证无需写入 `.env`，页面不会回显已保存的秘密。添加服务器时选择凭证；SSH 用户名留空时使用凭证用户名，填写后则覆盖该服务器的凭证用户名。OpenSSH 会按密钥内容识别其支持的 Ed25519、ECDSA、RSA OpenSSH/PEM 格式。建议将 `.env` 权限限制为 `600`。`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 可单独设置为平台默认值；未设置时分别回退到 `REDIS_URL` 和 `S3_ENDPOINT`。服务器级 Redis URL 使用页面 SSH 凭证加密密钥加密保存，不会在列表中回显。修改后需点击服务器卡片上的“重新部署并应用配置”，目标 worker 才会使用新设置。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 是服务端加密密钥，不是目标 SSH 登录凭证。
 3. 构建平台 worker 镜像。GPU 平台使用默认 Compose 文件；纯 CPU 平台使用 CPU 文件：
    ```bash
    docker compose build worker
@@ -136,13 +135,13 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
    # CPU 版
    docker compose -f docker-compose.cpu.yml -f docker-compose.remote.yml up --build -d
    ```
-5. 打开主页面「添加服务器」，填写 `WORKER_REMOTE_TOKEN`，在同一对话框的「平台 SSH 凭证设置」中配置全平台共用的密钥或密码，再填写目标主机、SSH 用户/端口、服务器标识及 CPU/GPU 类型。平台会执行安装并启动 worker；资源心跳出现后，CPU/GPU 槽默认处于待选择状态，手动点击「加入资源池」才会接收训练任务。服务器卡片还可通过 SSH 启动、停止或重启 worker。
+5. 打开主页面「添加服务器」，在「SSH 凭证管理」中配置全平台共用的密钥或密码，再填写目标主机、SSH 用户/端口、服务器标识及 CPU/GPU 类型。平台会执行安装并启动 worker；资源心跳出现后，CPU/GPU 槽默认处于待选择状态，手动点击「加入资源池」才会接收训练任务。服务器卡片还可通过 SSH 启动、停止或重启 worker。
 
 页面配置私钥时，平台仅将加密密文保存到 MySQL；执行 SSH 时在平台临时创建权限为 `600` 的密钥文件，操作完成后立即删除。远程操作轮询状态仍保存在 Redis。SSH 用户需要有 Docker 权限。目标服务器需要运行 Docker Engine。GPU 目标机还需要 NVIDIA 驱动和 NVIDIA Container Toolkit。`stop` 和 `restart` 会给予 worker 最多 45 秒优雅停机时间，运行中的任务会保存断点，再由其它在线计算槽接续。
 
 私钥格式和认证算法由平台容器内的 OpenSSH 自动协商；旧服务器若只支持已禁用的弱算法（例如 RSA/SHA-1 `ssh-rsa` 签名），连接会失败，不会自动降低安全设置。
 
-远程操作配置以单文件脚本通过 SSH stdin 发送；脚本会把 worker 运行所需配置以权限 `600` 保存到目标机用户的 `~/.config/mtp-worker/`，不会把平台源码复制到目标服务器。服务器记录不保存 SSH 密钥、远程管理令牌或 S3 密钥。平台现有 API 尚未提供通用身份认证；远程管理路由使用独立令牌，部署时仍应限制平台管理页面的网络访问。
+远程操作配置以单文件脚本通过 SSH stdin 发送；脚本会把 worker 运行所需配置以权限 `600` 保存到目标机用户的 `~/.config/mtp-worker/`，不会把平台源码复制到目标服务器。服务器记录不保存 SSH 密钥或 S3 密钥。平台 API 尚未提供身份认证，远程管理 API 默认启用且不使用独立令牌；部署时必须限制平台管理页面的网络访问，只允许可信网络访问。
 
 ### 3. 迁移历史数据（老版本升级）
 

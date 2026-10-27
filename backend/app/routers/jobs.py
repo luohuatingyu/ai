@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import re
-import secrets
 import time
 import uuid
 from typing import Literal, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import FileResponse
 
 import app.config as config
@@ -327,20 +326,6 @@ def update_worker_selection(
     }
 
 
-def _require_remote_admin_token(
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
-) -> None:
-    """仅在启用远程管理且令牌配置有效时接受受保护的 SSH 管理请求。"""
-    if not config.WORKER_REMOTE_ENABLED:
-        raise HTTPException(503, "远程服务器管理尚未启用")
-    if len(config.WORKER_REMOTE_TOKEN) < 32:
-        raise HTTPException(503, "平台未配置有效的远程管理令牌")
-    if not x_worker_admin_token or not secrets.compare_digest(
-        x_worker_admin_token, config.WORKER_REMOTE_TOKEN
-    ):
-        raise HTTPException(401, "远程管理令牌无效")
-
-
 def _remote_config_db_call(function, *args):
     """将 MySQL 远程配置仓储错误转换为受控的 503 API 响应。"""
     try:
@@ -380,23 +365,16 @@ def _start_remote_operation(
 
 
 @router.get("/remote-servers")
-def list_remote_servers(
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
-) -> dict:
-    """列出经 SSH 接入的远程服务器；管理元数据仅对令牌持有者可见。"""
-    _require_remote_admin_token(x_worker_admin_token)
+def list_remote_servers() -> dict:
+    """列出经 SSH 接入的远程服务器管理元数据。"""
     servers = _remote_config_db_call(remote_config_repository.list_remote_servers)
     return {"servers": [remote_server_public_view(server) for server in servers]}
 
 
 @router.get("/remote-ssh-settings")
-def get_remote_ssh_settings(
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
-) -> dict:
+def get_remote_ssh_settings() -> dict:
     """返回 SSH 认证方式与凭证状态，绝不向页面回传凭证明文。"""
     from app.remote_workers import RemoteWorkerError, remote_ssh_settings_status
-
-    _require_remote_admin_token(x_worker_admin_token)
     try:
         status = remote_ssh_settings_status()
         if status.get("status_error"):
@@ -411,13 +389,9 @@ def get_remote_ssh_settings(
 
 
 @router.get("/remote-ssh-credentials")
-def get_remote_ssh_credentials(
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
-) -> dict:
+def get_remote_ssh_credentials() -> dict:
     """列出平台 SSH 凭证目录元数据，不返回密码、私钥或私钥口令。"""
     from app.remote_workers import RemoteWorkerError, list_platform_ssh_credentials
-
-    _require_remote_admin_token(x_worker_admin_token)
     try:
         return list_platform_ssh_credentials()
     except RemoteWorkerError as exc:
@@ -429,7 +403,6 @@ def get_remote_ssh_credentials(
 @router.post("/remote-ssh-credentials")
 async def post_remote_ssh_credential(
     http_request: Request,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
 ) -> dict:
     """创建加密保存的 SSH 凭证；输入校验失败时不会回显用户提交的秘密。"""
     from app.remote_workers import (
@@ -438,8 +411,6 @@ async def post_remote_ssh_credential(
         create_platform_ssh_credential,
     )
     from app.routers.schemas import RemoteSSHCredentialRequest
-
-    _require_remote_admin_token(x_worker_admin_token)
     try:
         request = RemoteSSHCredentialRequest.model_validate(await http_request.json())
     except (TypeError, ValueError):
@@ -466,7 +437,6 @@ async def post_remote_ssh_credential(
 async def put_remote_ssh_credential(
     credential_id: str,
     http_request: Request,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
 ) -> dict:
     """完整替换 SSH 凭证；出于安全要求，编辑时需要重新提交全部秘密字段。"""
     from app.remote_workers import (
@@ -476,8 +446,6 @@ async def put_remote_ssh_credential(
         update_platform_ssh_credential,
     )
     from app.routers.schemas import RemoteSSHCredentialRequest
-
-    _require_remote_admin_token(x_worker_admin_token)
     try:
         request = RemoteSSHCredentialRequest.model_validate(await http_request.json())
     except (TypeError, ValueError):
@@ -503,10 +471,7 @@ async def put_remote_ssh_credential(
 
 
 @router.delete("/remote-ssh-credentials/{credential_id}")
-def delete_remote_ssh_credential(
-    credential_id: str,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
-) -> dict:
+def delete_remote_ssh_credential(credential_id: str) -> dict:
     """删除凭证；仍被服务器引用的凭证需先修改服务器关联后才能删除。"""
     from app.remote_workers import (
         RemoteCredentialConflictError,
@@ -514,8 +479,6 @@ def delete_remote_ssh_credential(
         RemoteWorkerError,
         delete_platform_ssh_credential,
     )
-
-    _require_remote_admin_token(x_worker_admin_token)
     try:
         return delete_platform_ssh_credential(credential_id)
     except RemoteCredentialNotFoundError as exc:
@@ -529,15 +492,10 @@ def delete_remote_ssh_credential(
 
 
 @router.put("/remote-ssh-settings")
-async def put_remote_ssh_settings(
-    http_request: Request,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
-) -> dict:
+async def put_remote_ssh_settings(http_request: Request) -> dict:
     """加密并保存平台统一 SSH 凭证；响应只包含认证方式和保存状态。"""
     from app.remote_workers import RemoteWorkerError, store_platform_ssh_credentials
     from app.routers.schemas import RemoteSSHCredentialsRequest
-
-    _require_remote_admin_token(x_worker_admin_token)
     try:
         request = RemoteSSHCredentialsRequest.model_validate(await http_request.json())
     except (TypeError, ValueError):
@@ -563,13 +521,9 @@ async def put_remote_ssh_settings(
 
 
 @router.delete("/remote-ssh-settings")
-def delete_remote_ssh_settings(
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
-) -> dict:
+def delete_remote_ssh_settings() -> dict:
     """清除通过旧版接口迁移的默认凭证；服务器登录凭证不再读取环境变量。"""
     from app.remote_workers import RemoteWorkerError, clear_platform_ssh_credentials
-
-    _require_remote_admin_token(x_worker_admin_token)
     try:
         return clear_platform_ssh_credentials()
     except RemoteWorkerError as exc:
@@ -582,10 +536,8 @@ def delete_remote_ssh_settings(
 def add_remote_server(
     request: RemoteServerRequest,
     background_tasks: BackgroundTasks,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
 ) -> dict:
     """经平台 SSH 远程安装 worker；目标主机只接收单文件脚本和容器镜像。"""
-    _require_remote_admin_token(x_worker_admin_token)
     from app.remote_workers import RemoteWorkerError
 
     server = request.model_dump()
@@ -613,10 +565,8 @@ def add_remote_server(
 def update_remote_server(
     machine_id: str,
     request: RemoteServerUpdateRequest,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
 ) -> dict:
     """更新一台远程服务器的连接参数和部署覆盖值，不自动重启目标 worker。"""
-    _require_remote_admin_token(x_worker_admin_token)
     _check_id(machine_id, "服务器")
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
@@ -666,10 +616,8 @@ def manage_remote_server(
     machine_id: str,
     action: Literal["install", "start", "stop", "restart"],
     background_tasks: BackgroundTasks,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
 ) -> dict:
     """经 SSH 重装、启动、优雅停止或重启目标服务器上的 worker 容器。"""
-    _require_remote_admin_token(x_worker_admin_token)
     _check_id(machine_id, "服务器")
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
@@ -692,10 +640,8 @@ def manage_remote_server(
 @router.get("/remote-operations/{operation_id}")
 def get_remote_operation(
     operation_id: str,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
 ) -> dict:
     """返回远程接入或生命周期操作的状态和经过凭证过滤的输出。"""
-    _require_remote_admin_token(x_worker_admin_token)
     if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
         raise HTTPException(404, "远程操作不存在")
     operation = manager.lease.get_remote_operation(operation_id)
@@ -710,10 +656,8 @@ def get_remote_operation(
 @router.post("/remote-operations/{operation_id}/cancel", status_code=202)
 def cancel_remote_operation(
     operation_id: str,
-    x_worker_admin_token: Optional[str] = Header(default=None, alias="X-Worker-Admin-Token"),
 ) -> dict:
     """向排队中或执行中的远程 SSH 操作发送中断请求。"""
-    _require_remote_admin_token(x_worker_admin_token)
     if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
         raise HTTPException(404, "远程操作不存在")
     operation = manager.lease.get_remote_operation(operation_id)
