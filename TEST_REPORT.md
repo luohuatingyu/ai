@@ -1,3 +1,37 @@
+## 本次变更测试结果：更新配置后由 start/restart 应用最新 worker 配置（2026-10-28）
+
+**Git基准点**：`bb93970`（Apply remote config on worker restart）  
+**分支**：`emdash/hot-boxes-clean-y9u6p`  
+**测试环境**：Docker Compose，容器 Python 3.12.15。
+
+**变更范围**：`config` 动作只原子覆盖目标机 worker 环境文件，不操作运行中的容器；`start/restart` 复用现有镜像并重新创建容器，通过 `--env-file` 读取最新配置；新容器启动失败时恢复旧容器并保留最新配置供下次重试。页面和 README 同步说明更新与应用之间的时序。
+
+**测试执行结果**：
+- 远程 Worker 定向测试：73 通过、0 失败、0 错误、0 跳过。
+- API 定向测试：58 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：278 项；272 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
+- `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- `bash -n backend/app/remote_worker.sh`、Python 语法检查和 `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 更新配置不重启容器 | Shell：`test_remote_bootstrap_script_config_writes_env_without_container`、`test_remote_bootstrap_script_config_does_not_restart_existing_container` | 写入最新环境文件，不产生 Docker 生命周期命令；运行中的容器保持旧值 | 正常、边界、回归 |
+| `start/restart` 应用最新配置 | Shell 参数化：`test_remote_bootstrap_script_lifecycle_uses_latest_env_file` | 使用现有镜像重建容器，`docker run` 读取最新 `--env-file` | 正常、兼容 |
+| 更新后失败可恢复 | Shell：`test_remote_bootstrap_script_lifecycle_rolls_back_when_new_container_fails` | 新容器启动失败后恢复旧容器，保留最新环境文件 | 异常、恢复 |
+| 部署、停止、状态查询兼容 | Shell：`test_remote_bootstrap_script_deploys_code_without_config_or_container_operations`、`test_remote_bootstrap_script_lifecycle`；完整套件回归 | 部署只同步代码，stop/status 行为保持不变 | 兼容、回归 |
+| 页面说明与实际时序一致 | API 页面契约：`test_remote_server_form_exposes_network_overrides_and_effective_config_action` | 页面说明更新配置不重启，提示通过 start/restart 应用 | 正常、回归 |
+| 业务回归保持通过 | 完整 `backend/tests` 套件 | 272 通过、6 跳过 | 数据、训练、API、远程管理回归 |
+
+**关键模块测试**：远程 Worker 73/73 通过；API 58/58 通过；完整套件 272/278 通过。
+
+**已知问题与限制**：未连接真实 SSH 目标机；容器重建、`--env-file` 加载和失败回滚通过隔离 Docker 替身验证。工作区另有 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 的既有未提交改动，未纳入本次提交；完整套件是在包含这些工作区改动的容器环境中执行并通过。
+
+**下次测试建议**：在真实 Linux 目标机依次执行“重启 → 更新配置 → 启动/重启”，核对更新后第一次运行仍保持旧值、下一次生命周期操作才读取新值，并验证任务优雅停止与 checkpoint 恢复。
+
 # 测试报告
 
 ## 本次变更测试结果：更新远程配置时重建 worker 容器（2026-10-28）
