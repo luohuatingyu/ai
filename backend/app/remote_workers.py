@@ -1,6 +1,7 @@
 """远程 worker 管理：校验接入参数、经 SSH 执行单个部署脚本并保存操作状态。"""
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
@@ -455,6 +456,31 @@ def _worker_build_context(
         raise
     except (OSError, tarfile.TarError) as exc:
         raise RemoteWorkerError("打包 worker 镜像构建上下文失败") from exc
+    return archive_buffer.getvalue()
+
+
+def _worker_code_archive() -> bytes:
+    """只打包 worker Python 代码，供已部署容器更新时复用现有镜像。"""
+    import io
+    import tarfile
+
+    app_root = Path(__file__).resolve().parent
+    archive_buffer = io.BytesIO()
+    try:
+        with tarfile.open(
+            fileobj=archive_buffer, mode="w:gz", format=tarfile.GNU_FORMAT
+        ) as archive:
+            archive.add(
+                app_root,
+                arcname="app",
+                recursive=True,
+                filter=lambda item: None
+                if Path(item.name).name in {"__pycache__", ".pytest_cache"}
+                or item.name.endswith((".pyc", ".pyo"))
+                else item,
+            )
+    except (OSError, tarfile.TarError) as exc:
+        raise RemoteWorkerError("打包 worker Python 代码失败") from exc
     return archive_buffer.getvalue()
 
 
@@ -1062,7 +1088,8 @@ def remote_server_public_view(server: Dict[str, object]) -> Dict[str, object]:
 
 def remote_server_is_deployed(server: Dict[str, object]) -> bool:
     """读取持久化部署标记，并从旧状态推断已部署服务器。"""
-    if "deployed" in server:
+    # 数据库旧记录可能把尚未迁移的标记读成 None；仅非空标记才覆盖状态推断。
+    if server.get("deployed") is not None:
         return bool(server.get("deployed"))
     return str(server.get("status", "")) in {
         "online", "stopped", "running", "starting", "stopping", "restarting"
@@ -1449,10 +1476,12 @@ def validate_server_record(server: Dict[str, object]) -> None:
         raise RemoteWorkerError("SSH 端口必须在 1 到 65535 之间")
 
 
-def render_remote_script(server: Dict[str, object], action: str) -> str:
+def render_remote_script(
+    server: Dict[str, object], action: str, code_archive_base64: str | None = None
+) -> str:
     """把经过校验的配置作为 shell 字面量前缀，拼接随镜像打包的单文件脚本。"""
     validate_server_record(server)
-    allowed_actions = {"install", "start", "stop", "restart", "status"}
+    allowed_actions = {"install", "update", "start", "stop", "restart", "status"}
     if action not in allowed_actions:
         raise RemoteWorkerError("不支持的远程操作")
     mode = str(server.get("mode", "cpu"))
@@ -1489,6 +1518,11 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
     except OSError as exc:
         raise RemoteWorkerError("远程部署脚本未打包到后端镜像") from exc
     prelude = "\n".join(f"export {key}={shlex.quote(settings[key])}" for key in _ENVIRONMENT_KEYS)
+    if code_archive_base64:
+        prelude += (
+            "\nMTP_WORKER_APP_ARCHIVE_B64=$(cat <<'MTP_WORKER_APP_ARCHIVE'\n"
+            f"{code_archive_base64}\nMTP_WORKER_APP_ARCHIVE\n)"
+        )
     return f"{prelude}\n{script_body}"
 
 
@@ -1579,11 +1613,16 @@ def run_remote_action(
         ]
     )
     command.extend([target, "bash -s"])
-    timeout = 3600 if action == "install" else 120
+    timeout = 3600 if action == "install" else 180
     try:
         environment: Dict[str, str] | None = None
+        code_archive = (
+            base64.b64encode(_worker_code_archive()).decode("ascii")
+            if action in {"install", "update"}
+            else None
+        )
         run_options = {
-            "input": render_remote_script(resolved_server, action),
+            "input": render_remote_script(resolved_server, action, code_archive),
             "text": True,
             "capture_output": True,
             "timeout": timeout,
@@ -1640,6 +1679,12 @@ def run_remote_action(
                 operation_id,
                 **progress_options,
             )
+        elif action == "update":
+            _emit_progress(
+                progress_callback,
+                "同步 worker 代码",
+                "同步最新 worker Python 代码并复用目标机现有镜像。",
+            )
         _emit_progress(progress_callback, "执行远程部署脚本", f"开始执行远端 {action} 脚本。")
         progress_options = (
             {
@@ -1668,7 +1713,7 @@ def run_remote_action(
         detail = (output["stderr"] or output["stdout"] or "远程脚本返回错误").strip()
         raise RemoteWorkerError(detail[-2000:])
     _emit_progress(progress_callback, "执行远程部署脚本", "远端脚本已成功返回。")
-    if action == "install" and operation_id:
+    if action in {"install", "update"} and operation_id:
         _wait_for_remote_worker_heartbeat(
             operation_id,
             str(server.get("machine_id", "")),
@@ -1720,8 +1765,8 @@ def execute_remote_operation(
                 "stderr": result.get("stderr", "")[-2000:],
                 "phase": "操作完成",
             }
-            server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"
-            if action == "install":
+            server["status"] = "online" if action in {"install", "update", "start", "restart"} else "stopped"
+            if action in {"install", "update"}:
                 server["deployed"] = True
             terminal_log = ("操作完成", "远程操作已成功完成。")
         except RemoteWorkerCancelledError as exc:

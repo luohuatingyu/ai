@@ -2,7 +2,7 @@
 
 ## Git基准点
 
-- **Commit Hash**: 59ca2fa（远程服务器部署与配置更新分离）
+- **Commit Hash**: 待提交（远程配置先写入并安全回滚）
 - **提交信息**: Separate remote deployment and config updates
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
@@ -71,6 +71,20 @@ git diff --check
 **已知问题与限制**：尚未在真实 SSH 目标机验证配置更新后的容器重建和首次心跳；本次未使用真实远端凭证或主机。现有 pytest 弃用警告与本次改动无关。
 
 **下次测试建议**：连接一台测试 Linux 主机，分别验证首次部署、在线节点更新配置后的容器重建、离线节点启动与配置失败后的重新部署。
+
+## 本次变更测试结果：远程配置先更新并回滚（2026-10-27）
+
+**变更范围**：已部署远程服务器使用 update 流程；更新先以原子方式写入新环境配置，再切换 worker 容器；启动失败时恢复旧配置、代码目录和容器；兼容 `deployed: null` 的旧记录。
+
+**测试执行结果**：
+- 定向测试：6 通过、0 失败。
+- 完整测试：272 通过、6 跳过、0 失败、0 错误；2 条既有弃用警告。
+- `docker compose up --build -d`：构建和启动成功；首次健康检查因服务刚启动返回 502，等待服务就绪后 `curl http://localhost:8000/api/health` 返回 `{"ok":true}`。
+- `git diff --check`：通过。
+
+**覆盖范围**：远程服务器状态兼容、CPU/GPU 更新、配置写入顺序、容器启动失败回滚、API 更新动作选择及全量回归。
+
+**已知限制**：未对真实远程 Linux 主机执行本次代码变更后的更新回环；此前目标机仍需修复 Docker Buildx 和 S3 地址配置后再验证心跳。
 
 **重测触发条件**：修改远程服务器创建、部署标记、配置更新后台操作或卡片生命周期按钮逻辑时，运行 `tests/test_api.py`、`tests/test_remote_workers.py`、完整 `tests/` 和 `docker compose up --build -d`。
 
