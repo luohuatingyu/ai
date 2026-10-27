@@ -2,10 +2,79 @@
 
 ## Git基准点
 
-- **Commit Hash**: 7f1ab3d（显示远程目标镜像构建进度）
-- **提交信息**: Show remote target build progress
+- **Commit Hash**: 59ca2fa（远程服务器部署与配置更新分离）
+- **提交信息**: Separate remote deployment and config updates
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：远程服务器部署与配置更新分离（2026-10-27）
+
+**变更范围**：新增远程服务器只登记配置，不再自动安装；未部署服务器显示“部署”，成功部署后显示“重新部署”；已部署服务器更新配置后异步应用配置并重建 worker 容器；在线隐藏启动和重启，离线隐藏停止。业务代码提交为 `59ca2fa`。
+
+**测试环境**：Docker Compose，容器 Python 3.12.15。完整测试包含工作区原有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动；这两个文件未纳入本次提交。
+
+**测试执行结果**：
+- 定向用例：5 通过、0 失败、0 错误、0 跳过。
+- API 与远程 worker 测试文件：120 通过、0 失败、0 错误、0 跳过。
+- 首次运行 API 与远程 worker 测试文件时，因测试容器未挂载仓库根目录 Compose 文件，119 项通过、1 项因找不到 `/workspace/docker-compose.yml` 失败；补齐 Compose 文件只读挂载后，同一套测试 120 项全部通过。
+- 最终完整测试：267 项；261 通过、6 跳过、0 失败、0 错误。6 项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- 最终 `docker compose up --build -d`：trainer、worker、frontend 镜像构建和服务启动成功；`curl -fsS http://localhost:8000/api/health` 返回 `{"ok":true}`。
+- `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+- 未连接真实远程 SSH 服务器；配置更新触发安装流程由 API 测试中的隔离执行器验证，远端容器重建未做真实主机回环。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 新增服务器只登记配置；部署状态随部署成功持久化 | API：`test_remote_server_api_separates_registration_deployment_and_config_update`、`test_remote_server_uses_credential_username_when_server_username_is_blank`；SQLite 隔离仓储、SSH 执行器替身 | 新登记返回 `deployed=false` 且不调用 SSH；点击部署完成后返回 `deployed=true` | 正常、兼容、秘密不泄露 |
+| 已部署服务器更新配置会应用配置并重建 worker；未部署时只保存 | API：`test_remote_server_api_separates_registration_deployment_and_config_update`；隔离 SQLite 与 SSH 执行器 | 未部署 PATCH 返回 200 且不触发远程操作；已部署 PATCH 返回异步操作 ID 并调用 install 流程，配置持久化 | 正常、状态边界、回归 |
+| 卡片部署文案依据部署状态切换，旧服务器状态兼容 | 页面/API 静态契约：`test_remote_server_form_exposes_host_overrides_and_edit_action`；兼容性：`test_remote_deployment_settings_apply_per_server_overrides_and_platform_fallback` | 未部署显示“部署”，已部署显示“重新部署”；旧 `online` / `stopped` 记录推断为已部署，显式 false 优先 | 正常、兼容 |
+| 在线隐藏启动和重启；离线隐藏停止；未部署不显示生命周期操作 | 页面静态契约：`test_remote_server_card_filters_lifecycle_actions_by_presence` | 在线模板分支只含停止；离线分支含启动和重启；未部署分支为空 | 边界、状态分支 |
+| 失败的生命周期操作保留已部署标记 | 单元：`test_execute_remote_operation_persists_success_and_failure`；SQLite 隔离仓储 | 已部署服务器的停止操作遇到 SSH 错误后，状态报错但 `deployed` 仍为 true | 异常、回归 |
+
+**关键模块测试**：API 与远程 worker 120/120 通过；完整数据、训练、API、协调与 worker 套件 261 通过、6 跳过。
+
+**实际执行命令**：
+
+```bash
+docker compose up --build -d
+```
+
+结果：构建及启动成功。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest -q -p no:cacheprovider tests/test_api.py::test_remote_server_api_separates_registration_deployment_and_config_update tests/test_api.py::test_remote_server_uses_credential_username_when_server_username_is_blank tests/test_api.py::test_remote_server_form_exposes_host_overrides_and_edit_action tests/test_api.py::test_remote_server_card_filters_lifecycle_actions_by_presence tests/test_remote_workers.py::test_remote_deployment_settings_apply_per_server_overrides_and_platform_fallback
+```
+
+结果：5 passed。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest -q -p no:cacheprovider tests/test_api.py tests/test_remote_workers.py
+```
+
+结果：120 passed。另一次缺少仓库根目录 Compose 文件挂载的同类命令结果为 119 passed、1 failed（环境挂载错误），修正挂载后通过。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v -p no:cacheprovider
+```
+
+结果：261 passed、6 skipped、0 failed。
+
+```bash
+curl -fsS http://localhost:8000/api/health
+git diff --check
+```
+
+结果：健康检查返回 `{"ok":true}`；差异空白检查通过。
+
+**已知问题与限制**：尚未在真实 SSH 目标机验证配置更新后的容器重建和首次心跳；本次未使用真实远端凭证或主机。现有 pytest 弃用警告与本次改动无关。
+
+**下次测试建议**：连接一台测试 Linux 主机，分别验证首次部署、在线节点更新配置后的容器重建、离线节点启动与配置失败后的重新部署。
+
+**重测触发条件**：修改远程服务器创建、部署标记、配置更新后台操作或卡片生命周期按钮逻辑时，运行 `tests/test_api.py`、`tests/test_remote_workers.py`、完整 `tests/` 和 `docker compose up --build -d`。
+
+**Git基准点**：`59ca2fa`（Separate remote deployment and config updates）；测试报告作为单独提交更新。
 
 ## 本次变更测试结果：显示远程目标镜像构建进度（2026-10-27）
 
