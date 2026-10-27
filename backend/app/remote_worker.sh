@@ -62,7 +62,7 @@ stage_worker_app() {
   fi
 }
 
-# 容器停止后切换源码目录，并保留旧目录供失败回滚。
+# 原子切换源码目录；运行中的容器保持不变，下一次启动时使用新代码。
 activate_worker_app() {
   rm -rf "${APP_DIR}.previous"
   if [[ -d "$APP_DIR" ]]; then
@@ -126,79 +126,11 @@ install_worker() {
   show_worker_startup
 }
 
-# 已部署服务器同步源码并复用现有镜像重建容器，不运行 Docker build。
-update_worker() {
-  if [[ "$MODE" != cpu && "$MODE" != gpu ]]; then
-    printf '资源类型必须是 cpu 或 gpu。\n' >&2
-    exit 2
-  fi
-  if ! command -v docker >/dev/null 2>&1; then
-    printf '目标服务器未安装 Docker。\n' >&2
-    exit 127
-  fi
-  local existing_tag existing_image image previous_container has_existing
-  local previous_env had_previous_env
-  has_existing=false
-  if docker inspect "$CONTAINER" >/dev/null 2>&1; then
-    has_existing=true
-    existing_tag="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER")"
-    existing_image="$(docker inspect --format '{{.Image}}' "$CONTAINER")"
-    if [[ "$MTP_WORKER_IMAGE" == "$existing_tag" ]]; then
-      image="$existing_image"
-    elif ! image="$(docker image inspect --format '{{.Id}}' "$MTP_WORKER_IMAGE")"; then
-      printf '目标服务器上没有配置的新 worker 镜像；请先加载该镜像。\n' >&2
-      exit 1
-    fi
-  elif ! image="$(docker image inspect --format '{{.Id}}' "$MTP_WORKER_IMAGE")"; then
-    printf '目标服务器上没有可复用的 worker 镜像；请先部署镜像。\n' >&2
-    exit 1
-  fi
-
+# 已部署服务器只同步源码，不写配置或操作容器。
+deploy_worker() {
   stage_worker_app
-  previous_env="${ENV_FILE}.previous"
-  had_previous_env=false
-  if [[ -f "$ENV_FILE" ]]; then
-    cp -p "$ENV_FILE" "$previous_env"
-    had_previous_env=true
-  else
-    rm -f "$previous_env"
-  fi
-  # 先持久化新配置，让远端明确进入配置已更新、等待容器切换的状态。
-  write_worker_env
-  previous_container="${CONTAINER}-previous"
-  if [[ "$has_existing" == true ]]; then
-    if docker inspect "$previous_container" >/dev/null 2>&1; then
-      docker rm --force "$previous_container" >/dev/null
-    fi
-    docker stop --time 45 "$CONTAINER" >/dev/null || true
-    docker rename "$CONTAINER" "$previous_container"
-  fi
   activate_worker_app
-  if ! run_worker_container "$image"; then
-    docker rm --force "$CONTAINER" >/dev/null 2>&1 || true
-    rm -rf "$APP_DIR"
-    if [[ -d "${APP_DIR}.previous" ]]; then
-      mv "${APP_DIR}.previous" "$APP_DIR"
-    fi
-    if [[ "$had_previous_env" == true ]]; then
-      mv "$previous_env" "$ENV_FILE"
-    else
-      rm -f "$ENV_FILE"
-    fi
-    if [[ "$has_existing" == true ]]; then
-      docker rename "$previous_container" "$CONTAINER"
-      docker start "$CONTAINER" >/dev/null || true
-    fi
-    printf '更新后的 worker 容器启动失败，已恢复原容器。\n' >&2
-    exit 1
-  fi
-  if [[ "$has_existing" == true ]]; then
-    docker rm --force "$previous_container" >/dev/null
-  fi
-  rm -rf "${APP_DIR}.previous"
-  rm -f "$previous_env"
-  printf 'worker 代码已更新并重启：%s\n' "$CONTAINER"
-  show_worker_startup
+  printf 'worker 代码已更新：%s\n' "$APP_DIR"
 }
 
 # 对目标服务器现有 worker 容器执行有限生命周期操作。
@@ -223,8 +155,12 @@ case "$ACTION" in
   install)
     install_worker
     ;;
-  update)
-    update_worker
+  config)
+    write_worker_env
+    printf 'worker 配置已覆盖：%s\n' "$ENV_FILE"
+    ;;
+  deploy|update)
+    deploy_worker
     ;;
   start|stop|restart|status)
     manage_worker
