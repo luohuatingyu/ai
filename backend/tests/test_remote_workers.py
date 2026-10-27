@@ -47,6 +47,7 @@ def _remote_config(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
     monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "rediss://redis.example.net:6380/0")
     monkeypatch.setattr(config, "WORKER_REMOTE_S3_ENDPOINT", "storage.example.net:9000")
     monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(config, "REDIS_PASSWORD", "redis-password-test")
     monkeypatch.setattr(config, "STORAGE_BACKEND", "s3")
     monkeypatch.setattr(config, "S3_ACCESS_KEY", "access-test")
     monkeypatch.setattr(config, "S3_SECRET_KEY", "secret-test")
@@ -512,6 +513,24 @@ def test_render_remote_script_quotes_values_and_does_not_transfer_repository(tmp
     assert "docker-compose" not in rendered
 
 
+def test_render_remote_script_includes_redis_password_and_effective_config_marks_auth(tmp_path, monkeypatch):
+    """Redis 密码单独配置（URL 不含认证）时也必须下发，远程 worker 才能通过认证。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "REDIS_PASSWORD", "standalone-redis-pass")
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
+    monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+
+    rendered = remote_workers.render_remote_script(_server(), "config")
+    assert "export MTP_REDIS_PASSWORD=standalone-redis-pass" in rendered
+
+    settings = remote_workers.remote_deployment_settings({})
+    assert settings["redis_password"] == "standalone-redis-pass"
+
+    effective = remote_workers.remote_effective_config(_server())
+    assert effective["redis_auth_configured"] is True
+    assert "standalone-redis-pass" not in repr(effective)
+
+
 def test_remote_deployment_settings_apply_platform_fallback_and_server_network_overrides(tmp_path, monkeypatch):
     """Worker 镜像只取平台配置，Redis/S3 未覆盖时回退平台 .env。"""
     _remote_config(tmp_path, monkeypatch)
@@ -525,6 +544,7 @@ def test_remote_deployment_settings_apply_platform_fallback_and_server_network_o
     assert defaults == {
         "worker_image": "registry.example.net/platform/worker:default",
         "redis_url": "rediss://platform-redis.example.net:6380/0",
+        "redis_password": "redis-password-test",
         "s3_endpoint": "platform-s3.example.net:9000",
     }
 
@@ -541,6 +561,7 @@ def test_remote_deployment_settings_apply_platform_fallback_and_server_network_o
     assert remote_workers.remote_deployment_settings(server) == {
         "worker_image": "registry.example.net/platform/worker:default",
         "redis_url": redis_url,
+        "redis_password": "redis-password-test",
         "s3_endpoint": "remote-s3.example.net:9000",
     }
     assert "worker_image_override" not in server
@@ -1944,6 +1965,7 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
             "MTP_CPU_SLOTS": "2",
             "MTP_WORKER_IMAGE": "registry.example.net/ml/worker:unit",
             "MTP_REDIS_URL": "rediss://redis.example.net:6380/0",
+            "MTP_REDIS_PASSWORD": "redis-password-test",
             "MTP_S3_ENDPOINT": "storage.example.net:9000",
             "MTP_S3_ACCESS_KEY": "access-test",
             "MTP_S3_SECRET_KEY": "secret-test",
@@ -1962,6 +1984,7 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
         saved = env_file.read_text(encoding="utf-8")
         assert "WORKER_MANAGED=true" in saved
         assert "S3_SECRET_KEY=secret-test" in saved
+        assert "REDIS_PASSWORD=redis-password-test" in saved
         app_dir = home / ".config" / "mtp-worker" / f"remote-{mode}" / "app"
         assert (app_dir / "worker.py").is_file()
         commands = docker_log.read_text(encoding="utf-8")

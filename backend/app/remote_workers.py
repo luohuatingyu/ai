@@ -816,6 +816,7 @@ _ENVIRONMENT_KEYS = (
     "MTP_CPU_SLOTS",
     "MTP_WORKER_IMAGE",
     "MTP_REDIS_URL",
+    "MTP_REDIS_PASSWORD",
     "MTP_S3_ENDPOINT",
     "MTP_S3_ACCESS_KEY",
     "MTP_S3_SECRET_KEY",
@@ -1173,6 +1174,7 @@ def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[
         "redis_url": str(
             redis_override or config.WORKER_REMOTE_REDIS_URL or config.REDIS_URL or ""
         ).strip(),
+        "redis_password": str(config.REDIS_PASSWORD or "").strip(),
         "s3_endpoint": str(
             server.get("remote_s3_endpoint_override")
             or config.WORKER_REMOTE_S3_ENDPOINT
@@ -1210,7 +1212,9 @@ def remote_effective_config(server: Dict[str, object]) -> Dict[str, object]:
         "worker_image_source": "WORKER_REMOTE_IMAGE",
         "redis_endpoint": _safe_startup_endpoint(deployment["redis_url"]),
         "redis_configured": bool(deployment["redis_url"]),
-        "redis_auth_configured": "@" in deployment["redis_url"],
+        "redis_auth_configured": "@" in deployment["redis_url"] or bool(
+            deployment.get("redis_password")
+        ),
         "redis_source": redis_source,
         "s3_endpoint": _safe_startup_endpoint(deployment["s3_endpoint"]),
         "s3_source": s3_source,
@@ -1526,7 +1530,7 @@ def remote_configuration_errors(
         settings = remote_deployment_settings(server)
     except RemoteWorkerError as exc:
         errors.append(str(exc))
-        settings = {"worker_image": "", "redis_url": "", "s3_endpoint": ""}
+        settings = {"worker_image": "", "redis_url": "", "redis_password": "", "s3_endpoint": ""}
     image = settings["worker_image"]
     if not image or any(c.isspace() for c in image):
         errors.append("平台 WORKER_IMAGE 必须是有效的 worker 镜像标签")
@@ -1599,6 +1603,7 @@ def render_remote_script(
         "MTP_CPU_SLOTS": str(cpu_slots),
         "MTP_WORKER_IMAGE": deployment["worker_image"],
         "MTP_REDIS_URL": deployment["redis_url"],
+        "MTP_REDIS_PASSWORD": deployment["redis_password"],
         "MTP_S3_ENDPOINT": deployment["s3_endpoint"],
         "MTP_S3_ACCESS_KEY": config.S3_ACCESS_KEY,
         "MTP_S3_SECRET_KEY": config.S3_SECRET_KEY,
@@ -1959,6 +1964,7 @@ def _redact_output(
         redis_url,
         config.WORKER_REMOTE_REDIS_URL,
         config.REDIS_URL,
+        config.REDIS_PASSWORD,
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
         credentials.get("password", ""),

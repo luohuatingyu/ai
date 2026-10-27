@@ -24,6 +24,10 @@ write_worker_env() {
   staging_env="${ENV_FILE}.tmp-${BASHPID}"
   {
     printf 'REDIS_URL=%s\n' "$MTP_REDIS_URL"
+    # Redis 密码可能单独配置（不内嵌在 URL 中），非空时才写入，避免留下空值。
+    if [[ -n "${MTP_REDIS_PASSWORD:-}" ]]; then
+      printf 'REDIS_PASSWORD=%s\n' "$MTP_REDIS_PASSWORD"
+    fi
     printf 'STORAGE_BACKEND=s3\n'
     printf 'S3_ENDPOINT=%s\n' "$MTP_S3_ENDPOINT"
     printf 'S3_ACCESS_KEY=%s\n' "$MTP_S3_ACCESS_KEY"
