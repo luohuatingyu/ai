@@ -44,6 +44,7 @@ _ACTIVE_REMOTE_OPERATIONS: Dict[str, threading.Event] = {}
 _ACTIVE_REMOTE_OPERATIONS_LOCK = threading.Lock()
 _REMOTE_OPERATION_LOG_LOCK = threading.Lock()
 _REMOTE_OPERATION_LOG_LIMIT = 24_000
+_REMOTE_BUILD_IDLE_PROGRESS_INTERVAL = 30.0
 _WORKER_STARTUP_HEARTBEAT_TIMEOUT = 15.0
 
 
@@ -169,12 +170,14 @@ def _communicate_remote_process(
 ):
     """轮询 SSH 子进程，实时转发输出并保留中断与超时语义。"""
     started_at = time.monotonic()
+    last_output_at = started_at
     pending_input = input_data
     seen_output = {"stdout": "", "stderr": ""}
     pending_lines = {"stdout": "", "stderr": ""}
 
     def consume_output(name: str, value: object, flush: bool = False) -> None:
-        """仅将新增完整行发送给进度回调，避免重复显示 communicate 缓冲区。"""
+        """将新增换行或回车分隔的输出发送给进度回调，避免重复显示缓冲区。"""
+        nonlocal last_output_at
         if value is None:
             return
         if isinstance(value, bytes):
@@ -192,15 +195,17 @@ def _communicate_remote_process(
         else:
             delta = current
             seen_output[name] = current
+        if delta:
+            last_output_at = time.monotonic()
         pending_lines[name] += delta
-        chunks = pending_lines[name].split("\n")
+        # BuildKit 的部分进度格式用裸回车刷新；将其转换为日志行以便及时展示。
+        chunks = re.split(r"\r\n|\r|\n", pending_lines[name])
         pending_lines[name] = chunks.pop()
         for line in chunks:
-            line = line.rstrip("\r")
             if line:
                 _emit_progress(progress_callback, progress_phase, f"{name}: {line}")
         if flush and pending_lines[name]:
-            line = pending_lines[name].rstrip("\r")
+            line = pending_lines[name]
             pending_lines[name] = ""
             if line:
                 _emit_progress(progress_callback, progress_phase, f"{name}: {line}")
@@ -227,6 +232,21 @@ def _communicate_remote_process(
         except subprocess.TimeoutExpired as exc:
             consume_output("stdout", exc.output)
             consume_output("stderr", exc.stderr)
+            now = time.monotonic()
+            if (
+                progress_callback is not None
+                and progress_phase == "构建目标架构镜像"
+                and now - last_output_at >= _REMOTE_BUILD_IDLE_PROGRESS_INTERVAL
+            ):
+                # 无输出时定期说明仍在等待，帮助区分网络拉取耗时和操作已失联。
+                seconds = int(_REMOTE_BUILD_IDLE_PROGRESS_INTERVAL)
+                _emit_progress(
+                    progress_callback,
+                    progress_phase,
+                    f"目标机仍在构建镜像，{seconds} 秒未收到新 Docker 输出；"
+                    "可能正在下载基础镜像或 Python 依赖。",
+                )
+                last_output_at = now
             pending_input = None
 
 
@@ -490,9 +510,9 @@ def _build_worker_image_on_remote(
             stdout, stderr, credentials, server
         )
 
-    remote_build_command = "DOCKER_BUILDKIT=1 docker build --platform {} --tag {} -".format(
-        shlex.quote(canonical_platform), shlex.quote(image)
-    )
+    remote_build_command = (
+        "DOCKER_BUILDKIT=1 docker build --progress=plain --platform {} --tag {} -"
+    ).format(shlex.quote(canonical_platform), shlex.quote(image))
     _emit_progress(
         progress_callback,
         "构建目标架构镜像",
