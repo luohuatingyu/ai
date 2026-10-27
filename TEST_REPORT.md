@@ -16,7 +16,9 @@
 **测试执行结果**：
 - 远程 worker 与 API 定向测试：110 通过、0 失败、0 错误、0 跳过。
 - 完整测试套件：250 项；244 通过、0 失败、0 错误、6 跳过。已执行用例通过率 100%。6 项为 Redis、S3 和 Supervisor 子进程环境门控测试。
-- `docker compose up --build -d`：通过；trainer、worker、frontend 已启动，frontend 健康检查通过，SeaweedFS 健康检查通过。
+- `docker compose up --build -d`：基础构建通过，但没有远程管理覆盖，trainer 未挂载 Docker socket；因此第一次远程安装以“无法访问平台 Docker socket”失败。
+- `docker compose -f docker-compose.yml -f docker-compose.remote.yml up --build -d`：通过；trainer、worker、frontend 已启动。
+- 运行态验证：trainer 挂载 `/var/run/docker.sock`，容器内 socket 存在；平台 Docker API 可读取 `mtp-worker:local` 的平台 `linux/arm64`；`/api/health` 返回 `{"ok":true}`。
 - 页面运行环境验证：`curl -fsS http://127.0.0.1:8000/` 返回的页面包含实时日志轮询和资源心跳阶段内容。
 - `git diff --check`：通过。
 - pytest 报告 2 条既有弃用警告：SQLAlchemy `declarative_base()` 和 Pandas `xlrd` 引擎。
@@ -33,7 +35,20 @@ docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/worksp
 docker compose up --build -d
 ```
 
-结果：构建和启动成功。
+结果：构建和启动成功；默认配置不挂载 Docker socket，无法执行远程镜像导出。
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.remote.yml up --build -d
+```
+
+结果：构建和启动成功；trainer 可访问 `/var/run/docker.sock`。
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.remote.yml exec -T trainer python -c 'from pathlib import Path; import app.config as c; from app.remote_workers import _local_docker_image_platform; p=Path(c.WORKER_DOCKER_SOCKET_PATH); print("socket_exists=", p.exists()); print("worker_image=", c.WORKER_REMOTE_IMAGE); print("worker_platform=", _local_docker_image_platform(c.WORKER_REMOTE_IMAGE))'
+curl -fsS http://127.0.0.1:8000/api/health
+```
+
+结果：`socket_exists=True`、平台镜像 `linux/arm64`、API 返回 `{"ok":true}`。
 
 ```bash
 docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider
