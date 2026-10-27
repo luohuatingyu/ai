@@ -2,8 +2,8 @@
 
 ## Git基准点
 
-- **Commit Hash**: 8b8112d（计算资源远程配置、部署和启动动作隔离）
-- **提交信息**: Document isolated remote worker actions
+- **Commit Hash**: a728181（计算资源远程配置、部署和启动动作隔离）
+- **提交信息**: Keep unrelated log controls out of deployment change
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
@@ -11,7 +11,7 @@
 
 **变更范围**：已部署计算资源的配置修改只覆盖目标机 worker `.env`；部署只同步 worker 代码，不上传新配置、不重建或重启容器；启动、停止和重启继续作为独立容器生命周期操作。新增 `config`、`deploy` 远程动作，并保留旧 `update` 动作作为代码部署兼容别名。首次部署仍负责准备镜像、配置、代码并启动容器。
 
-**测试环境**：Docker Compose，容器 Python 3.12。工作区中预先存在的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 修改未纳入本次提交。
+**测试环境**：Docker Compose，容器 Python 3.12。工作区中预先存在的远程日志清除、`backend/app/storage.py` 和 `backend/tests/test_storage.py` 修改未纳入本次提交。
 
 **测试执行结果**：
 - API 与远程 worker 定向测试：129 通过、0 失败、0 错误、0 跳过。
@@ -20,7 +20,7 @@
 - `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health` 返回 `{"ok":true}`。
 - `git diff --check`：通过。
 - pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
-- 未连接真实远程 SSH 主机；远程文件覆盖和代码切换通过隔离 Shell 测试验证。
+- 未连接真实远程 SSH 主机；远程文件覆盖和代码切换通过隔离 Shell 测试验证。清理无关工作区改动后完整测试再次通过。
 
 **验收标准—测试用例映射**：
 
