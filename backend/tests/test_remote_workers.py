@@ -479,10 +479,41 @@ def test_builds_worker_image_for_requested_platform_with_minimal_context(tmp_pat
     assert headers == {"Content-Type": "application/x-tar"}
     with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as context:
         names = set(context.getnames())
+        dockerfile = context.extractfile("Dockerfile").read().decode("utf-8")
     assert "Dockerfile" in names
     assert "requirements.txt" in names
     assert "app/remote_worker.sh" in names
     assert not any(name.startswith(("data/", "tests/")) for name in names)
+    assert "dict(os.environ)" not in dockerfile
+    assert "COPY app ./app" in dockerfile
+
+
+def test_worker_build_context_skips_invalid_same_named_dockerfile(tmp_path):
+    """错误目录中的同名 Dockerfile 不得被上传给 Docker Engine。"""
+    import io
+    import tarfile
+
+    invalid_root = tmp_path / "installed-package"
+    invalid_root.mkdir()
+    (invalid_root / "Dockerfile").write_text("ENV dict(os.environ)\n", encoding="utf-8")
+
+    valid_root = tmp_path / "backend"
+    (valid_root / "app").mkdir(parents=True)
+    (valid_root / "static").mkdir()
+    (valid_root / "sample_data").mkdir()
+    (valid_root / "Dockerfile").write_text(
+        "FROM python:3.12-slim\nCOPY app ./app\nCOPY Dockerfile ./Dockerfile\n",
+        encoding="utf-8",
+    )
+    for filename in ("requirements.txt", "init_db.sh", "start.sh"):
+        (valid_root / filename).write_text("", encoding="utf-8")
+
+    context_bytes = remote_workers._worker_build_context([invalid_root, valid_root])
+    with tarfile.open(fileobj=io.BytesIO(context_bytes), mode="r:") as context:
+        dockerfile = context.extractfile("Dockerfile").read().decode("utf-8")
+
+    assert dockerfile.startswith("FROM python:3.12-slim")
+    assert "dict(os.environ)" not in dockerfile
 
 
 def test_target_platform_worker_build_failure_is_reported(tmp_path, monkeypatch):

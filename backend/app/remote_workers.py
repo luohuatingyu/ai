@@ -243,12 +243,11 @@ def _canonical_docker_platform(platform: str) -> str:
     return f"{operating_system}/{architecture}"
 
 
-def _worker_build_context() -> bytes:
-    """打包构建 worker 镜像所需的最小后端上下文，不包含运行数据和测试文件。"""
+def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
+    """从可信后端目录打包 worker 构建上下文，拒绝同名的错误 Dockerfile。"""
     import io
     import tarfile
 
-    context_root = Path(__file__).resolve().parents[1]
     context_paths = (
         "Dockerfile",
         "requirements.txt",
@@ -258,6 +257,33 @@ def _worker_build_context() -> bytes:
         "init_db.sh",
         "start.sh",
     )
+    roots = context_roots or [
+        config.APP_ROOT.parent,
+        Path("/app"),
+        Path(__file__).resolve().parents[1],
+    ]
+    context_root = None
+    for candidate in dict.fromkeys(Path(root).resolve() for root in roots):
+        dockerfile = candidate / "Dockerfile"
+        try:
+            dockerfile_text = dockerfile.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if (
+            "dict(os.environ)" in dockerfile_text
+            or not re.search(r"(?m)^FROM\s+\S+", dockerfile_text)
+            or "COPY app ./app" not in dockerfile_text
+            or "COPY Dockerfile ./Dockerfile" not in dockerfile_text
+        ):
+            continue
+        if all((candidate / relative_path).exists() for relative_path in context_paths):
+            context_root = candidate
+            break
+    if context_root is None:
+        raise RemoteWorkerError(
+            "无法自动构建 worker 镜像：未找到完整且有效的后端 Docker 构建目录"
+        )
+
     archive_buffer = io.BytesIO()
     try:
         with tarfile.open(fileobj=archive_buffer, mode="w") as archive:
