@@ -16,6 +16,7 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import app.config as config
 
@@ -30,6 +31,28 @@ def validate_key(key: str) -> str:
     if ".." in key.split("/"):
         raise ValueError(f"产物 key 不允许包含 '..': {key!r}")
     return key
+
+
+def _oss_region_from_endpoint(endpoint: str) -> Optional[str]:
+    """从阿里云 OSS/S3 endpoint 提取 region，避免 SDK 使用路径式区域探测。"""
+    endpoint_url = endpoint if "://" in endpoint else f"//{endpoint}"
+    hostname = (urlsplit(endpoint_url).hostname or "").lower()
+    suffix = ".aliyuncs.com"
+    if not hostname.endswith(suffix):
+        return None
+
+    domain = hostname[:-len(suffix)]
+    if domain.startswith("s3.oss-"):
+        region = domain[len("s3.oss-"):]
+    elif domain.startswith("oss-"):
+        region = domain[len("oss-"):]
+    else:
+        return None
+    if region.endswith("-internal"):
+        region = region[:-len("-internal")]
+    if not re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+)+", region):
+        return None
+    return region
 
 
 class ArtifactStore:
@@ -197,11 +220,13 @@ class S3ArtifactStore(ArtifactStore):
         # 惰性导入：保持 local 模式零依赖
         from minio import Minio  # noqa: WPS433
 
+        resolved_endpoint = endpoint or config.S3_ENDPOINT
         self._client = Minio(
-            endpoint or config.S3_ENDPOINT,
+            resolved_endpoint,
             access_key=access_key or config.S3_ACCESS_KEY,
             secret_key=secret_key or config.S3_SECRET_KEY,
             secure=config.S3_SECURE if secure is None else secure,
+            region=_oss_region_from_endpoint(resolved_endpoint),
         )
         self.bucket = bucket or config.S3_BUCKET
         self._ensure_bucket()

@@ -205,6 +205,47 @@ def test_job_log_helpers(store):
     assert "第一步" in text and "第二步" in text
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "expected_region"),
+    [
+        ("oss-cn-shanghai.aliyuncs.com", "cn-shanghai"),
+        ("oss-cn-shanghai-internal.aliyuncs.com:443", "cn-shanghai"),
+        ("s3.oss-cn-shanghai.aliyuncs.com", "cn-shanghai"),
+        ("s3.oss-cn-hangzhou.aliyuncs.com", "cn-hangzhou"),
+        ("s3.oss-cn-shanghai-internal.aliyuncs.com:443", "cn-shanghai"),
+        ("seaweedfs:8333", None),
+        ("s3.oss-accelerate.aliyuncs.com", None),
+    ],
+)
+def test_s3_store_infers_region_only_for_regional_oss_endpoints(
+    monkeypatch, endpoint, expected_region
+):
+    """阿里云区域端点跳过路径式区域探测，其他 S3 服务保持 SDK 默认行为。"""
+    from app.storage import S3ArtifactStore
+
+    captured = {}
+
+    class CapturingMinio:
+        def __init__(self, endpoint, **kwargs):
+            captured["endpoint"] = endpoint
+            captured.update(kwargs)
+
+        def bucket_exists(self, bucket):
+            return True
+
+    monkeypatch.setattr("minio.Minio", CapturingMinio)
+    S3ArtifactStore(
+        endpoint=endpoint,
+        access_key="test-access",
+        secret_key="test-secret",
+        bucket="test-bucket",
+        secure=True,
+    )
+
+    assert captured["endpoint"] == endpoint
+    assert captured["region"] == expected_region
+
+
 # ---------------------------------------------------------------------------
 # S3 后端集成（需 MTP_TEST_S3 指向 S3 兼容端点，如 SeaweedFS；默认跳过）
 # ---------------------------------------------------------------------------
