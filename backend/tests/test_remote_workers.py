@@ -477,6 +477,7 @@ def test_builds_worker_image_for_requested_platform_with_minimal_context(tmp_pat
     assert "platform=linux%2Famd64" in target
     assert "t=worker%3Alocal" in target
     assert headers == {"Content-Type": "application/x-tar"}
+    assert body[:100].split(b"\0", 1)[0] == b"Dockerfile"
     with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as context:
         names = set(context.getnames())
         dockerfile = context.extractfile("Dockerfile").read().decode("utf-8")

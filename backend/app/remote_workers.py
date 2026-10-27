@@ -286,7 +286,11 @@ def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
 
     archive_buffer = io.BytesIO()
     try:
-        with tarfile.open(fileobj=archive_buffer, mode="w") as archive:
+        # Docker Engine 需要直接识别 tar 上下文；Python 默认 PAX 扩展头会被部分
+        # BuildKit API 路径当作 Dockerfile 文本解析，继而误读 app/worker.py 内容。
+        with tarfile.open(
+            fileobj=archive_buffer, mode="w", format=tarfile.GNU_FORMAT
+        ) as archive:
             for relative_path in context_paths:
                 source = context_root / relative_path
                 if not source.exists():
