@@ -374,46 +374,6 @@ def test_remote_operation_cancel_cancels_queued_operation(
     assert server["status"] == "error"
 
 
-def test_remote_operation_logs_can_be_cleared_without_changing_state(client):
-    """清除远程执行日志后保留操作状态和阶段元数据。"""
-    from app.state import manager
-
-    operation_id = "a" * 32
-    manager.lease.set_remote_operation(
-        operation_id,
-        {
-            "operation_id": operation_id,
-            "machine_id": "remote-clear-logs-api",
-            "action": "restart",
-            "status": "running",
-            "phase": "执行远程部署脚本",
-            "log": "旧阶段输出",
-            "output": "旧标准输出",
-            "stderr": "旧错误输出",
-            "error": "旧错误",
-        },
-    )
-
-    response = client.delete(f"/api/remote-operations/{operation_id}/logs")
-
-    assert response.status_code == 200
-    assert response.json() == {"ok": True, "operation_id": operation_id}
-    cleared = manager.lease.get_remote_operation(operation_id)
-    assert cleared["status"] == "running"
-    assert cleared["phase"] == "执行远程部署脚本"
-    assert cleared["log"] == ""
-    assert cleared["output"] == ""
-    assert cleared["stderr"] == ""
-    assert cleared["error"] is None
-
-
-def test_remote_operation_log_clear_returns_404_for_missing_operation(client):
-    """不存在的远程操作不得创建记录或返回清除成功。"""
-    response = client.delete(f"/api/remote-operations/{'b' * 32}/logs")
-
-    assert response.status_code == 404
-
-
 def test_remote_operation_cancel_marks_active_operation_as_cancelling(client, monkeypatch):
     """执行中的操作收到取消请求后保留忙碌状态，直到 SSH 执行器确认退出。"""
     from app import remote_workers
@@ -1528,10 +1488,6 @@ def test_remote_server_card_exposes_live_operation_logs():
     assert "text.textContent = line || \" \"" in html
     assert 'id="remoteLogModal"' in html
     assert 'id="btnCopyRemoteLog" type="button">复制全部</button>' in html
-    assert 'id="btnClearRemoteLog" type="button">清除日志</button>' in html
-    assert "async function clearRemoteOperationLogs()" in html
-    assert "/logs" in logs_handler or "/logs" in html
-    assert "清除执行日志失败" in html
     assert "user-select:text" in html
     assert "data-copy-remote-log-line" in html
     assert "copyRemoteLogText(line.textContent" in html

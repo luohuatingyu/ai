@@ -616,10 +616,7 @@
       <button id="btnCloseRemoteLog" class="close-btn" aria-label="关闭">×</button>
     </div>
     <div id="remoteLogStatus" class="server-log-status" role="status"></div>
-    <div class="server-log-actions">
-      <button id="btnClearRemoteLog" type="button">清除日志</button>
-      <button id="btnCopyRemoteLog" type="button">复制全部</button>
-    </div>
+    <div class="server-log-actions"><button id="btnCopyRemoteLog" type="button">复制全部</button></div>
     <div id="remoteLogOutput" class="server-log-output" aria-label="远程操作日志" aria-live="polite"></div>
   </div>
 </div>
@@ -1991,7 +1988,7 @@ async function refreshRemoteOperationLogs() {
     status.textContent = `${operation.action || "远程操作"} · ${stateText}${phaseText}`;
     const displayLog = log || (operation.status === "queued" || operation.status === "running"
       ? "等待远程命令输出；若停留在某阶段，可根据该阶段判断检查位置。"
-      : "暂无执行日志");
+      : "远程命令未返回输出");
     const wasAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 48;
     output.dataset.rawLog = displayLog;
     renderRemoteLogLines(output, displayLog.split("\n"));
@@ -2006,26 +2003,6 @@ async function refreshRemoteOperationLogs() {
     status.textContent = "读取执行日志失败。";
     renderRemoteLogLines(output, [error.message]);
     if (!modal.hidden) state.remoteLogPollTimer = setTimeout(refreshRemoteOperationLogs, 2000);
-  }
-}
-
-// 清除当前远程操作的日志输出，保留操作状态并继续轮询运行中的操作。
-async function clearRemoteOperationLogs() {
-  const operationId = state.remoteLogOperationId;
-  if (!operationId) return;
-  const button = $("btnClearRemoteLog");
-  button.disabled = true;
-  try {
-    await apiJson(`/api/remote-operations/${encodeURIComponent(operationId)}/logs`, { method: "DELETE" });
-    if (state.remoteLogOperationId !== operationId || $("remoteLogModal").hidden) return;
-    $("remoteLogOutput").dataset.rawLog = "";
-    renderRemoteLogLines($("remoteLogOutput"), ["暂无执行日志"]);
-    toast("执行日志已清除", "ok");
-    await refreshRemoteOperationLogs();
-  } catch (error) {
-    toast(error.message || "清除执行日志失败", "error");
-  } finally {
-    if (state.remoteLogOperationId === operationId) button.disabled = false;
   }
 }
 
@@ -2175,7 +2152,6 @@ $("addServerModal").addEventListener("click", (event) => {
   if (event.target === $("addServerModal")) closeAddServerModal();
 });
 $("btnCloseRemoteLog").onclick = closeRemoteLogModal;
-$("btnClearRemoteLog").onclick = clearRemoteOperationLogs;
 $("btnCopyRemoteLog").onclick = () => copyRemoteLogText($("remoteLogOutput").dataset.rawLog || "");
 $("remoteLogOutput").addEventListener("click", (event) => {
   const button = event.target.closest("[data-copy-remote-log-line]");
