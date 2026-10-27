@@ -1797,13 +1797,18 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     monkeypatch.setattr(
         remote_workers,
         "run_remote_action",
-        lambda *_args: {"stdout": "container started", "stderr": "worker boot warning"},
+        lambda *_args: {
+            "stdout": "worker 配置摘要：\nWORKER_MODE=cpu\nS3_SECRET_KEY=[已配置]",
+            "stderr": "worker boot warning",
+        },
     )
 
     remote_workers.execute_remote_operation(operation_id, server, "start")
     result = manager.lease.get_remote_operation(operation_id)
     assert result["status"] == "completed"
-    assert result["output"] == "container started"
+    assert "worker 配置摘要" in result["output"]
+    assert "worker 配置摘要" in result["log"]
+    assert "S3_SECRET_KEY=[已配置]" in result["log"]
     assert result["stderr"] == "worker boot warning"
     assert result["phase"] == "操作完成"
     assert result["duration_sec"] >= 0
