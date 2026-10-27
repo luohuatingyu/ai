@@ -34,11 +34,14 @@
 
 3. **启动应用**
    ```bash
-   # GPU 版（推荐，需 NVIDIA 驱动 + nvidia-container-toolkit）
-   docker compose up -d --build
+   # 未指定硬件时默认使用 CPU 版
+   bash scripts/start-platform.sh
 
-   # GPU 尚未就绪时，先用 CPU 版把页面跑起来（镜像相同，仅去掉 gpus 声明）
-   docker compose -f docker-compose.cpu.yml up -d --build
+   # 选择 GPU 版（需 NVIDIA 驱动 + nvidia-container-toolkit）
+   PLATFORM_MODE=gpu bash scripts/start-platform.sh
+
+   # 开启远程管理时单独启用 Docker socket 覆盖
+   PLATFORM_MODE=gpu REMOTE_MANAGEMENT=true bash scripts/start-platform.sh
    ```
 
 打开 http://localhost:8000 即可使用。
@@ -57,7 +60,7 @@ export DB_PORT=33061
 export DB_USER=root
 export DB_PASSWORD=password
 export DB_NAME=model_training
-docker compose up -d --build
+PLATFORM_MODE=gpu bash scripts/start-platform.sh
 ```
 
 建议流程：在左侧先点「＋ classification_demo」「＋ regression_demo」导入任意一个内置示例数据集（客户流失二分类 / 房价回归），选择分类或回归后点「开始训练」，右侧实时观看曲线与日志。
@@ -102,7 +105,7 @@ LLM 任务要求单张 GPU，并将 tokenizer 与模型权重保存为 `best_mod
 ### 1. 主节点（frontend + API + Redis + SeaweedFS + worker）
 
 ```bash
-docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cpu.yml
+bash scripts/start-platform.sh   # 默认 CPU；设置 PLATFORM_MODE=gpu 选择 GPU 版
 ```
 
 打开 http://localhost:8000：页面由 frontend 容器托管，API 经同源代理转发。
@@ -130,10 +133,10 @@ docker compose up -d --build     # GPU 版；纯 CPU 环境用 docker-compose.cp
    远程管理覆盖文件会将 `/var/run/docker.sock` 挂载到 trainer，以便导出平台本地镜像。Docker socket 可控制宿主 Docker，权限接近宿主 root；应限制平台管理 API 的网络访问。镜像会在每次安装或重新部署时通过 SSH 传输，传输耗时取决于镜像大小和网络带宽。
 4. 使用远程管理 Compose 覆盖文件启动平台。GPU / CPU 两种启动方式如下：
    ```bash
-   docker compose -f docker-compose.yml -f docker-compose.remote.yml up --build -d
+   PLATFORM_MODE=gpu REMOTE_MANAGEMENT=true bash scripts/start-platform.sh
 
    # CPU 版
-   docker compose -f docker-compose.cpu.yml -f docker-compose.remote.yml up --build -d
+   PLATFORM_MODE=cpu REMOTE_MANAGEMENT=true bash scripts/start-platform.sh
    ```
 5. 打开主页面「添加服务器」，在「SSH 凭证管理」中配置全平台共用的密钥或密码，再填写目标主机、SSH 用户/端口、服务器标识及 CPU/GPU 类型。平台会执行安装并启动 worker；资源心跳出现后，CPU/GPU 槽默认处于待选择状态，手动点击「加入资源池」才会接收训练任务。服务器卡片还可通过 SSH 启动、停止或重启 worker。
 
@@ -170,7 +173,7 @@ python -m app.worker --probe-gpu     # 一次性卡健康探测（退出码 0=�
 | 宿主机驱动 | 安装与本机匹配的 NVIDIA 驱动（容器内**不需要**装 CUDA Toolkit，torch 的 Linux wheel 已内置 CUDA 12 运行时依赖） |
 | 容器运行时 | Linux 需安装 `nvidia-container-toolkit` 并 `systemctl restart docker`；Docker Desktop（Windows/WSL2）在设置中开启 GPU |
 | 验证宿主能力 | `docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi` |
-| 启动 | 直接使用 `docker-compose.yml`（已含 `gpus: all`） |
+| 启动 | 使用 `PLATFORM_MODE=gpu bash scripts/start-platform.sh` |
 | 页面确认 | 顶栏徽章显示 GPU 型号即成功；每次训练的「设备」统计也会显示 GPU/CPU |
 
 CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch.cuda.is_available()`，无 GPU 时仅打印提示并回退 CPU。
