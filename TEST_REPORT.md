@@ -2,7 +2,7 @@
 
 ## Git基准点
 
-- **Commit Hash**: 待提交（远程配置先写入并安全回滚）
+- **Commit Hash**: c0e03d1（远程配置先写入并安全回滚）
 - **提交信息**: Separate remote deployment and config updates
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
