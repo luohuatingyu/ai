@@ -2,10 +2,73 @@
 
 ## Git基准点
 
-- **Commit Hash**: 63bc551（修复阿里云 OSS region 自动识别）
-- **提交信息**: Fix Aliyun OSS region detection
+- **Commit Hash**: 7f1ab3d（显示远程目标镜像构建进度）
+- **提交信息**: Show remote target build progress
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：显示远程目标镜像构建进度（2026-10-27）
+
+**变更范围**：目标机 Docker BuildKit 构建启用纯文本进度；SSH 输出采集器把换行和回车都作为进度分隔符；目标机连续 30 秒无新构建输出时写入等待提示，说明可能正在下载基础镜像或 Python 依赖。Buildx 缺失回退、取消、超时和错误脱敏行为保持兼容。业务代码提交为 `7f1ab3d`。
+
+**测试环境**：Docker Compose，测试容器 Python 3.12。完整测试包含工作区原有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动；这两个文件未纳入本次提交。
+
+**测试执行结果**：
+- 修复前新增的回归用例按预期复现 3 项失败：回车进度被合并缓冲、静默构建没有提示、构建命令未请求纯文本进度。
+- 修复后定向日志与构建用例：5 通过、0 失败、0 错误、0 跳过。
+- 远程 worker 完整测试：66 通过、0 失败、0 错误、0 跳过。
+- 完整测试：266 项；260 通过、6 跳过、0 失败、0 错误。6 项为 Redis、S3 与 Supervisor 子进程环境门控项。
+- `docker compose up --build -d`：构建成功，trainer 与 worker 已启动。trainer 初始化 MySQL 时健康检查短暂返回 502；重试后 `/api/health` 返回 `{"ok":true}`。frontend、SeaweedFS 保持 healthy。
+- `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+- 未连接真实 Linux 目标机进行 SSH 构建回环；实际 Docker 输出格式和远程网络等待通过单元测试模拟验证。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| Docker 构建进度及时进入远程操作日志 | 单元：`test_communicate_remote_process_streams_carriage_return_progress`、`test_remote_worker_build_sends_minimal_context_and_quotes_docker_args` | 回车分隔的 Docker 输出逐条回调；BuildKit 命令带 `--progress=plain` 且仍安全引用镜像名 | 正常、兼容、输入安全 |
+| 构建静默达到 30 秒时提示等待原因 | 单元：`test_communicate_remote_process_reports_idle_target_build` | 无 Docker 输出满 30 秒时出现“可能正在下载基础镜像或 Python 依赖”的阶段日志 | 边界、等待场景 |
+| Buildx 回退和远程 worker 历史行为保持兼容 | 定向：`test_remote_worker_build_falls_back_when_buildx_is_missing`；完整：`tests/` | Buildx 缺失仍只回退一次；远程 worker 66 项和完整套件均通过 | 异常、兼容、回归 |
+
+**关键模块测试**：远程 worker 构建与 SSH 日志层 66/66 通过；数据、训练、API 等其他模块均包含在完整测试中，整套结果为 260 通过、6 跳过。
+
+**实际执行命令**：
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py::test_communicate_remote_process_streams_only_new_output_lines tests/test_remote_workers.py::test_communicate_remote_process_streams_carriage_return_progress tests/test_remote_workers.py::test_communicate_remote_process_reports_idle_target_build tests/test_remote_workers.py::test_remote_worker_build_sends_minimal_context_and_quotes_docker_args tests/test_remote_workers.py::test_remote_worker_build_falls_back_when_buildx_is_missing -q -p no:cacheprovider
+```
+
+结果：5 passed。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q -p no:cacheprovider
+```
+
+结果：66 passed。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider
+```
+
+结果：260 passed、6 skipped。
+
+```bash
+docker compose up --build -d
+docker compose ps
+curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 20 http://127.0.0.1:8000/api/health
+git diff --check
+```
+
+结果：Compose 构建与启动成功；健康检查最终返回 `{"ok":true}`；差异空白检查通过。
+
+**已知问题与限制**：真实 Linux SSH 目标机尚未复测，基础镜像和 Python 依赖下载耗时仍取决于目标机网络。等待提示每 30 秒重复一次，日志受现有 24,000 字符上限约束。
+
+**下次测试建议**：在实际 Linux 目标机执行一次重新部署，确认 BuildKit 的纯文本步骤实时进入页面日志，并观察网络较慢时的等待提示。
+
+**重测触发条件**：修改 `_communicate_remote_process` 的输出分隔、静默提示或目标机 Docker 构建命令时，运行 `tests/test_remote_workers.py`、完整 `tests/` 和 `docker compose up --build -d`。
+
+**Git基准点**：`7f1ab3d`（Show remote target build progress）；测试报告作为单独提交更新。
 
 ## 本次变更测试结果：阿里云 OSS region 自动识别（2026-10-27）
 
