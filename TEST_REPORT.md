@@ -32,6 +32,43 @@
 
 **下次测试建议**：在真实 Linux 目标机依次执行“重启 → 更新配置 → 启动/重启”，核对更新后第一次运行仍保持旧值、下一次生命周期操作才读取新值，并验证任务优雅停止与 checkpoint 恢复。
 
+## 本次变更测试结果：部署/更新配置立即重建容器，启动/重启改为纯容器操作（2026-10-28）
+
+**Git基准点**：`863cef1`（Recreate worker container on deploy/config; keep start/restart pure container ops）  
+**分支**：`emdash/hot-boxes-clean-y9u6p`  
+**测试环境**：Docker Compose，容器 Python 3.12.15。
+
+**变更范围**：远程操作语义对齐「部署=生成配置文件并生成容器、更新配置=更新配置文件与容器配置、启动/重启=只操作容器」：`deploy` 同步 worker 源码、重写环境文件并用现有镜像重建容器；`config` 覆盖环境文件并重建容器立即应用（不再等待手动 start/restart）；重建保持原运行状态（运行中的保持运行、停止的保持停止），新容器创建失败时自动回滚旧容器；`start/restart` 改为纯 `docker start` / `docker restart --time 45`，不再重建容器或读取配置文件。`stop/status`、首次 `install` 行为不变。页面按钮文案、提示与 README 同步更新。
+
+**测试执行结果**：
+- 完整测试套件：279 项；273 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- 远程 Worker 定向测试（含 6 个 Shell 脚本用例与新增「停止状态保持」用例）：全部通过。
+- API 定向测试（页面契约标记更新）：全部通过。
+- 以 `tests/test_remote_workers.py tests/test_api.py` 顺序合并运行时出现 1 例既有测试顺序干扰（`test_remote_workers` 中 `"b"*32` 操作记录残留使 `test_api` 的日志清除 404 用例返回 200）；该用例单独复跑通过，标准命令 `pytest tests/` 下 273 项全部通过。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
+- `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- `bash -n backend/app/remote_worker.sh` 与 `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 部署生成配置文件并生成容器 | Shell：`test_remote_bootstrap_script_deploy_syncs_code_and_recreates_container` | 同步代码包、重写环境文件、用现有镜像重建并启动容器 | 正常、回归 |
+| 更新配置同时更新配置文件与容器配置 | Shell：`test_remote_bootstrap_script_config_recreates_container_with_latest_env` | 覆盖环境文件后停止旧容器、`docker run --detach` 读取最新 `--env-file` | 正常、兼容 |
+| 更新配置失败可回滚 | Shell：`test_remote_bootstrap_script_config_rolls_back_when_new_container_fails` | 新容器创建失败后恢复旧容器并重新启动，保留新配置供重试 | 异常、恢复 |
+| 更新配置不改变停止状态 | Shell：`test_remote_bootstrap_script_config_keeps_stopped_container_stopped` | 停止容器重建时仅 `docker create`，不自动启动 | 边界、回归 |
+| 启动/重启只操作容器 | Shell 参数化：`test_remote_bootstrap_script_lifecycle_controls_container_only` | 仅执行 `docker start` / `docker restart --time 45`，不重建容器、不读写配置文件 | 正常、兼容 |
+| 未部署时更新配置给出明确提示 | Shell：`test_remote_bootstrap_script_config_requires_existing_container` | 无容器时报错「请先部署」，环境文件已写入 | 异常、边界 |
+| 页面文案与实际动作一致 | API 页面契约：`test_remote_server_form_exposes_network_overrides_and_effective_config_action` | 页面提示部署/更新配置会重建容器，无旧时序描述 | 正常、回归 |
+| 业务回归保持通过 | 完整 `backend/tests` 套件 | 273 通过、6 跳过 | 数据、训练、API、远程管理回归 |
+
+**关键模块测试**：远程 Worker 与 API 定向测试全部通过；完整套件 273/279 通过（97.8%）。
+
+**已知问题与限制**：未连接真实 SSH 目标机；容器重建、失败回滚与停止状态保持通过隔离 Docker 替身验证。工作区另有 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 的既有未提交改动，未纳入本次提交；完整套件是在包含这些工作区改动的容器环境中执行并通过。
+
+**下次测试建议**：在真实 Linux 目标机依次执行「更新配置 → 部署代码 → 停止 → 更新配置 → 启动」，核对运行中的 worker 立即应用新配置/代码、停止状态在重建后保持，并验证训练任务优雅停止与 checkpoint 恢复。
+
 # 测试报告
 
 ## 本次变更测试结果：更新远程配置时重建 worker 容器（2026-10-28）
