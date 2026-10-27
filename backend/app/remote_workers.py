@@ -1108,30 +1108,25 @@ def resolve_remote_server_credentials(server: Dict[str, object]) -> Dict[str, st
 
 
 def apply_remote_server_overrides(
-    server: Dict[str, object], overrides: Dict[str, object], *, is_update: bool = False
+    server: Dict[str, object], overrides: Dict[str, object]
 ) -> Dict[str, object]:
-    """应用服务器级部署覆盖值，并将可能含密码的 Redis URL 加密后保存。"""
+    """应用服务器级 Redis/S3 覆盖值，并将 Redis URL 加密后保存。"""
     updated = dict(server)
-    for request_key, stored_key in (
-        ("worker_image", "worker_image_override"),
-        ("remote_s3_endpoint", "remote_s3_endpoint_override"),
-    ):
-        if request_key not in overrides:
-            continue
-        value = str(overrides.get(request_key) or "").strip()
-        updated[stored_key] = value or None
+    # Worker 镜像只由平台环境配置决定，不再支持服务器级镜像覆盖。
+    updated.pop("worker_image_override", None)
+    if "remote_s3_endpoint" in overrides:
+        value = str(overrides.get("remote_s3_endpoint") or "").strip()
+        updated["remote_s3_endpoint_override"] = value or None
 
     redis_was_sent = "remote_redis_url" in overrides
     redis_url = str(overrides.get("remote_redis_url") or "").strip()
     clear_redis = bool(overrides.get("clear_remote_redis_url_override"))
-    if clear_redis:
+    if clear_redis or (redis_was_sent and not redis_url):
         updated.pop("remote_redis_url_encrypted", None)
     elif redis_was_sent and redis_url:
         updated["remote_redis_url_encrypted"] = _credential_fernet().encrypt(
             redis_url.encode("utf-8")
         ).decode("ascii")
-    elif redis_was_sent and not is_update:
-        updated.pop("remote_redis_url_encrypted", None)
 
     # 兼容请求构造时的临时字段，绝不把 Redis URL 明文留在服务器记录中。
     updated.pop("remote_redis_url", None)
@@ -1140,9 +1135,10 @@ def apply_remote_server_overrides(
 
 
 def remote_server_public_view(server: Dict[str, object]) -> Dict[str, object]:
-    """返回公开服务器配置，隐藏 Redis 密文并兼容旧记录的部署状态。"""
+    """返回公开服务器配置，隐藏敏感 Redis 密文和已移除的镜像覆盖字段。"""
     public = dict(server)
     encrypted_redis_url = public.pop("remote_redis_url_encrypted", None)
+    public.pop("worker_image_override", None)
     public.pop("remote_redis_url", None)
     public.pop("clear_remote_redis_url_override", None)
     public["has_remote_redis_url_override"] = bool(encrypted_redis_url)
@@ -1161,7 +1157,7 @@ def remote_server_is_deployed(server: Dict[str, object]) -> bool:
 
 
 def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[str, str]:
-    """解析单机覆盖值与平台默认值，返回远程 worker 所需的部署配置。"""
+    """解析服务器 Redis/S3 覆盖值，未配置时回退平台 .env 配置。"""
     server = server or {}
     encrypted_redis_url = str(server.get("remote_redis_url_encrypted", "") or "")
     redis_override = ""
@@ -1173,9 +1169,7 @@ def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[
         except (InvalidToken, ValueError, UnicodeError) as exc:
             raise RemoteWorkerError("服务器 Redis 覆盖配置无法解密；请检查平台加密主密钥") from exc
     return {
-        "worker_image": str(
-            server.get("worker_image_override") or config.WORKER_REMOTE_IMAGE or ""
-        ).strip(),
+        "worker_image": str(config.WORKER_REMOTE_IMAGE or "").strip(),
         "redis_url": str(
             redis_override or config.WORKER_REMOTE_REDIS_URL or config.REDIS_URL or ""
         ).strip(),
@@ -1498,7 +1492,7 @@ def remote_configuration_errors(
         settings = {"worker_image": "", "redis_url": "", "s3_endpoint": ""}
     image = settings["worker_image"]
     if not image or any(c.isspace() for c in image):
-        errors.append("WORKER_IMAGE 或服务器镜像覆盖值必须是有效的 worker 镜像标签")
+        errors.append("平台 WORKER_IMAGE 必须是有效的 worker 镜像标签")
     if not settings["redis_url"].startswith(("redis://", "rediss://")):
         errors.append("平台或服务器必须配置目标服务器可访问的 Redis URL")
     if not settings["s3_endpoint"] or any(

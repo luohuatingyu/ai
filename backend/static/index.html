@@ -502,7 +502,7 @@
       <h3 id="addServerTitle">通过 SSH 添加服务器</h3>
       <button id="btnCloseAddServer" class="close-btn" aria-label="关闭">×</button>
     </div>
-    <p>平台会使用页面统一管理的 SSH 凭证连接目标机，将本机 worker 镜像流式传输到目标机并执行单文件部署脚本。不会同步项目源码，也不要求目标机访问镜像仓库。目标机需要 SSH 可达、安装 Docker，并能访问 Redis 和 S3。</p>
+    <p>平台会使用页面统一管理的 SSH 凭证连接目标机，将平台 .env 配置的 worker 镜像流式传输到目标机并执行单文件部署脚本；页面不单独配置镜像。不会同步项目源码，也不要求目标机访问镜像仓库。目标机需要 SSH 可达、安装 Docker，并能访问 Redis 和 S3。</p>
     <form id="remoteServerForm" class="server-form">
       <div class="field">
         <label for="remoteMachineId">服务器标识</label>
@@ -540,13 +540,8 @@
         <div class="hint">设为 0 可只运行管理容器，不提供 CPU 槽。</div>
       </div>
       <div class="field wide">
-        <label for="remoteWorkerImage">Worker 镜像（可选本地标签覆盖）</label>
-        <input id="remoteWorkerImage" name="worker_image" maxlength="512" placeholder="留空时使用平台本地默认镜像">
-        <div class="hint">填写平台 Docker 中已存在的镜像标签。首次部署时平台会通过 SSH 发送镜像，目标机无需访问镜像仓库。</div>
-      </div>
-      <div class="field wide">
         <label for="remoteRedisUrl">远程 Redis URL（可选覆盖）</label>
-        <input id="remoteRedisUrl" name="remote_redis_url" type="password" maxlength="4096" autocomplete="new-password" placeholder="留空时使用平台默认 Redis">
+        <input id="remoteRedisUrl" name="remote_redis_url" type="password" maxlength="4096" autocomplete="new-password" placeholder="留空时使用平台 .env 的 Redis">
         <div class="hint" id="remoteRedisUrlHint">可使用 redis:// 或 rediss://；URL 中的密码会加密保存。</div>
       </div>
       <label class="field wide" id="clearRemoteRedisOverrideField" hidden>
@@ -554,7 +549,7 @@
       </label>
       <div class="field wide">
         <label for="remoteS3Endpoint">S3 地址（可选覆盖）</label>
-        <input id="remoteS3Endpoint" name="remote_s3_endpoint" maxlength="512" placeholder="留空时使用平台默认 S3_ENDPOINT">
+        <input id="remoteS3Endpoint" name="remote_s3_endpoint" maxlength="512" placeholder="留空时使用平台 .env 的 S3_ENDPOINT">
       </div>
       <div class="field wide hint" id="remoteConfigApplyHint">登记配置后，可在服务器卡片上单独部署。</div>
       <div class="field wide hint">SSH 凭证在页面统一配置；主机密钥首次连接时自动信任并持久化。</div>
@@ -1821,7 +1816,7 @@ function openAddServerModal() {
   $("clearRemoteRedisOverrideField").hidden = true;
   $("clearRemoteRedisOverride").checked = false;
   $("remoteRedisUrl").disabled = false;
-  $("remoteRedisUrl").placeholder = "留空时使用平台默认 Redis";
+  $("remoteRedisUrl").placeholder = "留空时使用平台 .env 的 Redis";
   resetRemoteSshCredentialForm();
   modal.hidden = false;
   modal.classList.add("open");
@@ -1847,14 +1842,13 @@ async function openEditRemoteServer(machineId) {
   document.querySelector(`input[name="mode"][value="${server.mode === "cpu" ? "cpu" : "gpu"}"]`).checked = true;
   $("remoteCpuSlots").value = server.cpu_slots ?? 2;
   $("remoteCpuSlotsField").hidden = server.mode !== "cpu";
-  $("remoteWorkerImage").value = server.worker_image_override || "";
   $("remoteRedisUrl").value = "";
   $("remoteRedisUrl").placeholder = server.has_remote_redis_url_override
-    ? "已设置服务器专属值；留空保持不变"
-    : "留空时使用平台默认 Redis";
+    ? "已设置服务器专属值；留空使用平台 .env"
+    : "留空时使用平台 .env 的 Redis";
   $("remoteRedisUrlHint").textContent = server.has_remote_redis_url_override
-    ? "服务器 Redis URL 已加密保存，不会回显；输入新值可替换。"
-    : "可使用 redis:// 或 rediss://；URL 中的密码会加密保存。";
+    ? "服务器 Redis URL 已加密保存，不会回显；输入新值可替换，留空会回退平台 .env。"
+    : "可使用 redis:// 或 rediss://；URL 中的密码会加密保存，留空使用平台 .env。";
   $("clearRemoteRedisOverrideField").hidden = !server.has_remote_redis_url_override;
   $("clearRemoteRedisOverride").checked = false;
   $("remoteRedisUrl").disabled = false;
@@ -1890,7 +1884,6 @@ async function submitRemoteServer(event) {
   payload.username = payload.username.trim() || null;
   payload.port = Number(payload.port);
   payload.cpu_slots = Number(payload.cpu_slots || 0);
-  payload.worker_image = payload.worker_image.trim() || null;
   payload.remote_redis_url = String(payload.remote_redis_url || "").trim();
   payload.remote_s3_endpoint = payload.remote_s3_endpoint.trim() || null;
   payload.clear_remote_redis_url_override = $("clearRemoteRedisOverride").checked;

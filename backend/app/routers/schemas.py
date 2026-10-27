@@ -135,15 +135,12 @@ class RemoteServerRequest(BaseModel):
     port: int = Field(default=22, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] = "gpu"
     cpu_slots: int = Field(default=2, ge=0, le=256)
-    worker_image: str | None = Field(default=None, max_length=512)
     remote_redis_url: str | None = Field(default=None, max_length=4096)
     remote_s3_endpoint: str | None = Field(default=None, max_length=512)
 
     @model_validator(mode="after")
     def validate_deployment_overrides(self) -> "RemoteServerRequest":
         """拒绝远程部署配置中的换行和格式错误值。"""
-        if self.worker_image and any(char.isspace() or ord(char) < 32 for char in self.worker_image):
-            raise ValueError("WORKER_IMAGE 不能包含空白字符")
         if self.remote_redis_url and not self.remote_redis_url.startswith(("redis://", "rediss://")):
             raise ValueError("Redis 地址必须以 redis:// 或 rediss:// 开头")
         if self.remote_redis_url and any(char.isspace() or ord(char) < 32 for char in self.remote_redis_url):
@@ -162,7 +159,6 @@ class RemoteServerUpdateRequest(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] | None = None
     cpu_slots: int | None = Field(default=None, ge=0, le=256)
-    worker_image: str | None = Field(default=None, max_length=512)
     remote_redis_url: str | None = Field(default=None, max_length=4096)
     remote_s3_endpoint: str | None = Field(default=None, max_length=512)
     clear_remote_redis_url_override: bool = False
@@ -170,8 +166,6 @@ class RemoteServerUpdateRequest(BaseModel):
     @model_validator(mode="after")
     def validate_deployment_overrides(self) -> "RemoteServerUpdateRequest":
         """拒绝编辑请求中的换行和格式错误值。"""
-        if self.worker_image and any(char.isspace() or ord(char) < 32 for char in self.worker_image):
-            raise ValueError("WORKER_IMAGE 不能包含空白字符")
         if self.remote_redis_url and not self.remote_redis_url.startswith(("redis://", "rediss://")):
             raise ValueError("Redis 地址必须以 redis:// 或 rediss:// 开头")
         if self.remote_redis_url and any(char.isspace() or ord(char) < 32 for char in self.remote_redis_url):

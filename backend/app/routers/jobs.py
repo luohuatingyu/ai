@@ -618,7 +618,7 @@ def update_remote_server(
         candidate["ssh_credential_id"] = updates.pop("ssh_credential_id")
 
     try:
-        candidate = apply_remote_server_overrides(candidate, updates, is_update=True)
+        candidate = apply_remote_server_overrides(candidate, updates)
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     try:

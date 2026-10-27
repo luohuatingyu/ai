@@ -404,8 +404,8 @@ def _set_page_credential(auth_method: str, **overrides) -> dict:
     return remote_workers.create_platform_ssh_credential(credential)
 
 
-def test_remote_configuration_requires_page_credentials_and_worker_image_tag(tmp_path, monkeypatch):
-    """远程执行依赖页面凭证和 worker 镜像标签，不要求镜像仓库地址。"""
+def test_remote_configuration_requires_page_credentials_and_platform_worker_image_tag(tmp_path, monkeypatch):
+    """远程执行依赖页面凭证和平台 worker 镜像标签，不要求镜像仓库地址。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     assert remote_workers.remote_configuration_errors() == []
@@ -413,7 +413,7 @@ def test_remote_configuration_requires_page_credentials_and_worker_image_tag(tmp
     missing_key = {"auth_method": "key", "private_key": "", "password": "", "passphrase": ""}
     assert any("页面未配置 SSH 私钥" in item for item in remote_workers.remote_configuration_errors(missing_key))
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "")
-    assert any("有效的 worker 镜像标签" in item for item in remote_workers.remote_configuration_errors())
+    assert any("平台 WORKER_IMAGE" in item for item in remote_workers.remote_configuration_errors())
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "worker:latest")
     assert not any("镜像" in item for item in remote_workers.remote_configuration_errors())
 
@@ -512,8 +512,8 @@ def test_render_remote_script_quotes_values_and_does_not_transfer_repository(tmp
     assert "docker-compose" not in rendered
 
 
-def test_remote_deployment_settings_apply_per_server_overrides_and_platform_fallback(tmp_path, monkeypatch):
-    """服务器覆盖值优先，未覆盖的配置回退到平台 WORKER_IMAGE、REDIS_URL 和 S3_ENDPOINT。"""
+def test_remote_deployment_settings_apply_platform_fallback_and_server_network_overrides(tmp_path, monkeypatch):
+    """Worker 镜像只取平台配置，Redis/S3 未覆盖时回退平台 .env。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/platform/worker:default")
     monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
@@ -532,7 +532,6 @@ def test_remote_deployment_settings_apply_per_server_overrides_and_platform_fall
     server = remote_workers.apply_remote_server_overrides(
         _server(),
         {
-            "worker_image": "registry.example.net/remote/worker:v5",
             "remote_redis_url": redis_url,
             "remote_s3_endpoint": "remote-s3.example.net:9000",
         },
@@ -540,10 +539,15 @@ def test_remote_deployment_settings_apply_per_server_overrides_and_platform_fall
     assert server["remote_redis_url_encrypted"] != redis_url
     assert "remote_redis_url" not in server
     assert remote_workers.remote_deployment_settings(server) == {
-        "worker_image": "registry.example.net/remote/worker:v5",
+        "worker_image": "registry.example.net/platform/worker:default",
         "redis_url": redis_url,
         "s3_endpoint": "remote-s3.example.net:9000",
     }
+    assert "worker_image_override" not in server
+    fallback = remote_workers.apply_remote_server_overrides(
+        server, {"remote_redis_url": "", "remote_s3_endpoint": ""}
+    )
+    assert remote_workers.remote_deployment_settings(fallback) == defaults
     public = remote_workers.remote_server_public_view(server)
     assert public["has_remote_redis_url_override"] is True
     assert "remote_redis_url_encrypted" not in public
@@ -558,17 +562,16 @@ def test_remote_deployment_settings_apply_per_server_overrides_and_platform_fall
     )["deployed"] is True
 
 
-def test_remote_configuration_accepts_complete_server_overrides_without_remote_env_values(tmp_path, monkeypatch):
-    """远程配置可由单机覆盖值补齐，避免要求 WORKER_REMOTE_* 重复配置。"""
+def test_remote_configuration_accepts_server_network_overrides_without_remote_env_values(tmp_path, monkeypatch):
+    """远程 Redis/S3 可由单机覆盖值补齐，镜像仍由平台配置提供。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "")
+    monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/ml/worker:unit")
     monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
     monkeypatch.setattr(config, "WORKER_REMOTE_S3_ENDPOINT", "")
     server = remote_workers.apply_remote_server_overrides(
         _server(),
         {
-            "worker_image": "registry.example.net/server/worker:v1",
             "remote_redis_url": "rediss://redis.example.net:6380/0",
             "remote_s3_endpoint": "s3.example.net:9000",
         },
@@ -576,31 +579,32 @@ def test_remote_configuration_accepts_complete_server_overrides_without_remote_e
 
     assert remote_workers.remote_configuration_errors(server=server) == []
     rendered = remote_workers.render_remote_script(server, "install")
-    assert "export MTP_WORKER_IMAGE=registry.example.net/server/worker:v1" in rendered
+    assert "registry.example.net/server/worker:v1" not in rendered
+    assert "export MTP_WORKER_IMAGE=registry.example.net/ml/worker:unit" in rendered
     assert "export MTP_REDIS_URL=rediss://redis.example.net:6380/0" in rendered
     assert "export MTP_S3_ENDPOINT=s3.example.net:9000" in rendered
 
 
 def test_remote_server_redis_override_can_be_preserved_replaced_or_cleared(tmp_path, monkeypatch):
-    """编辑时空 Redis 输入保留密文，重置选项清除覆盖值并回退到平台默认。"""
+    """编辑时空 Redis 输入清除密文并回退到平台 .env。"""
     _remote_config(tmp_path, monkeypatch)
     original = "redis://user:first-password@redis-one.example.net:6379/0"
     replacement = "rediss://user:second-password@redis-two.example.net:6380/2"
     server = remote_workers.apply_remote_server_overrides(
         _server(), {"remote_redis_url": original}
     )
-    encrypted_original = server["remote_redis_url_encrypted"]
 
     preserved = remote_workers.apply_remote_server_overrides(
-        server, {"remote_redis_url": ""}, is_update=True
+        server, {"remote_redis_url": ""}
     )
-    assert preserved["remote_redis_url_encrypted"] == encrypted_original
+    assert "remote_redis_url_encrypted" not in preserved
+    assert remote_workers.remote_deployment_settings(preserved)["redis_url"] == config.WORKER_REMOTE_REDIS_URL
     replaced = remote_workers.apply_remote_server_overrides(
-        preserved, {"remote_redis_url": replacement}, is_update=True
+        preserved, {"remote_redis_url": replacement}
     )
     assert remote_workers.remote_deployment_settings(replaced)["redis_url"] == replacement
     cleared = remote_workers.apply_remote_server_overrides(
-        replaced, {"clear_remote_redis_url_override": True}, is_update=True
+        replaced, {"clear_remote_redis_url_override": True}
     )
     assert "remote_redis_url_encrypted" not in cleared
     assert remote_workers.remote_server_public_view(cleared)["has_remote_redis_url_override"] is False

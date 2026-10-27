@@ -526,7 +526,6 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
         "port": 2222,
         "mode": "gpu",
         "cpu_slots": 0,
-        "worker_image": "registry.example.net/remote/worker:v2",
         "remote_redis_url": "rediss://worker:synthetic-redis-password@redis.example.net:6380/4",
         "remote_s3_endpoint": "remote-storage.example.net:9000",
     }
@@ -545,8 +544,8 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     assert server["host"] == payload["host"]
     assert server["username_override"] == "worker"
     assert server["ssh_credential_id"] == credential_id
-    assert server["worker_image_override"] == payload["worker_image"]
     assert server["remote_s3_endpoint_override"] == payload["remote_s3_endpoint"]
+    assert "worker_image_override" not in server
     assert server["has_remote_redis_url_override"] is True
     assert server["deployed"] is False
     assert "remote_redis_url_encrypted" not in server
@@ -556,26 +555,18 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     edited = client.patch(
         f"/api/remote-servers/{machine_id}",
         json={
-            "worker_image": "registry.example.net/remote/worker:v3",
             "remote_redis_url": "",
-            "remote_s3_endpoint": "storage-v2.example.net:9000",
+            "remote_s3_endpoint": "",
         },
     )
     assert edited.status_code == 200, edited.text
     edited_server = remote_config_repository.get_remote_server(machine_id)
-    assert edited_server["worker_image_override"] == "registry.example.net/remote/worker:v3"
-    assert edited_server["remote_s3_endpoint_override"] == "storage-v2.example.net:9000"
-    assert edited_server["remote_redis_url_encrypted"] == stored_server["remote_redis_url_encrypted"]
-    assert edited.json()["server"]["has_remote_redis_url_override"] is True
+    assert "worker_image_override" not in edited_server
+    assert edited_server["remote_s3_endpoint_override"] is None
+    assert "remote_redis_url_encrypted" not in edited_server
+    assert edited.json()["server"]["has_remote_redis_url_override"] is False
     assert calls == []
 
-    cleared = client.patch(
-        f"/api/remote-servers/{machine_id}",
-        json={"clear_remote_redis_url_override": True},
-    )
-    assert cleared.status_code == 200, cleared.text
-    assert "remote_redis_url_encrypted" not in remote_config_repository.get_remote_server(machine_id)
-    assert cleared.json()["server"]["has_remote_redis_url_override"] is False
     assert client.post("/api/remote-servers", json=payload).status_code == 409
 
     deployed = client.post(f"/api/remote-servers/{machine_id}/install")
@@ -595,7 +586,6 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     updated = client.patch(
         f"/api/remote-servers/{machine_id}",
         json={
-            "worker_image": "registry.example.net/remote/worker:v4",
             "remote_s3_endpoint": "storage-v3.example.net:9000",
         },
     )
@@ -606,7 +596,7 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     assert update_operation["status"] == "completed"
     assert update_operation["action"] == "config"
     assert calls[-1] == (machine_id, "config", "worker")
-    assert remote_config_repository.get_remote_server(machine_id)["worker_image_override"] == "registry.example.net/remote/worker:v4"
+    assert remote_config_repository.get_remote_server(machine_id)["remote_s3_endpoint_override"] == "storage-v3.example.net:9000"
 
     for action in ("install", "deploy", "start", "stop", "restart"):
         result = client.post(f"/api/remote-servers/{machine_id}/{action}")
@@ -1444,9 +1434,7 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
     html = (static_dir / "index.html").read_text(encoding="utf-8")
 
     for marker in (
-        'id="remoteWorkerImage"',
-        "Worker 镜像（可选本地标签覆盖）",
-        "平台会通过 SSH 发送镜像，目标机无需访问镜像仓库",
+        "页面不单独配置镜像",
         'id="remoteRedisUrl"',
         'id="remoteS3Endpoint"',
         'id="clearRemoteRedisOverride"',
@@ -1460,6 +1448,8 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
         "openEditRemoteServer",
     ):
         assert marker in html
+    assert 'id="remoteWorkerImage"' not in html
+    assert "worker_image" not in html
 
 
 def test_remote_server_card_filters_lifecycle_actions_by_presence():
