@@ -47,7 +47,7 @@ install_worker() {
     exit 127
   fi
   if ! docker image inspect "$MTP_WORKER_IMAGE" >/dev/null 2>&1; then
-    printf '目标服务器尚未收到 worker 镜像，请从平台重新部署。\n' >&2
+    printf '目标服务器尚未构建 worker 镜像，请从平台重新部署。\n' >&2
     exit 1
   fi
   write_worker_env

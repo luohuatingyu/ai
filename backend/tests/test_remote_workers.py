@@ -188,6 +188,40 @@ def test_communicate_remote_process_streams_only_new_output_lines():
     assert "stderr: connection timed out" in timeout_lines
 
 
+def test_run_remote_subprocess_preserves_binary_build_context(monkeypatch):
+    """SSH 子进程以二进制模式接收 tar 上下文并返回可解码的构建输出。"""
+    command = ["ssh", "worker@compute.example.net", "docker build -"]
+    payload = b"docker-build-context-tar"
+    received = {}
+
+    class FakeProcess:
+        args = command
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            received["input"] = input
+            return b"built\n", b""
+
+        def poll(self):
+            return self.returncode
+
+    def fake_popen(_command, **kwargs):
+        received["text"] = kwargs["text"]
+        return FakeProcess()
+
+    monkeypatch.setattr(remote_workers.subprocess, "Popen", fake_popen)
+    result = remote_workers._run_remote_subprocess(
+        command,
+        input_data=payload,
+        timeout=10,
+        environment=None,
+        operation_id=None,
+    )
+
+    assert received == {"text": False, "input": payload}
+    assert result.stdout == b"built\n"
+
+
 def test_worker_heartbeat_probe_reports_present_and_missing_slots(monkeypatch):
     """启动探测能报告收到心跳及 15 秒内未收到心跳两种结果。"""
     operation_id = "e" * 32
@@ -213,7 +247,7 @@ def test_worker_heartbeat_probe_reports_present_and_missing_slots(monkeypatch):
 
 
 def test_run_remote_install_records_stages_and_worker_heartbeat(tmp_path, monkeypatch):
-    """远程安装日志记录目标架构、镜像传输、远端启动和首次资源心跳。"""
+    """远程安装日志记录目标架构、目标机构建、worker 启动和首次资源心跳。"""
     _remote_config(tmp_path, monkeypatch)
     operation_id = "f" * 32
     server = _server()
@@ -223,7 +257,6 @@ def test_run_remote_install_records_stages_and_worker_heartbeat(tmp_path, monkey
         {"operation_id": operation_id, "machine_id": server["machine_id"], "status": "running"},
     )
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/amd64")
     monkeypatch.setattr(
         manager.lease,
         "list_workers",
@@ -247,19 +280,19 @@ def test_run_remote_install_records_stages_and_worker_heartbeat(tmp_path, monkey
                 callback(kwargs.get("progress_phase", "远程命令"), f"stdout: {line}")
         return result
 
-    def fake_transfer(*_args, progress_callback=None, **_kwargs):
+    def fake_build(*_args, progress_callback=None, **_kwargs):
         if progress_callback:
-            progress_callback("传输并加载 worker 镜像", "镜像已加载。")
-        return {"stdout": "Loaded image", "stderr": ""}
+            progress_callback("构建目标架构镜像", "目标机使用缓存开始构建。")
 
     monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
-    monkeypatch.setattr(remote_workers, "_stream_worker_image_to_remote", fake_transfer)
+    monkeypatch.setattr(remote_workers, "_build_worker_image_on_remote", fake_build)
 
     remote_workers.run_remote_action(server, "install", operation_id)
 
     result = manager.lease.get_remote_operation(operation_id)
     assert "检查镜像架构" in result["log"]
-    assert "传输并加载 worker 镜像" in result["log"]
+    assert "构建目标架构镜像" in result["log"]
+    assert "传输并加载 worker 镜像" not in result["log"]
     assert "stdout: worker started" in result["log"]
     assert config.REDIS_URL not in result["log"]
     assert "[redacted]" in result["log"]
@@ -284,8 +317,8 @@ def _set_page_credential(auth_method: str, **overrides) -> dict:
     return remote_workers.create_platform_ssh_credential(credential)
 
 
-def test_remote_configuration_requires_page_credentials_and_local_image_tag(tmp_path, monkeypatch):
-    """远程执行依赖页面凭证和平台本地镜像标签，不要求镜像仓库地址。"""
+def test_remote_configuration_requires_page_credentials_and_worker_image_tag(tmp_path, monkeypatch):
+    """远程执行依赖页面凭证和 worker 镜像标签，不要求镜像仓库地址。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     assert remote_workers.remote_configuration_errors() == []
@@ -293,7 +326,7 @@ def test_remote_configuration_requires_page_credentials_and_local_image_tag(tmp_
     missing_key = {"auth_method": "key", "private_key": "", "password": "", "passphrase": ""}
     assert any("页面未配置 SSH 私钥" in item for item in remote_workers.remote_configuration_errors(missing_key))
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "")
-    assert any("平台本地 Docker 镜像标签" in item for item in remote_workers.remote_configuration_errors())
+    assert any("有效的 worker 镜像标签" in item for item in remote_workers.remote_configuration_errors())
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "worker:latest")
     assert not any("镜像" in item for item in remote_workers.remote_configuration_errors())
 
@@ -673,6 +706,93 @@ def test_builds_worker_image_for_requested_platform_with_minimal_context(tmp_pat
     assert "COPY app ./app" in dockerfile
 
 
+def test_remote_worker_build_sends_minimal_context_and_quotes_docker_args(monkeypatch):
+    """SSH 只接收精简源码 tar；目标机 Docker 命令安全引用镜像名并自行构建。"""
+    import io
+    import tarfile
+
+    calls = []
+    progress = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout=b"Build complete\n", stderr=b"")
+
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+    ssh_command = ["/usr/bin/ssh", "-p", "2222", "worker@compute.example.net", "bash -s"]
+    remote_workers._build_worker_image_on_remote(
+        "worker:stable;touch /tmp/pwn",
+        "linux/x86_64",
+        ssh_command,
+        None,
+        {"password": "", "passphrase": ""},
+        _server(),
+        timeout=3600,
+        progress_callback=lambda phase, message: progress.append((phase, message)),
+    )
+
+    command, options = calls[0]
+    assert command[-2] == "worker@compute.example.net"
+    assert command[-1] == (
+        "DOCKER_BUILDKIT=1 docker build --platform linux/amd64 "
+        "--tag 'worker:stable;touch /tmp/pwn' -"
+    )
+    assert options["timeout"] == 3600
+    assert any("MiB" in message and "目标机将拉取" in message for _phase, message in progress)
+    assert options["input_data"][:100].split(b"\0", 1)[0] == b"Dockerfile"
+    with tarfile.open(fileobj=io.BytesIO(options["input_data"]), mode="r:") as context:
+        names = set(context.getnames())
+    assert {"Dockerfile", "requirements.txt", "app/worker.py"} <= names
+    assert not any(name.startswith(("data/", "tests/")) for name in names)
+
+
+def test_remote_worker_build_reports_redacted_target_error(monkeypatch):
+    """目标 Docker 构建失败时保留原因并脱敏 SSH 密码。"""
+    secret = "remote-ssh-secret"
+
+    def failed_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command, 1, stdout=b"", stderr=f"pull failed for {secret}\n".encode()
+        )
+
+    monkeypatch.setattr(remote_workers, "_worker_build_context", lambda: b"minimal context")
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", failed_run)
+
+    with pytest.raises(remote_workers.RemoteWorkerError, match="pull failed") as exc_info:
+        remote_workers._build_worker_image_on_remote(
+            "worker:latest",
+            "linux/amd64",
+            ["ssh", "worker@compute.example.net", "bash -s"],
+            None,
+            {"password": secret, "passphrase": ""},
+            _server(),
+            timeout=3600,
+        )
+
+    assert secret not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
+
+
+def test_remote_worker_build_rejects_unsupported_platform_before_ssh(monkeypatch):
+    """远程 worker 构建在启动 SSH 前拒绝非 Linux 架构。"""
+    monkeypatch.setattr(
+        remote_workers,
+        "_worker_build_context",
+        lambda: pytest.fail("非法平台不应打包构建上下文"),
+    )
+
+    with pytest.raises(remote_workers.RemoteWorkerError, match="暂不支持目标镜像平台"):
+        remote_workers._build_worker_image_on_remote(
+            "worker:latest",
+            "windows/amd64",
+            ["ssh", "worker@compute.example.net", "bash -s"],
+            None,
+            {},
+            _server(),
+            timeout=3600,
+        )
+
+
 def test_worker_build_context_skips_invalid_same_named_dockerfile(tmp_path):
     """错误目录中的同名 Dockerfile 不得被上传给 Docker Engine。"""
     import io
@@ -985,21 +1105,15 @@ def test_server_redis_override_is_redacted_from_remote_output(tmp_path, monkeypa
 
 
 def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tmp_path, monkeypatch):
-    """安装前经 SSH 传输本机镜像，主机密钥固定且凭证不进入参数或日志。"""
+    """目标机通过 SSH 构建 worker 镜像，主机密钥固定且凭证不进入参数或日志。"""
     key, known_hosts = _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/amd64")
-    monkeypatch.setattr(
-        remote_workers,
-        "_build_local_docker_image_for_platform",
-        lambda *_args: pytest.fail("架构一致时不应重新构建 worker 镜像"),
-    )
     calls = {}
-    transfers = []
+    builds = []
 
-    def fake_transfer(image, command, environment, credentials, server, timeout, operation_id=None):
-        transfers.append((image, command, environment, credentials, server, timeout, operation_id))
-        return {"stdout": "Loaded image: worker:local", "stderr": ""}
+    def fake_build(image, platform, command, environment, credentials, server, timeout,
+                   operation_id=None, progress_callback=None):
+        builds.append((image, platform, command, environment, credentials, server, timeout, operation_id))
 
     def fake_run(command, **kwargs):
         calls.setdefault("commands", []).append(command)
@@ -1011,7 +1125,7 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
         return subprocess.CompletedProcess(command, 0, stdout="worker running\n", stderr="")
 
     monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
-    monkeypatch.setattr(remote_workers, "_stream_worker_image_to_remote", fake_transfer)
+    monkeypatch.setattr(remote_workers, "_build_worker_image_on_remote", fake_build)
     result = remote_workers.run_remote_action(_server(), "install")
 
     assert result["stdout"].strip() == "worker running"
@@ -1026,73 +1140,96 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     assert command[-2:] == ["worker@compute.example.net", "bash -s"]
     assert calls["timeout"] == 3600
     assert calls["commands"][0][-1] == "docker info --format '{{.OSType}}/{{.Architecture}}'"
-    assert len(transfers) == 1
-    assert transfers[0][0] == "registry.example.net/ml/worker:unit"
-    assert transfers[0][1][-2:] == ["worker@compute.example.net", "docker load"]
-    assert transfers[0][-2] == 3600
+    assert len(builds) == 1
+    assert builds[0][0:2] == ("registry.example.net/ml/worker:unit", "linux/amd64")
+    assert builds[0][2][-2] == "worker@compute.example.net"
+    assert builds[0][-2] == 3600
+    assert not any("docker load" in " ".join(item) for item in calls["commands"])
     assert "secret-test" not in " ".join(command)
     assert "secret-test" in calls["input"]
 
 
-def test_run_remote_action_builds_target_architecture_before_transfer(tmp_path, monkeypatch):
-    """本机镜像架构不同时先自动构建目标架构，再经 SSH 传输并安装。"""
+def test_run_remote_action_builds_worker_on_target_before_install(tmp_path, monkeypatch):
+    """目标平台收到精简构建上下文后自行构建镜像，再执行安装脚本。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    platforms = iter(["linux/arm64", "linux/amd64"])
-    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: next(platforms))
+    monkeypatch.setattr(
+        remote_workers,
+        "_local_docker_image_platform",
+        lambda _image: pytest.fail("远程安装不依赖平台本地 worker 镜像"),
+    )
     calls = []
     builds = []
-    transfers = []
+    steps = []
 
     def fake_run(command, **kwargs):
         calls.append(command)
         if command[-1].startswith("docker info"):
             return subprocess.CompletedProcess(command, 0, stdout="linux/x86_64\n", stderr="")
-        return subprocess.CompletedProcess(command, 0, stdout="linux/amd64\n", stderr="")
+        steps.append("install")
+        return subprocess.CompletedProcess(command, 0, stdout="worker running\n", stderr="")
 
-    def fake_build(image, platform, operation_id=None):
+    def fake_build(image, platform, *_args, **_kwargs):
         builds.append((image, platform))
-
-    def fake_transfer(image, *_args, **_kwargs):
-        transfers.append(image)
-        return {"stdout": "Loaded image", "stderr": ""}
+        steps.append("build")
 
     monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
-    monkeypatch.setattr(remote_workers, "_build_local_docker_image_for_platform", fake_build)
-    monkeypatch.setattr(remote_workers, "_stream_worker_image_to_remote", fake_transfer)
+    monkeypatch.setattr(remote_workers, "_build_worker_image_on_remote", fake_build)
 
     result = remote_workers.run_remote_action(_server(), "install")
 
-    assert result["stdout"].strip() == "linux/amd64"
+    assert result["stdout"].strip() == "worker running"
     assert builds == [("registry.example.net/ml/worker:unit", "linux/amd64")]
-    assert transfers == ["registry.example.net/ml/worker:unit"]
+    assert steps == ["build", "install"]
     assert len(calls) == 2
     assert calls[0][-1].startswith("docker info")
 
 
-def test_run_remote_action_stops_when_target_architecture_build_fails(tmp_path, monkeypatch):
-    """目标架构构建失败时不传镜像，也不在远端执行安装脚本。"""
+def test_run_remote_action_stops_when_remote_worker_build_fails(tmp_path, monkeypatch):
+    """目标机镜像构建失败时不执行远端 worker 安装脚本。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/arm64")
     ssh_calls = []
 
     def fake_run(command, **_kwargs):
         ssh_calls.append(command)
         return subprocess.CompletedProcess(command, 0, stdout="linux/amd64\n", stderr="")
 
-    def failed_build(_image, _platform, _operation_id=None):
-        raise remote_workers.RemoteWorkerError("平台 Docker 自动构建 linux/amd64 worker 镜像失败")
+    def failed_build(*_args, **_kwargs):
+        raise remote_workers.RemoteWorkerError("目标机 Docker 构建 linux/amd64 worker 镜像失败")
 
     monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
-    monkeypatch.setattr(remote_workers, "_build_local_docker_image_for_platform", failed_build)
+    monkeypatch.setattr(remote_workers, "_build_worker_image_on_remote", failed_build)
     monkeypatch.setattr(
         remote_workers,
         "_stream_worker_image_to_remote",
         lambda *_args, **_kwargs: pytest.fail("构建失败后不应传输镜像"),
     )
 
-    with pytest.raises(remote_workers.RemoteWorkerError, match="自动构建 linux/amd64"):
+    with pytest.raises(remote_workers.RemoteWorkerError, match="构建 linux/amd64"):
+        remote_workers.run_remote_action(_server(), "install")
+
+    assert len(ssh_calls) == 1
+    assert ssh_calls[0][-1].startswith("docker info")
+
+
+def test_run_remote_action_stops_when_remote_worker_build_is_cancelled(tmp_path, monkeypatch):
+    """目标机构建期间取消操作后不再执行远程安装脚本。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    ssh_calls = []
+
+    def fake_run(command, **_kwargs):
+        ssh_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="linux/amd64\n", stderr="")
+
+    def cancelled_build(*_args, **_kwargs):
+        raise remote_workers.RemoteWorkerCancelledError("操作已中断")
+
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+    monkeypatch.setattr(remote_workers, "_build_worker_image_on_remote", cancelled_build)
+
+    with pytest.raises(remote_workers.RemoteWorkerCancelledError, match="操作已中断"):
         remote_workers.run_remote_action(_server(), "install")
 
     assert len(ssh_calls) == 1

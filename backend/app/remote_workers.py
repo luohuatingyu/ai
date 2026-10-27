@@ -163,7 +163,7 @@ def _communicate_remote_process(
     process: subprocess.Popen,
     operation_id: str | None,
     timeout: int | None,
-    input_data: str | None = None,
+    input_data: str | bytes | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
     progress_phase: str = "远程命令",
 ):
@@ -233,7 +233,7 @@ def _communicate_remote_process(
 def _run_remote_subprocess(
     command: List[str],
     *,
-    input_data: str,
+    input_data: str | bytes,
     timeout: int,
     environment: Dict[str, str] | None,
     operation_id: str | None,
@@ -246,7 +246,7 @@ def _run_remote_subprocess(
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=isinstance(input_data, str),
         env=environment,
     )
     try:
@@ -415,6 +415,65 @@ def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
     except (OSError, tarfile.TarError) as exc:
         raise RemoteWorkerError("打包 worker 镜像构建上下文失败") from exc
     return archive_buffer.getvalue()
+
+
+def _build_worker_image_on_remote(
+    image: str,
+    platform: str,
+    ssh_command: List[str],
+    environment: Dict[str, str] | None,
+    credentials: Dict[str, str],
+    server: Dict[str, object],
+    timeout: int,
+    operation_id: str | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> None:
+    """经 SSH 发送精简构建上下文，让目标 Docker 拉取依赖并构建 worker 镜像。"""
+    canonical_platform = _canonical_docker_platform(platform)
+    if not canonical_platform.startswith("linux/"):
+        raise RemoteWorkerError(f"远程 worker 暂不支持目标镜像平台 {platform}")
+
+    build_context = _worker_build_context()
+    remote_build_command = "DOCKER_BUILDKIT=1 docker build --platform {} --tag {} -".format(
+        shlex.quote(canonical_platform), shlex.quote(image)
+    )
+    command = ssh_command[:-1] + [remote_build_command]
+    _emit_progress(
+        progress_callback,
+        "构建目标架构镜像",
+        f"经 SSH 发送精简构建上下文（{len(build_context) / (1024 * 1024):.1f} MiB）；"
+        "目标机将拉取或复用通用基础镜像和依赖。",
+    )
+    try:
+        result = _run_remote_subprocess(
+            command,
+            input_data=build_context,
+            timeout=timeout,
+            environment=environment,
+            operation_id=operation_id,
+            progress_callback=progress_callback,
+            progress_phase="构建目标架构镜像",
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RemoteWorkerError("目标机构建 worker 镜像超时") from exc
+    except OSError as exc:
+        raise RemoteWorkerError("无法启动 SSH 客户端在目标机构建 worker 镜像") from exc
+
+    stdout = (
+        result.stdout.decode("utf-8", "replace")
+        if isinstance(result.stdout, bytes)
+        else result.stdout
+    )
+    stderr = (
+        result.stderr.decode("utf-8", "replace")
+        if isinstance(result.stderr, bytes)
+        else result.stderr
+    )
+    output = _redact_output(stdout, stderr, credentials, server)
+    if result.returncode != 0:
+        detail = (output["stderr"] or output["stdout"] or "目标机 Docker 构建失败").strip()
+        raise RemoteWorkerError(f"目标机 Docker 构建 worker 镜像失败：{detail[-1500:]}")
+    _emit_progress(progress_callback, "构建目标架构镜像", "目标机 worker 镜像构建完成。")
 
 
 def _build_local_docker_image_for_platform(
@@ -1263,7 +1322,7 @@ def remote_configuration_errors(
         settings = {"worker_image": "", "redis_url": "", "s3_endpoint": ""}
     image = settings["worker_image"]
     if not image or any(c.isspace() for c in image):
-        errors.append("WORKER_IMAGE 或服务器镜像覆盖值必须是平台本地 Docker 镜像标签")
+        errors.append("WORKER_IMAGE 或服务器镜像覆盖值必须是有效的 worker 镜像标签")
     if not settings["redis_url"].startswith(("redis://", "rediss://")):
         errors.append("平台或服务器必须配置目标服务器可访问的 Redis URL")
     if not settings["s3_endpoint"] or any(
@@ -1367,7 +1426,7 @@ def run_remote_action(
         )
 
     progress_callback = report if operation_id else None
-    _emit_progress(progress_callback, "检查部署配置", "检查 SSH、Redis、S3 和本地 worker 镜像配置。")
+    _emit_progress(progress_callback, "检查部署配置", "检查 SSH、Redis、S3 和 worker 镜像配置。")
     errors = remote_configuration_errors(credentials, server)
     if errors:
         raise RemoteWorkerError("；".join(errors))
@@ -1469,10 +1528,8 @@ def run_remote_action(
             )
             run_options["env"] = environment
         if action == "install":
-            image_command = command[:-1] + ["docker load"]
             image = remote_deployment_settings(server)["worker_image"]
             _emit_progress(progress_callback, "检查远端 Docker 平台", "读取目标机 Docker 操作系统和 CPU 架构。")
-            local_platform = _local_docker_image_platform(image)
             progress_options = (
                 {"progress_callback": progress_callback}
                 if progress_callback is not None else {}
@@ -1485,24 +1542,18 @@ def run_remote_action(
             _emit_progress(
                 progress_callback,
                 "检查镜像架构",
-                f"平台镜像架构：{local_platform}；目标 Docker 架构：{target_platform}。",
+                f"目标 Docker 架构：{target_platform}；将在目标机上构建 worker 镜像。",
             )
-            if _canonical_docker_platform(local_platform) != target_platform:
-                _emit_progress(
-                    progress_callback,
-                    "构建目标架构镜像",
-                    f"架构不一致，开始构建 {target_platform} worker 镜像。",
-                )
-                _build_local_docker_image_for_platform(
-                    image, target_platform, operation_id, **progress_options
-                )
-                _emit_progress(progress_callback, "构建目标架构镜像", "目标架构镜像构建完成。")
-            else:
-                _emit_progress(progress_callback, "构建目标架构镜像", "架构一致，跳过重新构建。")
-            _emit_progress(progress_callback, "传输并加载 worker 镜像", "开始从平台 Docker 导出镜像并经 SSH 发送。")
-            _stream_worker_image_to_remote(
-                image, image_command, environment, credentials, server, timeout,
-                operation_id, **progress_options,
+            _build_worker_image_on_remote(
+                image,
+                target_platform,
+                command,
+                environment,
+                credentials,
+                resolved_server,
+                timeout,
+                operation_id,
+                **progress_options,
             )
         _emit_progress(progress_callback, "执行远程部署脚本", f"开始执行远端 {action} 脚本。")
         progress_options = (
