@@ -40,6 +40,41 @@ write_worker_env() {
   mv -f "$staging_env" "$ENV_FILE"
 }
 
+# 输出目标机刚写入的安全配置摘要；秘密只显示是否已配置。
+secret_state() {
+  if [[ -n "$1" ]]; then
+    printf '[已配置]'
+  else
+    printf '[未配置]'
+  fi
+}
+
+# 从 Redis URL 中移除协议、认证信息和查询参数，只保留可诊断的目标地址。
+redis_target() {
+  local url="$1"
+  local target="$url"
+  if [[ "$target" == *://* ]]; then
+    target="${target#*://}"
+  fi
+  target="${target#*@}"
+  target="${target%%\?*}"
+  printf '%s' "$target"
+}
+
+# 配置更新完成后输出实际写入文件对应的非敏感参数。
+show_worker_config() {
+  printf 'worker 配置摘要：\n'
+  printf 'WORKER_MODE=%s\n' "$MODE"
+  printf 'WORKER_MACHINE_ID=%s\n' "$MTP_MACHINE_ID"
+  printf 'WORKER_CPU_SLOTS=%s\n' "$CPU_SLOTS"
+  printf 'REDIS_TARGET=%s\n' "$(redis_target "$MTP_REDIS_URL")"
+  printf 'S3_ENDPOINT=%s\n' "$MTP_S3_ENDPOINT"
+  printf 'S3_BUCKET=%s\n' "$MTP_S3_BUCKET"
+  printf 'S3_SECURE=%s\n' "$MTP_S3_SECURE"
+  printf 'S3_ACCESS_KEY=%s\n' "$(secret_state "$MTP_S3_ACCESS_KEY")"
+  printf 'S3_SECRET_KEY=%s\n' "$(secret_state "$MTP_S3_SECRET_KEY")"
+}
+
 # 将平台同步的 worker 源码解压到临时目录，尚不影响当前运行容器。
 stage_worker_app() {
   if [[ -z "${MTP_WORKER_APP_ARCHIVE_B64:-}" ]]; then
@@ -158,6 +193,7 @@ case "$ACTION" in
   config)
     write_worker_env
     printf 'worker 配置已覆盖：%s\n' "$ENV_FILE"
+    show_worker_config
     ;;
   deploy|update)
     deploy_worker
