@@ -85,6 +85,25 @@ def _append_remote_operation_log(
         return
 
 
+def clear_remote_operation_log(operation_id: str) -> bool:
+    """清除远程操作的可见输出，保留状态和阶段等操作元数据。"""
+    with _REMOTE_OPERATION_LOG_LOCK:
+        operation = manager.lease.get_remote_operation(operation_id)
+        if operation is None:
+            return False
+        operation.update(
+            {
+                "log": "",
+                "output": "",
+                "stderr": "",
+                "error": None,
+                "updated_at": time.time(),
+            }
+        )
+        manager.lease.set_remote_operation(operation_id, operation)
+    return True
+
+
 def _emit_progress(
     callback: Callable[[str, str], None] | None,
     phase: str,

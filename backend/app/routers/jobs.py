@@ -31,6 +31,7 @@ from app.routers.schemas import (
 from app.remote_workers import (
     RemoteWorkerError,
     apply_remote_server_overrides,
+    clear_remote_operation_log,
     execute_remote_operation,
     request_remote_operation_cancel,
     remote_configuration_errors,
@@ -688,6 +689,16 @@ def get_remote_operation(
         operation_id
     )
     return operation
+
+
+@router.delete("/remote-operations/{operation_id}/logs")
+def clear_remote_operation_logs(operation_id: str) -> dict:
+    """清除远程操作日志输出，但保留操作状态和阶段信息。"""
+    if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+        raise HTTPException(404, "远程操作不存在")
+    if not clear_remote_operation_log(operation_id):
+        raise HTTPException(404, "远程操作不存在")
+    return {"ok": True, "operation_id": operation_id}
 
 
 @router.post("/remote-operations/{operation_id}/cancel", status_code=202)
