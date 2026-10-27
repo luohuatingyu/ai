@@ -1,5 +1,12 @@
 #!/bin/bash
 # 数据库初始化：等待 MySQL 就绪（最多 90s）-> 建表；失败则跳过，服务照常启动（数据以文件为主）
+
+# USE_DATABASE=false 时直接跳过等待与初始化（单机零依赖场景，启动不必等 90s）
+if [ "${USE_DATABASE:-true}" != "true" ]; then
+  echo "USE_DATABASE=false：跳过数据库等待与初始化（仅文件存储）"
+  exit 0
+fi
+
 echo "等待MySQL服务启动..."
 
 DB_OK=0

@@ -1,0 +1,8 @@
+# 远程服务器管理覆盖配置：主机密钥首次连接时自动信任，并持久化在 DATA_DIR。
+
+services:
+  trainer:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      USE_DATABASE: ${USE_DATABASE:-true}

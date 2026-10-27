@@ -7,108 +7,299 @@
 <link rel="icon" href="data:,">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
+  /* ===== 设计令牌 ===== */
   :root {
     --bg: #0d1117; --panel: #161b22; --panel2: #1c2333; --border: #2d333b;
-    --text: #e6edf3; --muted: #9fb0c7; --accent: #58a6ff; --ok: #3fb950;
-    --danger: #f85149; --warn: #d29922; --chip: #21262d;
+    --border-strong: #3d444d;
+    --text: #e6edf3; --muted: #9fb0c7; --accent: #58a6ff;
+    --ok: #3fb950; --danger: #f85149; --warn: #d29922; --chip: #21262d;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,.35);
+    --shadow-md: 0 6px 20px rgba(0,0,0,.45);
+    --radius: 10px;
+    --trans: .18s ease;
   }
+
+  /* ===== 基础 ===== */
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
-         font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+         font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         -webkit-font-smoothing: antialiased; }
+  ::selection { background: rgba(88,166,255,.35); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px;
+                              border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: #4d5560; background-clip: content-box; }
+
+  /* ===== 控件 ===== */
   button { cursor: pointer; border: 1px solid var(--border); background: var(--chip);
-           color: var(--text); border-radius: 8px; padding: 7px 14px; font-size: 13px; }
+           color: var(--text); border-radius: 8px; padding: 7px 14px; font-size: 13px;
+           transition: border-color var(--trans), background var(--trans),
+                       color var(--trans), transform var(--trans), box-shadow var(--trans); }
   button:hover { border-color: var(--accent); }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-  button.danger { color: var(--danger); border-color: transparent; background: rgba(248,85,49,.12); }
-  button.danger:hover { border-color: var(--danger); }
+  button:active { transform: translateY(1px); }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(88,166,255,.25); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff;
+                   font-weight: 600; box-shadow: var(--shadow-sm); }
+  button.primary:hover { background: #6cb0ff; border-color: #6cb0ff; box-shadow: var(--shadow-md); }
+  button.primary:disabled { background: var(--chip); border-color: var(--border);
+                            color: var(--muted); box-shadow: none; }
+  button.danger { color: var(--danger); border-color: rgba(248,85,49,.35);
+                  background: rgba(248,85,49,.12); }
+  button.danger:hover { background: rgba(248,85,49,.2); border-color: var(--danger); }
   button:disabled { opacity: .45; cursor: not-allowed; }
   input, select, textarea { background: var(--panel2); color: var(--text);
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 13px; width: 100%; }
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px;
+    font-size: 13px; width: 100%; transition: border-color var(--trans), box-shadow var(--trans); }
+  input:hover, select:hover, textarea:hover { border-color: var(--border-strong); }
+  input[type="checkbox"] { width: auto; accent-color: var(--accent); cursor: pointer; }
+  input[type="radio"] { width: auto; margin: 0; padding: 0; accent-color: var(--accent); cursor: pointer; flex: none; }
   textarea { font-family: ui-monospace, Menlo, monospace; min-height: 120px; resize: vertical; }
-  h2 { font-size: 14px; margin: 18px 0 8px; color: var(--muted);
-       text-transform: none; letter-spacing: .3px; }
+  select { cursor: pointer; }
 
-  .topbar { display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  /* ===== 分区标题：左侧强调条 + 小号全大写 ===== */
+  h2 { font-size: 12px; margin: 18px 0 8px; color: var(--muted);
+       letter-spacing: .8px; text-transform: uppercase; font-weight: 600;
+       display: flex; align-items: center; gap: 8px; }
+  h2::before { content: ""; width: 3px; height: 12px; border-radius: 2px;
+               background: var(--accent); flex: none; }
+  h2:first-child { margin-top: 0; }
+
+  /* ===== 顶栏 ===== */
+  .topbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center;
+            justify-content: space-between; gap: 12px; flex-wrap: wrap;
+            padding: 12px 20px; border-bottom: 1px solid var(--border);
+            background: rgba(22,27,34,.85); backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px); }
   .brand { font-weight: 700; font-size: 16px; }
   .brand .sub { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 10px; }
   .badge { display: inline-flex; gap: 7px; align-items: center; padding: 4px 12px;
     border-radius: 999px; background: var(--chip); border: 1px solid var(--border); font-size: 12px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
-  .dot.ok { background: var(--ok); } .dot.bad { background: var(--danger); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn);
+         box-shadow: 0 0 0 3px rgba(210,153,34,.18); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(63,185,80,.18); }
+  .dot.bad { background: var(--danger); box-shadow: 0 0 0 3px rgba(248,85,49,.18); }
 
+  /* ===== 布局 ===== */
   .layout { display: grid; grid-template-columns: 380px 1fr; gap: 16px;
-            padding: 16px 20px; max-width: 1280px; margin: 0 auto; }
+            padding: 16px 20px 28px; max-width: 1280px; margin: 0 auto; }
   @media (max-width: 960px) { .layout { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--border);
-           border-radius: 12px; padding: 16px; align-self: start; }
+           border-radius: 12px; padding: 16px; align-self: start;
+           box-shadow: var(--shadow-sm); }
   .row { display: flex; gap: 8px; margin-bottom: 10px; }
   .formgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+  @media (max-width: 560px) { .formgrid { grid-template-columns: 1fr; } }
   .field label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
   .hint { color: var(--muted); font-size: 12px; }
   .stack { display: flex; flex-direction: column; gap: 10px; }
-  .empty { color: var(--muted); text-align: center; padding: 22px 8px; border: 1px dashed var(--border);
-           border-radius: 10px; font-size: 13px; }
+  .empty { color: var(--muted); text-align: center; padding: 24px 8px;
+           border: 1px dashed var(--border-strong); border-radius: 10px; font-size: 13px;
+           background: rgba(28,35,51,.35); }
 
-  /* 任务卡片 */
-  .jobcard { border: 1px solid var(--border); background: var(--panel2); border-radius: 10px;
-    padding: 10px 12px; margin-bottom: 10px; cursor: pointer; }
-  .jobcard:hover { border-color: var(--accent); }
+  /* ===== 任务卡片 ===== */
+  .jobcard { border: 1px solid var(--border); background: var(--panel2); border-radius: var(--radius);
+    padding: 10px 12px; margin-bottom: 10px; cursor: pointer;
+    transition: border-color var(--trans), transform var(--trans), box-shadow var(--trans); }
+  .jobcard:hover { border-color: var(--accent); transform: translateY(-1px);
+                   box-shadow: var(--shadow-sm); }
   .jobcard.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
   .jobline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .jobname { font-weight: 600; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
   .chip { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--chip);
           border: 1px solid var(--border); color: var(--muted); }
-  .st-queued { color: var(--muted); } .st-running { color: var(--accent); }
-  .st-completed { color: var(--ok); } .st-failed { color: var(--danger); }
-  .st-cancelled { color: var(--warn); }
+
+  /* 状态徽标：半透明底色增强可扫读性 */
+  .st-queued   { color: var(--muted); background: rgba(159,176,199,.12); }
+  .st-running  { color: #79c0ff; background: rgba(88,166,255,.14); border-color: rgba(88,166,255,.35); }
+  .st-completed{ color: #56d364; background: rgba(63,185,80,.14);  border-color: rgba(63,185,80,.35); }
+  .st-failed   { color: #ff7b72; background: rgba(248,85,49,.14);  border-color: rgba(248,85,49,.35); }
+  .st-cancelled{ color: var(--warn); background: rgba(210,153,34,.14); border-color: rgba(210,153,34,.35); }
+  .st-paused   { color: var(--warn); background: rgba(210,153,34,.14); border-color: rgba(210,153,34,.35); }
+
+  /* ===== 计算槽面板 ===== */
+  .wgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+           gap: 8px; margin-top: 8px; }
+  .wcard { border: 1px solid var(--border); background: var(--panel2); border-radius: var(--radius);
+           padding: 8px 10px; font-size: 12px;
+           transition: border-color var(--trans), opacity var(--trans); }
+  .wcard:hover { border-color: var(--border-strong); }
+  .wcard .wtop { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+  .wcard .wid { font-weight: 600; word-break: break-all; }
+  .wcard .wmuted { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .wstate { font-size: 11px; padding: 1px 8px; border-radius: 999px;
+            border: 1px solid var(--border); white-space: nowrap; }
+  .wstate.idle      { color: #56d364; background: rgba(63,185,80,.12); border-color: rgba(63,185,80,.35); }
+  .wstate.running   { color: #79c0ff; background: rgba(88,166,255,.12); border-color: rgba(88,166,255,.35); }
+  .wstate.degraded, .wstate.recovering { color: var(--warn); background: rgba(210,153,34,.12); border-color: rgba(210,153,34,.35); }
+  .wstate.offline   { color: #ff7b72; background: rgba(248,85,49,.12); border-color: rgba(248,85,49,.35); }
+  .wstate.disabled  { color: #e3b341; background: rgba(210,153,34,.12); border-color: rgba(210,153,34,.35); }
+  .wcard:has(.wstate.offline) { opacity: .6; }
+  .compute-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .compute-actions { display:flex; gap:7px; flex-wrap:wrap; }
+  .compute-summary { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .compute-summary .chip { font-size:12px; padding:3px 10px; }
+  .server-grid { display:grid; gap:12px; margin-top:12px; }
+  .server-card { overflow:hidden; border:1px solid var(--border); border-radius:12px;
+    background:linear-gradient(135deg, rgba(88,166,255,.055), transparent 42%), var(--panel2); }
+  .server-head { display:flex; align-items:center; justify-content:space-between; gap:14px;
+    padding:13px 15px; border-bottom:1px solid var(--border); }
+  .server-head-main { min-width:0; flex:1; }
+  .server-title { min-width:0; display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+  .server-title strong { font-size:14px; overflow-wrap:anywhere; }
+  .server-kind { padding:2px 8px; border:1px solid var(--border); border-radius:999px;
+    color:var(--muted); background:rgba(13,17,23,.35); font-size:11px; }
+  .server-presence { color:var(--ok); font-size:12px; white-space:nowrap; }
+  .server-presence.offline { color:var(--muted); }
+  .server-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:9px 15px 2px;
+    color:var(--muted); font-size:12px; }
+  .server-head-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+  .server-controls { display:flex; gap:6px; flex-wrap:wrap; }
+  .server-controls button { padding:5px 9px; font-size:11px; }
+  .server-controls .server-log-button { border-color:rgba(88,166,255,.5); color:#a5d6ff; }
+  .server-operation { padding:7px 15px 0; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+  .server-operation-log { margin:7px 15px 10px; color:var(--muted); font-size:11px; }
+  .server-operation-log summary { width:fit-content; cursor:pointer; }
+  .server-operation-log pre { max-height:240px; overflow:auto; margin:6px 0 0; padding:9px 11px; border:1px solid var(--border); border-radius:7px; background:rgba(13,17,23,.5); color:var(--text); font:11px/1.5 ui-monospace,SFMono-Regular,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .server-operation-log-hint { padding:5px 15px 0; color:var(--muted); font-size:11px; }
+  .server-slots { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:8px; padding:10px 12px 13px; }
+  .resource-slot { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px;
+    padding:10px 11px; border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.42); }
+  .resource-slot.enabled { border-color:rgba(63,185,80,.35); }
+  .slot-main { min-width:0; }
+  .slot-title { display:flex; align-items:center; gap:7px; font-weight:650; }
+  .slot-title .dot { width:7px; height:7px; border-radius:50%; background:var(--muted); }
+  .resource-slot.enabled .slot-title .dot { background:var(--ok); box-shadow:0 0 9px rgba(63,185,80,.5); }
+  .slot-details { margin-top:3px; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+  .slot-action { min-width:96px; padding:6px 10px; }
+  .slot-action.enable { border-color:rgba(63,185,80,.4); color:#7ee787; }
+  .slot-action.disable { color:var(--muted); }
+  .slot-action:disabled { cursor:not-allowed; opacity:.5; }
+  .server-modal { position:fixed; inset:0; z-index:60; display:none; align-items:center; justify-content:center;
+    padding:18px; background:rgba(4,8,14,.78); backdrop-filter:blur(5px); }
+  .server-modal.open { display:flex; }
+  .server-modal-card { width:min(660px,100%); max-height:90vh; overflow:auto; padding:22px;
+    border:1px solid var(--border-strong); border-radius:14px; background:var(--panel); box-shadow:var(--shadow-md); }
+  .server-modal-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .server-modal-head h3 { margin:0; font-size:18px; }
+  .server-modal-card p { color:var(--muted); font-size:13px; line-height:1.6; }
+  .server-log-modal-card { width:min(1120px,100%); }
+  .server-log-status { margin:10px 0; color:var(--muted); font-size:12px; }
+  .server-log-actions { display:flex; justify-content:flex-end; margin:10px 0 8px; }
+  .server-log-output { max-height:65vh; min-height:220px; overflow:auto; margin:0; padding:10px 14px;
+    border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.6); color:var(--text);
+    font:13px/1.65 ui-monospace,SFMono-Regular,monospace; white-space:pre; overflow-wrap:normal; }
+  .server-log-line { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:12px;
+    min-width:max-content; padding:5px 0; border-bottom:1px solid rgba(139,148,158,.12); }
+  .server-log-line:last-child { border-bottom:0; }
+  .server-log-line-text { user-select:text; -webkit-user-select:text; cursor:text; }
+  .server-log-line-copy { position:sticky; right:0; margin-left:8px; padding:3px 7px; font-size:11px; opacity:.68; }
+  .server-log-line-copy:hover,.server-log-line-copy:focus-visible { opacity:1; }
+  .server-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:15px; }
+  .server-form .field { min-width:0; }
+  .server-form .field.wide { grid-column:1/-1; }
+  .ssh-credential-settings { grid-column:1/-1; padding:12px; border:1px solid var(--border);
+    border-radius:10px; background:rgba(28,35,51,.45); }
+  .ssh-credential-settings summary { cursor:pointer; color:var(--text); font-weight:600; }
+  .ssh-credential-settings[open] summary { margin-bottom:10px; }
+  .ssh-credential-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+  .ssh-credential-grid .wide { grid-column:1/-1; }
+  .ssh-credential-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  @media (max-width:560px) { .ssh-credential-grid { grid-template-columns:1fr; }
+    .ssh-credential-grid .wide { grid-column:auto; } }
+  .server-mode { display:flex; gap:7px; flex-wrap:wrap; }
+  .server-mode label { display:flex; align-items:center; gap:7px; padding:8px 11px;
+    border:1px solid var(--border); border-radius:9px; cursor:pointer; color:var(--text); }
+  .server-mode label:has(input:checked) { border-color:var(--accent); color:#a5d6ff; background:rgba(88,166,255,.1); }
+  .server-form .hint { margin-top:4px; }
+  .server-form-actions { grid-column:1/-1; display:flex; justify-content:flex-end; gap:8px; margin-top:3px; }
+  .server-form-actions button { min-width:120px; }
+  .server-modal-note { margin-top:14px; padding:10px 12px; border-left:3px solid var(--warning,var(--warn));
+    border-radius:5px; color:#e3b341; background:rgba(210,153,34,.08); font-size:12px; }
+  @media (max-width:560px) {
+    .server-head { align-items:flex-start; flex-direction:column; gap:5px; }
+    .server-slots { grid-template-columns:1fr; padding:9px; }
+    .server-modal-card { padding:17px; }
+    .server-form { grid-template-columns:1fr; }
+    .server-form .field.wide,.server-form-actions { grid-column:auto; }
+  }
+
+  /* ===== 进度条 ===== */
   .progress { height: 6px; background: var(--chip); border-radius: 4px; margin-top: 8px; overflow: hidden; }
-  .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .4s; }
+  .progress > div { height: 100%; background: var(--accent); width: 0;
+                    border-radius: 4px; transition: width .4s; }
+  .progress.running > div { background-image: linear-gradient(45deg,
+      rgba(255,255,255,.18) 25%, transparent 25%, transparent 50%,
+      rgba(255,255,255,.18) 50%, rgba(255,255,255,.18) 75%, transparent 75%);
+      background-size: 16px 16px; animation: progressSlide 1s linear infinite; }
+  @keyframes progressSlide { from { background-position: 0 0; } to { background-position: 16px 0; } }
   .progress.done > div { background: var(--ok); }
   .progress.failed > div, .progress.cancelled > div { background: var(--danger); }
 
-  /* 详情区 */
+  /* ===== 详情区 ===== */
   #detailHead { display: flex; align-items: center; justify-content: space-between;
     gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
   #detailHead .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
   .tabs button { border: none; background: transparent; border-bottom: 2px solid transparent;
     border-radius: 8px 8px 0 0; color: var(--muted); padding: 8px 14px; }
+  .tabs button:hover { color: var(--text); border-bottom-color: var(--border-strong); }
   .tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
   .chartbox { background: var(--panel2); border: 1px solid var(--border);
-    border-radius: 10px; padding: 12px; margin-bottom: 14px; }
+    border-radius: var(--radius); padding: 12px; margin-bottom: 14px; }
   .chartbox h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 500; }
-  #logBox { background: #0a0d12; border: 1px solid var(--border); border-radius: 10px;
+  #logBox { background: #0a0d12; border: 1px solid var(--border); border-radius: var(--radius);
     padding: 12px; height: 420px; overflow: auto; white-space: pre-wrap;
     font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 0; }
-  .statgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
-  .stat { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .statgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+              gap: 10px; margin-bottom: 14px; }
+  .stat { background: var(--panel2); border: 1px solid var(--border); border-radius: var(--radius);
+          padding: 10px 12px; transition: border-color var(--trans); }
+  .stat:hover { border-color: var(--border-strong); }
   .stat .k { color: var(--muted); font-size: 12px; }
-  .stat .v { font-size: 17px; font-weight: 700; margin-top: 2px; }
+  .stat .v { font-size: 17px; font-weight: 700; margin-top: 2px; color: var(--accent); }
+
+  /* ===== 表格 ===== */
   table.report { border-collapse: collapse; width: 100%; font-size: 13px; margin-bottom: 10px; }
   table.report th, table.report td { border: 1px solid var(--border); padding: 6px 10px; text-align: center; }
   table.report th { background: var(--panel2); color: var(--muted); font-weight: 500; }
-  #predictOut { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
-    padding: 12px; margin-top: 10px; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
-    white-space: pre-wrap; }
-
-  /* toast */
-  #toastWrap { position: fixed; top: 16px; right: 16px; z-index: 50; display: flex;
-    flex-direction: column; gap: 8px; }
-  .toast { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    padding: 10px 16px; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,.4); max-width: 340px; }
-  .toast.err { border-color: var(--danger); } .toast.ok { border-color: var(--ok); }
+  table.report tbody tr:hover { background: rgba(88,166,255,.06); }
   .preview-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
   .preview-table th, .preview-table td { border: 1px solid var(--border); padding: 4px 8px;
     text-align: left; white-space: nowrap; max-width: 130px; overflow: hidden; text-overflow: ellipsis; }
-  .preview-table th { background: var(--panel2); color: var(--muted); }
+  .preview-table th { background: var(--panel2); color: var(--muted);
+                      position: sticky; top: 0; }
+  .preview-table tbody tr:nth-child(even) { background: rgba(255,255,255,.02); }
+  #predictOut { background: var(--panel2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px; margin-top: 10px; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+    white-space: pre-wrap; }
+
+  /* ===== toast：滑入 + 彩色侧边条 ===== */
+  #toastWrap { position: fixed; top: 16px; right: 16px; z-index: 70; display: flex;
+    flex-direction: column; gap: 8px; }
+  .toast { background: var(--panel); border: 1px solid var(--border);
+           border-left: 3px solid var(--accent); border-radius: var(--radius);
+    padding: 10px 16px; font-size: 13px; box-shadow: var(--shadow-md); max-width: 340px;
+    animation: toastIn .22s ease; }
+  .toast.err { border-left-color: var(--danger); }
+  .toast.ok { border-left-color: var(--ok); }
+  @keyframes toastIn { from { opacity: 0; transform: translateX(12px); }
+                       to { opacity: 1; transform: none; } }
 </style>
+<link rel="stylesheet" href="/app.css?v=20261025-2">
 </head>
-<body>
+<body class="training-page">
 
 <header class="topbar">
   <div class="brand">🏋️ 可视化模型训练平台<span class="sub">Docker · Python 3.12 · PyTorch GPU</span></div>
+  <nav class="app-nav" aria-label="主导航">
+    <a href="/" aria-current="page">训练工作台</a>
+    <a href="/dataset-manager.html">数据集管理</a>
+  </nav>
   <div id="deviceBadge" class="badge"><span class="dot"></span><span id="deviceText">检测训练设备中…</span></div>
 </header>
 
@@ -116,19 +307,20 @@
   <!-- 左栏：数据集 + 参数 -->
   <aside class="panel">
     <h2>① 数据集</h2>
-    <div class="row">
-      <select id="datasetSelect"></select>
-      <button id="btnUpload">上传 CSV</button>
+    <div id="datasetLocalPanel">
+      <div class="row">
+        <select id="datasetSelect"></select>
+        <button id="btnUpload">上传数据</button>
+      </div>
+      <input type="file" id="fileInput" accept=".csv,.json,.jsonl,.ndjson" hidden>
+      <div id="previewWrap"><div class="empty">选择或上传数据集后在此预览</div></div>
+      <div id="previewMeta" class="hint" style="margin-top:6px;"></div>
     </div>
-    <input type="file" id="fileInput" accept=".csv" hidden>
-    <div id="sampleBox" class="chips" style="margin-bottom:10px;"></div>
-    <div id="previewWrap"><div class="empty">选择或上传数据集后在此预览</div></div>
-    <div id="previewMeta" class="hint" style="margin-top:6px;"></div>
 
     <h2>② 训练配置</h2>
     <form id="trainForm" class="stack" onsubmit="return false;">
       <div class="formgrid">
-        <div class="field">
+        <div class="field" id="targetField">
           <label>目标列（要预测的列）</label>
           <select id="targetSelect"></select>
         </div>
@@ -137,23 +329,114 @@
           <select id="taskSelect">
             <option value="classification">分类</option>
             <option value="regression">回归</option>
+            <option value="clustering">KMeans 聚类</option>
+            <option value="time_series_forecasting">时间序列预测</option>
+            <option value="llm_pretraining">LLM 从零预训练</option>
+            <option value="llm_sft">LLM 全参数 SFT</option>
+            <option value="llm_dpo">LLM DPO</option>
+            <option value="llm_ppo">LLM PPO / RLHF</option>
           </select>
         </div>
-        <div class="field"><label>轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"></div>
-        <div class="field"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"></div>
-        <div class="field"><label>学习率 lr</label><input id="p_lr" type="number" value="0.001" step="0.0001" min="0.0001"></div>
-        <div class="field"><label>隐藏层数</label><input id="p_hidden_layers" type="number" value="3" min="0" max="8"></div>
-        <div class="field"><label>每层神经元</label><input id="p_hidden_size" type="number" value="128" min="1" max="2048"></div>
-        <div class="field"><label>验证集比例</label><input id="p_test_split" type="number" value="0.2" step="0.05" min="0.05" max="0.5"></div>
+        <div class="field" id="timeColumnField" hidden>
+          <label>时间列（用于排序）</label>
+          <select id="timeColumnSelect"></select>
+        </div>
+        <div class="field" id="nClustersField" hidden>
+          <label>聚类数</label><input id="p_n_clusters" type="number" value="3" min="2" max="64">
+        </div>
+        <div class="field" id="lookbackField" hidden>
+          <label>历史窗口长度</label><input id="p_lookback" type="number" value="12" min="2" max="512">
+        </div>
+        <div class="field" id="forecastHorizonField" hidden>
+          <label>预测步数</label><input id="p_forecast_horizon" type="number" value="1" min="1" max="64">
+        </div>
+        <div class="field wide" id="llmFields" hidden>
+          <div class="formgrid">
+            <div class="field">
+              <label>数据来源</label>
+              <select id="p_dataset_source"><option value="local">本地数据集</option><option value="hub">Hugging Face Hub</option></select>
+            </div>
+            <div class="field" id="hubDatasetField" hidden>
+              <label>Hub 数据集 ID</label><input id="p_hub_dataset" maxlength="193" placeholder="例如: org/dataset">
+            </div>
+            <div class="field" id="hubConfigField" hidden>
+              <label>数据集配置（可选）</label><input id="p_hub_config" maxlength="128" placeholder="默认配置留空">
+            </div>
+            <div class="field" id="hubSplitField" hidden>
+              <label>数据 split</label><input id="p_hub_split" value="train" maxlength="128">
+            </div>
+            <div class="field" id="baseModelField" hidden>
+              <label>基座模型 Hub ID</label><input id="p_base_model" maxlength="256" placeholder="例如: org/model-name">
+            </div>
+            <div class="field" id="rewardModelField" hidden>
+              <label>PPO 奖励模型 Hub ID（num_labels=1）</label><input id="p_reward_model" maxlength="256" placeholder="例如: org/reward-model">
+            </div>
+            <div class="field" id="textColumnField">
+              <label>文本列</label><input id="p_text_column" value="text" maxlength="128">
+            </div>
+            <div class="field" id="promptColumnField" hidden>
+              <label>Prompt 列</label><input id="p_prompt_column" value="prompt" maxlength="128">
+            </div>
+            <div class="field" id="completionColumnField" hidden>
+              <label>Completion 列（可选）</label><input id="p_completion_column" maxlength="128">
+            </div>
+            <div class="field" id="chosenColumnField" hidden>
+              <label>DPO chosen 列</label><input id="p_chosen_column" value="chosen" maxlength="128">
+            </div>
+            <div class="field" id="rejectedColumnField" hidden>
+              <label>DPO rejected 列</label><input id="p_rejected_column" value="rejected" maxlength="128">
+            </div>
+            <div class="field"><label>最大样本数</label><input id="p_max_samples" type="number" value="5000" min="1" max="1000000"></div>
+            <div class="field"><label>最大序列长度</label><input id="p_max_seq_len" type="number" value="256" min="2" max="8192"></div>
+            <div class="field" id="vocabSizeField" hidden><label>Tokenizer 词表大小</label><input id="p_vocab_size" type="number" value="8000" min="32" max="250000"></div>
+            <div class="field" id="modelHiddenSizeField" hidden><label>模型隐藏维度</label><input id="p_model_hidden_size" type="number" value="256" min="16" max="8192"></div>
+            <div class="field" id="modelLayersField" hidden><label>模型层数</label><input id="p_model_layers" type="number" value="4" min="1" max="96"></div>
+            <div class="field" id="modelHeadsField" hidden><label>注意力头数</label><input id="p_model_heads" type="number" value="4" min="1" max="128"></div>
+            <div class="field" id="ppoUpdatesField" hidden><label>PPO 更新次数</label><input id="p_ppo_updates" type="number" value="4" min="1" max="16"></div>
+            <div class="field" id="llmLearningRateField" hidden><label>微调学习率</label><input id="p_llm_lr" type="number" value="0.00002" step="0.00001" min="0.000001" max="1"></div>
+          </div>
+          <div class="hint">Hub 模型和数据集均按公共仓库加载，禁用自定义远程代码。LLM 任务要求单张 GPU，模型与序列长度需适配该卡显存。</div>
+        </div>
+        <div class="field"><label id="epochLabel">轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"></div>
+        <div class="field" id="batchSizeField"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"></div>
+        <div class="field" id="learningRateField"><label>学习率 lr</label><input id="p_lr" type="number" value="0.001" step="0.0001" min="0.0001"></div>
+        <div class="field" id="hiddenLayersField"><label>隐藏层数</label><input id="p_hidden_layers" type="number" value="3" min="0" max="8"></div>
+        <div class="field" id="hiddenSizeField"><label>每层神经元</label><input id="p_hidden_size" type="number" value="128" min="1" max="2048"></div>
+        <div class="field" id="testSplitField"><label>验证集比例</label><input id="p_test_split" type="number" value="0.2" step="0.05" min="0.05" max="0.5"></div>
+        <div class="field" id="resourceHintField">
+          <label>资源提示</label>
+          <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-top:4px; color:var(--text);">
+            <input id="p_require_gpu" type="checkbox" style="width:auto;"> 要求在 GPU 上训练
+          </label>
+          <div id="gpuResourceHint" class="hint" style="margin-top:5px;">正在读取已启用的 GPU 资源…</div>
+        </div>
+        <div class="field" id="minVramField" hidden>
+          <label>最低显存（MiB，可选）</label>
+          <input id="p_min_vram" type="number" value="0" min="0" step="1024">
+        </div>
       </div>
       <button id="btnStart" class="primary" disabled>🚀 开始训练</button>
-      <div class="hint">提示：目标列为连续数值时请选择「回归」，否则选「分类」。</div>
+      <div class="hint" id="taskHint">分类适用于离散标签，回归适用于连续数值目标。</div>
     </form>
   </aside>
 
-  <!-- 右栏：任务列表 + 详情 -->
+  <!-- 右栏：计算资源 + 任务列表 + 详情 -->
   <section class="panel">
-    <h2 style="margin-top:0;">③ 训练任务</h2>
+    <div class="compute-toolbar">
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <h2 style="margin:0;">🖥 计算资源</h2>
+        <span id="queueDepth" class="chip">队列 0</span>
+      </div>
+      <div class="compute-actions">
+        <button id="btnRefreshWorkers" title="重新读取服务器和计算槽状态">↻ 刷新</button>
+        <button id="btnAddServer" class="primary">＋ 添加服务器</button>
+      </div>
+    </div>
+    <div class="hint" style="margin-top:4px;">平台通过 SSH 连接服务器并执行单文件脚本，不同步项目源码；worker 自动检测 CPU / GPU，槽位需手动加入资源池。停用后不再领取新任务，运行中的任务会完成后退出。</div>
+    <div id="workerSummary" class="compute-summary" aria-live="polite"></div>
+    <div id="workerGrid" class="server-grid"><div class="empty">尚未发现计算服务器。添加服务器后，页面会显示检测到的计算资源。</div></div>
+
+    <h2>③ 训练任务</h2>
     <div id="jobList"><div class="empty">暂无任务，先在左侧发起训练</div></div>
 
     <div id="detail" hidden>
@@ -161,12 +444,27 @@
         <div class="jobline"><span id="dName" class="jobname"></span><span id="dStatus" class="chip"></span><span id="dDevice" class="chip"></span></div>
         <div class="actions">
           <button id="btnCancel" hidden>⏹ 取消</button>
+          <button id="btnPause" hidden>⏸ 暂停</button>
+          <button id="btnResume" hidden>▶ 恢复训练</button>
           <button id="btnDownload" hidden>⬇ 下载模型</button>
           <button id="btnDelete" class="danger">🗑 删除</button>
         </div>
       </div>
       <div class="progress" id="dProgress"><div></div></div>
       <div id="dProgressText" class="hint" style="margin:4px 0 12px;"></div>
+      <div id="resourceAllocation" class="resource-allocation" hidden></div>
+      <div id="retryPanel" class="retry-panel" hidden>
+        <div class="retry-panel-copy">
+          <strong>失败后重试</strong>
+          <span class="hint">可由队列自动分配，也可指定一个在线计算槽。</span>
+        </div>
+        <div class="retry-panel-controls">
+          <label class="sr-only" for="retryResourceSelect">重试资源</label>
+          <select id="retryResourceSelect" aria-label="选择重试资源"></select>
+          <button id="btnRetry" type="button" class="primary">重新排队</button>
+        </div>
+        <div id="retryHint" class="hint" aria-live="polite"></div>
+      </div>
 
       <div class="tabs">
         <button data-tab="curves" class="active">📈 曲线</button>
@@ -195,6 +493,131 @@
   </section>
 </main>
 
+<div id="addServerModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="addServerTitle" hidden>
+  <div class="server-modal-card">
+    <div class="server-modal-head">
+      <h3 id="addServerTitle">通过 SSH 添加服务器</h3>
+      <button id="btnCloseAddServer" class="close-btn" aria-label="关闭">×</button>
+    </div>
+    <p>平台会使用页面统一管理的 SSH 凭证连接目标机，将本机 worker 镜像流式传输到目标机并执行单文件部署脚本。不会同步项目源码，也不要求目标机访问镜像仓库。目标机需要 SSH 可达、安装 Docker，并能访问 Redis 和 S3。</p>
+    <form id="remoteServerForm" class="server-form">
+      <div class="field">
+        <label for="remoteMachineId">服务器标识</label>
+        <input id="remoteMachineId" name="machine_id" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" placeholder="例如 gpu-node-01">
+      </div>
+      <div class="field">
+        <label for="remoteHost">SSH 主机</label>
+        <input id="remoteHost" name="host" required maxlength="253" pattern="[A-Za-z0-9][A-Za-z0-9.:-]*" placeholder="主机名或 IP 地址">
+      </div>
+      <div class="field">
+        <label for="remoteCredentialSelect">SSH 凭证</label>
+        <select id="remoteCredentialSelect" name="ssh_credential_id" required>
+          <option value="">请先配置 SSH 凭证</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="remoteUsername">SSH 用户（可选覆盖）</label>
+        <input id="remoteUsername" name="username" maxlength="32" pattern="[A-Za-z_][A-Za-z0-9_-]*" placeholder="留空时使用所选凭证的用户名">
+        <div class="hint">填写后仅覆盖这台服务器的 SSH 用户名。</div>
+      </div>
+      <div class="field">
+        <label for="remotePort">SSH 端口</label>
+        <input id="remotePort" name="port" type="number" min="1" max="65535" value="22" required>
+      </div>
+      <div class="field wide">
+        <label>计算类型</label>
+        <div class="server-mode" role="group" aria-label="目标服务器计算类型">
+          <label><input type="radio" name="mode" value="gpu" checked> GPU（使用全部可见 GPU）</label>
+          <label><input type="radio" name="mode" value="cpu"> CPU</label>
+        </div>
+      </div>
+      <div class="field" id="remoteCpuSlotsField" hidden>
+        <label for="remoteCpuSlots">CPU 计算槽</label>
+        <input id="remoteCpuSlots" name="cpu_slots" type="number" min="0" max="256" value="2">
+        <div class="hint">设为 0 可只运行管理容器，不提供 CPU 槽。</div>
+      </div>
+      <div class="field wide">
+        <label for="remoteWorkerImage">Worker 镜像（可选本地标签覆盖）</label>
+        <input id="remoteWorkerImage" name="worker_image" maxlength="512" placeholder="留空时使用平台本地默认镜像">
+        <div class="hint">填写平台 Docker 中已存在的镜像标签。安装或重新部署时平台会通过 SSH 发送镜像，目标机无需访问镜像仓库。</div>
+      </div>
+      <div class="field wide">
+        <label for="remoteRedisUrl">远程 Redis URL（可选覆盖）</label>
+        <input id="remoteRedisUrl" name="remote_redis_url" type="password" maxlength="4096" autocomplete="new-password" placeholder="留空时使用平台默认 Redis">
+        <div class="hint" id="remoteRedisUrlHint">可使用 redis:// 或 rediss://；URL 中的密码会加密保存。</div>
+      </div>
+      <label class="field wide" id="clearRemoteRedisOverrideField" hidden>
+        <span><input id="clearRemoteRedisOverride" type="checkbox"> 改回平台默认 Redis</span>
+      </label>
+      <div class="field wide">
+        <label for="remoteS3Endpoint">S3 地址（可选覆盖）</label>
+        <input id="remoteS3Endpoint" name="remote_s3_endpoint" maxlength="512" placeholder="留空时使用平台默认 S3_ENDPOINT">
+      </div>
+      <div class="field wide hint">保存后点击服务器卡片上的“重新部署并应用配置”，让目标 worker 使用新设置。</div>
+      <div class="field wide hint">SSH 凭证在页面统一配置；主机密钥首次连接时自动信任并持久化。</div>
+      <div class="server-form-actions">
+        <button type="button" id="btnCancelAddServer">取消</button>
+        <button type="submit" id="btnSubmitRemoteServer" class="primary">远程添加并检测资源</button>
+      </div>
+    </form>
+    <details class="ssh-credential-settings" id="remoteSshSettings">
+      <summary>SSH 凭证管理</summary>
+      <div id="remoteSshSettingsStatus" class="hint" aria-live="polite">正在读取凭证状态…</div>
+      <div id="remoteSshCredentialList" class="ssh-credential-list" aria-live="polite"></div>
+      <form id="remoteSshCredentialForm" class="ssh-credential-grid" style="margin-top:10px;" novalidate>
+        <input id="remoteSshCredentialId" type="hidden">
+        <div class="field">
+          <label for="remoteSshCredentialName">凭证名称</label>
+          <input id="remoteSshCredentialName" maxlength="80" required placeholder="例如：生产 GPU 用户">
+        </div>
+        <div class="field">
+          <label for="remoteSshCredentialUsername">凭证用户名</label>
+          <input id="remoteSshCredentialUsername" maxlength="32" pattern="[A-Za-z_][A-Za-z0-9_-]*" required placeholder="SSH 登录用户名">
+        </div>
+        <div class="field wide">
+          <label for="remoteSshAuthMethod">认证组合</label>
+          <select id="remoteSshAuthMethod">
+            <option value="password">用户名 + 密码</option>
+            <option value="key">用户名 + 密钥</option>
+            <option value="key_password">用户名 + 密钥 + 密码（先尝试密钥）</option>
+          </select>
+        </div>
+        <div class="field wide" id="remoteSshKeyFields" hidden>
+          <label for="remoteSshPrivateKey">私钥内容</label>
+          <textarea id="remoteSshPrivateKey" autocomplete="off" spellcheck="false" placeholder="粘贴完整的 OpenSSH / PEM 私钥；支持 OpenSSH 可识别的密钥类型"></textarea>
+          <div class="hint">支持 OpenSSH 可识别的 Ed25519、ECDSA、RSA 等格式。保存或编辑时不会回显私钥。</div>
+        </div>
+        <div class="field wide" id="remoteSshPassphraseField" hidden>
+          <label for="remoteSshPassphrase">私钥口令（可选）</label>
+          <input id="remoteSshPassphrase" type="password" autocomplete="new-password">
+        </div>
+        <div class="field wide" id="remoteSshPasswordField" hidden>
+          <label for="remoteSshPassword">SSH 登录密码</label>
+          <input id="remoteSshPassword" type="password" autocomplete="new-password">
+        </div>
+        <label class="field wide"><span><input id="remoteSshMakeDefault" type="checkbox"> 设为默认凭证</span></label>
+        <div class="ssh-credential-actions field wide">
+          <button type="submit" id="btnSaveRemoteSshSettings" class="primary">加密保存凭证</button>
+          <button type="button" id="btnCancelEditRemoteSshCredential" hidden>取消编辑</button>
+        </div>
+      </form>
+    </details>
+    <div class="server-modal-note">GPU 服务器还需要 NVIDIA 驱动和 NVIDIA Container Toolkit。安装完成后，检测到的槽位默认不接收任务；请在服务器卡片中手动加入资源池。镜像拉取时间取决于镜像大小和网络。</div>
+  </div>
+</div>
+
+<div id="remoteLogModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="remoteLogTitle" hidden>
+  <div class="server-modal-card server-log-modal-card">
+    <div class="server-modal-head">
+      <h3 id="remoteLogTitle">远程操作日志</h3>
+      <button id="btnCloseRemoteLog" class="close-btn" aria-label="关闭">×</button>
+    </div>
+    <div id="remoteLogStatus" class="server-log-status" role="status"></div>
+    <div class="server-log-actions"><button id="btnCopyRemoteLog" type="button">复制全部</button></div>
+    <div id="remoteLogOutput" class="server-log-output" aria-label="远程操作日志" aria-live="polite"></div>
+  </div>
+</div>
+
 <div id="toastWrap"></div>
 
 <script>
@@ -206,6 +629,11 @@ const state = {
   datasets: [], datasetId: null, preview: null,
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   charts: { loss: null, metric: null }, metricKind: null,
+  workerSlots: [], detailRecord: null, retrySubmitting: false,
+  remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
+  remoteLogOperationId: null, remoteLogPollTimer: null,
+  editingRemoteMachineId: null,
+  remoteCredentials: [], remoteCredentialDefaultId: null, remoteCredentialsCanConfigure: false,
 };
 
 /* ---------- 基础工具 ---------- */
@@ -225,6 +653,162 @@ function toast(msg, kind = "") {
 }
 const fmtTime = (ts) => ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "-";
 const fmtLoss = (v) => (v === null || v === undefined) ? "-" : Number(v).toFixed(4);
+// 将一次执行记录转换成稳定可读的机器、槽位和设备标签。
+function resourceText(attempt) {
+  if (!attempt) return "";
+  const machine = attempt.machine_id || attempt.worker_id || "未知机器";
+  const slot = attempt.slot ? ` / ${attempt.slot}` : "";
+  const worker = attempt.worker_id && attempt.worker_id !== machine ? ` · ${attempt.worker_id}` : "";
+  const device = attempt.device === "cuda"
+    ? `GPU${attempt.gpu_name ? ` · ${attempt.gpu_name}` : ""}${attempt.vram_mb ? ` ${(Number(attempt.vram_mb) / 1024).toFixed(1)} GB` : ""}`
+    : attempt.device === "cpu" ? "CPU" : "设备未知";
+  return `${machine}${slot}${worker} · ${device}`;
+}
+
+// 按任务状态显示待分配、正在运行或已完成分段的资源位置。
+function renderResourceAllocation(job) {
+  const box = $("resourceAllocation");
+  const segments = Array.isArray(job.segments) ? job.segments : [];
+  const rows = [];
+  if (job.status === "queued") {
+    if (job.retry_worker_id) {
+      rows.push({
+        title: "重试目标",
+        resource: job.retry_worker_id,
+        meta: "等待指定槽位领取",
+        status: "手动指定",
+      });
+    } else {
+      const hint = job.spec.resource_hint || {};
+      rows.push({
+        title: "等待分配",
+        resource: "自动匹配空闲资源",
+        meta: hint.require_gpu ? "仅 GPU 槽位" : hint.min_vram_mb ? `GPU 显存 ≥ ${hint.min_vram_mb} MiB` : "CPU / GPU 均可",
+        status: "排队中",
+      });
+    }
+  }
+  if (job.current_attempt) {
+    rows.push({
+      title: "当前执行",
+      resource: resourceText(job.current_attempt),
+      meta: `epoch ${job.current_attempt.from_epoch || 1} 起 · ${fmtTime(job.current_attempt.started_at)}`,
+      status: "训练中",
+    });
+  } else if (job.status === "running" && job.worker_id) {
+    rows.push({
+      title: "当前执行",
+      resource: resourceText({ worker_id: job.worker_id, machine_id: job.machine_id, slot: job.slot, device: job.device }),
+      meta: "旧任务记录未保存执行分段详情",
+      status: "训练中",
+    });
+  }
+  const segmentStates = {
+    completed: "完成", paused: "暂停交接", retrying: "自动重试", interrupted: "中断重派",
+    failed: "失败", cancelled: "已取消",
+  };
+  for (const segment of segments.slice().reverse()) {
+    rows.push({
+      title: "执行分段",
+      resource: resourceText(segment),
+      meta: `epoch ${segment.from_epoch ?? "?"}–${segment.to_epoch ?? "?"}${segment.finished_at ? ` · ${fmtTime(segment.finished_at)}` : ""}`,
+      status: segmentStates[segment.status] || "已记录",
+    });
+  }
+  if (!rows.length && job.worker_id) {
+    rows.push({
+      title: "最近执行",
+      resource: resourceText({ worker_id: job.worker_id, machine_id: job.machine_id, slot: job.slot, device: job.device }),
+      meta: "旧任务记录未保存分段位置",
+      status: "已记录",
+    });
+  }
+  if (!rows.length) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.innerHTML = `<div class="resource-allocation-title">资源分配与执行轨迹</div><div class="resource-allocation-list">${rows.map((row) => `
+    <div class="resource-allocation-row">
+      <div class="resource-allocation-main">${esc(row.title)} · ${esc(row.resource)}</div>
+      <div class="resource-allocation-meta">${esc(row.meta)}<span class="resource-allocation-state">${esc(row.status)}</span></div>
+    </div>`).join("")}</div>`;
+}
+
+// 用最近一次实际执行位置补充任务列表信息，排队任务显示其分配策略。
+function jobResourceLabel(job) {
+  if (job.current_attempt) return `资源 · ${resourceText(job.current_attempt)}`;
+  if (job.status === "queued" && job.retry_worker_id) return `重试目标 · ${job.retry_worker_id}`;
+  const segments = Array.isArray(job.segments) ? job.segments : [];
+  if (segments.length) return `最近资源 · ${resourceText(segments[segments.length - 1])}`;
+  if (job.status === "queued") return "资源 · 自动分配";
+  if (job.worker_id) return `最近资源 · ${resourceText(job)}`;
+  return "";
+}
+
+// 仅提供在线、已启用且满足 GPU/显存要求的槽位作为手动重试目标。
+function renderRetryControls(job) {
+  const select = $("retryResourceSelect");
+  if (!select) return;
+  if (!job || job.status !== "failed") {
+    $("retryPanel").hidden = true;
+    return;
+  }
+  $("retryPanel").hidden = false;
+  const hint = job.spec.resource_hint || {};
+  const minVram = Number(hint.min_vram_mb || 0);
+  const gpuRequired = Boolean(hint.require_gpu || minVram > 0);
+  const eligible = state.workerSlots.filter((worker) => {
+    const gpu = worker.gpu || {};
+    return worker.active && worker.enabled && worker.state !== "degraded"
+      && (!gpuRequired || gpu.available)
+      && (!minVram || Number(gpu.vram_mb || 0) >= minVram);
+  });
+  const selected = select.value;
+  const options = ['<option value="">自动分配 · 所有符合要求的资源</option>'];
+  for (const worker of eligible) {
+    const gpu = worker.gpu || {};
+    const device = gpu.available
+      ? `GPU · ${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB` : ""}`
+      : `CPU · ${worker.cpu && worker.cpu.cores ? `${worker.cpu.cores} 线程` : "资源"}`;
+    const stateText = worker.state === "running" ? "训练中，排队等待" : "在线";
+    const label = `${worker.machine_id || worker.worker_id} / ${worker.slot || "计算槽"} · ${device} · ${stateText}`;
+    options.push(`<option value="${esc(worker.worker_id)}">${esc(label)}</option>`);
+  }
+  select.innerHTML = options.join("");
+  if (eligible.some((worker) => worker.worker_id === selected)) select.value = selected;
+  $("retryHint").textContent = eligible.length
+    ? gpuRequired ? "此任务只能分配到满足 GPU / 显存要求的槽位。" : "CPU 与 GPU 槽位均可手动选择；自动分配会由队列选择空闲资源。"
+    : gpuRequired ? "当前没有在线且满足 GPU / 显存要求的槽位；自动分配会排队等待合适资源。"
+      : "当前没有在线计算槽；自动分配会排队等待资源上线。";
+  $("btnRetry").disabled = state.retrySubmitting;
+}
+
+// 将失败任务按所选策略重新放回队列并刷新资源执行信息。
+async function retryFailedJob(jobId) {
+  if (state.retrySubmitting) return;
+  const button = $("btnRetry");
+  state.retrySubmitting = true;
+  button.disabled = true;
+  try {
+    const workerId = $("retryResourceSelect").value || null;
+    const result = await apiJson(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    toast(result.assignment_mode === "worker" ? `已重新排队，等待 ${result.worker_id} 执行` : "已重新排队，由调度器自动分配资源", "ok");
+    await refreshJobs();
+  } catch (error) {
+    toast(`重试失败：${error.message}`, "err");
+  } finally {
+    state.retrySubmitting = false;
+    renderRetryControls(state.detailRecord);
+  }
+}
+const taskName = (task) => ({
+  classification: "分类", regression: "回归", clustering: "KMeans 聚类",
+  time_series_forecasting: "时间序列预测",
+  llm_pretraining: "LLM 从零预训练", llm_sft: "LLM 全参数 SFT",
+  llm_dpo: "LLM DPO", llm_ppo: "LLM PPO / RLHF",
+}[task] || task || "未知任务");
 
 /* ---------- 设备徽章 ---------- */
 async function loadSystem() {
@@ -233,23 +817,33 @@ async function loadSystem() {
     const dot = $("deviceBadge").querySelector(".dot");
     if (sys.device === "cuda") {
       dot.className = "dot ok";
-      $("deviceText").textContent = `GPU 已就绪：${sys.device_name}${sys.gpu_count > 1 ? " ×" + sys.gpu_count : ""}（CUDA ${sys.cuda_version || ""}）`;
+      $("deviceText").textContent = `部署节点 GPU 已就绪：${sys.device_name}${sys.gpu_count > 1 ? " ×" + sys.gpu_count : ""}（CUDA ${sys.cuda_version || ""}）`;
     } else {
       dot.className = "dot";
-      $("deviceText").textContent = "未检测到 GPU，将使用 CPU 训练";
+      $("deviceText").textContent = "部署节点未检测到 GPU；集群资源请看右侧计算资源";
     }
   } catch { $("deviceText").textContent = "后端连接失败"; }
 }
 
 /* ---------- 数据集 ---------- */
+/** 按数据集列表渲染选择框；列表为空时清理预览并禁用选择。 */
 function renderDatasetSelect() {
   const sel = $("datasetSelect");
   sel.innerHTML = "";
   if (!state.datasets.length) {
-    sel.innerHTML = `<option value="">（暂无数据集）</option>`;
-    $("btnStart").disabled = true;
+    state.datasetId = null;
+    state.preview = null;
+    sel.disabled = true;
+    sel.innerHTML = `<option value="">（暂无数据集，请上传 CSV）</option>`;
+    $("targetSelect").innerHTML = "";
+    $("timeColumnSelect").innerHTML = "";
+    $("previewWrap").innerHTML = `<div class="empty">暂无数据集，请上传 CSV 后预览</div>`;
+    $("previewMeta").hidden = true;
+    $("previewMeta").textContent = "";
+    updateStart();
     return;
   }
+  sel.disabled = false;
   for (const d of state.datasets) {
     const opt = document.createElement("option");
     opt.value = d.id;
@@ -264,38 +858,20 @@ function renderDatasetSelect() {
   sel.dispatchEvent(new Event("change"));
 }
 
+/** 读取数据集列表接口的 datasets 字段，并保留上传后的当前选择。 */
 async function loadDatasets(keepId) {
-  state.datasets = await apiJson("/api/datasets");
+  const response = await apiJson("/api/datasets");
+  state.datasets = Array.isArray(response.datasets) ? response.datasets : [];
   if (keepId) state.datasetId = keepId;
   renderDatasetSelect();
-}
-
-async function loadSamples() {
-  try {
-    const samples = await apiJson("/api/samples");
-    const box = $("sampleBox");
-    box.innerHTML = "";
-    for (const s of samples) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = "＋ " + s.name.replace(".csv", "");
-      b.title = "导入示例数据集 " + s.name;
-      b.onclick = async () => {
-        try {
-          const meta = await apiJson(`/api/datasets/sample/${encodeURIComponent(s.name)}`, { method: "POST" });
-          toast("示例数据已导入: " + meta.name, "ok");
-          await loadDatasets(meta.id);
-        } catch (e) { toast("导入失败: " + e.message, "err"); }
-      };
-      box.appendChild(b);
-    }
-  } catch { /* 静默 */ }
 }
 
 async function loadPreview() {
   const wrap = $("previewWrap"), metaBox = $("previewMeta");
   const targetSel = $("targetSelect");
+  const timeColumnSel = $("timeColumnSelect");
   targetSel.innerHTML = "";
+  timeColumnSel.innerHTML = "";
   $("previewMeta").hidden = true;
   metaBox.textContent = "";
   if (!state.datasetId) { wrap.innerHTML = `<div class="empty">选择或上传数据集后在此预览</div>`; state.preview = null; updateStart(); return; }
@@ -307,10 +883,14 @@ async function loadPreview() {
       const opt = document.createElement("option");
       opt.value = c; opt.textContent = c;
       targetSel.appendChild(opt);
+      const timeOpt = document.createElement("option");
+      timeOpt.value = c; timeOpt.textContent = c;
+      timeColumnSel.appendChild(timeOpt);
     }
     targetSel.value = d.columns[d.columns.length - 1];
+    timeColumnSel.value = d.columns.find((column) => column !== targetSel.value) || "";
     targetSel.onchange = updateStart;
-    taskSelect.onchange = updateStart;
+    timeColumnSel.onchange = updateStart;
     // 预览表
     let html = `<table class="preview-table"><tr>${d.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>`;
     for (const row of (d.preview || []).slice(0, 5)) {
@@ -328,7 +908,77 @@ async function loadPreview() {
 }
 
 function updateStart() {
-  $("btnStart").disabled = !(state.datasetId && $("targetSelect").value);
+  const task = taskSelect.value;
+  const isLLM = task.startsWith("llm_");
+  const source = isLLM ? $("p_dataset_source").value : "local";
+  const datasetReady = isLLM && source === "hub" ? Boolean($("p_hub_dataset").value.trim()) : Boolean(state.datasetId);
+  const hasTarget = Boolean($("targetSelect").value);
+  const hasTimeColumn = Boolean($("timeColumnSelect").value)
+    && $("timeColumnSelect").value !== $("targetSelect").value;
+  const hasBaseModel = !isLLM || task === "llm_pretraining" || Boolean($("p_base_model").value.trim());
+  const hasRewardModel = !isLLM || task !== "llm_ppo" || Boolean($("p_reward_model").value.trim());
+  const ready = datasetReady && hasBaseModel && hasRewardModel && (isLLM || (task === "clustering"
+    || (hasTarget && (task !== "time_series_forecasting" || hasTimeColumn))));
+
+  $("btnStart").disabled = !ready;
+}
+
+function updateTaskFields() {
+  const task = taskSelect.value;
+  const isClustering = task === "clustering";
+  const isForecasting = task === "time_series_forecasting";
+  const isLLM = task.startsWith("llm_");
+  const isPretraining = task === "llm_pretraining";
+  const isDpo = task === "llm_dpo";
+  const isPpo = task === "llm_ppo";
+  $("targetField").hidden = isClustering || isLLM;
+  $("timeColumnField").hidden = !isForecasting;
+  $("nClustersField").hidden = !isClustering;
+  $("lookbackField").hidden = !isForecasting;
+  $("forecastHorizonField").hidden = !isForecasting;
+  $("llmFields").hidden = !isLLM;
+  $("datasetLocalPanel").hidden = isLLM && $("p_dataset_source").value === "hub";
+  $("hubDatasetField").hidden = !isLLM || $("p_dataset_source").value !== "hub";
+  $("hubConfigField").hidden = !isLLM || $("p_dataset_source").value !== "hub";
+  $("hubSplitField").hidden = !isLLM || $("p_dataset_source").value !== "hub";
+  $("baseModelField").hidden = !isLLM || isPretraining;
+  $("rewardModelField").hidden = !isPpo;
+  $("textColumnField").hidden = !isPretraining && task !== "llm_sft";
+  $("promptColumnField").hidden = !isDpo && !isPpo && !(task === "llm_sft" && $("p_completion_column").value.trim());
+  $("completionColumnField").hidden = !isLLM || task !== "llm_sft";
+  $("chosenColumnField").hidden = !isDpo;
+  $("rejectedColumnField").hidden = !isDpo;
+  $("vocabSizeField").hidden = !isPretraining;
+  ["modelHiddenSizeField", "modelLayersField", "modelHeadsField"].forEach((id) => { $(id).hidden = !isPretraining; });
+  $("ppoUpdatesField").hidden = !isPpo;
+  ["batchSizeField", "testSplitField"].forEach((id) => { $(id).hidden = isClustering; });
+  $("learningRateField").hidden = isClustering || (isLLM && !isPretraining);
+  $("llmLearningRateField").hidden = !isLLM || isPretraining;
+  ["hiddenLayersField", "hiddenSizeField"].forEach((id) => { $(id).hidden = isClustering || isLLM; });
+  $("resourceHintField").hidden = isClustering || isLLM;
+  $("p_require_gpu").disabled = isLLM;
+  $("p_require_gpu").checked = isLLM || $("p_require_gpu").checked;
+  $("minVramField").hidden = isLLM ? false : (isClustering || !$("p_require_gpu").checked);
+  $("btnPredict").textContent = isLLM ? "生成文本" : "预测";
+  if (isClustering) {
+    $("p_require_gpu").checked = false;
+    $("minVramField").hidden = true;
+  }
+  $("epochLabel").textContent = isClustering ? "最大迭代次数" : "轮数 epochs";
+  $("taskHint").textContent = isClustering
+    ? "KMeans 根据所有特征自动分组，不需要目标列，当前使用 CPU。"
+    : isForecasting
+      ? "按时间列排序目标值；使用最近窗口预测指定步数后的数值。"
+      : isLLM
+        ? isPretraining
+          ? "从随机初始化 tokenizer 和 decoder-only GPT-2 模型，使用文本列做因果语言建模。"
+          : isDpo
+            ? "基于 prompt、chosen、rejected 偏好对执行 DPO，全参数更新基座模型。"
+            : isPpo
+              ? "基于奖励模型执行 PPO 式 RLHF；需要标量奖励模型和单张 GPU。"
+              : "对 Hugging Face CausalLM 执行全参数监督微调（SFT）。"
+        : "分类适用于离散标签，回归适用于连续数值目标。";
+  updateStart();
 }
 
 /* 上传 */
@@ -351,13 +1001,23 @@ $("datasetSelect").onchange = (e) => { state.datasetId = e.target.value; loadPre
 
 /* ---------- 训练任务 ---------- */
 const taskSelect = $("taskSelect");
+taskSelect.addEventListener("change", updateTaskFields);
+$("p_dataset_source").addEventListener("change", updateTaskFields);
+[
+  "p_hub_dataset", "p_base_model", "p_reward_model", "p_completion_column",
+].forEach((id) => $(id).addEventListener("input", () => { updateTaskFields(); updateStart(); }));
+$("p_require_gpu").onchange = () => { $("minVramField").hidden = !$("p_require_gpu").checked; };
 
 $("btnStart").onclick = async () => {
-  if (!state.datasetId || !$("targetSelect").value) return;
+  const task = taskSelect.value;
+  const isLLM = task.startsWith("llm_");
+  const datasetSource = isLLM ? $("p_dataset_source").value : "local";
+  const datasetId = isLLM && datasetSource === "hub" ? $("p_hub_dataset").value.trim() : state.datasetId;
+  if (!datasetId || (!isLLM && task !== "clustering" && !$("targetSelect").value)) return;
   const payload = {
-    dataset_id: state.datasetId,
-    target: $("targetSelect").value,
-    task: taskSelect.value,
+    dataset_id: datasetId,
+    target: task === "clustering" || isLLM ? null : $("targetSelect").value,
+    task,
     epochs: Number($("p_epochs").value),
     batch_size: Number($("p_batch_size").value),
     lr: Number($("p_lr").value),
@@ -365,7 +1025,39 @@ $("btnStart").onclick = async () => {
     hidden_size: Number($("p_hidden_size").value),
     test_split: Number($("p_test_split").value),
     seed: 42,
+    require_gpu: $("p_require_gpu").checked,
+    min_vram_mb: $("p_require_gpu").checked ? Math.max(Number($("p_min_vram").value) || 0, 0) : 0,
   };
+  if (task === "clustering") payload.n_clusters = Number($("p_n_clusters").value);
+  if (task === "time_series_forecasting") {
+    payload.time_column = $("timeColumnSelect").value;
+    payload.lookback = Number($("p_lookback").value);
+    payload.forecast_horizon = Number($("p_forecast_horizon").value);
+  }
+  if (isLLM) {
+    Object.assign(payload, {
+      dataset_source: datasetSource,
+      dataset_config: $("p_hub_config").value.trim() || null,
+      dataset_split: $("p_hub_split").value.trim() || "train",
+      base_model: $("p_base_model").value.trim() || null,
+      reward_model: $("p_reward_model").value.trim() || null,
+      text_column: $("p_text_column").value.trim() || "text",
+      prompt_column: $("p_prompt_column").value.trim() || "prompt",
+      completion_column: $("p_completion_column").value.trim() || null,
+      chosen_column: $("p_chosen_column").value.trim() || "chosen",
+      rejected_column: $("p_rejected_column").value.trim() || "rejected",
+      max_samples: Number($("p_max_samples").value),
+      max_seq_len: Number($("p_max_seq_len").value),
+      vocab_size: Number($("p_vocab_size").value),
+      model_hidden_size: Number($("p_model_hidden_size").value),
+      model_layers: Number($("p_model_layers").value),
+      model_heads: Number($("p_model_heads").value),
+      ppo_updates: Number($("p_ppo_updates").value),
+      llm_lr: Number($("p_llm_lr").value),
+      require_gpu: true,
+      min_vram_mb: Math.max(Number($("p_min_vram").value) || 0, 0),
+    });
+  }
   $("btnStart").disabled = true;
   try {
     const { job_id } = await apiJson("/api/train", {
@@ -377,26 +1069,35 @@ $("btnStart").onclick = async () => {
   updateStart();
 };
 
-const statusText = { queued: "排队中", running: "训练中", completed: "已完成", failed: "失败", cancelled: "已取消" };
+const statusText = { queued: "排队中", running: "训练中", completed: "已完成", failed: "失败", cancelled: "已取消", paused: "已暂停" };
 
 function jobCard(j) {
   const m = j.spec.params || {};
   const last = (j.metrics || []).slice(-1)[0] || {};
-  const taskLabel = j.spec.task === "regression" ? "回归" : "分类";
+  const label = taskName(j.spec.task);
+  const target = j.spec.target || (j.spec.task === "clustering" ? "无目标列" : "目标列");
   const pct = j.progress ? Math.round(j.progress.percent) : 0;
   const active = j.id === state.jobId ? " active" : "";
   let metric = "";
   if (last.val_accuracy !== undefined) metric = `acc ${fmtLoss(last.val_accuracy)}`;
   else if (last.val_r2 !== undefined) metric = `R² ${fmtLoss(last.val_r2)}`;
+  else if (last.val_silhouette !== undefined) metric = `silhouette ${fmtLoss(last.val_silhouette)}`;
   return `<div class="jobcard${active}" data-id="${esc(j.id)}">
     <div class="jobline">
-      <span class="jobname">${esc(j.spec.target)} · ${taskLabel}</span>
+      <span class="jobname">${esc(target)} · ${esc(label)}</span>
       <span class="chip st-${esc(j.status)}">${statusText[j.status] || j.status}</span>
       <span class="chip">${esc(j.spec.dataset_name || "")}</span>
+      ${(j.spec.resource_hint || {}).require_gpu ? `<span class="chip" title="要求 GPU 训练">GPU</span>` : ""}
+      ${j.retry_count ? `<span class="chip" title="环境性错误自动重试次数">↻ ${j.retry_count}</span>` : ""}
+      ${j.manual_retry_count ? `<span class="chip" title="失败后手动重新排队次数">手动重试 ${j.manual_retry_count}</span>` : ""}
     </div>
     <div class="chips">
-      <span class="chip">ep ${m.epochs}</span><span class="chip">bs ${m.batch_size}</span>
-      <span class="chip">lr ${m.lr}</span>${metric ? `<span class="chip">${metric}</span>` : ""}
+      ${jobResourceLabel(j) ? `<span class="chip">${esc(jobResourceLabel(j))}</span>` : ""}
+      <span class="chip">${j.spec.task === "clustering" ? "最多迭代" : "ep"} ${m.epochs}</span>
+      ${m.n_clusters ? `<span class="chip">${m.n_clusters} 簇</span>` : ""}
+      ${m.lookback ? `<span class="chip">窗口 ${m.lookback} · 预测 ${m.forecast_horizon} 步</span>` : ""}
+      ${m.batch_size ? `<span class="chip">bs ${m.batch_size}</span>` : ""}
+      ${m.lr ? `<span class="chip">lr ${m.lr}</span>` : ""}${metric ? `<span class="chip">${metric}</span>` : ""}
       <span class="chip">${fmtTime(j.created_at)}</span>
     </div>
     <div class="progress ${(j.status === "completed" ? "done" : "") + (j.status === "failed" || j.status === "cancelled" ? " failed" : "")}">
@@ -441,14 +1142,23 @@ async function loadDetail() {
   try { j = await apiJson(`/api/jobs/${state.jobId}`); }
   catch { state.jobId = null; $("detail").hidden = true; return; }
 
-  const taskLabel = j.spec.task === "regression" ? "回归" : "分类";
-  $("dName").textContent = `${j.spec.target} · ${taskLabel}（${j.spec.dataset_name || ""}）`;
+  state.detailRecord = j;
+  const taskLabel = taskName(j.spec.task);
+  $("dName").textContent = `${j.spec.target || "无目标列"} · ${taskLabel}（${j.spec.dataset_name || ""}）`;
   const st = $("dStatus");
   st.textContent = statusText[j.status] || j.status;
   st.className = "chip st-" + j.status;
-  $("dDevice").textContent = j.device ? (j.device === "cuda" ? "GPU" : "CPU") : "设备待分配";
+  const latestSegment = (j.segments || []).slice(-1)[0];
+  const assignedResource = j.current_attempt || latestSegment || j;
+  $("dDevice").textContent = j.current_attempt || latestSegment || j.worker_id
+    ? resourceText(assignedResource) : (j.retry_worker_id ? `等待 ${j.retry_worker_id}` : "等待资源分配");
+  renderResourceAllocation(j);
+  renderRetryControls(j);
+  $("btnRetry").onclick = () => retryFailedJob(j.id);
 
   $("btnCancel").hidden = !(j.status === "queued" || j.status === "running");
+  $("btnPause").hidden = !(j.status === "queued" || j.status === "running");
+  $("btnResume").hidden = j.status !== "paused";
   $("btnDownload").hidden = !j.summary;
   $("btnDelete").onclick = async () => {
     if (!confirm("确定删除该任务及其产物？")) return;
@@ -460,15 +1170,28 @@ async function loadDetail() {
     try { await apiJson(`/api/jobs/${j.id}/cancel`, { method: "POST" }); toast("已发送取消请求"); }
     catch (e) { toast(e.message, "err"); }
   };
+  $("btnPause").onclick = async () => {
+    try {
+      await apiJson(`/api/jobs/${j.id}/pause`, { method: "POST" });
+      toast("暂停请求已发送：断点保存后可由任意卡/服务器恢复");
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("btnResume").onclick = async () => {
+    try {
+      await apiJson(`/api/jobs/${j.id}/resume`, { method: "POST" });
+      toast("已恢复排队：任意可用卡/服务器将从断点接续", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  };
 
   const bar = $("dProgress");
   bar.className = "progress" + (j.status === "completed" ? " done" : (j.status === "failed" || j.status === "cancelled" ? " failed" : ""));
   const pct = Math.round(j.progress.percent || 0);
   bar.querySelector("div").style.width = pct + "%";
   let ptxt = `进度 ${pct}%`;
-  if (j.progress.epochs_total) ptxt = `epoch ${j.progress.epoch}/${j.progress.epochs_total}`;
+  if (j.progress.epochs_total) ptxt = `${j.spec.task === "clustering" ? "迭代" : "epoch"} ${j.progress.epoch}/${j.progress.epochs_total}`;
   if (j.status === "failed" && j.error) ptxt += ` · ${esc(j.error)}`;
   if (j.summary && j.summary.duration_sec) ptxt += ` · 用时 ${j.summary.duration_sec}s`;
+  if ((j.segments || []).length > 1) ptxt += ` · 跨槽续训 ${j.segments.length} 段`;
   $("dProgressText").innerHTML = ptxt;
 
   j.metrics = j.metrics || [];
@@ -483,8 +1206,13 @@ function ensureCharts() {
     $("chartNote").textContent = "图表组件（Chart.js CDN）未加载，检查浏览器网络后刷新。";
     return false;
   }
-  Chart.defaults.color = "#9fb0c7";
-  Chart.defaults.borderColor = "rgba(45,51,59,.8)";
+  Chart.defaults.color = "#718096";
+  Chart.defaults.borderColor = "#e6ecf3";
+  Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif';
+  Chart.defaults.plugins.legend.labels.usePointStyle = true;
+  Chart.defaults.plugins.legend.labels.pointStyle = "line";
+  Chart.defaults.plugins.legend.labels.boxWidth = 22;
+  Chart.defaults.plugins.legend.labels.padding = 16;
   if (!state.charts.loss) {
     state.charts.loss = new Chart($("lossChart"), {
       type: "line",
@@ -492,12 +1220,28 @@ function ensureCharts() {
         { label: "train_loss", data: [], borderColor: "#58a6ff", pointRadius: 0, borderWidth: 2, tension: 0.25 },
         { label: "val_loss", data: [], borderColor: "#f0883e", pointRadius: 0, borderWidth: 2, tension: 0.25 },
       ]},
-      options: { animation: false, maintainAspectRatio: true, scales: { y: { beginAtZero: true } } },
+      options: {
+        animation: false,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "top", align: "end" } },
+        scales: {
+          x: { grid: { display: false }, ticks: { maxTicksLimit: 12, color: "#8796aa" } },
+          y: { beginAtZero: true, grid: { color: "#edf1f6" }, border: { display: false }, ticks: { padding: 8, color: "#8796aa" } },
+        },
+      },
     });
     state.charts.metric = new Chart($("metricChart"), {
       type: "line",
       data: { labels: [], datasets: [{ label: "metric", data: [], borderColor: "#3fb950", pointRadius: 0, borderWidth: 2, tension: 0.25 }] },
-      options: { animation: false, maintainAspectRatio: true, scales: { y: { beginAtZero: true } } },
+      options: {
+        animation: false,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { display: false }, ticks: { maxTicksLimit: 12, color: "#8796aa" } },
+          y: { beginAtZero: true, grid: { color: "#edf1f6" }, border: { display: false }, ticks: { padding: 8, color: "#8796aa" } },
+        },
+      },
     });
   }
   return true;
@@ -511,12 +1255,30 @@ function renderCharts(j) {
   loss.data.labels = labels;
   loss.data.datasets[0].data = m.map((r) => r.train_loss);
   loss.data.datasets[1].data = m.map((r) => r.val_loss);
+  if (j.spec.task === "clustering") {
+    loss.data.datasets[0].label = "平均惯性";
+    loss.data.datasets[1].label = "惯性";
+    $("lossChart").previousElementSibling.textContent = "KMeans 惯性（越低越好）";
+  } else if (j.spec.task.startsWith("llm_")) {
+    loss.data.datasets[0].label = "train_loss";
+    loss.data.datasets[1].label = "val_loss";
+    $("lossChart").previousElementSibling.textContent = "LLM 训练 / 验证 Loss";
+  } else {
+    loss.data.datasets[0].label = "train_loss";
+    loss.data.datasets[1].label = "val_loss";
+    $("lossChart").previousElementSibling.textContent = "Loss（训练 / 验证）";
+  }
   loss.update("none");
 
   const metric = state.charts.metric;
   let key, title;
-  if (j.spec.task === "regression") { key = "val_r2"; title = "验证 R²（越高越好）"; }
-  else { key = "val_accuracy"; title = "验证准确率 accuracy"; }
+  if (j.spec.task === "clustering") { key = "val_silhouette"; title = "轮廓系数 Silhouette（越高越好）"; }
+  else if (j.spec.task === "llm_dpo") { key = "preference_accuracy"; title = "DPO 偏好准确率"; }
+  else if (j.spec.task === "llm_ppo") { key = "reward"; title = "PPO 奖励分数"; }
+  else if (j.spec.task.startsWith("llm_")) { key = "perplexity"; title = "验证 Perplexity（越低越好）"; }
+  else if (j.spec.task === "regression" || j.spec.task === "time_series_forecasting") {
+    key = "val_r2"; title = "验证 R²（越高越好）";
+  } else { key = "val_accuracy"; title = "验证准确率 accuracy"; }
   if (state.metricKind !== key) {
     state.metricKind = key;
     metric.data.datasets[0].label = key;
@@ -553,8 +1315,41 @@ function renderResult(j) {
   }
   const stat = (k, v) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
   let html = `<div class="statgrid">`;
+  if (j.spec.task === "clustering") {
+    html += stat("收敛迭代", s.epochs_total);
+    html += stat("聚类数", s.n_clusters);
+    html += stat("轮廓系数", fmtLoss(s.final.val_silhouette));
+    html += stat("惯性 inertia", fmtLoss(s.final.val_inertia));
+    html += stat("样本数", s.rows.total);
+    html += stat("特征数", s.features);
+    html += stat("用时", s.duration_sec + "s");
+    html += `</div>`;
+    html += `<div class="hint">各簇样本数：${Object.entries(s.cluster_counts || {}).map(([k, v]) => `簇 ${esc(k)}：${v}`).join(" · ")}</div>`;
+    html += `<div class="hint" style="margin-top:8px;">KMeans 中心已保存为该任务的 best.pt，可下载或在预测页输入一条特征记录。</div>`;
+    box.className = "";
+    box.innerHTML = html;
+    return;
+  }
+  if (j.spec.task.startsWith("llm_")) {
+    html += stat("最佳 epoch", `${s.best_epoch} / ${s.epochs_total}`);
+    html += stat("训练 loss", fmtLoss(s.final.train_loss));
+    if (s.final.val_loss !== undefined) {
+      html += stat("验证 loss", fmtLoss(s.final.val_loss));
+      html += stat("Perplexity", fmtLoss(s.final.perplexity));
+    }
+    if (s.final.preference_accuracy !== undefined) html += stat("偏好准确率", `${(s.final.preference_accuracy * 100).toFixed(1)}%`);
+    if (s.final.reward !== undefined) html += stat("PPO reward", fmtLoss(s.final.reward));
+    if (s.final.kl !== undefined) html += stat("KL", fmtLoss(s.final.kl));
+    html += stat("样本", `${s.rows.train} / ${s.rows.val}`);
+    html += stat("设备", s.device === "cuda" ? "GPU" : "CPU");
+    html += stat("用时", `${s.duration_sec}s`);
+    html += `</div><div class="hint" style="margin-top:8px;">模型 tokenizer 与权重已保存为 best_model.zip。可下载模型包，或切到「预测」页输入 prompt 生成文本。</div>`;
+    box.className = "";
+    box.innerHTML = html;
+    return;
+  }
   html += stat("最佳 epoch", s.best_epoch + " / " + s.epochs_total);
-  if (j.spec.task === "regression") {
+  if (j.spec.task === "regression" || j.spec.task === "time_series_forecasting") {
     html += stat("验证 R²", fmtLoss(s.final.val_r2));
     html += stat("验证 RMSE", fmtLoss(s.final.val_rmse));
     html += stat("验证 MAE", fmtLoss(s.final.val_mae));
@@ -588,32 +1383,764 @@ function renderResult(j) {
 async function fillPredictTemplate() {
   const j = state.jobs.find((x) => x.id === state.jobId);
   if (!j) return;
+  if (j.spec.task.startsWith("llm_")) {
+    $("predictInput").value = "";
+    $("predictInput").placeholder = "输入 prompt，例如：用三句话介绍机器学习。";
+    $("tab-predict").querySelector(".hint").textContent = "输入一段 prompt，平台使用已训练的 decoder-only LLM 生成续写内容。";
+    $("btnPredict").textContent = "生成文本";
+    return;
+  }
+  $("btnPredict").textContent = "预测";
+  if (j.spec.task === "time_series_forecasting") {
+    $("predictInput").value = "[]";
+    $("predictInput").placeholder = `输入最近 ${j.spec.params.lookback} 个目标值，例如 [1.2, 1.4, 1.3, ...]`;
+    $("tab-predict").querySelector(".hint").textContent =
+      `输入按时间顺序排列的最近 ${j.spec.params.lookback} 个目标值（JSON 数组），模型预测 ${j.spec.params.forecast_horizon} 步后的值。`;
+    return;
+  }
   try {
     const d = await apiJson(`/api/datasets/${j.spec.dataset_id}`);
     if (d.preview && d.preview[0]) {
       const row = { ...d.preview[0] };
-      delete row[j.spec.target];
+      if (j.spec.target) delete row[j.spec.target];
       for (const k of Object.keys(row)) if (row[k] === null) delete row[k];
       $("predictInput").value = JSON.stringify(row, null, 2);
+      $("tab-predict").querySelector(".hint").textContent = j.spec.task === "clustering"
+        ? "输入一条 JSON 特征记录（字段名与数据集列名一致），模型返回最近簇编号。"
+        : "使用最佳模型进行单条预测（JSON，与数据集列同名字段）：";
     }
   } catch { /* 无预览则留空 */ }
 }
 
 $("btnPredict").onclick = async () => {
   const out = $("predictOut");
+  const job = state.jobs.find((item) => item.id === state.jobId);
   let body;
-  try { body = { row: JSON.parse($("predictInput").value) }; }
+  const isLLM = Boolean(job && job.spec.task.startsWith("llm_"));
+  try {
+    if (isLLM) body = { prompt: $("predictInput").value, max_new_tokens: 64, temperature: 0.0, top_p: 0.9 };
+    else {
+      const input = JSON.parse($("predictInput").value);
+      body = job && job.spec.task === "time_series_forecasting" ? { history: input } : { row: input };
+    }
+  }
   catch (e) { toast("预测输入不是合法 JSON: " + e.message, "err"); return; }
   try {
-    const r = await apiJson(`/api/jobs/${state.jobId}/predict`, {
+    const r = await apiJson(`/api/jobs/${state.jobId}/${isLLM ? "generate" : "predict"}`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     out.hidden = false;
-    let txt = "预测结果: " + (typeof r.prediction === "number" ? r.prediction.toFixed(4) : r.prediction);
+    let txt = isLLM
+      ? r.generated_text
+      : job && job.spec.task === "clustering"
+      ? `所属簇：${r.prediction}（中心距离 ${Number(r.distance).toFixed(4)}）`
+      : "预测结果: " + (typeof r.prediction === "number" ? r.prediction.toFixed(4) : r.prediction);
     if (r.probabilities) txt += "\n各类别概率:\n" + Object.entries(r.probabilities).map(([k, v]) => `  ${k}: ${(v * 100).toFixed(2)}%`).join("\n");
     out.textContent = txt;
   } catch (e) { toast(e.message, "err"); out.hidden = true; }
 };
+
+/* ---------- 计算服务器与手动资源选择 ---------- */
+const workerStateText = {
+  idle: "空闲", running: "训练中", degraded: "卡降级", recovering: "恢复中",
+  disabled: "未启用", offline: "离线",
+};
+
+// 把检测到的内存统一格式化为用户容易比较的容量。
+function formatMemory(memoryMb) {
+  if (!Number.isFinite(Number(memoryMb)) || Number(memoryMb) <= 0) return "内存未知";
+  const gb = Number(memoryMb) / 1024;
+  return `${gb >= 10 ? gb.toFixed(0) : gb.toFixed(1)} GB 内存`;
+}
+
+// 渲染单个 CPU/GPU 执行槽，并把加入资源池的操作绑定到槽位 ID。
+function workerSlotCard(w) {
+  const gpu = w.gpu || {};
+  const cpu = w.cpu || {};
+  const isGpu = Boolean(gpu.available);
+  const device = isGpu
+    ? `${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB 显存` : ""}`
+    : `CPU${cpu.cores ? ` · ${cpu.cores} 线程` : ""}${cpu.memory_mb ? ` · ${formatMemory(cpu.memory_mb)}` : ""}`;
+  const active = Boolean(w.active);
+  const enabled = Boolean(w.enabled);
+  const rawState = w.state || (active ? "idle" : "offline");
+  const state = !active ? "offline" : (["running", "degraded", "recovering"].includes(rawState)
+    ? rawState : (enabled ? rawState : "disabled"));
+  const job = w.current_job ? `${w.current_job}${w.epoch ? ` · 第 ${w.epoch} 轮` : ""}` : "当前无任务";
+  const heartbeat = w.heartbeat_age_sec != null ? `最近心跳 ${w.heartbeat_age_sec}s 前` : "尚无心跳";
+  const action = w.managed
+    ? `<button class="slot-action ${enabled ? "disable" : "enable"}" data-worker-id="${esc(w.worker_id)}" data-worker-enabled="${enabled ? "true" : "false"}" ${active ? "" : "disabled"}>${enabled ? "停止接单" : "加入资源池"}</button>`
+    : `<span class="server-kind">平台内置</span>`;
+  return `<div class="resource-slot ${enabled && active ? "enabled" : ""}">
+    <div class="slot-main">
+      <div class="slot-title"><span class="dot"></span>${isGpu ? "GPU" : "CPU"} · ${esc(w.slot || "计算槽")}
+        <span class="wstate ${esc(state)}">${workerStateText[state] || esc(state)}</span></div>
+      <div class="slot-details">${esc(device)} · ${esc(job)} · ${esc(heartbeat)}</div>
+    </div>
+    ${action}
+  </div>`;
+}
+
+// 按服务器聚合计算槽、SSH 操作和远程生命周期按钮。
+function workerServerCard(machineId, slots, remoteServer = null) {
+  const online = slots.filter((slot) => slot.active).length;
+  const managed = Boolean(remoteServer) || slots.some((slot) => slot.managed);
+  const gpuCount = slots.filter((slot) => slot.gpu && slot.gpu.available).length;
+  const cpuCount = slots.length - gpuCount;
+  const cpu = slots.find((slot) => slot.cpu && slot.cpu.cores)?.cpu || {};
+  const memory = formatMemory(cpu.memory_mb);
+  const heartbeat = slots
+    .filter((slot) => slot.heartbeat_age_sec != null)
+    .map((slot) => Number(slot.heartbeat_age_sec));
+  const lastSeen = heartbeat.length ? `${Math.min(...heartbeat).toFixed(0)} 秒前更新` : "等待首次心跳";
+  const summary = [gpuCount ? `${gpuCount} 个 GPU 槽` : "", cpuCount ? `${cpuCount} 个 CPU 槽` : ""]
+    .filter(Boolean).join(" · ") || "未发现计算槽";
+  const operation = remoteServer && remoteServer.operation;
+  const operationBusy = operation && ["queued", "running"].includes(operation.status);
+  const cancelRequested = Boolean(operation && operation.cancel_requested);
+  const remoteStatus = remoteServer ? {
+    provisioning: "正在安装并检测资源", starting: "正在启动 worker", stopping: "正在停止 worker",
+    restarting: "正在重启 worker", online: "worker 已启动", stopped: "worker 已停止", error: "上次远程操作失败",
+  }[remoteServer.status] || "SSH 服务器已登记" : "";
+  const operationLabel = operation ? {
+    queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "install" ? "正在远程安装并检测…" : `正在远程${operation.action}…`,
+    completed: "最近操作已完成", failed: "最近操作失败", cancelled: "最近操作已中断",
+  }[operation.status] || remoteStatus : remoteStatus;
+  const operationPhaseLabels = {
+    "检查部署配置": "检查部署配置", "检查远端 Docker 平台": "检查远端 Docker",
+    "检查镜像架构": "比较镜像架构", "构建目标架构镜像": "构建目标架构镜像",
+    "传输并加载 worker 镜像": "传输并加载镜像", "远端 docker load": "远端加载镜像",
+    "执行远程部署脚本": "执行远端部署脚本", "等待资源心跳": "等待资源心跳",
+  };
+  const phaseLabel = operation && operationPhaseLabels[operation.phase];
+  const phaseElapsed = operation && operation.phase_started_at
+    ? Math.max(0, Math.floor(Date.now() / 1000 - Number(operation.phase_started_at))) : null;
+  const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
+      <button class="server-log-button" data-remote-server-logs="${esc(machineId)}">日志</button>
+      <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>编辑</button>
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="install" ${operationBusy ? "disabled" : ""}>重新部署并应用配置</button>
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="start" ${operationBusy ? "disabled" : ""}>启动</button>
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop" ${operationBusy ? "disabled" : ""}>停止</button>
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="restart" ${operationBusy ? "disabled" : ""}>重启</button>
+      ${operationBusy ? `<button data-cancel-remote-operation="${esc(operation.operation_id)}" ${cancelRequested ? "disabled" : ""}>${cancelRequested ? "正在中断…" : "中断操作"}</button>` : ""}
+    </div>` : "";
+  const endpoint = remoteServer ? `${remoteServer.username}@${remoteServer.host}:${remoteServer.port} · ${remoteServer.mode.toUpperCase()}` : "";
+  const operationDetails = operation && ["failed", "cancelled"].includes(operation.status) && operation.error
+    ? `${operationLabel}：${operation.error}`
+    : operationBusy && phaseLabel
+      ? `${operationLabel} · ${phaseLabel}${phaseElapsed == null ? "" : ` · ${phaseElapsed} 秒`}`
+      : operationLabel;
+  const operationLog = operation && [operation.output, operation.stderr, operation.error]
+    .filter((part) => typeof part === "string" && part.trim())
+    .join("\n");
+  return `<article class="server-card">
+    <header class="server-head">
+      <div class="server-head-main">
+        <div class="server-title"><strong>${esc(machineId || "未命名服务器")}</strong>
+          <span class="server-kind">${managed ? "远程服务器" : "平台内置"}</span>
+          <span class="chip">${esc(summary)}</span></div>
+        ${endpoint ? `<div class="server-meta">SSH ${esc(endpoint)}</div>` : ""}
+      </div>
+      <div class="server-head-actions">${serverControls}<span class="server-presence ${online ? "" : "offline"}">${online ? `在线 · ${online}/${slots.length} 槽` : remoteServer && operationBusy ? "远程操作中" : "离线"}</span></div>
+    </header>
+    ${remoteServer && operationDetails ? `<div class="server-operation" role="status">${esc(operationDetails)}</div>` : ""}
+    ${slots.length
+      ? `<div class="server-meta">${cpu.cores ? `CPU ${esc(cpu.cores)} 线程` : "CPU 信息未知"} · ${esc(memory)} · ${esc(lastSeen)}</div><div class="server-slots">${slots.map(workerSlotCard).join("")}</div>`
+      : `<div class="server-meta">${remoteServer ? "尚未收到资源心跳；worker 启动后将自动检测 CPU / GPU。" : "等待计算资源心跳"}</div>`}
+  </article>`;
+}
+
+// 读取仅在当前会话授权的远程服务器状态，缓存操作结果以减少重复请求。
+async function loadRemoteServers() {
+  try {
+    const result = await apiJson("/api/remote-servers");
+    const servers = result.servers || [];
+    for (const server of servers) {
+      if (!server.operation_id) continue;
+      let operation = state.remoteOperations.get(server.operation_id);
+      if (!operation || ["queued", "running"].includes(operation.status)) {
+        try {
+          operation = await apiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`);
+          state.remoteOperations.set(server.operation_id, operation);
+          if (["completed", "failed", "cancelled"].includes(operation.status) && !state.remoteOperationNotified.has(server.operation_id)) {
+            state.remoteOperationNotified.add(server.operation_id);
+            const message = operation.status === "completed"
+              ? `${server.machine_id}：远程操作完成`
+              : operation.status === "cancelled"
+                ? `${server.machine_id}：远程操作已中断`
+                : `${server.machine_id}：${operation.error || "远程操作失败"}`;
+            toast(message, operation.status === "completed" ? "ok" : operation.status === "cancelled" ? "" : "err");
+          }
+        } catch (error) {
+          operation = { status: "failed", error: error.message };
+        }
+      }
+      server.operation = operation;
+    }
+    state.remoteServers = servers;
+    return { servers, error: null, authorized: true };
+  } catch (error) {
+    state.remoteServers = [];
+    return { servers: [], error: error.message, authorized: true };
+  }
+}
+
+// 刷新服务器和槽位状态，同时合并 SSH 登记记录与 worker 心跳信息。
+async function refreshWorkers() {
+  if (state.refreshingWorkers) return;
+  state.refreshingWorkers = true;
+  try {
+    const d = await apiJson("/api/workers");
+    const grid = $("workerGrid");
+    const workers = d.workers || [];
+    state.workerSlots = workers;
+    renderRetryControls(state.detailRecord);
+    const remoteResult = await loadRemoteServers();
+    const groups = new Map();
+    for (const worker of workers) {
+      const machineId = worker.machine_id || worker.hostname || "未命名服务器";
+      if (!groups.has(machineId)) groups.set(machineId, []);
+      groups.get(machineId).push(worker);
+    }
+    const remoteById = new Map(remoteResult.servers.map((server) => [server.machine_id, server]));
+    for (const server of remoteResult.servers) if (!groups.has(server.machine_id)) groups.set(server.machine_id, []);
+    const servers = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b, "zh-CN"));
+    const cards = servers.map(([machineId, slots]) => workerServerCard(machineId, slots, remoteById.get(machineId))).join("");
+    const authorizationNote = !remoteResult.authorized
+      ? `<div class="empty">SSH 管理服务器需使用管理令牌查看。<button type="button" data-open-remote-modal>配置令牌并添加服务器</button></div>`
+      : remoteResult.error
+        ? `<div class="empty">远程服务器列表读取失败：${esc(remoteResult.error)}。请检查令牌后重新添加服务器。</div>` : "";
+    grid.innerHTML = cards + authorizationNote || `<div class="empty">尚未添加计算服务器。点击「添加服务器」，由平台通过 SSH 安装 worker 并检测 CPU / GPU 资源。</div>`;
+    const onlineSlots = workers.filter((worker) => worker.active).length;
+    const selectedSlots = workers.filter((worker) => worker.active && worker.enabled).length;
+    const pendingSlots = workers.filter((worker) => worker.managed && worker.active && !worker.enabled).length;
+    const selectedGpuSlots = workers.filter((worker) => worker.active && worker.enabled && worker.gpu && worker.gpu.available).length;
+    const onlineServers = new Set(workers.filter((worker) => worker.active).map((worker) => worker.machine_id || worker.hostname)).size;
+    $("workerSummary").innerHTML = [
+      `<span class="chip">在线服务器 ${onlineServers}</span>`,
+      `<span class="chip">在线计算槽 ${onlineSlots}</span>`,
+      `<span class="chip">已加入资源池 ${selectedSlots}</span>`,
+      `<span class="chip">待选择 ${pendingSlots}</span>`,
+      `<span class="chip">远程服务器 ${remoteResult.servers.length}</span>`,
+    ].join("");
+    $("gpuResourceHint").textContent = selectedGpuSlots
+      ? `当前有 ${selectedGpuSlots} 个已启用 GPU 槽可接单。`
+      : "当前没有已启用的 GPU 槽；要求 GPU 的任务会排队等待。可先添加服务器并启用 GPU 槽。";
+    $("queueDepth").textContent = `队列 ${d.queue_depth ?? 0}`;
+  } catch {
+    $("gpuResourceHint").textContent = "GPU 资源状态暂不可用，请检查连接后刷新。";
+  } finally {
+    state.refreshingWorkers = false;
+  }
+}
+
+// 按凭证认证组合显示秘密输入项，并只校验当前需要的字段。
+function updateRemoteSshCredentialFields(clearHidden = true) {
+  const method = $("remoteSshAuthMethod").value;
+  const useKey = method === "key" || method === "key_password";
+  const usePassword = method === "password" || method === "key_password";
+  $("remoteSshKeyFields").hidden = !useKey;
+  $("remoteSshPassphraseField").hidden = !useKey;
+  $("remoteSshPasswordField").hidden = !usePassword;
+  $("remoteSshPrivateKey").required = useKey;
+  $("remoteSshPassword").required = usePassword;
+  if (clearHidden) {
+    if (!usePassword) $("remoteSshPassword").value = "";
+    if (!useKey) {
+      $("remoteSshPrivateKey").value = "";
+      $("remoteSshPassphrase").value = "";
+    }
+  }
+}
+
+// 更新服务器凭证下拉框，保留选择并展示凭证公开元数据。
+function renderRemoteCredentialOptions() {
+  const select = $("remoteCredentialSelect");
+  const currentId = select.value;
+  const selectedId = state.remoteCredentials.some((item) => item.id === currentId)
+    ? currentId : state.remoteCredentialDefaultId;
+  const methodName = { password: "用户名 + 密码", key: "用户名 + 密钥", key_password: "用户名 + 密钥 + 密码" };
+  select.innerHTML = `<option value="">${state.remoteCredentials.length ? "选择 SSH 凭证" : "请先配置 SSH 凭证"}</option>`
+    + state.remoteCredentials.map((item) => `<option value="${esc(item.id)}">${esc(item.name)} · ${esc(item.username)} · ${esc(methodName[item.auth_method] || item.auth_method)}${item.is_default ? " · 默认" : ""}</option>`).join("");
+  select.value = selectedId || "";
+  select.disabled = state.remoteCredentials.length === 0;
+}
+
+// 绘制凭证目录操作项，不显示或缓存凭证明文。
+function renderRemoteCredentialList() {
+  const list = $("remoteSshCredentialList");
+  if (!state.remoteCredentials.length) {
+    list.innerHTML = `<div class="hint" style="margin-top:10px;">尚未配置 SSH 凭证。添加后可在服务器表单中选择。</div>`;
+    return;
+  }
+  const methodName = { password: "用户名 + 密码", key: "用户名 + 密钥", key_password: "密钥优先，密码回退" };
+  list.innerHTML = state.remoteCredentials.map((item) => `
+    <div class="ssh-credential-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid #e5ebf3;">
+      <div><strong>${esc(item.name)}</strong>${item.is_default ? ` <span class="hint">默认</span>` : ""}<div class="hint">${esc(item.username)} · ${esc(methodName[item.auth_method] || item.auth_method)}</div></div>
+      <div style="display:flex;gap:6px;flex-shrink:0;">
+        <button type="button" data-ssh-credential-action="edit" data-ssh-credential-id="${esc(item.id)}" ${state.remoteCredentialsCanConfigure ? "" : "disabled"}>编辑</button>
+        <button type="button" data-ssh-credential-action="delete" data-ssh-credential-id="${esc(item.id)}" ${state.remoteCredentialsCanConfigure ? "" : "disabled"}>删除</button>
+      </div>
+    </div>`).join("");
+}
+
+// 查询页面凭证目录；接口只返回名称、用户名、类型和默认状态。
+async function loadRemoteSshSettings() {
+  const status = $("remoteSshSettingsStatus");
+  status.textContent = "正在读取凭证目录…";
+  try {
+    const catalog = await apiJson("/api/remote-ssh-credentials");
+    state.remoteCredentials = catalog.credentials || [];
+    state.remoteCredentialDefaultId = catalog.default_credential_id || null;
+    state.remoteCredentialsCanConfigure = Boolean(catalog.can_configure);
+    renderRemoteCredentialOptions();
+    renderRemoteCredentialList();
+    status.textContent = `${state.remoteCredentials.length} 条凭证已加密保存在 MySQL；页面不会显示已保存的秘密。`;
+    if (!catalog.can_configure) status.textContent += " 保存需要启用 MySQL，并配置 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY。";
+  } catch (error) {
+    status.textContent = error.message;
+    state.remoteCredentials = [];
+    state.remoteCredentialDefaultId = null;
+    state.remoteCredentialsCanConfigure = false;
+    renderRemoteCredentialOptions();
+    renderRemoteCredentialList();
+  }
+}
+
+// 清空凭证编辑表单和临时秘密输入值。
+function resetRemoteSshCredentialForm() {
+  $("remoteSshCredentialForm").reset();
+  $("remoteSshCredentialId").value = "";
+  $("btnSaveRemoteSshSettings").textContent = "加密保存凭证";
+  $("btnCancelEditRemoteSshCredential").hidden = true;
+  updateRemoteSshCredentialFields();
+}
+
+// 保存或更新凭证；请求完成后清空浏览器中的秘密。
+async function saveRemoteSshSettings() {
+  const form = $("remoteSshCredentialForm");
+  updateRemoteSshCredentialFields(false);
+  if (!form.reportValidity()) {
+    toast("请填写凭证名称、用户名和当前认证方式要求的凭证内容", "err");
+    return;
+  }
+  const authMethod = $("remoteSshAuthMethod").value;
+  const payload = {
+    name: $("remoteSshCredentialName").value.trim(),
+    username: $("remoteSshCredentialUsername").value.trim(),
+    auth_method: authMethod,
+    make_default: $("remoteSshMakeDefault").checked,
+  };
+  if (authMethod === "key" || authMethod === "key_password") {
+    payload.private_key = $("remoteSshPrivateKey").value;
+    payload.passphrase = $("remoteSshPassphrase").value || null;
+  }
+  if (authMethod === "password" || authMethod === "key_password") payload.password = $("remoteSshPassword").value;
+  const credentialId = $("remoteSshCredentialId").value;
+  const button = $("btnSaveRemoteSshSettings");
+  button.disabled = true;
+  try {
+    await apiJson(credentialId ? `/api/remote-ssh-credentials/${encodeURIComponent(credentialId)}` : "/api/remote-ssh-credentials", {
+      method: credentialId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    resetRemoteSshCredentialForm();
+    toast("SSH 凭证已加密保存", "ok");
+    await loadRemoteSshSettings();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
+  }
+}
+
+// 把凭证元数据载入编辑表单，秘密字段要求重新填写。
+function editRemoteSshCredential(credentialId) {
+  const credential = state.remoteCredentials.find((item) => item.id === credentialId);
+  if (!credential) return;
+  $("remoteSshCredentialId").value = credential.id;
+  $("remoteSshCredentialName").value = credential.name;
+  $("remoteSshCredentialUsername").value = credential.username;
+  $("remoteSshAuthMethod").value = credential.auth_method;
+  $("remoteSshMakeDefault").checked = credential.is_default;
+  $("btnSaveRemoteSshSettings").textContent = "加密保存修改";
+  $("btnCancelEditRemoteSshCredential").hidden = false;
+  updateRemoteSshCredentialFields();
+  $("remoteSshSettings").open = true;
+  $("remoteSshPrivateKey").focus();
+}
+
+// 删除未被服务器使用的凭证，被引用时由服务端阻止删除。
+async function deleteRemoteSshCredential(credentialId) {
+  const credential = state.remoteCredentials.find((item) => item.id === credentialId);
+  if (!credential || !window.confirm(`确认删除 SSH 凭证“${credential.name}”？`)) return;
+  try {
+    await apiJson(`/api/remote-ssh-credentials/${encodeURIComponent(credentialId)}`, { method: "DELETE" });
+    toast("SSH 凭证已删除", "ok");
+    resetRemoteSshCredentialForm();
+    await loadRemoteSshSettings();
+  } catch (error) {
+    toast(error.message, "err");
+  }
+}
+
+// 打开远程服务器表单，并恢复会话内令牌。
+function openAddServerModal() {
+  const modal = $("addServerModal");
+  state.editingRemoteMachineId = null;
+  $("remoteServerForm").reset();
+  $("remoteMachineId").readOnly = false;
+  $("addServerTitle").textContent = "通过 SSH 添加服务器";
+  $("btnSubmitRemoteServer").textContent = "远程添加并检测资源";
+  $("clearRemoteRedisOverrideField").hidden = true;
+  $("clearRemoteRedisOverride").checked = false;
+  $("remoteRedisUrl").disabled = false;
+  $("remoteRedisUrl").placeholder = "留空时使用平台默认 Redis";
+  resetRemoteSshCredentialForm();
+  modal.hidden = false;
+  modal.classList.add("open");
+  loadRemoteSshSettings();
+  $("remoteMachineId").focus();
+}
+
+// 载入已登记服务器配置，并打开编辑表单；Redis URL 不回显明文。
+async function openEditRemoteServer(machineId) {
+  const server = state.remoteServers.find((item) => item.machine_id === machineId);
+  if (!server) return;
+  await loadRemoteSshSettings();
+  const modal = $("addServerModal");
+  $("remoteServerForm").reset();
+  state.editingRemoteMachineId = machineId;
+  $("remoteMachineId").value = server.machine_id;
+  $("remoteMachineId").readOnly = true;
+  $("remoteHost").value = server.host || "";
+  $("remoteCredentialSelect").value = server.ssh_credential_id || "";
+  $("remoteUsername").value = server.username_override !== undefined
+    ? (server.username_override || "") : (server.username || "");
+  $("remotePort").value = server.port || 22;
+  document.querySelector(`input[name="mode"][value="${server.mode === "cpu" ? "cpu" : "gpu"}"]`).checked = true;
+  $("remoteCpuSlots").value = server.cpu_slots ?? 2;
+  $("remoteCpuSlotsField").hidden = server.mode !== "cpu";
+  $("remoteWorkerImage").value = server.worker_image_override || "";
+  $("remoteRedisUrl").value = "";
+  $("remoteRedisUrl").placeholder = server.has_remote_redis_url_override
+    ? "已设置服务器专属值；留空保持不变"
+    : "留空时使用平台默认 Redis";
+  $("remoteRedisUrlHint").textContent = server.has_remote_redis_url_override
+    ? "服务器 Redis URL 已加密保存，不会回显；输入新值可替换。"
+    : "可使用 redis:// 或 rediss://；URL 中的密码会加密保存。";
+  $("clearRemoteRedisOverrideField").hidden = !server.has_remote_redis_url_override;
+  $("clearRemoteRedisOverride").checked = false;
+  $("remoteRedisUrl").disabled = false;
+  $("remoteS3Endpoint").value = server.remote_s3_endpoint_override || "";
+  $("addServerTitle").textContent = `编辑服务器 ${machineId}`;
+  $("btnSubmitRemoteServer").textContent = "保存服务器配置";
+  modal.hidden = false;
+  modal.classList.add("open");
+  $("remoteHost").focus();
+}
+
+// 关闭接入引导并把焦点交还给触发按钮。
+function closeAddServerModal() {
+  const modal = $("addServerModal");
+  modal.classList.remove("open");
+  modal.hidden = true;
+  state.editingRemoteMachineId = null;
+  $("remoteServerForm").reset();
+  $("remoteMachineId").readOnly = false;
+  resetRemoteSshCredentialForm();
+  $("btnAddServer").focus();
+}
+
+// 提交 SSH 服务器配置，后台接入完成后继续读取自动检测到的资源。
+async function submitRemoteServer(event) {
+  event.preventDefault();
+  const form = $("remoteServerForm");
+  const submit = $("btnSubmitRemoteServer");
+  const payload = Object.fromEntries(new FormData(form).entries());
+  payload.username = payload.username.trim() || null;
+  payload.port = Number(payload.port);
+  payload.cpu_slots = Number(payload.cpu_slots || 0);
+  payload.worker_image = payload.worker_image.trim() || null;
+  payload.remote_redis_url = String(payload.remote_redis_url || "").trim();
+  payload.remote_s3_endpoint = payload.remote_s3_endpoint.trim() || null;
+  payload.clear_remote_redis_url_override = $("clearRemoteRedisOverride").checked;
+  const editingMachineId = state.editingRemoteMachineId;
+  if (editingMachineId) delete payload.machine_id;
+  submit.disabled = true;
+  submit.textContent = "正在提交…";
+  try {
+    await apiJson(editingMachineId
+      ? `/api/remote-servers/${encodeURIComponent(editingMachineId)}`
+      : "/api/remote-servers", {
+      method: editingMachineId ? "PATCH" : "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    toast(editingMachineId
+      ? "服务器配置已保存；请点击服务器卡片上的“重新部署并应用配置”"
+      : "服务器已登记，平台正在通过 SSH 安装并检测资源", "ok");
+    closeAddServerModal();
+    await refreshWorkers();
+  } catch (error) {
+    toast(error.message, "err");
+  } finally {
+    submit.disabled = false;
+    submit.textContent = editingMachineId ? "保存服务器配置" : "远程添加并检测资源";
+  }
+}
+
+// 通过平台 SSH 启动、停止或重启服务器上的 worker 容器。
+async function manageRemoteServer(button) {
+  const machineId = button.dataset.remoteMachineId;
+  const action = button.dataset.remoteAction;
+  const actionText = { install: "重新部署", start: "启动", stop: "停止", restart: "重启" }[action];
+  if (action !== "start" && !window.confirm(`确认${actionText} ${machineId} 上的 worker？`)) return;
+  button.disabled = true;
+  try {
+    await apiJson(`/api/remote-servers/${encodeURIComponent(machineId)}/${action}`, { method: "POST" });
+    toast(`${machineId}：已提交${actionText}操作`, "ok");
+    await refreshWorkers();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
+  }
+}
+
+// 打开远程日志窗口，并从操作状态接口读取该服务器最近一次操作的输出。
+async function showRemoteServerLogs(button) {
+  const machineId = button.dataset.remoteServerLogs;
+  const server = state.remoteServers.find((item) => item.machine_id === machineId);
+  const modal = $("remoteLogModal");
+  const output = $("remoteLogOutput");
+  const status = $("remoteLogStatus");
+  stopRemoteLogPolling();
+  output.dataset.rawLog = "";
+  $("remoteLogTitle").textContent = `${machineId} · 执行日志`;
+  modal.hidden = false;
+  modal.classList.add("open");
+  renderRemoteLogLines(output, ["正在读取日志…"]);
+  status.textContent = "";
+  if (!server || !server.operation_id) {
+    state.remoteLogOperationId = null;
+    status.textContent = "该服务器还没有远程操作记录。";
+    renderRemoteLogLines(output, ["暂无执行日志"]);
+    return;
+  }
+  state.remoteLogOperationId = server.operation_id;
+  await refreshRemoteOperationLogs();
+}
+
+// 轮询当前远程操作日志，使运行阶段和命令输出在操作过程中可见。
+async function refreshRemoteOperationLogs() {
+  const operationId = state.remoteLogOperationId;
+  const modal = $("remoteLogModal");
+  if (!operationId || modal.hidden) return;
+  const output = $("remoteLogOutput");
+  const status = $("remoteLogStatus");
+  try {
+    const operation = await apiJson(`/api/remote-operations/${encodeURIComponent(operationId)}`);
+    state.remoteOperations.set(operation.operation_id, operation);
+    const fallbackLog = [operation.output, operation.stderr, operation.error]
+      .filter((part) => typeof part === "string" && part.trim()).join("\n");
+    const log = typeof operation.log === "string" && operation.log.trim()
+      ? operation.log : fallbackLog;
+    const stateText = {
+      queued: "操作排队中；开始执行后会显示阶段和日志。",
+      running: "操作执行中；日志会自动刷新。",
+      completed: "操作已完成。",
+      failed: "操作失败。",
+      cancelled: "操作已中断。",
+    }[operation.status] || `操作状态：${operation.status || "未知"}`;
+    const phaseAge = operation.phase_started_at
+      ? `，已持续 ${Math.max(0, Math.floor(Date.now() / 1000 - Number(operation.phase_started_at)))} 秒` : "";
+    const phaseText = operation.phase ? ` · 当前阶段：${operation.phase}${phaseAge}` : "";
+    status.textContent = `${operation.action || "远程操作"} · ${stateText}${phaseText}`;
+    const displayLog = log || (operation.status === "queued" || operation.status === "running"
+      ? "等待远程命令输出；若停留在某阶段，可根据该阶段判断检查位置。"
+      : "远程命令未返回输出");
+    const wasAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 48;
+    output.dataset.rawLog = displayLog;
+    renderRemoteLogLines(output, displayLog.split("\n"));
+    if (wasAtBottom) output.scrollTop = output.scrollHeight;
+    if (["queued", "running"].includes(operation.status)
+        && !modal.hidden && state.remoteLogOperationId === operationId) {
+      state.remoteLogPollTimer = setTimeout(refreshRemoteOperationLogs, 1500);
+    } else {
+      state.remoteLogPollTimer = null;
+    }
+  } catch (error) {
+    status.textContent = "读取执行日志失败。";
+    renderRemoteLogLines(output, [error.message]);
+    if (!modal.hidden) state.remoteLogPollTimer = setTimeout(refreshRemoteOperationLogs, 2000);
+  }
+}
+
+// 停止日志轮询，避免关闭窗口后继续请求远程操作状态。
+function stopRemoteLogPolling() {
+  if (state.remoteLogPollTimer !== null) clearTimeout(state.remoteLogPollTimer);
+  state.remoteLogPollTimer = null;
+}
+
+// 逐行创建日志文本和复制按钮，文本通过 textContent 写入避免执行远程输出内容。
+function renderRemoteLogLines(container, lines) {
+  container.replaceChildren();
+  lines.forEach((line, index) => {
+    const row = document.createElement("div");
+    row.className = "server-log-line";
+    const text = document.createElement("span");
+    text.className = "server-log-line-text";
+    text.textContent = line || " ";
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "server-log-line-copy";
+    copy.dataset.copyRemoteLogLine = String(index);
+    copy.textContent = "复制";
+    copy.setAttribute("aria-label", `复制第 ${index + 1} 行日志`);
+    row.append(text, copy);
+    container.appendChild(row);
+  });
+}
+
+// 复制日志行或全部日志，并兼容未授予 Clipboard API 权限的页面环境。
+async function copyRemoteLogText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (error) {
+    const fallback = document.createElement("textarea");
+    fallback.value = text;
+    fallback.style.position = "fixed";
+    fallback.style.opacity = "0";
+    document.body.appendChild(fallback);
+    fallback.select();
+    const copied = document.execCommand("copy");
+    fallback.remove();
+    if (!copied) throw error;
+  }
+  toast("日志已复制", "ok");
+}
+
+// 关闭远程日志窗口。
+function closeRemoteLogModal() {
+  const modal = $("remoteLogModal");
+  stopRemoteLogPolling();
+  state.remoteLogOperationId = null;
+  modal.classList.remove("open");
+  modal.hidden = true;
+}
+
+// 中断当前 SSH 操作；远端已经产生的部分变更不会自动回滚。
+async function cancelRemoteOperation(button) {
+  const operationId = button.dataset.cancelRemoteOperation;
+  if (!window.confirm("确认中断这项远程操作？Linux 上已经完成的部分变更不会自动回滚。")) return;
+  button.disabled = true;
+  button.textContent = "正在中断…";
+  try {
+    const result = await apiJson(`/api/remote-operations/${encodeURIComponent(operationId)}/cancel`, { method: "POST" });
+    const operation = state.remoteOperations.get(operationId) || { operation_id: operationId };
+    if (result.status === "cancelled") operation.status = "cancelled";
+    operation.cancel_requested = result.status === "cancelling";
+    state.remoteOperations.set(operationId, operation);
+    toast(result.status === "cancelled" ? "远程操作已中断" : "已发送中断请求，正在停止 SSH 操作", "ok");
+    await refreshWorkers();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
+    button.textContent = "中断操作";
+  }
+}
+
+// 修改一个外接槽位是否接收新任务，并立即刷新状态。
+async function toggleWorkerSelection(button) {
+  const workerId = button.dataset.workerId;
+  const enabled = button.dataset.workerEnabled !== "true";
+  button.disabled = true;
+  try {
+    const result = await apiJson(`/api/workers/${encodeURIComponent(workerId)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    toast(result.message, "ok");
+    await refreshWorkers();
+  } catch (error) {
+    toast(error.message, "err");
+    button.disabled = false;
+  }
+}
+
+// 绑定远程接入、资源池开关、生命周期操作和键盘关闭行为。
+$("btnAddServer").onclick = openAddServerModal;
+$("btnCloseAddServer").onclick = closeAddServerModal;
+$("btnCancelAddServer").onclick = closeAddServerModal;
+$("btnRefreshWorkers").onclick = refreshWorkers;
+$("remoteServerForm").addEventListener("submit", submitRemoteServer);
+$("remoteSshCredentialForm").addEventListener("submit", (event) => { event.preventDefault(); saveRemoteSshSettings(); });
+$("clearRemoteRedisOverride").addEventListener("change", () => {
+  $("remoteRedisUrl").disabled = $("clearRemoteRedisOverride").checked;
+});
+$("remoteSshAuthMethod").addEventListener("change", () => updateRemoteSshCredentialFields());
+$("btnCancelEditRemoteSshCredential").onclick = resetRemoteSshCredentialForm;
+$("remoteSshCredentialList").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-ssh-credential-action]");
+  if (!button || button.disabled) return;
+  const credentialId = button.dataset.sshCredentialId;
+  if (button.dataset.sshCredentialAction === "edit") editRemoteSshCredential(credentialId);
+  if (button.dataset.sshCredentialAction === "delete") deleteRemoteSshCredential(credentialId);
+});
+updateRemoteSshCredentialFields(false);
+["remoteSshPassphrase", "remoteSshPassword"].forEach((id) => {
+  $(id).addEventListener("keydown", (event) => {
+    if (event.key === "Enter") event.preventDefault();
+  });
+});
+document.querySelectorAll("input[name='mode']").forEach((input) => {
+  input.addEventListener("change", () => { $("remoteCpuSlotsField").hidden = input.value !== "cpu" || !input.checked; });
+});
+$("workerGrid").addEventListener("click", (event) => {
+  const logsButton = event.target.closest("[data-remote-server-logs]");
+  if (logsButton) {
+    showRemoteServerLogs(logsButton);
+    return;
+  }
+  const editRemoteButton = event.target.closest("[data-edit-remote-machine-id]");
+  if (editRemoteButton && !editRemoteButton.disabled) {
+    openEditRemoteServer(editRemoteButton.dataset.editRemoteMachineId);
+    return;
+  }
+  const cancelRemoteButton = event.target.closest("[data-cancel-remote-operation]");
+  if (cancelRemoteButton && !cancelRemoteButton.disabled) {
+    cancelRemoteOperation(cancelRemoteButton);
+    return;
+  }
+  const button = event.target.closest("[data-worker-id]");
+  if (button && !button.disabled) toggleWorkerSelection(button);
+  const remoteButton = event.target.closest("[data-remote-machine-id]");
+  if (remoteButton && !remoteButton.disabled) manageRemoteServer(remoteButton);
+  if (event.target.closest("[data-open-remote-modal]")) openAddServerModal();
+});
+$("addServerModal").addEventListener("click", (event) => {
+  if (event.target === $("addServerModal")) closeAddServerModal();
+});
+$("btnCloseRemoteLog").onclick = closeRemoteLogModal;
+$("btnCopyRemoteLog").onclick = () => copyRemoteLogText($("remoteLogOutput").dataset.rawLog || "");
+$("remoteLogOutput").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-copy-remote-log-line]");
+  if (!button) return;
+  const line = $("remoteLogOutput").querySelectorAll(".server-log-line-text")[Number(button.dataset.copyRemoteLogLine)];
+  if (line) copyRemoteLogText(line.textContent === " " ? "" : line.textContent);
+});
+$("remoteLogModal").addEventListener("click", (event) => {
+  if (event.target === $("remoteLogModal")) closeRemoteLogModal();
+});
+document.querySelectorAll("[data-worker-mode]").forEach((button) => {
+  button.onclick = () => {
+    document.querySelectorAll("[data-worker-mode]").forEach((item) => item.classList.toggle("active", item === button));
+    $("workerAddCommand").textContent = button.dataset.workerMode === "cpu"
+      ? "WORKER_COMPOSE_FILE=docker-compose.cpu.yml ./scripts/worker-node.sh add"
+      : "./scripts/worker-node.sh add";
+  };
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && $("addServerModal").classList.contains("open")) closeAddServerModal();
+  if (event.key === "Escape" && $("remoteLogModal").classList.contains("open")) closeRemoteLogModal();
+});
 
 /* ---------- Tab 切换 ---------- */
 document.querySelectorAll(".tabs button").forEach((b) => {
@@ -630,9 +2157,11 @@ $("btnDownload").onclick = () => { if (state.jobId) location.href = `/api/jobs/$
 
 /* ---------- 启动 ---------- */
 (async function init() {
+  updateTaskFields();
   loadSystem();
   setInterval(loadSystem, 15000);
-  loadSamples();
+  refreshWorkers();
+  setInterval(refreshWorkers, 2000);
   try { await loadDatasets(); } catch (e) { toast("加载数据集失败: " + e.message, "err"); }
   await refreshJobs();
   setInterval(refreshJobs, 1500);

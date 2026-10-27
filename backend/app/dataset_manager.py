@@ -108,7 +108,8 @@ class DatasetManager:
             "rows": len(df),
             "columns": list(df.columns),
             "column_types": {col: str(dtype) for col, dtype in df.dtypes.items()},
-            "memory_usage": df.memory_usage(deep=True).sum(),
+            # Pandas 返回 numpy 整数，保存 JSON 前转换为原生 int。
+            "memory_usage": int(df.memory_usage(deep=True).sum()),
             "created_at": time.time(),
             "file_size": file_size,
             "status": "validated"
@@ -133,10 +134,15 @@ class DatasetManager:
         # 生成数据集ID
         ds_id = f"ds-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         
-        # 更新元数据
+        # 统一补齐数据规模、字段和类型，保证不同导入方式返回相同的数据集摘要。
         metadata.update({
             "id": ds_id,
             "name": metadata.get("original_filename", f"dataset_{ds_id}"),
+            "rows": int(len(df)),
+            "columns": [str(column) for column in df.columns],
+            "column_types": {
+                str(column): str(dtype) for column, dtype in df.dtypes.items()
+            },
             "description": description,
             "tags": tags or [],
             "status": "active",

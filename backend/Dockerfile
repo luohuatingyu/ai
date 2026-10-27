@@ -14,6 +14,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# API 通过 OpenSSH 客户端远程执行已打包的 worker 引导脚本。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 # BuildKit 缓存挂载：网络中断重试时保留已下载的 wheel，不必从头装
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -22,6 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY app ./app
 COPY static ./static
 COPY sample_data ./sample_data
+COPY Dockerfile ./Dockerfile
 
 # 启动与数据库初始化脚本
 COPY init_db.sh start.sh ./

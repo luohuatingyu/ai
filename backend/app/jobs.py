@@ -1,369 +1,424 @@
-"""训练任务管理：线程池执行、状态机、日志/指标文件、磁盘持久化。
+"""训练任务管理（状态平面版）。
 
-数据全部落在 ./data/jobs/<job_id>/ 下：
-- job.json       任务元信息+状态（每次变更原子覆盖写）
-- log.txt        追加式日志
-- metrics.jsonl  逐 epoch 指标
-- best.pt/last.pt/preprocessor.json/summary.json 由训练器产出
+职责分离后的 JobManager 是控制平面的"任务登记处"，只做四件事：
+1. 任务创建：写 job.json（状态平面的权威记录）→ 入队 → 尽力镜像数据库；
+2. 任务控制：cancel/pause/resume 通过协调平面信号与状态流转表达；
+3. 任务查询：全部从状态平面读取（API/UI 与 Worker 看到同一份数据）；
+4. Watchdog：周期巡检——心跳迷失的 running 任务自动重派（不消耗重试额度）；
+   排队任务不在队列中时补投（防丢失）。
 
-同时支持MySQL数据库存储：
-- 数据集信息存储在datasets表
-- 任务信息存储在training_jobs表
-- 任务日志存储在job_logs表
+训练执行本身不在本模块：由 Worker（独立进程或嵌入式线程）领取；
+"文件优先、DB 可选镜像"哲学保留——job.json 是唯一权威，数据库只做镜像。
 """
 from __future__ import annotations
 
-import json
-import shutil
 import threading
 import time
-import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional
 
 import app.config as config
-from app.db_utils import (
-    save_job_to_db,
-    update_job_status,
-    get_job_from_db,
-    get_all_jobs_from_db,
-    add_job_log,
-    get_job_logs,
+from app import jobstore
+from app.coordination import build_coordination
+from app.jobstore import (
+    CANCELLED,
+    COMPLETED,
+    FAILED,
+    PAUSED,
+    QUEUED,
+    RUNNING,
 )
+from app.storage import ArtifactStore, get_store, job_key
+from app.worker import TrainingWorker, detect_capabilities
 
-QUEUED = "queued"
-RUNNING = "running"
-COMPLETED = "completed"
-FAILED = "failed"
-CANCELLED = "cancelled"
-Terminal = {COMPLETED, FAILED, CANCELLED}
+TERMINAL = {COMPLETED, FAILED, CANCELLED}
 
-
-def _now() -> float:
-    return time.time()
+_LEGACY_DELETABLE = {QUEUED, PAUSED, FAILED, CANCELLED, COMPLETED}
 
 
-def _persist(job: "Job") -> None:
-    path = job.dir / "job.json"
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps(
-            {
-                "id": job.id,
-                "spec": job.spec,
-                "status": job.status,
-                "created_at": job.created_at,
-                "started_at": job.started_at,
-                "finished_at": job.finished_at,
-                "error": job.error,
-                "device": job.device,
-                "summary": job.summary,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    tmp.replace(path)
-
-
-def _append_log(job: "Job", msg: str) -> None:
-    try:
-        stamp = time.strftime("%H:%M:%S")
-        with job.log_path.open("a", encoding="utf-8") as f:
-            f.write(f"[{stamp}] {msg}\n")
-    except OSError:
-        pass
-
-
-def _resolve_dataset_csv(ds_id: str) -> Path:
-    """查找数据集 CSV 文件路径，兼容新旧两种存储布局。
-
-    布局一（旧扁平格式）：{DATA_DIR}/datasets/{ds_id}.csv
-    布局二（新结构）：{DATA_DIR}/datasets/processed/{ds_id}.csv（优先）
-                     或 raw/、数据集目录副本
-    找不到时返回旧扁平格式路径（由训练器抛出明确的文件不存在错误）。
-    """
-    candidates = [
-        config.DATASETS_DIR / f"{ds_id}.csv",               # 旧扁平格式
-        config.DATASETS_DIR / "processed" / f"{ds_id}.csv", # 新结构：processed 目录
-        config.DATASETS_DIR / "raw" / f"{ds_id}.csv",       # 新结构：raw 目录
-        config.DATASETS_DIR / ds_id / f"{ds_id}.csv",       # 新结构：数据集目录副本
-    ]
-    for path in candidates:
-        if path.exists():
-            return path
-    return candidates[0]
-
-
-def read_metrics(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    out: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-    return out
-
-
-class Job:
-    def __init__(self, spec: dict):
-        self.id = f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        self.spec: dict = spec
-        self.status: str = QUEUED
-        self.created_at: float = _now()
-        self.started_at: float | None = None
-        self.finished_at: float | None = None
-        self.error: str | None = None
-        self.device: str | None = None
-        self.summary: dict | None = None
-        self.cancel_event = threading.Event()
-
-    @property
-    def dir(self) -> Path:
-        return config.JOBS_DIR / self.id
-
-    @property
-    def log_path(self) -> Path:
-        return self.dir / "log.txt"
-
-    @property
-    def metrics_path(self) -> Path:
-        return self.dir / "metrics.jsonl"
-
-    def api_view(self, include_metrics: bool = False, include_summary: bool = False) -> dict:
-        data = {
-            "id": self.id,
-            "status": self.status,
-            "created_at": self.created_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "error": self.error,
-            "device": self.device,
-            "spec": self.spec,
-        }
-        if include_summary:
-            data["summary"] = self.summary
-        if include_metrics:
-            data["metrics"] = read_metrics(self.metrics_path)
-        return data
+def api_view(
+    record: dict,
+    include_metrics: bool = False,
+    include_summary: bool = False,
+    store: Optional[ArtifactStore] = None,
+) -> dict:
+    """任务记录的 API 视图（与旧 Job.api_view 兼容，并补充多卡相关字段）。"""
+    data = {
+        "id": record.get("id"),
+        "status": record.get("status"),
+        "created_at": record.get("created_at"),
+        "started_at": record.get("started_at"),
+        "finished_at": record.get("finished_at"),
+        "error": record.get("error"),
+        "device": record.get("device"),
+        "machine_id": record.get("machine_id"),
+        "slot": record.get("slot"),
+        "current_attempt": record.get("current_attempt"),
+        "spec": record.get("spec") or {},
+        "resource_hint": (record.get("spec") or {}).get("resource_hint") or {},
+        "worker_id": record.get("worker_id"),
+        "retry_worker_id": record.get("retry_worker_id"),
+        "retry_assignment_mode": record.get("retry_assignment_mode") or "auto",
+        "manual_retry_count": record.get("manual_retry_count") or 0,
+        "retry_count": record.get("retry_count") or 0,
+        "last_error": record.get("last_error"),
+        "redispatched": record.get("redispatched") or 0,
+        "segments": record.get("segments") or [],
+    }
+    if include_summary:
+        data["summary"] = record.get("summary")
+    if include_metrics:
+        store = store or get_store()
+        data["metrics"] = jobstore.read_metrics(store, record.get("id") or "")
+    return data
 
 
 class JobManager:
-    def __init__(self) -> None:
-        self._jobs: dict[str, Job] = {}
-        self._lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="train")
-        self._load_existing()
+    """控制平面任务登记处（含嵌入式 worker 线程与 watchdog 的宿主）。
+
+    分布式模式（REDIS_URL 配置时）：只做登记/控制/watchdog，训练由独立
+    worker 进程（一卡一进程）领取；
+    嵌入式模式（无 Redis，单机零依赖）：额外启动 EMBEDDED_WORKERS 个
+    TrainingWorker 线程，API 进程内直接消费队列。
+    """
+
+    def __init__(
+        self,
+        store: Optional[ArtifactStore] = None,
+        queue=None,
+        lease=None,
+        start_workers: Optional[bool] = None,
+        start_watchdog: bool = True,
+    ) -> None:
+        self.store = store or get_store()
+        if queue is None or lease is None:
+            built_queue, built_lease, distributed = build_coordination()
+            self.queue = queue if queue is not None else built_queue
+            self.lease = lease if lease is not None else built_lease
+            self.distributed = distributed
+        else:
+            self.queue = queue
+            self.lease = lease
+            self.distributed = config.REDIS_URL != ""
         self._db_available = config.DB_AVAILABLE
+        self._stop = threading.Event()
+        self._workers: List[TrainingWorker] = []
+        self._threads: List[threading.Thread] = []
+        self._recover_on_restart()
+        self._start_watchdog = start_watchdog
+        self._watchdog_thread: Optional[threading.Thread] = None
+        if start_watchdog:
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, name="job-watchdog", daemon=True
+            )
+            self._watchdog_thread.start()
+        # 嵌入式模式：API 进程内直接起 worker 线程消费队列（单机零依赖）
+        if start_workers is None:
+            start_workers = not self.distributed
+        if start_workers:
+            self._start_embedded_workers()
 
     # ------------------------------------------------------------------
     # 对外 API
     # ------------------------------------------------------------------
 
-    def submit(self, spec: dict) -> Job:
-        job = Job(spec)
-        job.dir.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            self._jobs[job.id] = job
-        
-        # 保存到数据库
-        if self._db_available:
-            try:
-                from app.database import SessionLocal
-                with SessionLocal() as db:
-                    save_job_to_db(
-                        db=db,
-                        job_id=job.id,
-                        dataset_id=spec["dataset_id"],
-                        dataset_name=spec.get("dataset_name", spec["dataset_id"]),
-                        target=spec["target"],
-                        task=spec["task"],
-                        params=spec["params"],
-                    )
-            except Exception as e:
-                _append_log(job, f"数据库保存失败: {e}")
-        
-        _persist(job)
-        self._executor.submit(self._run, job)
-        return job
+    def submit(self, spec: dict) -> dict:
+        """创建任务：写权威 job.json → 入队 → 尽力镜像数据库。"""
+        for required in ("dataset_id", "task"):
+            if not spec.get(required):
+                raise ValueError(f"缺少必填字段: {required}")
+        if spec.get("task") not in {
+            "clustering", "llm_pretraining", "llm_sft", "llm_dpo", "llm_ppo"
+        } and not spec.get("target"):
+            raise ValueError("缺少必填字段: target")
+        job_id = f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        spec = dict(spec)
+        spec["target"] = spec.get("target") or ""
+        spec.setdefault("dataset_name", spec["dataset_id"])
+        spec.setdefault("resource_hint", {})  # resource_hint: {require_gpu, min_vram_mb}
+        record = {
+            "id": job_id,
+            "spec": spec,
+            "status": QUEUED,
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+            "device": None,
+            "summary": None,
+            "segments": [],
+            "worker_id": None,
+            "machine_id": None,
+            "slot": None,
+            "current_attempt": None,
+            "retry_worker_id": None,
+            "retry_assignment_mode": "auto",
+            "retry_count": 0,
+            "manual_retry_count": 0,
+            "last_error": None,
+            "redispatched": 0,
+        }
+        jobstore.write_job(self.store, record)
+        self.queue.push(job_id)
+        jobstore.append_job_log(self.store, job_id, "任务创建，已进入队列")
+        self._mirror_create(spec, job_id)
+        return record
 
-    def get(self, job_id: str) -> Job | None:
-        return self._jobs.get(job_id)
+    def get(self, job_id: str) -> Optional[dict]:
+        """读取任务记录（权威源 job.json）。"""
+        return jobstore.read_job(self.store, job_id)
 
-    def list(self) -> list[Job]:
-        # 优先从内存获取，如果数据库可用则合并数据库中的任务
-        jobs = list(self._jobs.values())
-        
-        if self._db_available:
-            try:
-                from app.database import SessionLocal
-                with SessionLocal() as db:
-                    db_jobs = get_all_jobs_from_db(db)
-                    # 将数据库中的任务添加到内存中（如果不存在）
-                    for db_job in db_jobs:
-                        if db_job.id not in self._jobs:
-                            # TrainingJob 模型没有 spec 字段，从拆分字段重建
-                            spec = {
-                                "dataset_id": db_job.dataset_id,
-                                "dataset_name": db_job.dataset_name,
-                                "target": db_job.target,
-                                "task": db_job.task,
-                                "params": db_job.params or {},
-                            }
-                            job = Job(spec)
-                            job.id = db_job.id
-                            job.status = db_job.status
-                            job.created_at = db_job.created_at.timestamp() if db_job.created_at else _now()
-                            job.started_at = db_job.started_at.timestamp() if db_job.started_at else None
-                            job.finished_at = db_job.finished_at.timestamp() if db_job.finished_at else None
-                            job.error = db_job.error
-                            job.device = db_job.device
-                            job.summary = db_job.summary
-                            jobs.append(job)
-            except Exception as e:
-                # 如果数据库操作失败，只返回内存中的任务
-                pass
-        
-        return sorted(jobs, key=lambda j: j.created_at, reverse=True)
+    def list(self) -> List[dict]:
+        """列出全部任务（按创建时间倒序）。"""
+        records: List[dict] = []
+        for job_id in jobstore.list_job_ids(self.store):
+            record = jobstore.read_job(self.store, job_id)
+            if record is not None:
+                records.append(record)
+        records.sort(key=lambda r: float(r.get("created_at") or 0), reverse=True)
+        return records
 
-    def cancel(self, job_id: str) -> Job:
-        job = self._jobs.get(job_id)
-        if not job:
+    def cancel(self, job_id: str) -> dict:
+        """取消任务：running 走协调平面信号（存档并停止），排队/暂停直接标记。"""
+        record = self.get(job_id)
+        if record is None:
             raise KeyError(job_id)
-        if job.status in Terminal:
+        status = record.get("status")
+        if status in TERMINAL:
             raise ValueError("任务已结束，无需取消")
-        job.cancel_event.set()
-        _append_log(job, "收到取消请求，将在当前批次结束后停止…")
-        return job
+        if status == RUNNING:
+            # 抢占式取消信号：控制线程逐 epoch/批次读取，保存断点后停止
+            self.lease.set_signal(job_id, "cancel")
+            jobstore.append_job_log(self.store, job_id, "收到取消请求，将在当前批次结束后停止…")
+            return jobstore.update_job(self.store, job_id)
+        # queued/paused：直接终态（排队条目会被 worker 按状态丢弃）
+        updated = jobstore.update_job(self.store, job_id, status=CANCELLED,
+                                      finished_at=time.time())
+        jobstore.append_job_log(self.store, job_id, "任务已取消（未开始训练）")
+        return updated
+
+    def pause(self, job_id: str) -> dict:
+        """暂停任务：running 发信号（checkpoint 后转 paused）；queued 直接转。"""
+        record = self.get(job_id)
+        if record is None:
+            raise KeyError(job_id)
+        status = record.get("status")
+        if status not in (RUNNING, QUEUED):
+            raise ValueError("仅排队中或训练中的任务可暂停")
+        if status == RUNNING:
+            self.lease.set_signal(job_id, "pause")
+            jobstore.append_job_log(self.store, job_id, "收到暂停请求，正在保存断点…")
+            return jobstore.update_job(self.store, job_id)
+        updated = jobstore.update_job(self.store, job_id, status=PAUSED)
+        jobstore.append_job_log(self.store, job_id, "排队任务已暂停")
+        return updated
+
+    def resume(self, job_id: str) -> dict:
+        """恢复暂停的任务：回到队列，任意可用卡/机器从 checkpoint 接续。"""
+        record = self.get(job_id)
+        if record is None:
+            raise KeyError(job_id)
+        if record.get("status") != PAUSED:
+            raise ValueError("仅暂停中的任务可恢复")
+        updated = jobstore.update_job(self.store, job_id, status=QUEUED)
+        self.queue.push(job_id)
+        jobstore.append_job_log(
+            self.store, job_id,
+            "任务恢复：重新排队，任意可用卡/机器将从最近 checkpoint 接续训练",
+        )
+        return updated
+
+    def retry(self, job_id: str, worker_id: Optional[str] = None) -> dict:
+        """重试失败任务；可将下一次执行固定到一个 worker 或交回自动调度。"""
+        token = f"manual-retry:{uuid.uuid4().hex}"
+        if not self.lease.acquire(
+            job_id, token, max(float(config.WORKER_LEASE_TTL), 10.0)
+        ):
+            raise RuntimeError("任务租约仍有效，或另一个重试请求正在处理")
+        try:
+            record = self.get(job_id)
+            if record is None:
+                raise KeyError(job_id)
+            if record.get("status") != FAILED:
+                raise ValueError("仅失败任务可重新排队")
+
+            previous_error = record.get("error") or record.get("last_error")
+            assignment_mode = "worker" if worker_id else "auto"
+            updated = jobstore.update_job(
+                self.store,
+                job_id,
+                status=QUEUED,
+                error=None,
+                finished_at=None,
+                current_attempt=None,
+                retry_count=0,
+                manual_retry_count=int(record.get("manual_retry_count") or 0) + 1,
+                last_error=previous_error,
+                retry_worker_id=worker_id,
+                retry_assignment_mode=assignment_mode,
+                retry_requested_at=time.time(),
+            )
+            jobstore.append_job_log(
+                self.store,
+                job_id,
+                "手动重试：" + (
+                    f"指定计算槽 {worker_id}"
+                    if worker_id
+                    else "使用自动资源分配"
+                ) + "；自动重试额度已重新计数",
+            )
+            self.queue.push(job_id)
+            return updated
+        finally:
+            self.lease.release(job_id, token)
 
     def delete(self, job_id: str) -> None:
-        job = self._jobs.get(job_id)
-        if job and job.status in (QUEUED, RUNNING):
+        """删除任务及其全部产物（终态或暂停/排队任务；running 需先取消）。"""
+        record = self.get(job_id)
+        if record is None:
+            raise KeyError(job_id)
+        if record.get("status") == RUNNING:
             raise ValueError("请先取消运行中的任务再删除")
-        with self._lock:
-            self._jobs.pop(job_id, None)
-        shutil.rmtree(config.JOBS_DIR / job_id, ignore_errors=True)
+        jobstore.delete_job_artifacts(self.store, job_id)
+        self._mirror_delete(job_id)
+
+    def stop(self) -> None:
+        """停掉 watchdog 与嵌入式 worker（测试/优雅退出用）。"""
+        self._stop.set()
+        for worker in self._workers:
+            worker.request_shutdown(pause_current=False)
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=5)
 
     # ------------------------------------------------------------------
-    # 内部
+    # 内部：重启恢复 / 数据库镜像 / watchdog / 嵌入式 worker
     # ------------------------------------------------------------------
 
-    def _load_existing(self) -> None:
-        """重启后从磁盘恢复任务历史；中断的任务标记为 failed。"""
-        for job_dir in sorted(config.JOBS_DIR.glob("job-*")):
-            path = job_dir / "job.json"
-            if not path.exists():
+    def _recover_on_restart(self) -> None:
+        """重启恢复；中断态处理：
+        - running：watchdog 之后按租约状态自动重派（不在此处臆断失败）；
+        - queued：后续 watchdog 检测缺失队列条目时补投；
+        - paused/completed/failed/cancelled：保持原状。
+        """
+        for job_id in jobstore.list_job_ids(self.store):
+            record = jobstore.read_job(self.store, job_id)
+            if record is None:
                 continue
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            job = Job(raw.get("spec", {}))
-            job.id = raw.get("id", job.id)
-            job.status = raw.get("status", FAILED)
-            job.created_at = raw.get("created_at", _now())
-            job.started_at = raw.get("started_at")
-            job.finished_at = raw.get("finished_at")
-            job.error = raw.get("error")
-            job.device = raw.get("device")
-            job.summary = raw.get("summary")
-            if job.status in (QUEUED, RUNNING):
-                job.status = FAILED
-                job.error = "服务重启，任务中断"
-                if not job.finished_at:
-                    job.finished_at = _now()
-                _append_log(job, "服务重启，任务标记为失败")
-                _persist(job)
-            self._jobs[job.id] = job
+            if record.get("status") == FAILED and record.get("error") == "服务重启，任务中断":
+                # 兼容旧逻辑留下的状态：重新排队（有 checkpoint 则续训）
+                jobstore.update_job(self.store, job_id, status=QUEUED, error=None)
 
-    def _run(self, job: Job) -> None:
-        job.status = RUNNING
-        job.started_at = _now()
-        _append_log(job, "任务开始")
-        
-        # 更新数据库中的任务状态
-        if self._db_available:
-            try:
-                from app.database import SessionLocal
-                with SessionLocal() as db:
-                    update_job_status(db, job.id, "running")
-            except Exception as e:
-                _append_log(job, f"数据库状态更新失败: {e}")
-        
-        _persist(job)
-
-        spec = job.spec
+    def _mirror_create(self, spec: dict, job_id: str) -> None:
+        """任务创建时的数据库镜像（失败静默，不影响文件权威源）。"""
+        if not self._db_available:
+            return
         try:
-            from app.trainer import JobCancelled, run_training
+            from app.database import SessionLocal
+            from app.db_utils import save_job_to_db
 
-            summary = run_training(
-                dataset_path=_resolve_dataset_csv(spec["dataset_id"]),
-                target=spec["target"],
-                task=spec["task"],
-                params=spec["params"],
-                cancel_event=job.cancel_event,
-                log_fn=lambda msg: _append_log(job, msg),
-                job_dir=job.dir,
+            with SessionLocal() as db:
+                save_job_to_db(
+                    db=db,
+                    job_id=job_id,
+                    dataset_id=spec["dataset_id"],
+                    dataset_name=spec.get("dataset_name", spec["dataset_id"]),
+                    target=spec["target"],
+                    task=spec["task"],
+                    params=spec.get("params") or {},
+                )
+        except Exception as exc:
+            jobstore.append_job_log(self.store, job_id, f"数据库保存失败: {exc}")
+
+    def _mirror_delete(self, job_id: str) -> None:
+        """删除任务时的数据库镜像清理（失败静默；DB 表是镜像，可重建）。
+
+        先删子表 job_logs（外键引用 training_jobs），再删父表任务行，
+        否则会触发 FK 约束失败导致镜像残留。
+        """
+        if not self._db_available:
+            return
+        try:
+            from app.database import SessionLocal
+            from app.db_utils import get_job_from_db
+            from app.models import JobLog
+
+            with SessionLocal() as db:
+                row = get_job_from_db(db, job_id)
+                if row is not None:
+                    db.query(JobLog).filter(JobLog.job_id == job_id).delete()
+                    db.delete(row)
+                    db.commit()
+        except Exception:
+            pass
+
+    def _watchdog_loop(self) -> None:
+        """watchdog 主循环：周期巡检 running 租约与排队条目防丢失。"""
+        interval = max(float(config.WATCHDOG_INTERVAL), 1.0)
+        while not self._stop.wait(interval):
+            try:
+                self._watchdog_once()
+            except Exception:
+                # watchdog 自身异常不得中断巡检循环
+                pass
+
+    def _watchdog_once(self) -> None:
+        """一轮巡检：
+        - running 且租约不存在（执行槽崩溃/心跳迷失）→ 重新排队（不消耗重试额度）；
+        - queued 但不在队列里 → 补投（防丢失；重复入队由领取方按状态跳过）；
+        - 清理崩溃残留的 worker 注册条目（心跳长期未更新的幽灵槽）。
+        """
+        try:
+            self.lease.cleanup_stale_workers(config.WORKER_STALE_CLEANUP_AGE)
+        except Exception:
+            pass  # 清理失败不影响本轮巡检主逻辑
+        try:
+            inflight = set(self.queue.snapshot())
+        except Exception:
+            inflight = None  # 队列观测失败时跳过补投，只做重派
+        for job_id in jobstore.list_job_ids(self.store):
+            record = jobstore.read_job(self.store, job_id)
+            if record is None:
+                continue
+            status = record.get("status")
+            if status == RUNNING and self.lease.peek_holder(job_id) is None:
+                redispatched = int(record.get("redispatched") or 0) + 1
+                jobstore.finish_current_attempt(
+                    self.store,
+                    job_id,
+                    attempt_status="interrupted",
+                    error="执行槽心跳丢失，任务由 watchdog 重新派发",
+                    status=QUEUED,
+                    worker_id=None,
+                    machine_id=None,
+                    slot=None,
+                    retry_worker_id=None,
+                    retry_assignment_mode="auto",
+                    redispatched=redispatched,
+                )
+                jobstore.append_job_log(
+                    self.store, job_id,
+                    "watchdog: 执行槽心跳丢失（租约已过期），任务重新排队"
+                    "——进度由 checkpoint 保留，任意可用卡可接手",
+                )
+                self.queue.push(job_id)
+            elif status == QUEUED and inflight is not None and job_id not in inflight:
+                self.queue.push(job_id)
+
+    def _start_embedded_workers(self) -> None:
+        """嵌入式模式：在 API 进程内启动 N 个 worker 线程消费队列。"""
+        count = max(int(config.EMBEDDED_WORKERS), 1)
+        for i in range(count):
+            caps = detect_capabilities(f"embedded-{i}")
+            worker = TrainingWorker(
+                store=self.store, queue=self.queue, lease_store=self.lease,
+                capabilities=caps,
+                # 嵌入式线程同进程，无需过于频繁的心跳
+                idle_poll=1.0,
+                gpu_probe_enabled=False,
             )
-            
-            # 更新任务状态和摘要
-            job.device = summary.get("device")
-            job.summary = summary
-            job.status = COMPLETED
-            
-            # 更新数据库
-            if self._db_available:
-                try:
-                    from app.database import SessionLocal
-                    with SessionLocal() as db:
-                        update_job_status(
-                            db, 
-                            job.id, 
-                            "completed", 
-                            device=job.device,
-                            summary=job.summary
-                        )
-                except Exception as e:
-                    _append_log(job, f"数据库状态更新失败: {e}")
-        except JobCancelled:
-            job.status = CANCELLED
-            _append_log(job, "任务已取消")
-            
-            # 更新数据库
-            if self._db_available:
-                try:
-                    from app.database import SessionLocal
-                    with SessionLocal() as db:
-                        update_job_status(db, job.id, "cancelled")
-                except Exception as e:
-                    _append_log(job, f"数据库状态更新失败: {e}")
-        except Exception as exc:  # noqa: BLE001
-            job.status = FAILED
-            job.error = str(exc)
-            _append_log(job, f"任务失败: {exc}")
-            _append_log(job, traceback.format_exc())
-            
-            # 更新数据库
-            if self._db_available:
-                try:
-                    from app.database import SessionLocal
-                    with SessionLocal() as db:
-                        update_job_status(
-                            db, 
-                            job.id, 
-                            "failed", 
-                            error=job.error
-                        )
-                except Exception as e:
-                    _append_log(job, f"数据库状态更新失败: {e}")
-        finally:
-            job.finished_at = _now()
-            _persist(job)
+            self._workers.append(worker)
+            thread = threading.Thread(
+                target=worker.run_forever, name=f"embedded-worker-{i}", daemon=True
+            )
+            self._threads.append(thread)
+            thread.start()
