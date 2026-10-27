@@ -1446,7 +1446,7 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
         'id="clearRemoteRedisOverride"',
         "data-edit-remote-machine-id",
         'data-remote-action="deploy"',
-        'deployed ? "重新部署" : "部署"',
+        'deployed ? "部署代码" : "部署"',
         "更新配置",
         "部署代码",
         "只同步 worker 代码，不修改配置或启动容器",

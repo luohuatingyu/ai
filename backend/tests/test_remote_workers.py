@@ -1438,8 +1438,6 @@ def test_run_remote_action_deploys_code_without_rebuilding_image(tmp_path, monke
 
 def test_run_remote_action_config_overwrites_remote_config_without_code_archive(tmp_path, monkeypatch):
     """配置动作只发送配置脚本，不携带 worker 代码包。"""
-    import re
-
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     calls = []
@@ -1454,7 +1452,7 @@ def test_run_remote_action_config_overwrites_remote_config_without_code_archive(
     assert result["stdout"] == "config applied\n"
     assert len(calls) == 1
     assert "export MTP_ACTION=config" in calls[0][1]["input_data"]
-    assert re.search(r"MTP_WORKER_APP_ARCHIVE_B64=\\$\\(cat", calls[0][1]["input_data"]) is None
+    assert "MTP_WORKER_APP_ARCHIVE_B64=$(cat" not in calls[0][1]["input_data"]
 
 
 def test_run_remote_action_stops_when_remote_worker_build_fails(tmp_path, monkeypatch):
