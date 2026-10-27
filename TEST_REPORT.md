@@ -1,3 +1,40 @@
+## 本次变更测试结果：启动/重启远程 worker 时应用最新配置（2026-10-28）
+
+**Git基准点**：`3467a3f`（Apply latest remote config on worker start/restart）
+**分支**：`emdash/hot-boxes-clean-y9u6p`
+**测试环境**：Docker Compose，一次性容器 Python 3.12.15（整仓挂载 /repo，`-w /repo/backend` 执行 pytest）。
+
+**变更范围**（修复"生效配置落后于部署配置"）：
+- `remote_worker.sh`：`write_worker_env` 改为可感知配置变化（`cmp` 对比，一致时不写入、不产生回滚快照）；start/restart 先把平台最新配置下发到目标机，配置有变化时用现有镜像重建容器（保持原运行状态、失败自动回滚旧容器与旧配置），再按语义启动/重启；配置无变化时保持纯容器操作；install/deploy/config 行为不变。
+- `remote_workers.py` / `routers/jobs.py`：start/restart 从"宽松校验"改为与部署类动作同等严格（Redis/S3/镜像配置必须可解析，避免用空值覆盖目标机配置）；仅 stop/status 保持宽松（`_PURE_LIFECYCLE_ACTIONS`）。
+- `scripts/worker-node.sh`：`restart` 先 `compose up` 应用 `.env.worker` 变化（Compose 检测变化时重建容器），再强制重启进程，保证 restart 语义。
+- README 更新生命周期操作描述；行为变化：此前 start/restart 不依赖平台配置即可执行，现要求配置可解析（配置不可解密/缺失时报错并提示）。
+
+**测试执行结果**：
+- 远程 Worker + 节点脚本定向测试（`tests/test_remote_workers.py tests/test_worker_node_script.py`）：99 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件（`tests/`）：287 通过、6 跳过、0 失败、0 错误。跳过项由 MTP_TEST_REDIS / MTP_TEST_S3 / Supervisor 子进程环境条件控制，与既有跳过类别一致。
+- `docker compose up --build -d`：trainer、worker、frontend、SeaweedFS 重建与启动成功。
+- `curl -fsS http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- `bash -n backend/app/remote_worker.sh`、`bash -n scripts/worker-node.sh`、`git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 启动在配置变化时应用新配置 | Shell：`test_remote_bootstrap_script_start_applies_config_change_while_running`、`..._start_applies_config_change_to_stopped_container` | 旧 env 文件 + 新 MTP_S3_ENDPOINT：运行中容器重建后保持运行；停止容器先按新配置重建（create）再 start；env 文件内容更新 | 正常、边界 |
+| 重启在配置变化时应用新配置 | Shell：`test_remote_bootstrap_script_restart_applies_config_change_without_double_restart` | 重建即完成重启，不重复执行 docker restart；env 文件更新 | 正常 |
+| 配置无变化时保持纯容器操作 | Shell：`test_remote_bootstrap_script_start_unchanged_config_keeps_pure_operation`、`..._restart_unchanged_config_forces_restart` | 不重建、不覆盖 env 文件、不产生 `.previous`；restart 仍强制重启进程（卡死恢复） | 边界、兼容 |
+| 配置不可解析时严格拒绝 | 单元：`test_run_remote_action_lifecycle_config_requirements`、`test_remote_configuration_errors_lifecycle_skips_platform_checks` | Redis 覆盖不可解密：stop 仍可执行；start/restart/config/deploy/update 拒绝并报"无法解密" | 异常、权限与安全 |
+| 节点脚本 restart 应用 env 变化 | Shell：`test_restart_applies_worker_env_then_restarts` | 命令顺序 `up --detach --no-deps worker` 先于 `restart --timeout 45 worker` | 正常、回归 |
+| 业务回归保持通过 | 完整 `backend/tests` 套件 | 287 通过、6 跳过 | 数据、训练、API、远程管理回归 |
+
+**关键模块测试**：远程 Worker 与节点脚本 99/99 通过；完整套件 287/287 通过（6 环境跳过）。
+
+**已知问题与限制**：未连接真实 SSH 目标机，重建与回滚通过隔离 Docker 替身与单元断言验证；行为变化点——平台 Redis/S3 配置不可解析时 start/restart 现在会失败（此前静默用旧配置操作容器），页面会显示明确报错。
+
+**下次测试建议**：在真实 Linux 目标机上 ① 页面修改 CPU 槽位/Redis 覆盖后点"重启"，确认 env 文件更新、容器重建并以新配置注册心跳；② 配置无变化时点"重启"，确认仅重启进程、无容器重建；③ 配置有变化且新配置非法（如错误 Redis 地址）时点"重启"，确认自动回滚旧容器且服务器状态可恢复。
+
 ## 本次变更测试结果：远程服务器操作整体流程加固（2026-10-28）
 
 **Git基准点**：`a94cb00`（Harden remote server operation flow: executor heartbeat recovery, post-rebuild heartbeat checks, scoped Redis password propagation, lifecycle action validation relaxation, resilient status persistence）
