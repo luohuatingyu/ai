@@ -2,10 +2,39 @@
 
 ## Git基准点
 
-- **Commit Hash**: c0e03d1（远程配置先写入并安全回滚）
-- **提交信息**: Separate remote deployment and config updates
+- **Commit Hash**: 8b8112d（计算资源远程配置、部署和启动动作隔离）
+- **提交信息**: Document isolated remote worker actions
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：计算资源远程动作隔离（2026-10-27）
+
+**变更范围**：已部署计算资源的配置修改只覆盖目标机 worker `.env`；部署只同步 worker 代码，不上传新配置、不重建或重启容器；启动、停止和重启继续作为独立容器生命周期操作。新增 `config`、`deploy` 远程动作，并保留旧 `update` 动作作为代码部署兼容别名。首次部署仍负责准备镜像、配置、代码并启动容器。
+
+**测试环境**：Docker Compose，容器 Python 3.12。工作区中预先存在的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 修改未纳入本次提交。
+
+**测试执行结果**：
+- API 与远程 worker 定向测试：129 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：270 通过、6 跳过、0 失败、0 错误；跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 启动成功。
+- `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health` 返回 `{"ok":true}`。
+- `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+- 未连接真实远程 SSH 主机；远程文件覆盖和代码切换通过隔离 Shell 测试验证。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 修改配置只覆盖远程配置文件 | API：`test_remote_server_api_separates_registration_deployment_and_config_update`；Shell：`test_remote_bootstrap_script_config_overwrites_env_without_touching_container`；SSH 执行器和 Docker 替身 | 已部署 PATCH 触发 `config`；`.env` 更新、代码包不发送且不调用 Docker | 正常、边界、回归 |
+| 部署只更新代码 | 单元：`test_run_remote_action_deploys_code_without_rebuilding_image`；Shell：`test_remote_bootstrap_script_deploys_code_without_config_or_container_operations` | `deploy` 携带代码包，保留旧 `.env`，不执行镜像构建、启动、停止或重启 | 正常、兼容、状态隔离 |
+| 启动等生命周期操作保持独立 | API 远程操作测试、`test_remote_bootstrap_script_lifecycle` | `start` 只执行 `docker start`，停止/重启保留原有优雅停机行为 | 正常、异常、回归 |
+| 首次部署和旧动作兼容 | `test_run_remote_action_builds_worker_on_target_before_install`、完整 `tests/` | 首次 `install` 仍构建镜像并启动；旧 `update` 映射为代码部署 | 兼容、回归 |
+| 页面文案与动作语义一致 | `test_remote_server_form_exposes_host_overrides_and_edit_action`、`test_remote_server_card_filters_lifecycle_actions_by_presence` | 页面区分“更新配置”“部署代码”“启动/停止/重启” | 正常、分支 |
+
+**关键模块测试**：API 与远程 worker 129/129 通过；完整套件 270/276 通过。
+
+**下次测试建议**：连接一台测试 Linux 主机，验证配置覆盖后远程 `.env` 权限、停止容器后的部署代码切换，以及单独启动/重启后新配置和新代码的实际加载。
 
 ## 本次变更测试结果：远程服务器部署与配置更新分离（2026-10-27）
 
