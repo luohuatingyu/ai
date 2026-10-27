@@ -2,10 +2,66 @@
 
 ## Git基准点
 
-- **Commit Hash**: 85b9bfb（目标机自行构建远程 worker 镜像）
-- **提交信息**: Build remote worker images on target
+- **Commit Hash**: 9485de8（补充传统 Dockerfile 回退边界测试）
+- **提交信息**: Cover incompatible legacy Dockerfile
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：远程 Docker 缺少 buildx 时兼容构建（2026-10-27）
+
+**变更范围**：远程 worker 镜像仍优先使用 BuildKit。只有目标机返回明确的“BuildKit 已启用但 buildx 缺失或损坏”错误时，才重试一次传统构建器；回退上下文会移除 Dockerfile 中仅用于 pip 下载缓存的 `RUN --mount`，并按目标 Docker daemon 的本机架构构建。其他构建错误不回退；重试失败仍阻止远程安装，错误输出继续脱敏。
+
+**测试环境**：Docker Engine 29.8.0，Docker Compose，测试容器 Python 3.12。完整套件包含工作区原有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动；这两个文件未纳入本次提交。
+
+**测试执行结果**：
+- 定向远程 worker 测试：64 通过、0 失败、0 错误、0 跳过。
+- 完整测试：257 项；251 通过、0 失败、0 错误、6 跳过。已执行用例通过率 100%；6 项为 Redis、S3 与 Supervisor 子进程环境门控测试。
+- `docker compose up --build -d`：构建成功，frontend、trainer、worker 镜像均重建。随后运行状态检查发现 frontend 与 SeaweedFS healthy，但 trainer 和 worker 因当前 Compose S3 endpoint 返回 `SecondLevelDomainForbidden`（要求使用 virtual hosted style）而反复重启；容器运行验证未通过，未修改本次范围外的存储配置。
+- `git diff --check`：通过。
+- 未连接实际 Linux 目标机复测 SSH 构建与 worker 启动；目标机是否支持传统构建器仍需部署环境确认。
+- pytest 输出 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**实际执行命令**：
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q -p no:cacheprovider
+```
+
+结果：64 passed。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider
+```
+
+结果：251 passed、6 skipped。
+
+```bash
+docker compose up --build -d
+docker compose ps
+docker compose logs --tail=80 trainer worker
+git diff --check
+```
+
+结果：镜像构建成功；运行状态检查发现 trainer 和 worker 因 S3 endpoint 拒绝 path-style 请求而重启；差异空白检查通过。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| Buildx 缺失时只回退一次，并使用无缓存挂载的 Dockerfile 构建目标机原生架构 | 单元：`test_remote_worker_build_falls_back_when_buildx_is_missing` | 精确缺失错误触发第二次 SSH 构建；命令关闭 BuildKit、不传 `--platform`；Dockerfile 保留 pip 安装步骤并移除 cache mount | 正常、兼容、平台边界 |
+| Dockerfile 不含预期的 BuildKit 缓存挂载时拒绝生成传统构建上下文 | 单元：`test_worker_build_context_skips_invalid_same_named_dockerfile` | 传统构建器上下文转换返回明确错误，不发送未经验证的 Dockerfile | 边界、异常、兼容 |
+| 普通构建错误不触发回退；回退失败保留脱敏错误 | 单元：`test_remote_worker_build_reports_redacted_target_error`、`test_remote_worker_build_reports_redacted_legacy_fallback_error` | 拉取错误只尝试一次；回退拉取失败时返回脱敏后的最终错误 | 异常、安全、敏感信息保护 |
+| 构建失败仍阻止后续安装，既有远程功能保持兼容 | 集成：`test_run_remote_action_stops_when_remote_worker_build_fails`、完整 `tests/` | 构建失败后不运行安装脚本；远程 worker 定向测试 64/64 通过，全套 251 通过、6 跳过 | 状态冲突、回归、兼容 |
+
+**关键模块测试**：远程 worker 与 SSH 构建流程 64/64 通过；完整测试 251 通过、6 个环境门控用例跳过。
+
+**已知问题与限制**：传统 Docker 构建器属于弃用路径，目标机 Docker 若不再提供它，仍需在目标机安装 buildx；真实远程 SSH 构建未复测。当前 Compose S3 endpoint 的请求风格错误导致 trainer 与 worker 重启，需修正该环境配置后才能完成容器运行验证。
+
+**下次测试建议**：修正 Compose S3 endpoint 使其支持当前客户端请求方式；在确认目标机 Docker 尚支持传统构建器的 Linux 服务器上重新安装 worker，确认回退构建、SSH 部署及 worker 心跳。
+
+**重测触发条件**：修改远程构建错误识别、传统构建器回退、兼容 Dockerfile 转换或安装阻断逻辑时，运行 `tests/test_remote_workers.py` 和完整 `tests/`，并执行 `docker compose up --build -d`。
+
+**Git基准点**：`9485de8`（Cover incompatible legacy Dockerfile）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：目标机从构建上下文构建 worker 镜像（2026-10-27）
 
