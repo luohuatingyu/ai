@@ -1325,6 +1325,7 @@ def execute_remote_operation(
                     "status": "completed",
                     "updated_at": time.time(),
                     "output": result.get("stdout", "")[-2000:],
+                    "stderr": result.get("stderr", "")[-2000:],
                 }
             )
             server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"

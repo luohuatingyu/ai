@@ -1191,12 +1191,17 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
         operation_id,
         {"operation_id": operation_id, "machine_id": machine_id, "action": "start", "status": "queued"},
     )
-    monkeypatch.setattr(remote_workers, "run_remote_action", lambda *_args: {"stdout": "container started"})
+    monkeypatch.setattr(
+        remote_workers,
+        "run_remote_action",
+        lambda *_args: {"stdout": "container started", "stderr": "worker boot warning"},
+    )
 
     remote_workers.execute_remote_operation(operation_id, server, "start")
     result = manager.lease.get_remote_operation(operation_id)
     assert result["status"] == "completed"
     assert result["output"] == "container started"
+    assert result["stderr"] == "worker boot warning"
     assert remote_config_repository.get_remote_server(machine_id)["status"] == "online"
 
     def fail_remote(*_args):

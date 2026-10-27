@@ -1355,3 +1355,22 @@ def test_remote_server_cards_expose_interrupt_action_for_active_operations():
     assert 'cancelled: "最近操作已中断"' in card_renderer
     assert "不会自动回滚" in cancel_handler
     assert "/cancel" in cancel_handler
+
+
+def test_remote_server_card_displays_command_output_and_error_logs():
+    """远程命令完成后，服务器卡片提供转义后的 stdout、stderr 和错误日志。"""
+    backend_dir = Path(__file__).resolve().parents[1]
+    static_dir = backend_dir / "static"
+    if not static_dir.is_dir():
+        static_dir = backend_dir.parent / "static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    card_renderer = html.split("function workerServerCard(", 1)[1].split(
+        "// 读取仅在当前会话授权的远程服务器状态", 1
+    )[0]
+
+    assert 'summary>查看执行日志</summary>' in card_renderer
+    assert "operation.output" in card_renderer
+    assert "operation.stderr" in card_renderer
+    assert "operation.error" in card_renderer
+    assert "${esc(operationLog ||" in card_renderer
+    assert "命令执行中，完成后可查看输出。" in card_renderer

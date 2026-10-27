@@ -160,6 +160,10 @@
   .server-controls { display:flex; gap:6px; flex-wrap:wrap; }
   .server-controls button { padding:5px 9px; font-size:11px; }
   .server-operation { padding:7px 15px 0; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+  .server-operation-log { margin:7px 15px 10px; color:var(--muted); font-size:11px; }
+  .server-operation-log summary { width:fit-content; cursor:pointer; }
+  .server-operation-log pre { max-height:240px; overflow:auto; margin:6px 0 0; padding:9px 11px; border:1px solid var(--border); border-radius:7px; background:rgba(13,17,23,.5); color:var(--text); font:11px/1.5 ui-monospace,SFMono-Regular,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .server-operation-log-hint { padding:5px 15px 0; color:var(--muted); font-size:11px; }
   .server-slots { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:8px; padding:10px 12px 13px; }
   .resource-slot { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px;
     padding:10px 11px; border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.42); }
@@ -1487,6 +1491,12 @@ function workerServerCard(machineId, slots, remoteServer = null) {
   const endpoint = remoteServer ? `${remoteServer.username}@${remoteServer.host}:${remoteServer.port} · ${remoteServer.mode.toUpperCase()}` : "";
   const operationDetails = operation && ["failed", "cancelled"].includes(operation.status) && operation.error
     ? `${operationLabel}：${operation.error}` : operationLabel;
+  const operationLog = operation && [operation.output, operation.stderr, operation.error]
+    .filter((part) => typeof part === "string" && part.trim())
+    .join("\n");
+  const operationLogView = operation && (operationLog || ["completed", "failed", "cancelled"].includes(operation.status))
+    ? `<details class="server-operation-log"><summary>查看执行日志</summary><pre>${esc(operationLog || "远程命令未返回输出")}</pre></details>`
+    : operationBusy ? `<div class="server-operation-log-hint">命令执行中，完成后可查看输出。</div>` : "";
   return `<article class="server-card">
     <header class="server-head">
       <div class="server-head-main">
@@ -1498,6 +1508,7 @@ function workerServerCard(machineId, slots, remoteServer = null) {
       <div class="server-head-actions">${serverControls}<span class="server-presence ${online ? "" : "offline"}">${online ? `在线 · ${online}/${slots.length} 槽` : remoteServer && operationBusy ? "远程操作中" : "离线"}</span></div>
     </header>
     ${remoteServer && operationDetails ? `<div class="server-operation" role="status">${esc(operationDetails)}</div>` : ""}
+    ${remoteServer ? operationLogView : ""}
     ${slots.length
       ? `<div class="server-meta">${cpu.cores ? `CPU ${esc(cpu.cores)} 线程` : "CPU 信息未知"} · ${esc(memory)} · ${esc(lastSeen)}</div><div class="server-slots">${slots.map(workerSlotCard).join("")}</div>`
       : `<div class="server-meta">${remoteServer ? "尚未收到资源心跳；worker 启动后将自动检测 CPU / GPU。" : "等待计算资源心跳"}</div>`}
