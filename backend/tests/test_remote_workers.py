@@ -188,6 +188,77 @@ def test_communicate_remote_process_streams_only_new_output_lines():
     assert "stderr: connection timed out" in timeout_lines
 
 
+def test_communicate_remote_process_streams_carriage_return_progress():
+    """Docker 以回车符刷新构建进度时也应实时发送日志，而不是等进程结束。"""
+    command = ["ssh", "worker@example.net", "docker build -"]
+    first_output = b" => [1/2] FROM python:3.12-slim\r => [2/2] RUN pip install\r"
+
+    class FakeProcess:
+        args = command
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, input=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(command, timeout, output=first_output, stderr=b"")
+            return first_output + b"Build complete\n", b""
+
+    emitted = []
+    remote_workers._communicate_remote_process(
+        FakeProcess(),
+        operation_id=None,
+        timeout=10,
+        progress_callback=lambda phase, message: emitted.append((phase, message)),
+        progress_phase="构建目标架构镜像",
+    )
+
+    assert emitted == [
+        ("构建目标架构镜像", "stdout:  => [1/2] FROM python:3.12-slim"),
+        ("构建目标架构镜像", "stdout:  => [2/2] RUN pip install"),
+        ("构建目标架构镜像", "stdout: Build complete"),
+    ]
+
+
+def test_communicate_remote_process_reports_idle_target_build(monkeypatch):
+    """目标机构建长时间无输出时发送等待提示，其他阶段不依赖此提示。"""
+    command = ["ssh", "worker@example.net", "docker build -"]
+    fake_clock = {"now": 0.0}
+    monkeypatch.setattr(remote_workers, "_REMOTE_BUILD_IDLE_PROGRESS_INTERVAL", 30.0)
+    monkeypatch.setattr(remote_workers.time, "monotonic", lambda: fake_clock["now"])
+
+    class FakeProcess:
+        args = command
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, input=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                fake_clock["now"] = 30.0
+                raise subprocess.TimeoutExpired(command, timeout, output=b"", stderr=b"")
+            return b"build complete\n", b""
+
+    emitted = []
+    remote_workers._communicate_remote_process(
+        FakeProcess(),
+        operation_id=None,
+        timeout=None,
+        progress_callback=lambda phase, message: emitted.append((phase, message)),
+        progress_phase="构建目标架构镜像",
+    )
+
+    assert emitted == [
+        (
+            "构建目标架构镜像",
+            "目标机仍在构建镜像，30 秒未收到新 Docker 输出；可能正在下载基础镜像或 Python 依赖。",
+        ),
+        ("构建目标架构镜像", "stdout: build complete"),
+    ]
+
+
 def test_run_remote_subprocess_preserves_binary_build_context(monkeypatch):
     """SSH 子进程以二进制模式接收 tar 上下文并返回可解码的构建输出。"""
     command = ["ssh", "worker@compute.example.net", "docker build -"]
@@ -734,7 +805,7 @@ def test_remote_worker_build_sends_minimal_context_and_quotes_docker_args(monkey
     command, options = calls[0]
     assert command[-2] == "worker@compute.example.net"
     assert command[-1] == (
-        "DOCKER_BUILDKIT=1 docker build --platform linux/amd64 "
+        "DOCKER_BUILDKIT=1 docker build --progress=plain --platform linux/amd64 "
         "--tag 'worker:stable;touch /tmp/pwn' -"
     )
     assert options["timeout"] == 3600
