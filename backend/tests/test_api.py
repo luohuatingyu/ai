@@ -1449,7 +1449,7 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
         'deployed ? "重新部署" : "部署"',
         "更新配置",
         "部署代码",
-        "应用当前已保存配置",
+        "只同步 worker 代码，不修改配置或启动容器",
         "不会上传代码或重启容器",
         "openEditRemoteServer",
     ):
