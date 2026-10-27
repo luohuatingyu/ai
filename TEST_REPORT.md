@@ -1213,3 +1213,11 @@ docker compose logs --tail=15 worker
 ```
 
 **遗留项**：阿里云安全组仍允许 `0.0.0.0/0`，虽然 UFW 已按 worker 来源限制访问，仍建议将安全组入方向同步收窄到实际所需的固定来源。业务代码测试基准未变，本次为主机防火墙操作及容器连通验证。
+
+## Redis 全 IPv4 入站放通验证（2026-10-27）
+
+**操作范围**：按用户要求，在 ECS UFW 添加 `0.0.0.0/0` 到 TCP 6379 的入站允许规则。阿里云安全组原已开放全 IPv4；现在两层均允许任意 IPv4 连接。Redis 仍要求密码认证，但 Redis 服务未启用 TLS。
+
+**验证结果**：`docker compose run --rm --no-deps worker python -c 'from app.coordination import create_redis_client; print(create_redis_client().ping())'` 返回 `True`；`docker compose ps` 显示 worker 持续运行。
+
+**安全说明**：Redis 6379 当前可从整个公网访问。密码认证仍生效；由于未配置 TLS，客户端与 Redis 间流量未加密。
