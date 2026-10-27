@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -417,6 +418,240 @@ def test_local_docker_image_platform_reads_engine_image_metadata(tmp_path, monke
     ]
 
 
+def test_builds_worker_image_for_requested_platform_with_minimal_context(tmp_path, monkeypatch):
+    """平台架构不同则可调用 Docker build API，并只上传镜像构建所需文件。"""
+    import io
+    import tarfile
+
+    socket_path = tmp_path / "docker.sock"
+    socket_path.touch()
+    monkeypatch.setattr(config, "WORKER_DOCKER_SOCKET_PATH", str(socket_path))
+
+    class FakeResponse:
+        """按 Docker API 顺序返回版本和逐行构建结果。"""
+
+        def __init__(self, status=200, body=b"", lines=()):
+            self.status = status
+            self.body = body
+            self.lines = iter(lines)
+
+        def read(self, *_args):
+            return self.body
+
+        def readline(self):
+            return next(self.lines, b"")
+
+        def close(self):
+            pass
+
+    responses = [
+        FakeResponse(body=b'{"ApiVersion":"1.45"}'),
+        FakeResponse(lines=[b'{"stream":"built\\n"}\n']),
+    ]
+    connections = []
+
+    class FakeConnection:
+        """记录 Docker Engine 构建请求和上下文归档。"""
+
+        def __init__(self, path, timeout=60.0):
+            self.path = path
+            self.timeout = timeout
+            self.requests = []
+            connections.append(self)
+
+        def request(self, method, target, body=None, headers=None):
+            self.requests.append((method, target, body, headers))
+
+        def getresponse(self):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_workers, "_DockerSocketHTTPConnection", FakeConnection)
+    monkeypatch.setattr(
+        remote_workers, "_local_docker_image_platform", lambda _image: "linux/amd64"
+    )
+
+    remote_workers._build_local_docker_image_for_platform("worker:local", "linux/x86_64")
+
+    assert connections[0].requests[0][:2] == ("GET", "/version")
+    method, target, body, headers = connections[1].requests[0]
+    assert method == "POST"
+    assert "platform=linux%2Famd64" in target
+    assert "t=worker%3Alocal" in target
+    assert headers == {"Content-Type": "application/x-tar"}
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as context:
+        names = set(context.getnames())
+    assert "Dockerfile" in names
+    assert "requirements.txt" in names
+    assert "app/remote_worker.sh" in names
+    assert not any(name.startswith(("data/", "tests/")) for name in names)
+
+
+def test_target_platform_worker_build_failure_is_reported(tmp_path, monkeypatch):
+    """Docker Engine 构建错误会中止部署并保留可读原因。"""
+    socket_path = tmp_path / "docker.sock"
+    socket_path.touch()
+    monkeypatch.setattr(config, "WORKER_DOCKER_SOCKET_PATH", str(socket_path))
+    class FakeResponse:
+        """按 Docker API 顺序返回版本和构建失败事件。"""
+
+        def __init__(self, body=b"", lines=()):
+            self.status = 200
+            self.body = body
+            self.lines = iter(lines)
+
+        def read(self, *_args):
+            return self.body
+
+        def readline(self):
+            return next(self.lines, b"")
+
+        def close(self):
+            pass
+
+    responses = [
+        FakeResponse(body=b'{"ApiVersion":"1.45"}'),
+        FakeResponse(lines=[b'{"error":"base image unavailable"}\n']),
+    ]
+
+    class FakeConnection:
+        """为构建错误场景提供 Docker API 响应。"""
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_workers, "_DockerSocketHTTPConnection", FakeConnection)
+
+    with pytest.raises(remote_workers.RemoteWorkerError, match="base image unavailable"):
+        remote_workers._build_local_docker_image_for_platform("worker:local", "linux/amd64")
+
+
+def test_target_platform_worker_build_rejects_engine_http_errors(tmp_path, monkeypatch):
+    """Docker Engine 拒绝构建请求时显示其错误响应，不继续部署。"""
+    socket_path = tmp_path / "docker.sock"
+    socket_path.touch()
+    monkeypatch.setattr(config, "WORKER_DOCKER_SOCKET_PATH", str(socket_path))
+
+    class FakeResponse:
+        def __init__(self, status, body=b""):
+            self.status = status
+            self.body = body
+
+        def read(self, *_args):
+            return self.body
+
+        def close(self):
+            pass
+
+    responses = [
+        FakeResponse(200, b'{"ApiVersion":"1.45"}'),
+        FakeResponse(400, b"BuildKit is not available"),
+    ]
+
+    class FakeConnection:
+        """返回 Docker Engine 构建接口拒绝响应。"""
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_workers, "_DockerSocketHTTPConnection", FakeConnection)
+
+    with pytest.raises(remote_workers.RemoteWorkerError, match="BuildKit is not available"):
+        remote_workers._build_local_docker_image_for_platform("worker:local", "linux/amd64")
+
+
+def test_target_platform_build_rejects_non_linux_targets():
+    """远程 worker 构建拒绝当前不支持的非 Linux 目标系统。"""
+    with pytest.raises(remote_workers.RemoteWorkerError, match="暂不支持目标镜像平台"):
+        remote_workers._build_local_docker_image_for_platform("worker:local", "windows/amd64")
+
+
+def test_target_platform_worker_build_can_be_cancelled(tmp_path, monkeypatch):
+    """中断远程操作时关闭等待中的 Docker 构建流，并阻止后续镜像传输。"""
+    socket_path = tmp_path / "docker.sock"
+    socket_path.touch()
+    monkeypatch.setattr(config, "WORKER_DOCKER_SOCKET_PATH", str(socket_path))
+    read_started = threading.Event()
+    release_response = threading.Event()
+    cancellation = threading.Event()
+
+    class VersionResponse:
+        status = 200
+
+        def read(self, *_args):
+            return b'{"ApiVersion":"1.45"}'
+
+        def close(self):
+            pass
+
+    class BuildResponse:
+        status = 200
+
+        def readline(self):
+            read_started.set()
+            release_response.wait(timeout=5)
+            return b""
+
+        def close(self):
+            release_response.set()
+
+    class FakeConnection:
+        """让构建读取阻塞，验证取消路径会关闭 Docker 连接。"""
+
+        def __init__(self, *_args, **_kwargs):
+            self.is_build = False
+
+        def request(self, method, *_args, **_kwargs):
+            self.is_build = method == "POST"
+
+        def getresponse(self):
+            return BuildResponse() if self.is_build else VersionResponse()
+
+        def close(self):
+            if self.is_build:
+                release_response.set()
+
+    monkeypatch.setattr(remote_workers, "_DockerSocketHTTPConnection", FakeConnection)
+    monkeypatch.setattr(
+        remote_workers,
+        "_remote_operation_cancel_requested",
+        lambda operation_id: operation_id == "cancel-build" and cancellation.is_set(),
+    )
+    cancel_thread = threading.Thread(
+        target=lambda: (read_started.wait(timeout=5), cancellation.set()), daemon=True
+    )
+    cancel_thread.start()
+
+    with pytest.raises(remote_workers.RemoteWorkerCancelledError, match="操作已中断"):
+        remote_workers._build_local_docker_image_for_platform(
+            "worker:local", "linux/amd64", operation_id="cancel-build"
+        )
+
+    cancel_thread.join(timeout=5)
+    assert not cancel_thread.is_alive()
+    assert release_response.is_set()
+
+
 def test_worker_image_archive_streams_over_ssh_without_saving_it(tmp_path, monkeypatch):
     """Docker 镜像归档按块经 SSH stdin 传输，不落地临时 tar 文件。"""
     archive = b"docker-image-archive-bytes" * 8192
@@ -536,6 +771,11 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     key, known_hosts = _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
     monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/amd64")
+    monkeypatch.setattr(
+        remote_workers,
+        "_build_local_docker_image_for_platform",
+        lambda *_args: pytest.fail("架构一致时不应重新构建 worker 镜像"),
+    )
     calls = {}
     transfers = []
 
@@ -577,32 +817,69 @@ def test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv(tm
     assert config.WORKER_REMOTE_TOKEN not in calls["input"]
 
 
-def test_run_remote_action_rejects_mismatched_image_architecture_before_transfer(tmp_path, monkeypatch):
-    """本机镜像与目标 Docker 架构不一致时，在传输大镜像前明确失败。"""
+def test_run_remote_action_builds_target_architecture_before_transfer(tmp_path, monkeypatch):
+    """本机镜像架构不同时先自动构建目标架构，再经 SSH 传输并安装。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
-    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/arm64")
+    platforms = iter(["linux/arm64", "linux/amd64"])
+    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: next(platforms))
     calls = []
+    builds = []
+    transfers = []
 
     def fake_run(command, **kwargs):
         calls.append(command)
+        if command[-1].startswith("docker info"):
+            return subprocess.CompletedProcess(command, 0, stdout="linux/x86_64\n", stderr="")
         return subprocess.CompletedProcess(command, 0, stdout="linux/amd64\n", stderr="")
 
+    def fake_build(image, platform, operation_id=None):
+        builds.append((image, platform))
+
+    def fake_transfer(image, *_args, **_kwargs):
+        transfers.append(image)
+        return {"stdout": "Loaded image", "stderr": ""}
+
     monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+    monkeypatch.setattr(remote_workers, "_build_local_docker_image_for_platform", fake_build)
+    monkeypatch.setattr(remote_workers, "_stream_worker_image_to_remote", fake_transfer)
+
+    result = remote_workers.run_remote_action(_server(), "install")
+
+    assert result["stdout"].strip() == "linux/amd64"
+    assert builds == [("registry.example.net/ml/worker:unit", "linux/amd64")]
+    assert transfers == ["registry.example.net/ml/worker:unit"]
+    assert len(calls) == 2
+    assert calls[0][-1].startswith("docker info")
+
+
+def test_run_remote_action_stops_when_target_architecture_build_fails(tmp_path, monkeypatch):
+    """目标架构构建失败时不传镜像，也不在远端执行安装脚本。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/arm64")
+    ssh_calls = []
+
+    def fake_run(command, **_kwargs):
+        ssh_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="linux/amd64\n", stderr="")
+
+    def failed_build(_image, _platform, _operation_id=None):
+        raise remote_workers.RemoteWorkerError("平台 Docker 自动构建 linux/amd64 worker 镜像失败")
+
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+    monkeypatch.setattr(remote_workers, "_build_local_docker_image_for_platform", failed_build)
     monkeypatch.setattr(
         remote_workers,
         "_stream_worker_image_to_remote",
-        lambda *_args, **_kwargs: pytest.fail("架构不匹配时不应传输镜像"),
+        lambda *_args, **_kwargs: pytest.fail("构建失败后不应传输镜像"),
     )
 
-    with pytest.raises(
-        remote_workers.RemoteWorkerError,
-        match="平台镜像架构 linux/arm64 与目标 Docker 架构 linux/amd64 不一致",
-    ):
+    with pytest.raises(remote_workers.RemoteWorkerError, match="自动构建 linux/amd64"):
         remote_workers.run_remote_action(_server(), "install")
 
-    assert len(calls) == 1
-    assert calls[0][-1].startswith("docker info")
+    assert len(ssh_calls) == 1
+    assert ssh_calls[0][-1].startswith("docker info")
 
 
 @pytest.mark.parametrize(

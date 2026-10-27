@@ -27,6 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY app ./app
 COPY static ./static
 COPY sample_data ./sample_data
+COPY Dockerfile ./Dockerfile
 
 # 启动与数据库初始化脚本
 COPY init_db.sh start.sh ./

@@ -15,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Dict, List
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -241,6 +241,163 @@ def _canonical_docker_platform(platform: str) -> str:
     }
     architecture = architecture_aliases.get(architecture, architecture)
     return f"{operating_system}/{architecture}"
+
+
+def _worker_build_context() -> bytes:
+    """打包构建 worker 镜像所需的最小后端上下文，不包含运行数据和测试文件。"""
+    import io
+    import tarfile
+
+    context_root = Path(__file__).resolve().parents[1]
+    context_paths = (
+        "Dockerfile",
+        "requirements.txt",
+        "app",
+        "static",
+        "sample_data",
+        "init_db.sh",
+        "start.sh",
+    )
+    archive_buffer = io.BytesIO()
+    try:
+        with tarfile.open(fileobj=archive_buffer, mode="w") as archive:
+            for relative_path in context_paths:
+                source = context_root / relative_path
+                if not source.exists():
+                    raise RemoteWorkerError(
+                        f"无法自动构建 worker 镜像：构建文件 {relative_path} 不存在"
+                    )
+                archive.add(
+                    source,
+                    arcname=relative_path,
+                    recursive=True,
+                    filter=lambda item: None
+                    if Path(item.name).name in {"__pycache__", ".pytest_cache"}
+                    or item.name.endswith((".pyc", ".pyo"))
+                    else item,
+                )
+    except RemoteWorkerError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        raise RemoteWorkerError("打包 worker 镜像构建上下文失败") from exc
+    return archive_buffer.getvalue()
+
+
+def _build_local_docker_image_for_platform(
+    image: str, platform: str, operation_id: str | None = None
+) -> None:
+    """通过平台 Docker Engine 为目标架构重建 worker 镜像并校验结果。"""
+    canonical_platform = _canonical_docker_platform(platform)
+    if not canonical_platform.startswith("linux/"):
+        raise RemoteWorkerError(f"远程 worker 暂不支持目标镜像平台 {platform}")
+
+    socket_path = config.WORKER_DOCKER_SOCKET_PATH
+    if not socket_path or not Path(socket_path).exists():
+        raise RemoteWorkerError(
+            "无法访问平台 Docker socket；请使用远程管理 Compose 配置启动 trainer"
+        )
+    version_connection = _DockerSocketHTTPConnection(socket_path)
+    try:
+        version_connection.request("GET", "/version")
+        version_response = version_connection.getresponse()
+        if version_response.status != 200:
+            raise RemoteWorkerError("无法读取平台 Docker Engine API 版本")
+        version_data = json.loads(version_response.read().decode("utf-8"))
+        api_version = str(version_data.get("ApiVersion", ""))
+    except RemoteWorkerError:
+        raise
+    except (OSError, http.client.HTTPException, ValueError, UnicodeError) as exc:
+        raise RemoteWorkerError("无法连接平台 Docker Engine；请检查 Docker socket 挂载") from exc
+    finally:
+        version_connection.close()
+    if not re.fullmatch(r"\d+\.\d+", api_version):
+        raise RemoteWorkerError("平台 Docker Engine 返回了无效的 API 版本")
+
+    query = urlencode(
+        {"t": image, "dockerfile": "Dockerfile", "platform": canonical_platform, "version": "2"}
+    )
+    build_connection = _DockerSocketHTTPConnection(socket_path, timeout=3600)
+
+    build_result: Dict[str, Exception] = {}
+    build_finished = threading.Event()
+
+    def build_image() -> None:
+        """在独立线程读取 Docker 构建流，供取消操作关闭底层连接。"""
+        build_response = None
+        try:
+            build_connection.request(
+                "POST",
+                f"/v{api_version}/build?{query}",
+                body=_worker_build_context(),
+                headers={"Content-Type": "application/x-tar"},
+            )
+            build_response = build_connection.getresponse()
+            if build_response.status != 200:
+                detail = build_response.read(2048).decode("utf-8", "replace").strip()
+                raise RemoteWorkerError(
+                    f"平台 Docker 自动构建 {canonical_platform} worker 镜像失败：{detail[:1000]}"
+                )
+            errors = []
+            while True:
+                line = build_response.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line.decode("utf-8"))
+                except (ValueError, UnicodeError):
+                    continue
+                if event.get("error"):
+                    error_detail = event.get("errorDetail") or {}
+                    detail = str(error_detail.get("message") or event["error"])
+                    errors.append(detail.strip())
+            if errors:
+                detail = errors[-1]
+                raise RemoteWorkerError(
+                    f"平台 Docker 自动构建 {canonical_platform} worker 镜像失败：{detail[-1000:]}"
+                )
+        except RemoteWorkerError as exc:
+            build_result["error"] = exc
+        except (OSError, http.client.HTTPException, ValueError, UnicodeError) as exc:
+            build_result["error"] = RemoteWorkerError(
+                f"平台 Docker 自动构建 {canonical_platform} worker 镜像失败"
+            )
+            build_result["cause"] = exc
+        except Exception as exc:
+            build_result["error"] = RemoteWorkerError(
+                f"平台 Docker 自动构建 {canonical_platform} worker 镜像失败"
+            )
+            build_result["cause"] = exc
+        finally:
+            if build_response is not None:
+                build_response.close()
+            build_connection.close()
+            build_finished.set()
+
+    build_thread = threading.Thread(target=build_image, name="remote-worker-image-build", daemon=True)
+    build_thread.start()
+    while not build_finished.wait(timeout=0.25):
+        if _remote_operation_cancel_requested(operation_id):
+            docker_socket = getattr(build_connection, "sock", None)
+            if docker_socket is not None:
+                try:
+                    docker_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            build_connection.close()
+            build_thread.join(timeout=5)
+            raise RemoteWorkerCancelledError("操作已中断；远端尚未收到本次镜像部署")
+    build_thread.join()
+    if _remote_operation_cancel_requested(operation_id):
+        raise RemoteWorkerCancelledError("操作已中断；远端尚未收到本次镜像部署")
+    if "error" in build_result:
+        raise build_result["error"] from build_result.get("cause")
+
+    built_platform = _canonical_docker_platform(_local_docker_image_platform(image))
+    if built_platform != canonical_platform:
+        raise RemoteWorkerError(
+            f"平台 Docker 构建后的 worker 镜像架构 {built_platform} 与目标架构 "
+            f"{canonical_platform} 不一致"
+        )
 
 
 def _remote_docker_image_platform(
@@ -1089,13 +1246,9 @@ def run_remote_action(
             remote_platform = _remote_docker_image_platform(
                 command, environment, credentials, server, timeout, operation_id
             )
-            if _canonical_docker_platform(local_platform) != _canonical_docker_platform(
-                remote_platform
-            ):
-                raise RemoteWorkerError(
-                    f"平台镜像架构 {local_platform} 与目标 Docker 架构 {remote_platform} 不一致；"
-                    "请先在平台 Docker 中准备目标架构的 WORKER_IMAGE"
-                )
+            target_platform = _canonical_docker_platform(remote_platform)
+            if _canonical_docker_platform(local_platform) != target_platform:
+                _build_local_docker_image_for_platform(image, target_platform, operation_id)
             _stream_worker_image_to_remote(
                 image, image_command, environment, credentials, server, timeout, operation_id
             )
