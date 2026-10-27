@@ -690,11 +690,14 @@ def manage_remote_server(
         validate_server_record(candidate)
     except RemoteWorkerError as exc:
         raise HTTPException(422, str(exc)) from exc
-    # start/stop/restart 只操作远端容器，不依赖 Redis/S3/镜像等部署配置可用。
+    # start/restart 会把最新配置下发并重建容器应用，需要 Redis/S3/镜像配置可用；
+    # 只有 stop/status 是纯容器操作，不依赖部署配置。
     errors = remote_configuration_errors(
         credentials,
         server,
-        require_platform_config=operation_action in {"install", "deploy", "config"},
+        require_platform_config=operation_action in {
+            "install", "deploy", "config", "start", "restart"
+        },
     )
     if errors:
         raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))

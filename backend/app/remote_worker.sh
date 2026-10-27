@@ -15,16 +15,13 @@ CONFIG_DIR="${HOME}/.config/mtp-worker"
 ENV_FILE="${CONFIG_DIR}/${MTP_MACHINE_ID}.env"
 APP_DIR="${CONFIG_DIR}/${MTP_MACHINE_ID}/app"
 
-# 保存运行配置与 worker Python 代码副本到目标机用户目录。
+# 重写目标机 worker 环境文件。返回 0 表示配置有变化（已覆盖并保留回滚快照），
+# 返回 1 表示与现网配置一致（不写入、不产生回滚快照），供调用方跳过无谓重建。
 write_worker_env() {
   local staging_env
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
   umask 077
-  # 覆盖前保留上一版配置快照，供容器重建失败时连同旧容器一起回滚。
-  if [[ -f "$ENV_FILE" ]]; then
-    cp -p "$ENV_FILE" "${ENV_FILE}.previous"
-  fi
   staging_env="${ENV_FILE}.tmp-${BASHPID}"
   {
     printf 'REDIS_URL=%s\n' "$MTP_REDIS_URL"
@@ -45,7 +42,17 @@ write_worker_env() {
     printf 'DATA_DIR=/app/data\n'
   } > "$staging_env"
   chmod 600 "$staging_env"
+  # 配置与现网一致时不做覆盖，避免运行中的容器被无谓重建。
+  if [[ -f "$ENV_FILE" ]] && cmp -s "$staging_env" "$ENV_FILE"; then
+    rm -f "$staging_env"
+    return 1
+  fi
+  # 覆盖前保留上一版配置快照，供容器重建失败时连同旧容器一起回滚。
+  if [[ -f "$ENV_FILE" ]]; then
+    cp -p "$ENV_FILE" "${ENV_FILE}.previous"
+  fi
   mv -f "$staging_env" "$ENV_FILE"
+  return 0
 }
 
 # 输出目标机刚写入的安全配置摘要；秘密只显示是否已配置。
@@ -170,7 +177,8 @@ install_worker() {
   if [[ -n "${APP_STAGING_DIR:-}" ]]; then
     activate_worker_app
   fi
-  write_worker_env
+  # 安装必须无条件写配置（返回 1 仅表示与现网一致，不影响后续启动）。
+  write_worker_env || true
   run_worker_container "$MTP_WORKER_IMAGE"
   rm -f "${ENV_FILE}.previous"
   printf 'worker 已安装并启动：%s\n' "$CONTAINER"
@@ -250,7 +258,8 @@ deploy_worker() {
   if [[ -n "${MTP_WORKER_APP_ARCHIVE_B64:-}" ]]; then
     stage_worker_app
   fi
-  write_worker_env
+  # 部署始终重建容器（代码同步），返回值 1 仅表示配置与现网一致。
+  write_worker_env || true
   if [[ -n "${APP_STAGING_DIR:-}" ]]; then
     activate_worker_app
   fi
@@ -260,21 +269,43 @@ deploy_worker() {
 
 # 更新配置：覆盖环境文件并重建容器应用，不修改 worker 源码。
 update_worker_config() {
-  write_worker_env
+  # 更新配置始终重建容器应用（与部署动作语义一致）。
+  write_worker_env || true
   recreate_worker_container
   printf 'worker 配置已更新并应用：%s\n' "$CONTAINER"
   show_worker_config
 }
 
-# 对目标服务器现有 worker 容器执行生命周期操作；只操作容器，不修改配置或代码。
+# 对目标服务器现有 worker 容器执行生命周期操作。启动和重启会先把平台最新
+# 配置下发到目标机：配置有变化时用现有镜像重建容器（保持原运行状态，失败
+# 自动回滚），避免"生效配置"落后于"部署配置"；配置无变化时保持纯容器操作。
+# 停止和状态查询只操作容器，不修改配置或代码。
 manage_worker() {
   if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     printf '目标服务器上未找到 worker 容器。\n' >&2
     exit 4
   fi
   case "$ACTION" in
-    start) docker start "$CONTAINER" ;;
-    restart) docker restart --time 45 "$CONTAINER" ;;
+    start|restart)
+      local config_changed=false
+      local container_state
+      # 与现网配置一致时不重建，避免无谓中断正在运行的任务。
+      if write_worker_env; then
+        recreate_worker_container
+        config_changed=true
+      fi
+      container_state="$(docker inspect --format '{{.State.Status}}' "$CONTAINER")"
+      if [[ "$container_state" == "running" ]]; then
+        # 配置变化时 recreate 已用新配置启动了新容器；配置无变化的 restart
+        # 仍需强制重启进程（如 worker 卡死恢复）。
+        if [[ "$ACTION" == "restart" && "$config_changed" != "true" ]]; then
+          docker restart --time 45 "$CONTAINER"
+        fi
+      else
+        # start 与 restart 对停止的容器均执行启动（与 docker restart 语义一致）。
+        docker start "$CONTAINER"
+      fi
+      ;;
     stop) docker stop --time 45 "$CONTAINER" ;;
     status) docker inspect --format '{{.State.Status}}' "$CONTAINER" ;;
     *)

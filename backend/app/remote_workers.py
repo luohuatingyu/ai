@@ -1597,8 +1597,9 @@ def remote_configuration_errors(
 ) -> List[str]:
     """列出远程执行缺少的配置，不读取或返回平台 SSH 凭证内容。
 
-    require_platform_config=False 用于 start/stop/restart 等纯容器生命周期操作：
+    require_platform_config=False 仅用于 stop/status 纯容器生命周期操作：
     只校验 SSH 可达性与凭证，不要求 Redis/S3/镜像等部署配置可用。
+    start/restart 会把最新配置下发到目标机，必须与部署类动作一样完整校验。
     """
     errors: List[str] = []
     if credentials is None:
@@ -1679,18 +1680,20 @@ def validate_server_record(server: Dict[str, object]) -> None:
         raise RemoteWorkerError("SSH 端口必须在 1 到 65535 之间")
 
 
-_LIFECYCLE_ACTIONS = ("start", "stop", "restart", "status")
+# start/restart 会把最新配置下发到目标机并重建容器应用（见 remote_worker.sh），
+# 因此与部署类动作一样依赖 Redis/S3 配置可解析；只有 stop/status 是纯容器操作。
+_PURE_LIFECYCLE_ACTIONS = ("stop", "status")
 
 
 def _deployment_settings_for_action(
     server: Dict[str, object], action: str
 ) -> Dict[str, str]:
-    """按动作解析部署配置：纯容器生命周期操作不依赖 Redis/S3 配置可解密。"""
+    """按动作解析部署配置：仅 stop/status 不依赖 Redis/S3 配置可解密。"""
     try:
         return remote_deployment_settings(server)
     except RemoteWorkerError:
-        if action in _LIFECYCLE_ACTIONS:
-            # start/stop/restart 只操作容器，远端脚本不读取这些值；配置不可解密时置空继续。
+        if action in _PURE_LIFECYCLE_ACTIONS:
+            # stop/status 只操作容器，远端脚本不读取这些值；配置不可解密时置空继续。
             return {
                 "worker_image": "",
                 "redis_url": "",
@@ -1776,7 +1779,7 @@ def run_remote_action(
     errors = remote_configuration_errors(
         credentials,
         server,
-        require_platform_config=action not in _LIFECYCLE_ACTIONS,
+        require_platform_config=action not in _PURE_LIFECYCLE_ACTIONS,
     )
     if errors:
         raise RemoteWorkerError("；".join(errors))
