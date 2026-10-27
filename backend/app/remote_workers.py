@@ -347,8 +347,10 @@ def _canonical_docker_platform(platform: str) -> str:
     return f"{operating_system}/{architecture}"
 
 
-def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
-    """从可信后端目录打包 worker 构建上下文，拒绝同名的错误 Dockerfile。"""
+def _worker_build_context(
+    context_roots: List[Path] | None = None, legacy_builder: bool = False
+) -> bytes:
+    """打包可信 worker 构建上下文；兼容模式会移除传统构建器不支持的缓存挂载。"""
     import io
     import tarfile
 
@@ -401,6 +403,25 @@ def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
                     raise RemoteWorkerError(
                         f"无法自动构建 worker 镜像：构建文件 {relative_path} 不存在"
                     )
+                if relative_path == "Dockerfile" and legacy_builder:
+                    # 传统构建器不支持 RUN --mount；移除仅用于 pip 下载缓存的挂载。
+                    cache_mount = re.compile(
+                        r"(?m)^RUN --mount=type=cache,target=/root/\.cache/pip \\\n[ \t]*"
+                    )
+                    compatible_dockerfile, replacements = cache_mount.subn(
+                        "RUN ", dockerfile_text
+                    )
+                    if replacements != 1:
+                        raise RemoteWorkerError(
+                            "无法自动构建兼容 worker 镜像：Dockerfile 缓存挂载语法不符合预期"
+                        )
+                    dockerfile_bytes = compatible_dockerfile.encode("utf-8")
+                    dockerfile_info = archive.gettarinfo(
+                        str(source), arcname=relative_path
+                    )
+                    dockerfile_info.size = len(dockerfile_bytes)
+                    archive.addfile(dockerfile_info, io.BytesIO(dockerfile_bytes))
+                    continue
                 archive.add(
                     source,
                     arcname=relative_path,
@@ -434,43 +455,77 @@ def _build_worker_image_on_remote(
         raise RemoteWorkerError(f"远程 worker 暂不支持目标镜像平台 {platform}")
 
     build_context = _worker_build_context()
+
+    def run_build(remote_build_command: str, context: bytes):
+        """运行一次远程构建并返回进程结果及脱敏输出。"""
+        command = ssh_command[:-1] + [remote_build_command]
+        try:
+            result = _run_remote_subprocess(
+                command,
+                input_data=context,
+                timeout=timeout,
+                environment=environment,
+                operation_id=operation_id,
+                progress_callback=progress_callback,
+                progress_phase="构建目标架构镜像",
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteWorkerError("目标机构建 worker 镜像超时") from exc
+        except OSError as exc:
+            raise RemoteWorkerError(
+                "无法启动 SSH 客户端在目标机构建 worker 镜像"
+            ) from exc
+
+        stdout = (
+            result.stdout.decode("utf-8", "replace")
+            if isinstance(result.stdout, bytes)
+            else result.stdout
+        )
+        stderr = (
+            result.stderr.decode("utf-8", "replace")
+            if isinstance(result.stderr, bytes)
+            else result.stderr
+        )
+        return result, stdout, stderr, _redact_output(
+            stdout, stderr, credentials, server
+        )
+
     remote_build_command = "DOCKER_BUILDKIT=1 docker build --platform {} --tag {} -".format(
         shlex.quote(canonical_platform), shlex.quote(image)
     )
-    command = ssh_command[:-1] + [remote_build_command]
     _emit_progress(
         progress_callback,
         "构建目标架构镜像",
         f"经 SSH 发送精简构建上下文（{len(build_context) / (1024 * 1024):.1f} MiB）；"
         "目标机将拉取或复用通用基础镜像和依赖。",
     )
-    try:
-        result = _run_remote_subprocess(
-            command,
-            input_data=build_context,
-            timeout=timeout,
-            environment=environment,
-            operation_id=operation_id,
-            progress_callback=progress_callback,
-            progress_phase="构建目标架构镜像",
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RemoteWorkerError("目标机构建 worker 镜像超时") from exc
-    except OSError as exc:
-        raise RemoteWorkerError("无法启动 SSH 客户端在目标机构建 worker 镜像") from exc
-
-    stdout = (
-        result.stdout.decode("utf-8", "replace")
-        if isinstance(result.stdout, bytes)
-        else result.stdout
-    )
-    stderr = (
-        result.stderr.decode("utf-8", "replace")
-        if isinstance(result.stderr, bytes)
-        else result.stderr
-    )
-    output = _redact_output(stdout, stderr, credentials, server)
+    result, stdout, stderr, output = run_build(remote_build_command, build_context)
     if result.returncode != 0:
+        buildkit_error = f"{stdout}\n{stderr}"
+        if (
+            "BuildKit is enabled but the buildx component is missing or broken"
+            in buildkit_error
+        ):
+            _emit_progress(
+                progress_callback,
+                "构建目标架构镜像",
+                "目标机缺少 Docker Buildx，改用本机架构的兼容构建器重试。",
+            )
+            legacy_context = _worker_build_context(legacy_builder=True)
+            # 目标平台刚从此 Docker daemon 读取；传统构建器按 daemon 本机架构构建。
+            legacy_command = "DOCKER_BUILDKIT=0 docker build --tag {} -".format(
+                shlex.quote(image)
+            )
+            result, _stdout, _stderr, output = run_build(
+                legacy_command, legacy_context
+            )
+            if result.returncode == 0:
+                _emit_progress(
+                    progress_callback,
+                    "构建目标架构镜像",
+                    "目标机 worker 镜像兼容构建完成。",
+                )
+                return
         detail = (output["stderr"] or output["stdout"] or "目标机 Docker 构建失败").strip()
         raise RemoteWorkerError(f"目标机 Docker 构建 worker 镜像失败：{detail[-1500:]}")
     _emit_progress(progress_callback, "构建目标架构镜像", "目标机 worker 镜像构建完成。")

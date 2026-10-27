@@ -746,11 +746,61 @@ def test_remote_worker_build_sends_minimal_context_and_quotes_docker_args(monkey
     assert not any(name.startswith(("data/", "tests/")) for name in names)
 
 
+def test_remote_worker_build_falls_back_when_buildx_is_missing(monkeypatch):
+    """Buildx 缺失时改用目标机原生架构和传统构建器重试。"""
+    import io
+    import tarfile
+
+    calls = []
+    progress = []
+    missing_buildx = (
+        b"ERROR: BuildKit is enabled but the buildx component is missing or broken.\n"
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=missing_buildx)
+        return subprocess.CompletedProcess(command, 0, stdout=b"Build complete\n", stderr=b"")
+
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+    remote_workers._build_worker_image_on_remote(
+        "worker:stable;touch /tmp/pwn",
+        "linux/x86_64",
+        ["/usr/bin/ssh", "worker@compute.example.net", "bash -s"],
+        None,
+        {"password": "", "passphrase": ""},
+        _server(),
+        timeout=3600,
+        progress_callback=lambda phase, message: progress.append((phase, message)),
+    )
+
+    assert len(calls) == 2
+    assert calls[0][0][-1] == (
+        "DOCKER_BUILDKIT=1 docker build --platform linux/amd64 "
+        "--tag 'worker:stable;touch /tmp/pwn' -"
+    )
+    assert calls[1][0][-1] == (
+        "DOCKER_BUILDKIT=0 docker build --tag 'worker:stable;touch /tmp/pwn' -"
+    )
+    assert calls[1][1]["timeout"] == 3600
+    with tarfile.open(fileobj=io.BytesIO(calls[0][1]["input_data"]), mode="r:") as context:
+        buildkit_dockerfile = context.extractfile("Dockerfile").read().decode("utf-8")
+    with tarfile.open(fileobj=io.BytesIO(calls[1][1]["input_data"]), mode="r:") as context:
+        legacy_dockerfile = context.extractfile("Dockerfile").read().decode("utf-8")
+    assert "RUN --mount=type=cache" in buildkit_dockerfile
+    assert "RUN --mount=type=cache" not in legacy_dockerfile
+    assert "RUN pip install --retries 10 -r requirements.txt" in legacy_dockerfile
+    assert any("改用本机架构的兼容构建器重试" in message for _, message in progress)
+
+
 def test_remote_worker_build_reports_redacted_target_error(monkeypatch):
     """目标 Docker 构建失败时保留原因并脱敏 SSH 密码。"""
     secret = "remote-ssh-secret"
+    calls = []
 
     def failed_run(command, **_kwargs):
+        calls.append(command)
         return subprocess.CompletedProcess(
             command, 1, stdout=b"", stderr=f"pull failed for {secret}\n".encode()
         )
@@ -771,6 +821,47 @@ def test_remote_worker_build_reports_redacted_target_error(monkeypatch):
 
     assert secret not in str(exc_info.value)
     assert "[redacted]" in str(exc_info.value)
+    assert len(calls) == 1
+
+
+def test_remote_worker_build_reports_redacted_legacy_fallback_error(monkeypatch):
+    """兼容构建器重试失败时保留脱敏后的最终错误。"""
+    secret = "legacy-build-secret"
+    calls = []
+
+    def failed_run(command, **_kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout=b"",
+                stderr=(
+                    b"BuildKit is enabled but the buildx component is missing or broken"
+                ),
+            )
+        return subprocess.CompletedProcess(
+            command, 1, stdout=b"", stderr=f"pull failed for {secret}\n".encode()
+        )
+
+    monkeypatch.setattr(remote_workers, "_worker_build_context", lambda **_kwargs: b"context")
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", failed_run)
+
+    with pytest.raises(remote_workers.RemoteWorkerError, match="pull failed") as exc_info:
+        remote_workers._build_worker_image_on_remote(
+            "worker:latest",
+            "linux/amd64",
+            ["ssh", "worker@compute.example.net", "bash -s"],
+            None,
+            {"password": secret, "passphrase": ""},
+            _server(),
+            timeout=3600,
+        )
+
+    assert secret not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
+    assert len(calls) == 2
+    assert "DOCKER_BUILDKIT=0" in calls[1][-1]
 
 
 def test_remote_worker_build_rejects_unsupported_platform_before_ssh(monkeypatch):
