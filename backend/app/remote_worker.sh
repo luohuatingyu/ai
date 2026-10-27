@@ -161,6 +161,81 @@ install_worker() {
   show_worker_startup
 }
 
+# 覆盖配置并使用新环境文件重建已有 worker 容器。
+apply_worker_config() {
+  if [[ "$MODE" != cpu && "$MODE" != gpu ]]; then
+    printf '资源类型必须是 cpu 或 gpu。\n' >&2
+    exit 2
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '目标服务器未安装 Docker。\n' >&2
+    exit 127
+  fi
+
+  local has_existing=false
+  local existing_image=""
+  local previous_container="${CONTAINER}-previous"
+  local previous_env="${ENV_FILE}.previous"
+  local had_previous_env=false
+  if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    has_existing=true
+    existing_image="$(docker inspect --format '{{.Image}}' "$CONTAINER")"
+    if [[ -z "$existing_image" ]]; then
+      printf '无法读取现有 worker 容器镜像。\n' >&2
+      exit 1
+    fi
+  fi
+
+  if [[ -f "$ENV_FILE" ]]; then
+    cp -p "$ENV_FILE" "$previous_env"
+    had_previous_env=true
+  else
+    rm -f "$previous_env"
+  fi
+  write_worker_env
+
+  if [[ "$has_existing" != true ]]; then
+    rm -f "$previous_env"
+    printf 'worker 配置已覆盖：%s（未找到现有容器，暂未启动）\n' "$ENV_FILE"
+    show_worker_config
+    return 0
+  fi
+
+  if docker inspect "$previous_container" >/dev/null 2>&1; then
+    docker rm --force "$previous_container" >/dev/null
+  fi
+  local container_state
+  container_state="$(docker inspect --format '{{.State.Status}}' "$CONTAINER")"
+  if [[ "$container_state" == "running" ]]; then
+    if ! docker stop --time 45 "$CONTAINER" >/dev/null; then
+      if [[ "$had_previous_env" == true ]]; then
+        mv -f "$previous_env" "$ENV_FILE"
+      else
+        rm -f "$ENV_FILE"
+      fi
+      printf '无法停止现有 worker 容器，配置未应用。\n' >&2
+      exit 1
+    fi
+  fi
+  docker rename "$CONTAINER" "$previous_container"
+  if ! run_worker_container "$existing_image"; then
+    docker rm --force "$CONTAINER" >/dev/null 2>&1 || true
+    if [[ "$had_previous_env" == true ]]; then
+      mv -f "$previous_env" "$ENV_FILE"
+    else
+      rm -f "$ENV_FILE"
+    fi
+    docker rename "$previous_container" "$CONTAINER"
+    docker start "$CONTAINER" >/dev/null || true
+    printf '更新后的 worker 容器启动失败，已恢复原容器和配置。\n' >&2
+    exit 1
+  fi
+  docker rm --force "$previous_container" >/dev/null
+  rm -f "$previous_env"
+  printf 'worker 配置已覆盖并重启：%s\n' "$CONTAINER"
+  show_worker_startup
+}
+
 # 已部署服务器只同步源码，不写配置或操作容器。
 deploy_worker() {
   stage_worker_app
@@ -191,9 +266,7 @@ case "$ACTION" in
     install_worker
     ;;
   config)
-    write_worker_env
-    printf 'worker 配置已覆盖：%s\n' "$ENV_FILE"
-    show_worker_config
+    apply_worker_config
     ;;
   deploy|update)
     deploy_worker

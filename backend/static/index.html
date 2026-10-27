@@ -1876,7 +1876,7 @@ async function openEditRemoteServer(machineId) {
   $("addServerTitle").textContent = `编辑服务器 ${machineId}`;
   $("btnSubmitRemoteServer").textContent = server.deployed ? "更新配置" : "保存配置";
   $("remoteConfigApplyHint").textContent = server.deployed
-    ? "保存后只覆盖服务器配置，不上传代码或重启容器；需要应用到进程时请单独启动或重启。"
+    ? "保存后会覆盖服务器配置并重建 worker 容器；不会上传 worker 代码。"
     : "服务器尚未部署；保存后可在服务器卡片上点击“部署”。";
   modal.hidden = false;
   modal.classList.add("open");
