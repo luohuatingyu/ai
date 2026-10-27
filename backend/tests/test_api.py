@@ -1357,8 +1357,8 @@ def test_remote_server_cards_expose_interrupt_action_for_active_operations():
     assert "/cancel" in cancel_handler
 
 
-def test_remote_server_card_displays_command_output_and_error_logs():
-    """远程命令完成后，服务器卡片提供转义后的 stdout、stderr 和错误日志。"""
+def test_remote_server_card_exposes_log_button_and_fetches_latest_output():
+    """远程服务器卡片展示日志按钮，窗口读取并安全渲染最新操作输出。"""
     backend_dir = Path(__file__).resolve().parents[1]
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
@@ -1368,9 +1368,14 @@ def test_remote_server_card_displays_command_output_and_error_logs():
         "// 读取仅在当前会话授权的远程服务器状态", 1
     )[0]
 
-    assert 'summary>查看执行日志</summary>' in card_renderer
-    assert "operation.output" in card_renderer
-    assert "operation.stderr" in card_renderer
-    assert "operation.error" in card_renderer
-    assert "${esc(operationLog ||" in card_renderer
-    assert "命令执行中，完成后可查看输出。" in card_renderer
+    logs_handler = html.split("async function showRemoteServerLogs(", 1)[1].split(
+        "// 关闭远程日志窗口", 1
+    )[0]
+    assert 'data-remote-server-logs="${esc(machineId)}">日志</button>' in card_renderer
+    assert 'event.target.closest("[data-remote-server-logs]")' in html
+    assert "operation.output" in logs_handler
+    assert "operation.stderr" in logs_handler
+    assert "operation.error" in logs_handler
+    assert "output.textContent = log" in logs_handler
+    assert "当前接口在命令结束后返回完整输出" in logs_handler
+    assert 'id="remoteLogModal"' in html

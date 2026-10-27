@@ -159,6 +159,7 @@
   .server-head-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
   .server-controls { display:flex; gap:6px; flex-wrap:wrap; }
   .server-controls button { padding:5px 9px; font-size:11px; }
+  .server-controls .server-log-button { border-color:rgba(88,166,255,.5); color:#a5d6ff; }
   .server-operation { padding:7px 15px 0; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
   .server-operation-log { margin:7px 15px 10px; color:var(--muted); font-size:11px; }
   .server-operation-log summary { width:fit-content; cursor:pointer; }
@@ -185,6 +186,11 @@
   .server-modal-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
   .server-modal-head h3 { margin:0; font-size:18px; }
   .server-modal-card p { color:var(--muted); font-size:13px; line-height:1.6; }
+  .server-log-modal-card { width:min(900px,100%); }
+  .server-log-status { margin:10px 0; color:var(--muted); font-size:12px; }
+  .server-log-output { max-height:65vh; min-height:150px; overflow:auto; margin:0; padding:14px;
+    border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.6); color:var(--text);
+    font:12px/1.6 ui-monospace,SFMono-Regular,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
   .server-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:15px; }
   .server-form .field { min-width:0; }
   .server-form .field.wide { grid-column:1/-1; }
@@ -590,6 +596,17 @@
       </form>
     </details>
     <div class="server-modal-note">GPU 服务器还需要 NVIDIA 驱动和 NVIDIA Container Toolkit。安装完成后，检测到的槽位默认不接收任务；请在服务器卡片中手动加入资源池。镜像拉取时间取决于镜像大小和网络。</div>
+  </div>
+</div>
+
+<div id="remoteLogModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="remoteLogTitle" hidden>
+  <div class="server-modal-card server-log-modal-card">
+    <div class="server-modal-head">
+      <h3 id="remoteLogTitle">远程操作日志</h3>
+      <button id="btnCloseRemoteLog" class="close-btn" aria-label="关闭">×</button>
+    </div>
+    <div id="remoteLogStatus" class="server-log-status" role="status"></div>
+    <pre id="remoteLogOutput" class="server-log-output">正在读取日志…</pre>
   </div>
 </div>
 
@@ -1481,6 +1498,7 @@ function workerServerCard(machineId, slots, remoteServer = null) {
     completed: "最近操作已完成", failed: "最近操作失败", cancelled: "最近操作已中断",
   }[operation.status] || remoteStatus : remoteStatus;
   const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
+      <button class="server-log-button" data-remote-server-logs="${esc(machineId)}">日志</button>
       <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>编辑</button>
       <button data-remote-machine-id="${esc(machineId)}" data-remote-action="install" ${operationBusy ? "disabled" : ""}>重新部署并应用配置</button>
       <button data-remote-machine-id="${esc(machineId)}" data-remote-action="start" ${operationBusy ? "disabled" : ""}>启动</button>
@@ -1494,9 +1512,6 @@ function workerServerCard(machineId, slots, remoteServer = null) {
   const operationLog = operation && [operation.output, operation.stderr, operation.error]
     .filter((part) => typeof part === "string" && part.trim())
     .join("\n");
-  const operationLogView = operation && (operationLog || ["completed", "failed", "cancelled"].includes(operation.status))
-    ? `<details class="server-operation-log"><summary>查看执行日志</summary><pre>${esc(operationLog || "远程命令未返回输出")}</pre></details>`
-    : operationBusy ? `<div class="server-operation-log-hint">命令执行中，完成后可查看输出。</div>` : "";
   return `<article class="server-card">
     <header class="server-head">
       <div class="server-head-main">
@@ -1508,7 +1523,6 @@ function workerServerCard(machineId, slots, remoteServer = null) {
       <div class="server-head-actions">${serverControls}<span class="server-presence ${online ? "" : "offline"}">${online ? `在线 · ${online}/${slots.length} 槽` : remoteServer && operationBusy ? "远程操作中" : "离线"}</span></div>
     </header>
     ${remoteServer && operationDetails ? `<div class="server-operation" role="status">${esc(operationDetails)}</div>` : ""}
-    ${remoteServer ? operationLogView : ""}
     ${slots.length
       ? `<div class="server-meta">${cpu.cores ? `CPU ${esc(cpu.cores)} 线程` : "CPU 信息未知"} · ${esc(memory)} · ${esc(lastSeen)}</div><div class="server-slots">${slots.map(workerSlotCard).join("")}</div>`
       : `<div class="server-meta">${remoteServer ? "尚未收到资源心跳；worker 启动后将自动检测 CPU / GPU。" : "等待计算资源心跳"}</div>`}
@@ -1869,6 +1883,53 @@ async function manageRemoteServer(button) {
   }
 }
 
+// 打开远程日志窗口，并从操作状态接口读取该服务器最近一次操作的输出。
+async function showRemoteServerLogs(button) {
+  const machineId = button.dataset.remoteServerLogs;
+  const server = state.remoteServers.find((item) => item.machine_id === machineId);
+  const modal = $("remoteLogModal");
+  const output = $("remoteLogOutput");
+  const status = $("remoteLogStatus");
+  $("remoteLogTitle").textContent = `${machineId} · 执行日志`;
+  modal.hidden = false;
+  modal.classList.add("open");
+  output.textContent = "正在读取日志…";
+  status.textContent = "";
+  if (!server || !server.operation_id) {
+    status.textContent = "该服务器还没有远程操作记录。";
+    output.textContent = "暂无执行日志";
+    return;
+  }
+  try {
+    const operation = await apiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`);
+    state.remoteOperations.set(operation.operation_id, operation);
+    const log = [operation.output, operation.stderr, operation.error]
+      .filter((part) => typeof part === "string" && part.trim())
+      .join("\n");
+    const stateText = {
+      queued: "操作排队中；命令结束后将显示完整输出。",
+      running: "命令执行中；当前接口在命令结束后返回完整输出。",
+      completed: "操作已完成。",
+      failed: "操作失败。",
+      cancelled: "操作已中断。",
+    }[operation.status] || `操作状态：${operation.status || "未知"}`;
+    status.textContent = `${operation.action || "远程操作"} · ${stateText}`;
+    output.textContent = log || (operation.status === "queued" || operation.status === "running"
+      ? "暂时没有可显示的输出。"
+      : "远程命令未返回输出");
+  } catch (error) {
+    status.textContent = "读取执行日志失败。";
+    output.textContent = error.message;
+  }
+}
+
+// 关闭远程日志窗口。
+function closeRemoteLogModal() {
+  const modal = $("remoteLogModal");
+  modal.classList.remove("open");
+  modal.hidden = true;
+}
+
 // 中断当前 SSH 操作；远端已经产生的部分变更不会自动回滚。
 async function cancelRemoteOperation(button) {
   const operationId = button.dataset.cancelRemoteOperation;
@@ -1937,6 +1998,11 @@ document.querySelectorAll("input[name='mode']").forEach((input) => {
   input.addEventListener("change", () => { $("remoteCpuSlotsField").hidden = input.value !== "cpu" || !input.checked; });
 });
 $("workerGrid").addEventListener("click", (event) => {
+  const logsButton = event.target.closest("[data-remote-server-logs]");
+  if (logsButton) {
+    showRemoteServerLogs(logsButton);
+    return;
+  }
   const editRemoteButton = event.target.closest("[data-edit-remote-machine-id]");
   if (editRemoteButton && !editRemoteButton.disabled) {
     openEditRemoteServer(editRemoteButton.dataset.editRemoteMachineId);
@@ -1956,6 +2022,10 @@ $("workerGrid").addEventListener("click", (event) => {
 $("addServerModal").addEventListener("click", (event) => {
   if (event.target === $("addServerModal")) closeAddServerModal();
 });
+$("btnCloseRemoteLog").onclick = closeRemoteLogModal;
+$("remoteLogModal").addEventListener("click", (event) => {
+  if (event.target === $("remoteLogModal")) closeRemoteLogModal();
+});
 document.querySelectorAll("[data-worker-mode]").forEach((button) => {
   button.onclick = () => {
     document.querySelectorAll("[data-worker-mode]").forEach((item) => item.classList.toggle("active", item === button));
@@ -1966,6 +2036,7 @@ document.querySelectorAll("[data-worker-mode]").forEach((button) => {
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && $("addServerModal").classList.contains("open")) closeAddServerModal();
+  if (event.key === "Escape" && $("remoteLogModal").classList.contains("open")) closeRemoteLogModal();
 });
 
 /* ---------- Tab 切换 ---------- */
