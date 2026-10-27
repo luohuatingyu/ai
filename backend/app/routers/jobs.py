@@ -31,6 +31,7 @@ from app.routers.schemas import (
 from app.remote_workers import (
     RemoteWorkerError,
     apply_remote_server_overrides,
+    clear_remote_operation_log,
     execute_remote_operation,
     request_remote_operation_cancel,
     remote_configuration_errors,
@@ -364,6 +365,7 @@ def _start_remote_operation(
         "operation_id": operation_id,
         "machine_id": str(server["machine_id"]),
         "action": action,
+        "previous_server_status": server.get("status"),
         "status": "queued",
         "created_at": now,
         "updated_at": now,
@@ -374,7 +376,9 @@ def _start_remote_operation(
     server["deployed"] = remote_server_is_deployed(server)
     server["status"] = {
         "install": "provisioning",
-        "update": "updating",
+        "config": "configuring",
+        "deploy": "deploying",
+        "update": "deploying",
         "start": "starting",
         "stop": "stopping",
         "restart": "restarting",
@@ -590,7 +594,7 @@ def update_remote_server(
     background_tasks: BackgroundTasks,
     response: Response,
 ) -> dict:
-    """保存服务器配置；已部署服务器随后异步重建容器以应用新配置。"""
+    """保存服务器配置；已部署服务器异步覆盖目标机配置文件。"""
     _check_id(machine_id, "服务器")
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
@@ -635,17 +639,17 @@ def update_remote_server(
     _remote_config_db_call(remote_config_repository.save_remote_server, candidate)
     if candidate["deployed"]:
         response.status_code = 202
-        return _start_remote_operation(candidate, "update", background_tasks)
+        return _start_remote_operation(candidate, "config", background_tasks)
     return {"server": remote_server_public_view(candidate)}
 
 
 @router.post("/remote-servers/{machine_id}/{action}", status_code=202)
 def manage_remote_server(
     machine_id: str,
-    action: Literal["install", "start", "stop", "restart"],
+    action: Literal["install", "deploy", "config", "start", "stop", "restart"],
     background_tasks: BackgroundTasks,
 ) -> dict:
-    """经 SSH 首次部署或同步代码更新、启动、停止和重启 worker 容器。"""
+    """经 SSH 首次部署、同步代码、覆盖配置或控制 worker 容器。"""
     _check_id(machine_id, "服务器")
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
@@ -662,9 +666,12 @@ def manage_remote_server(
     previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
     if previous and previous.get("status") in {"queued", "running"}:
         raise HTTPException(409, "该服务器已有远程操作正在执行")
-    operation_action = (
-        "update" if action == "install" and remote_server_is_deployed(server) else action
-    )
+    if action == "install" and remote_server_is_deployed(server):
+        operation_action = "deploy"
+    elif action == "deploy" and not remote_server_is_deployed(server):
+        operation_action = "install"
+    else:
+        operation_action = action
     return _start_remote_operation(server, operation_action, background_tasks)
 
 
@@ -682,6 +689,16 @@ def get_remote_operation(
         operation_id
     )
     return operation
+
+
+@router.delete("/remote-operations/{operation_id}/logs")
+def clear_remote_operation_logs(operation_id: str) -> dict:
+    """清除远程操作日志输出，但保留操作状态和阶段信息。"""
+    if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+        raise HTTPException(404, "远程操作不存在")
+    if not clear_remote_operation_log(operation_id):
+        raise HTTPException(404, "远程操作不存在")
+    return {"ok": True, "operation_id": operation_id}
 
 
 @router.post("/remote-operations/{operation_id}/cancel", status_code=202)
