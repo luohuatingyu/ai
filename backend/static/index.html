@@ -189,10 +189,15 @@
   .server-log-modal-card { width:min(1120px,100%); }
   .server-log-status { margin:10px 0; color:var(--muted); font-size:12px; }
   .server-log-actions { display:flex; justify-content:flex-end; margin:10px 0 8px; }
-  .server-log-output { max-height:65vh; min-height:220px; overflow:auto; margin:0; padding:16px;
+  .server-log-output { max-height:65vh; min-height:220px; overflow:auto; margin:0; padding:10px 14px;
     border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.6); color:var(--text);
-    font:13px/1.65 ui-monospace,SFMono-Regular,monospace; white-space:pre; overflow-wrap:normal;
-    user-select:text; -webkit-user-select:text; cursor:text; }
+    font:13px/1.65 ui-monospace,SFMono-Regular,monospace; white-space:pre; overflow-wrap:normal; }
+  .server-log-line { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:12px;
+    min-width:max-content; padding:5px 0; border-bottom:1px solid rgba(139,148,158,.12); }
+  .server-log-line:last-child { border-bottom:0; }
+  .server-log-line-text { user-select:text; -webkit-user-select:text; cursor:text; }
+  .server-log-line-copy { position:sticky; right:0; margin-left:8px; padding:3px 7px; font-size:11px; opacity:.68; }
+  .server-log-line-copy:hover,.server-log-line-copy:focus-visible { opacity:1; }
   .server-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:15px; }
   .server-form .field { min-width:0; }
   .server-form .field.wide { grid-column:1/-1; }
@@ -608,8 +613,8 @@
       <button id="btnCloseRemoteLog" class="close-btn" aria-label="关闭">×</button>
     </div>
     <div id="remoteLogStatus" class="server-log-status" role="status"></div>
-    <div class="server-log-actions"><button id="btnCopyRemoteLog" type="button">复制日志</button></div>
-    <pre id="remoteLogOutput" class="server-log-output">正在读取日志…</pre>
+    <div class="server-log-actions"><button id="btnCopyRemoteLog" type="button">复制全部</button></div>
+    <div id="remoteLogOutput" class="server-log-output" aria-label="远程操作日志" aria-live="polite"></div>
   </div>
 </div>
 
@@ -1893,14 +1898,15 @@ async function showRemoteServerLogs(button) {
   const modal = $("remoteLogModal");
   const output = $("remoteLogOutput");
   const status = $("remoteLogStatus");
+  output.dataset.rawLog = "";
   $("remoteLogTitle").textContent = `${machineId} · 执行日志`;
   modal.hidden = false;
   modal.classList.add("open");
-  output.textContent = "正在读取日志…";
+  renderRemoteLogLines(output, ["正在读取日志…"]);
   status.textContent = "";
   if (!server || !server.operation_id) {
     status.textContent = "该服务器还没有远程操作记录。";
-    output.textContent = "暂无执行日志";
+    renderRemoteLogLines(output, ["暂无执行日志"]);
     return;
   }
   try {
@@ -1917,13 +1923,53 @@ async function showRemoteServerLogs(button) {
       cancelled: "操作已中断。",
     }[operation.status] || `操作状态：${operation.status || "未知"}`;
     status.textContent = `${operation.action || "远程操作"} · ${stateText}`;
-    output.textContent = log || (operation.status === "queued" || operation.status === "running"
+    const displayLog = log || (operation.status === "queued" || operation.status === "running"
       ? "暂时没有可显示的输出。"
       : "远程命令未返回输出");
+    output.dataset.rawLog = displayLog;
+    renderRemoteLogLines(output, displayLog.split("\n"));
   } catch (error) {
     status.textContent = "读取执行日志失败。";
-    output.textContent = error.message;
+    renderRemoteLogLines(output, [error.message]);
   }
+}
+
+// 逐行创建日志文本和复制按钮，文本通过 textContent 写入避免执行远程输出内容。
+function renderRemoteLogLines(container, lines) {
+  container.replaceChildren();
+  lines.forEach((line, index) => {
+    const row = document.createElement("div");
+    row.className = "server-log-line";
+    const text = document.createElement("span");
+    text.className = "server-log-line-text";
+    text.textContent = line || " ";
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "server-log-line-copy";
+    copy.dataset.copyRemoteLogLine = String(index);
+    copy.textContent = "复制";
+    copy.setAttribute("aria-label", `复制第 ${index + 1} 行日志`);
+    row.append(text, copy);
+    container.appendChild(row);
+  });
+}
+
+// 复制日志行或全部日志，并兼容未授予 Clipboard API 权限的页面环境。
+async function copyRemoteLogText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (error) {
+    const fallback = document.createElement("textarea");
+    fallback.value = text;
+    fallback.style.position = "fixed";
+    fallback.style.opacity = "0";
+    document.body.appendChild(fallback);
+    fallback.select();
+    const copied = document.execCommand("copy");
+    fallback.remove();
+    if (!copied) throw error;
+  }
+  toast("日志已复制", "ok");
 }
 
 // 关闭远程日志窗口。
@@ -2026,14 +2072,13 @@ $("addServerModal").addEventListener("click", (event) => {
   if (event.target === $("addServerModal")) closeAddServerModal();
 });
 $("btnCloseRemoteLog").onclick = closeRemoteLogModal;
-$("btnCopyRemoteLog").onclick = async () => {
-  try {
-    await navigator.clipboard.writeText($("remoteLogOutput").textContent || "");
-    toast("日志已复制", "ok");
-  } catch (error) {
-    toast("复制失败，请选中日志后使用快捷键复制", "err");
-  }
-};
+$("btnCopyRemoteLog").onclick = () => copyRemoteLogText($("remoteLogOutput").dataset.rawLog || "");
+$("remoteLogOutput").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-copy-remote-log-line]");
+  if (!button) return;
+  const line = $("remoteLogOutput").querySelectorAll(".server-log-line-text")[Number(button.dataset.copyRemoteLogLine)];
+  if (line) copyRemoteLogText(line.textContent === " " ? "" : line.textContent);
+});
 $("remoteLogModal").addEventListener("click", (event) => {
   if (event.target === $("remoteLogModal")) closeRemoteLogModal();
 });

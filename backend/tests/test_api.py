@@ -1376,9 +1376,13 @@ def test_remote_server_card_exposes_log_button_and_fetches_latest_output():
     assert "operation.output" in logs_handler
     assert "operation.stderr" in logs_handler
     assert "operation.error" in logs_handler
-    assert "output.textContent = log" in logs_handler
+    assert "output.dataset.rawLog = displayLog" in logs_handler
+    assert "renderRemoteLogLines(output, displayLog.split(\"\\n\"))" in logs_handler
     assert "当前接口在命令结束后返回完整输出" in logs_handler
     assert 'id="remoteLogModal"' in html
-    assert 'id="btnCopyRemoteLog" type="button">复制日志</button>' in html
+    assert 'id="btnCopyRemoteLog" type="button">复制全部</button>' in html
     assert "user-select:text" in html
+    assert "data-copy-remote-log-line" in html
+    assert "copyRemoteLogText(line.textContent" in html
+    assert 'remoteLogOutput").dataset.rawLog' in html
     assert "navigator.clipboard.writeText" in html
