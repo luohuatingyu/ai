@@ -2,10 +2,38 @@
 
 ## Git基准点
 
-- **Commit Hash**: 489b222（计算资源远程配置、部署和启动动作隔离）
-- **提交信息**: Clarify initial remote deployment action
+- **Commit Hash**: cf6afcd（远程执行日志清除）
+- **提交信息**: Add remote log clear control
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：远程执行日志清除（2026-10-27）
+
+**变更范围**：远程操作日志弹窗增加“清除日志”按钮；新增 `DELETE /api/remote-operations/{operation_id}/logs`，清空 `log`、`output`、`stderr` 和 `error`，保留操作状态与阶段；运行中的操作清除后仍可追加后续日志。
+
+**测试环境**：Docker Compose，容器 Python 3.12。工作区中预先存在的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 修改未纳入本次提交。
+
+**测试执行结果**：
+- 远程日志清除与页面契约定向测试：3 通过、0 失败、0 错误、0 跳过。
+- API 与远程 worker 定向测试：129 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：270 通过、6 跳过、0 失败、0 错误；跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建并启动成功。
+- `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 弹窗可清除当前执行日志并保留状态 | API：`test_remote_operation_logs_can_be_cleared_without_changing_state`；页面契约：`test_remote_server_card_exposes_live_operation_logs` | 清除后日志字段为空，操作仍为 running 且阶段不变；按钮、DELETE 调用和空状态提示存在 | 正常、并发后续日志、回归 |
+| 清除后运行中的操作可继续写入新日志 | `test_remote_operation_logs_can_be_cleared_without_changing_state` | 清除后追加新阶段日志，新日志可读且状态不变 | 状态边界、回归 |
+| 不存在的操作返回 404 | API：`test_remote_operation_log_clear_returns_404_for_missing_operation` | 随机合法 ID 不创建记录并返回 404 | 异常、边界 |
+
+**已知问题与限制**：未连接真实远程 SSH 主机；清除动作及 Redis/内存租约语义通过 API 和隔离协调存储测试验证。页面显示的“暂无执行日志”是清空后的占位文本。
+
+**下次测试建议**：在测试远程主机上执行一次运行中部署操作，清除日志后确认新阶段输出继续出现，并验证 Redis 多进程下清除与追加的时序行为。
+
+**Git基准点**：`cf6afcd`（Add remote log clear control）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：计算资源远程动作隔离（2026-10-27）
 
