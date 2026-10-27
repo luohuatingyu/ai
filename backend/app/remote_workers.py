@@ -1780,13 +1780,13 @@ def run_remote_action(
             _emit_progress(
                 progress_callback,
                 "同步 worker 代码",
-                "同步最新 worker Python 代码，不修改远端配置或容器。",
+                "同步最新 worker Python 代码、重写配置并重建远端容器。",
             )
         elif action == "config":
             _emit_progress(
                 progress_callback,
                 "覆盖 worker 配置",
-                "覆盖目标机 worker 配置，不上传代码或操作容器。",
+                "覆盖目标机 worker 配置并重建容器应用，不上传代码。",
             )
         _emit_progress(progress_callback, "执行远程部署脚本", f"开始执行远端 {action} 脚本。")
         progress_options = (

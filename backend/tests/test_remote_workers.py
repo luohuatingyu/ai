@@ -1975,8 +1975,8 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
         assert "mtp-worker-remote-" in commands
 
 
-def test_remote_bootstrap_script_config_writes_env_without_container(tmp_path: Path):
-    """没有现有容器时，配置动作覆盖环境文件但不创建新容器。"""
+def test_remote_bootstrap_script_config_requires_existing_container(tmp_path: Path):
+    """没有现有容器时，配置动作覆盖环境文件后报错，提示先部署。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
@@ -2015,29 +2015,37 @@ def test_remote_bootstrap_script_config_writes_env_without_container(tmp_path: P
 
     result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 4
+    assert "未找到 worker 容器" in result.stderr
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     saved = env_file.read_text(encoding="utf-8")
     assert "S3_ENDPOINT=storage.example.net:9000" in saved
     assert "WORKER_CPU_SLOTS=4" in saved
-    assert "WORKER_MODE=cpu" in result.stdout
-    assert "REDIS_TARGET=redis.example.net:6380/0" in result.stdout
-    assert "S3_ENDPOINT=storage.example.net:9000" in result.stdout
-    assert "S3_ACCESS_KEY=[已配置]" in result.stdout
-    assert "S3_SECRET_KEY=[已配置]" in result.stdout
     assert not (home / ".config" / "mtp-worker" / "remote-config" / "app").exists()
     assert not docker_log.exists()
 
 
-def test_remote_bootstrap_script_config_does_not_restart_existing_container(tmp_path: Path):
-    """已有容器时，配置动作只覆盖环境文件，不重启或重建容器。"""
+def test_remote_bootstrap_script_config_recreates_container_with_latest_env(tmp_path: Path):
+    """已有容器时，配置动作覆盖环境文件并重建容器应用新配置。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
     docker_stub = bin_dir / "docker"
     docker_stub.write_text(
         "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-config\" ]]; then exit 0; fi\n"
+        "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-config-previous\" ]]; then exit 1; fi\n"
+        "if [[ \"$1\" == inspect && \"$2\" == --format ]]; then\n"
+        "  if [[ \"$3\" == \"{{.Image}}\" ]]; then printf 'sha256:existing-image\\n'; elif [[ \"$3\" == \"{{.State.Status}}\" ]]; then printf 'running\\n'; else printf 'state=running restart_count=0 exit_code=0 error=\\n'; fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [[ \"$1\" == logs ]]; then printf 'worker startup diagnostic\\n'; exit 0; fi\n"
         "printf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n"
+        "if [[ \"$1\" == run ]]; then\n"
+        "  for ((i=1; i<=$#; i++)); do\n"
+        "    if [[ \"${!i}\" == --env-file ]]; then next=$((i + 1)); printf 'env=%s\\n' \"$(cat \"${!next}\")\" >> \"$DOCKER_LOG\"; fi\n"
+        "  done\n"
+        "fi\n"
         "exit 0\n",
         encoding="utf-8",
     )
@@ -2070,12 +2078,26 @@ def test_remote_bootstrap_script_config_does_not_restart_existing_container(tmp_
 
     assert result.returncode == 0, result.stderr
     assert "S3_ENDPOINT=storage.example.net:9000" in env_file.read_text(encoding="utf-8")
-    assert not docker_log.exists()
+    commands = docker_log.read_text(encoding="utf-8")
+    assert "stop --time 45 mtp-worker-remote-config" in commands
+    assert "rename mtp-worker-remote-config mtp-worker-remote-config-previous" in commands
+    assert "run --detach" in commands
+    assert "S3_ENDPOINT=storage.example.net:9000" in commands
+    assert "rm --force mtp-worker-remote-config-previous" in commands
+    assert "worker 配置已更新并应用" in result.stdout
 
 
-@pytest.mark.parametrize("action", ["start", "restart"])
-def test_remote_bootstrap_script_lifecycle_uses_latest_env_file(tmp_path: Path, action: str):
-    """启动或重启会重建容器，并将最新环境文件传给新容器。"""
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("start", "start mtp-worker-remote-config"),
+        ("restart", "restart --time 45 mtp-worker-remote-config"),
+    ],
+)
+def test_remote_bootstrap_script_lifecycle_controls_container_only(
+    tmp_path: Path, action: str, expected: str
+):
+    """启动或重启只操作现有容器，不重建容器也不改动配置文件。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
@@ -2083,17 +2105,7 @@ def test_remote_bootstrap_script_lifecycle_uses_latest_env_file(tmp_path: Path, 
     docker_stub.write_text(
         "#!/usr/bin/env bash\n"
         "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-config\" ]]; then exit 0; fi\n"
-        "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-config-previous\" ]]; then exit 1; fi\n"
-        "if [[ \"$1\" == inspect && \"$2\" == --format ]]; then\n"
-        "  if [[ \"$3\" == \"{{.Image}}\" ]]; then printf 'sha256:existing-image\\n'; elif [[ \"$3\" == \"{{.State.Status}}\" ]]; then printf 'running\\n'; else printf 'state=running restart_count=0 exit_code=0 error=\\n'; fi\n"
-        "  exit 0\n"
-        "fi\n"
         "printf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n"
-        "if [[ \"$1\" == run ]]; then\n"
-        "  for ((i=1; i<=$#; i++)); do\n"
-        "    if [[ \"${!i}\" == --env-file ]]; then next=$((i + 1)); printf 'env=%s\\n' \"$(cat \"${!next}\")\" >> \"$DOCKER_LOG\"; fi\n"
-        "  done\n"
-        "fi\n"
         "exit 0\n",
         encoding="utf-8",
     )
@@ -2128,17 +2140,13 @@ def test_remote_bootstrap_script_lifecycle_uses_latest_env_file(tmp_path: Path, 
     assert result.returncode == 0, result.stderr
     assert env_file.read_text(encoding="utf-8") == latest_env
     commands = docker_log.read_text(encoding="utf-8")
-    assert "stop --time 45 mtp-worker-remote-config" in commands
-    assert "rename mtp-worker-remote-config mtp-worker-remote-config-previous" in commands
-    assert "run --detach" in commands
-    assert "--env-file " + str(env_file) in commands
-    assert "S3_ENDPOINT=latest-storage.example.net:9000" in commands
-    assert "rm --force mtp-worker-remote-config-previous" in commands
-    assert "worker 已使用最新配置重新启动" in result.stdout
+    assert expected in commands
+    assert "run --detach" not in commands
+    assert "--env-file" not in commands
 
 
-def test_remote_bootstrap_script_lifecycle_rolls_back_when_new_container_fails(tmp_path: Path):
-    """新容器启动失败时恢复旧容器，但保留最新配置供下次重试。"""
+def test_remote_bootstrap_script_config_rolls_back_when_new_container_fails(tmp_path: Path):
+    """更新配置重建容器失败时恢复旧容器，并保留新配置供下次重试。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
@@ -2168,7 +2176,7 @@ def test_remote_bootstrap_script_lifecycle_rolls_back_when_new_container_fails(t
         "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
         "HOME": str(home),
         "DOCKER_LOG": str(docker_log),
-        "MTP_ACTION": "restart",
+        "MTP_ACTION": "config",
         "MTP_MACHINE_ID": "remote-config",
         "MTP_MODE": "cpu",
         "MTP_CPU_SLOTS": "4",
@@ -2185,7 +2193,7 @@ def test_remote_bootstrap_script_lifecycle_rolls_back_when_new_container_fails(t
     result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
 
     assert result.returncode == 1
-    assert env_file.read_text(encoding="utf-8") == latest_env
+    assert "S3_ENDPOINT=storage.example.net:9000" in env_file.read_text(encoding="utf-8")
     commands = docker_log.read_text(encoding="utf-8")
     assert "rename mtp-worker-remote-config mtp-worker-remote-config-previous" in commands
     assert "rename mtp-worker-remote-config-previous mtp-worker-remote-config" in commands
@@ -2193,13 +2201,25 @@ def test_remote_bootstrap_script_lifecycle_rolls_back_when_new_container_fails(t
     assert "已恢复旧容器" in result.stderr
 
 
-def test_remote_bootstrap_script_deploys_code_without_config_or_container_operations(tmp_path: Path):
-    """部署只切换源码目录，保留已有配置且不操作容器。"""
+def test_remote_bootstrap_script_deploy_syncs_code_and_recreates_container(tmp_path: Path):
+    """部署同步 worker 源码、重写配置并用现有镜像重建容器。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
     docker_stub = bin_dir / "docker"
-    docker_stub.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\nexit 0\n", encoding="utf-8")
+    docker_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-deploy\" ]]; then exit 0; fi\n"
+        "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-deploy-previous\" ]]; then exit 1; fi\n"
+        "if [[ \"$1\" == inspect && \"$2\" == --format ]]; then\n"
+        "  if [[ \"$3\" == \"{{.Image}}\" ]]; then printf 'sha256:existing-image\\n'; elif [[ \"$3\" == \"{{.State.Status}}\" ]]; then printf 'running\\n'; else printf 'state=running restart_count=0 exit_code=0 error=\\n'; fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [[ \"$1\" == logs ]]; then printf 'worker startup diagnostic\\n'; exit 0; fi\n"
+        "printf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     docker_stub.chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
@@ -2215,6 +2235,13 @@ def test_remote_bootstrap_script_deploys_code_without_config_or_container_operat
         "MTP_MACHINE_ID": "remote-deploy",
         "MTP_MODE": "cpu",
         "MTP_CPU_SLOTS": "4",
+        "MTP_WORKER_IMAGE": "registry.example.net/ml/worker:unit",
+        "MTP_REDIS_URL": "rediss://redis.example.net:6380/0",
+        "MTP_S3_ENDPOINT": "storage.example.net:9000",
+        "MTP_S3_ACCESS_KEY": "access-test",
+        "MTP_S3_SECRET_KEY": "secret-test",
+        "MTP_S3_BUCKET": "models-test",
+        "MTP_S3_SECURE": "true",
         "MTP_WORKER_APP_ARCHIVE_B64": _test_worker_app_archive_base64(),
     })
     script = Path(remote_workers.__file__).with_name("remote_worker.sh")
@@ -2222,10 +2249,71 @@ def test_remote_bootstrap_script_deploys_code_without_config_or_container_operat
     result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
 
     assert result.returncode == 0, result.stderr
-    assert "worker 代码已更新" in result.stdout
-    assert env_file.read_text(encoding="utf-8") == "S3_ENDPOINT=old-storage.example.net:9000\n"
+    assert "worker 代码与配置已部署并重建容器" in result.stdout
+    saved = env_file.read_text(encoding="utf-8")
+    assert "S3_ENDPOINT=storage.example.net:9000" in saved
+    assert "WORKER_CPU_SLOTS=4" in saved
     assert (home / ".config" / "mtp-worker" / "remote-deploy" / "app" / "worker.py").is_file()
-    assert not docker_log.exists()
+    commands = docker_log.read_text(encoding="utf-8")
+    assert "stop --time 45 mtp-worker-remote-deploy" in commands
+    assert "rename mtp-worker-remote-deploy mtp-worker-remote-deploy-previous" in commands
+    assert "run --detach" in commands
+    assert "rm --force mtp-worker-remote-deploy-previous" in commands
+
+
+def test_remote_bootstrap_script_config_keeps_stopped_container_stopped(tmp_path: Path):
+    """容器处于停止状态时，更新配置重建容器但不启动它。"""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-config\" ]]; then exit 0; fi\n"
+        "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-config-previous\" ]]; then exit 1; fi\n"
+        "if [[ \"$1\" == inspect && \"$2\" == --format ]]; then\n"
+        "  if [[ \"$3\" == \"{{.Image}}\" ]]; then printf 'sha256:existing-image\\n'; elif [[ \"$3\" == \"{{.State.Status}}\" ]]; then printf 'exited\\n'; else printf 'state=exited restart_count=0 exit_code=0 error=\\n'; fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [[ \"$1\" == logs ]]; then printf 'worker startup diagnostic\\n'; exit 0; fi\n"
+        "printf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    env_file = home / ".config" / "mtp-worker" / "remote-config.env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text("S3_ENDPOINT=old-storage.example.net:9000\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+        "HOME": str(home),
+        "DOCKER_LOG": str(docker_log),
+        "MTP_ACTION": "config",
+        "MTP_MACHINE_ID": "remote-config",
+        "MTP_MODE": "cpu",
+        "MTP_CPU_SLOTS": "4",
+        "MTP_WORKER_IMAGE": "registry.example.net/ml/worker:unit",
+        "MTP_REDIS_URL": "rediss://redis.example.net:6380/0",
+        "MTP_S3_ENDPOINT": "storage.example.net:9000",
+        "MTP_S3_ACCESS_KEY": "access-test",
+        "MTP_S3_SECRET_KEY": "secret-test",
+        "MTP_S3_BUCKET": "models-test",
+        "MTP_S3_SECURE": "true",
+    })
+    script = Path(remote_workers.__file__).with_name("remote_worker.sh")
+
+    result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "保持原停止状态" in result.stdout
+    commands = docker_log.read_text(encoding="utf-8")
+    assert "create --name mtp-worker-remote-config" in commands
+    assert "run --detach" not in commands
+    assert "stop --time" not in commands
+    assert "start mtp-worker-remote-config" not in commands
 
 
 @pytest.mark.parametrize(

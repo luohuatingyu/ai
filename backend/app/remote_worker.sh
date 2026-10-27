@@ -108,10 +108,16 @@ activate_worker_app() {
   APP_STAGING_DIR=""
 }
 
-# 用指定的现有镜像和当前部署配置创建 worker 容器。
+# 用指定的现有镜像和当前部署配置创建 worker 容器；start=0 时仅创建不启动，
+# 用于保持"部署/更新配置不改变容器停止状态"的语义。
 run_worker_container() {
   local image="$1"
-  args=(run --detach --name "$CONTAINER" --restart unless-stopped
+  local start="${2:-1}"
+  local launch=(run --detach)
+  if [[ "$start" == "0" ]]; then
+    launch=(create)
+  fi
+  args=("${launch[@]}" --name "$CONTAINER" --restart unless-stopped
     --env-file "$ENV_FILE" --volume "$CONFIG_DIR/data:/app/data")
   if [[ -d "$APP_DIR" ]]; then
     args+=(--volume "$APP_DIR:/app/app:ro")
@@ -161,7 +167,8 @@ install_worker() {
   show_worker_startup
 }
 
-# 使用当前保存的环境文件重新创建 worker 容器。
+# 使用当前保存的环境文件和现有镜像重建 worker 容器，保持重建前的运行状态
+# （运行中的保持运行，停止的保持停止）；失败时回滚恢复旧容器。
 recreate_worker_container() {
   if [[ "$MODE" != cpu && "$MODE" != gpu ]]; then
     printf '资源类型必须是 cpu 或 gpu。\n' >&2
@@ -173,15 +180,15 @@ recreate_worker_container() {
   fi
 
   if [[ ! -f "$ENV_FILE" ]]; then
-    printf '目标服务器未找到 worker 配置文件，请先更新配置或重新部署。\n' >&2
+    printf '目标服务器未找到 worker 配置文件，请先部署。\n' >&2
     exit 4
   fi
   if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
-    printf '目标服务器上未找到 worker 容器。\n' >&2
+    printf '目标服务器上未找到 worker 容器，请先部署。\n' >&2
     exit 4
   fi
 
-  local existing_image container_state previous_container
+  local existing_image container_state previous_container start_flag
   existing_image="$(docker inspect --format '{{.Image}}' "$CONTAINER")"
   if [[ -z "$existing_image" ]]; then
     printf '无法读取现有 worker 容器镜像。\n' >&2
@@ -197,38 +204,62 @@ recreate_worker_container() {
       printf '无法停止现有 worker 容器，最新配置尚未应用。\n' >&2
       exit 1
     fi
+    start_flag=1
+  else
+    start_flag=0
   fi
   if ! docker rename "$CONTAINER" "$previous_container"; then
     printf '无法暂存现有 worker 容器，最新配置尚未应用。\n' >&2
     exit 1
   fi
-  if ! run_worker_container "$existing_image"; then
+  if ! run_worker_container "$existing_image" "$start_flag"; then
     docker rm --force "$CONTAINER" >/dev/null 2>&1 || true
     docker rename "$previous_container" "$CONTAINER" >/dev/null 2>&1 || true
-    docker start "$CONTAINER" >/dev/null 2>&1 || true
-    printf '最新配置启动失败，已恢复旧容器；请修复后再次执行 start/restart。\n' >&2
+    if [[ "$start_flag" == "1" ]]; then
+      docker start "$CONTAINER" >/dev/null 2>&1 || true
+    fi
+    printf '最新配置启动失败，已恢复旧容器；请修复后再次执行更新配置或部署。\n' >&2
     exit 1
   fi
   docker rm --force "$previous_container" >/dev/null
-  printf 'worker 已使用最新配置重新启动：%s\n' "$CONTAINER"
+  if [[ "$start_flag" == "1" ]]; then
+    printf 'worker 已重建并运行（保持原运行状态）：%s\n' "$CONTAINER"
+  else
+    printf 'worker 容器已重建（保持原停止状态，执行 start 启动）：%s\n' "$CONTAINER"
+  fi
   show_worker_startup
 }
 
-# 已部署服务器只同步源码，不写配置或操作容器。
+# 部署已接入服务器：同步 worker 源码、重写配置并用现有镜像重建容器，立即生效。
 deploy_worker() {
-  stage_worker_app
-  activate_worker_app
-  printf 'worker 代码已更新：%s\n' "$APP_DIR"
+  if [[ -n "${MTP_WORKER_APP_ARCHIVE_B64:-}" ]]; then
+    stage_worker_app
+  fi
+  write_worker_env
+  if [[ -n "${APP_STAGING_DIR:-}" ]]; then
+    activate_worker_app
+  fi
+  recreate_worker_container
+  printf 'worker 代码与配置已部署并重建容器：%s\n' "$CONTAINER"
 }
 
-# 对目标服务器现有 worker 容器执行生命周期操作；启动和重启会应用最新配置。
+# 更新配置：覆盖环境文件并重建容器应用，不修改 worker 源码。
+update_worker_config() {
+  write_worker_env
+  recreate_worker_container
+  printf 'worker 配置已更新并应用：%s\n' "$CONTAINER"
+  show_worker_config
+}
+
+# 对目标服务器现有 worker 容器执行生命周期操作；只操作容器，不修改配置或代码。
 manage_worker() {
   if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     printf '目标服务器上未找到 worker 容器。\n' >&2
     exit 4
   fi
   case "$ACTION" in
-    start|restart) recreate_worker_container ;;
+    start) docker start "$CONTAINER" ;;
+    restart) docker restart --time 45 "$CONTAINER" ;;
     stop) docker stop --time 45 "$CONTAINER" ;;
     status) docker inspect --format '{{.State.Status}}' "$CONTAINER" ;;
     *)
@@ -243,9 +274,7 @@ case "$ACTION" in
     install_worker
     ;;
   config)
-    write_worker_env
-    printf 'worker 配置已覆盖：%s（运行中的容器仍使用旧配置，请执行 start/restart 应用）\n' "$ENV_FILE"
-    show_worker_config
+    update_worker_config
     ;;
   deploy|update)
     deploy_worker

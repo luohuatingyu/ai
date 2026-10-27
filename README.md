@@ -122,7 +122,7 @@ bash scripts/start-platform.sh   # 默认 CPU；设置 PLATFORM_MODE=gpu 选择 
    S3_ENDPOINT=目标服务器可访问的S3主机:8333
    WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY=使用Fernet生成的稳定密钥
    ```
-   `WORKER_IMAGE` 是平台 Docker 中 worker 镜像的本地标签，默认镜像由 Compose 构建；无需配置仓库地址，服务器页面不单独配置镜像。首次部署时，平台通过 Docker socket 导出镜像，再通过 SSH 流式传输到目标机执行 `docker load`；目标机不需要访问镜像仓库或执行 `docker pull`。目标机必须能访问同一 Redis 和 S3 存储。远程服务器和 SSH 凭证目录保存到 MySQL；远程管理 Compose 默认启用 MySQL，需在 `.env` 配置可从 trainer 容器访问的 `DB_HOST`、`DB_USER`、`DB_PASSWORD`、`DB_NAME` 等连接参数。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 用于页面凭证加密，可用 `python3.12 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'` 生成并长期保管。更换此密钥后，MySQL 中已有的页面凭证无法解密，需要重新保存。在「SSH 凭证管理」中添加用户名 + 密码、用户名 + 密钥或用户名 + 密钥 + 密码凭证。第三种方式先尝试密钥认证，失败后再尝试密码。私钥、登录密码和可选私钥口令都由页面提交并加密保存到 MySQL；登录凭证无需写入 `.env`，页面不会回显已保存的秘密。添加服务器时选择凭证；SSH 用户名留空时使用凭证用户名，填写后则覆盖该服务器的凭证用户名。OpenSSH 会按密钥内容识别其支持的 Ed25519、ECDSA、RSA OpenSSH/PEM 格式。建议将 `.env` 权限限制为 `600`。服务器没有专属 Redis URL 或 S3 地址时，分别使用 `.env` 中的 `REDIS_URL` 和 `S3_ENDPOINT` 覆盖远程 worker 配置；`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 可单独设置平台级默认值。服务器卡片的「生效配置」可查看平台当前解析出的镜像、Redis/S3 地址、来源和目标状态，认证信息会脱敏；查看结果是待下发配置。修改服务器配置时，平台只把新配置覆盖到目标机配置文件，不上传代码或重启容器；运行中的容器仍使用旧配置，需执行启动或重启才会重新创建容器并读取最新配置。部署操作只同步 worker 代码，启动/重启操作单独控制容器。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 是服务端加密密钥，不是目标 SSH 登录凭证。
+   `WORKER_IMAGE` 是平台 Docker 中 worker 镜像的本地标签，默认镜像由 Compose 构建；无需配置仓库地址，服务器页面不单独配置镜像。首次部署时，平台通过 Docker socket 导出镜像，再通过 SSH 流式传输到目标机执行 `docker load`；目标机不需要访问镜像仓库或执行 `docker pull`。目标机必须能访问同一 Redis 和 S3 存储。远程服务器和 SSH 凭证目录保存到 MySQL；远程管理 Compose 默认启用 MySQL，需在 `.env` 配置可从 trainer 容器访问的 `DB_HOST`、`DB_USER`、`DB_PASSWORD`、`DB_NAME` 等连接参数。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 用于页面凭证加密，可用 `python3.12 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'` 生成并长期保管。更换此密钥后，MySQL 中已有的页面凭证无法解密，需要重新保存。在「SSH 凭证管理」中添加用户名 + 密码、用户名 + 密钥或用户名 + 密钥 + 密码凭证。第三种方式先尝试密钥认证，失败后再尝试密码。私钥、登录密码和可选私钥口令都由页面提交并加密保存到 MySQL；登录凭证无需写入 `.env`，页面不会回显已保存的秘密。添加服务器时选择凭证；SSH 用户名留空时使用凭证用户名，填写后则覆盖该服务器的凭证用户名。OpenSSH 会按密钥内容识别其支持的 Ed25519、ECDSA、RSA OpenSSH/PEM 格式。建议将 `.env` 权限限制为 `600`。服务器没有专属 Redis URL 或 S3 地址时，分别使用 `.env` 中的 `REDIS_URL` 和 `S3_ENDPOINT` 覆盖远程 worker 配置；`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 可单独设置平台级默认值。服务器卡片的「生效配置」可查看平台当前解析出的镜像、Redis/S3 地址、来源和目标状态，认证信息会脱敏；查看结果是待下发配置。修改服务器配置时，平台把新配置覆盖到目标机配置文件并重建 worker 容器立即应用（运行中的 worker 会短暂重启，失败自动回滚旧容器）。部署操作同步最新 worker 代码、重写配置并重建容器；启动/停止/重启操作只控制容器生命周期，不修改配置或代码。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 是服务端加密密钥，不是目标 SSH 登录凭证。
 3. 构建平台 worker 镜像。GPU 平台使用默认 Compose 文件；纯 CPU 平台使用 CPU 文件：
    ```bash
    docker compose build worker
@@ -130,7 +130,7 @@ bash scripts/start-platform.sh   # 默认 CPU；设置 PLATFORM_MODE=gpu 选择 
    # CPU 版
    docker compose -f docker-compose.cpu.yml build worker
    ```
-   远程管理覆盖文件会将 `/var/run/docker.sock` 挂载到 trainer，以便导出平台本地镜像。Docker socket 可控制宿主 Docker，权限接近宿主 root；应限制平台管理 API 的网络访问。镜像只在首次安装时通过 SSH 传输，传输耗时取决于镜像大小和网络带宽；后续部署只同步 worker 代码。
+   远程管理覆盖文件会将 `/var/run/docker.sock` 挂载到 trainer，以便导出平台本地镜像。Docker socket 可控制宿主 Docker，权限接近宿主 root；应限制平台管理 API 的网络访问。镜像只在首次安装时通过 SSH 传输，传输耗时取决于镜像大小和网络带宽；后续部署同步最新 worker 代码与配置并重建容器。
 4. 使用远程管理 Compose 覆盖文件启动平台。GPU / CPU 两种启动方式如下：
    ```bash
    PLATFORM_MODE=gpu REMOTE_MANAGEMENT=true bash scripts/start-platform.sh
