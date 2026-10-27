@@ -16,9 +16,9 @@
 **测试执行结果**：
 - 存储定向测试：29 项；27 通过、0 失败、0 错误、2 跳过。跳过项需要显式设置 S3 测试端点。
 - 完整测试：264 项；258 通过、0 失败、0 错误、6 跳过。6 项由 Redis、S3 与 Supervisor 子进程环境条件控制。
-- 当前 OSS bucket 启动检查通过；临时对象写入、读取、存在性检查、列表、删除及清理回环通过。
-- `docker compose up --build -d`：镜像构建成功；trainer 启动，frontend 与 SeaweedFS healthy；`/api/health` 返回 `{"ok":true}`。
-- worker 尚未通过运行验证：外部 Redis 返回 `Authentication required`，且容器中的 `REDIS_PASSWORD` 为空。需在本地 `.env` 配置有效 Redis 凭证后重启并复测 worker；本次未执行端到端训练。
+- OSS bucket 启动检查及对象读写、存在性检查、列表、删除和清理回环通过。分别用 `oss-cn-shanghai.aliyuncs.com` 与 `s3.oss-cn-shanghai.aliyuncs.com` 验证；随后将本地忽略文件 `.env` 中的 `S3_ENDPOINT` 改为 S3 网关 endpoint，未提交该文件。
+- `docker compose up --build -d` 后 trainer 启动且 `/api/health` 曾返回 `{"ok":true}`。应用 S3 网关 endpoint 并执行 `docker compose up -d` 后，frontend 与 SeaweedFS healthy，但 trainer 目前等待 MySQL，API 返回 502；容器内至 MySQL 的 TCP 检查未通过。
+- worker 尚未通过运行验证：外部 Redis 返回 `Authentication required`，且容器中的 `REDIS_PASSWORD` 为空。需在本地 `.env` 配置有效 Redis 凭证、恢复 MySQL 可达性后重启并复测；本次未执行端到端训练。
 - `git diff --check`：通过。pytest 有两条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
 
 **验收标准—测试用例映射**：
@@ -27,7 +27,7 @@
 |---|---|---|---|
 | 标准 OSS endpoint 自动提供正确 region，非 OSS endpoint 不改变默认行为 | 单元：`test_s3_store_infers_region_only_for_regional_oss_endpoints`，7 组参数 | 上海/杭州、内外网及 S3 网关域名传入对应 region；SeaweedFS 与加速域名不传 region | 正常、边界、兼容 |
 | OSS bucket 初始化及对象存储基本操作可用 | 集成：当前 `.env` OSS bucket 上执行临时对象回环 | bucket 检查、写/读/exists/list/delete 均成功，最后确认对象已清理 | 正常、回归、资源清理 |
-| Compose 应用入口可用 | 容器/API：`docker compose up --build -d`、`curl /api/health` | trainer 启动且 API 返回 `ok=true`；frontend 与 SeaweedFS healthy | 启动、接口回归 |
+| Compose 应用入口可用 | 容器/API：`docker compose up --build -d`、`docker compose up -d`、`curl /api/health` | 初次代码重建后 API 返回 `ok=true`；应用 endpoint 并重建后 trainer 等待 MySQL，API 502 | 启动、接口回归；外部 DB 阻塞 |
 | worker 可接入协调服务 | 容器集成：Compose worker | 未通过；外部 Redis 要求认证，而当前容器没有 Redis 密码，未执行训练链路 | 外部依赖阻塞；修复凭证后需复测 |
 
 **实际执行命令**：
@@ -65,7 +65,25 @@ git diff --check
 
 结果：OSS 回环与清理通过；Compose 构建通过，API 健康检查通过；worker 因 Redis 缺少有效认证而重启。
 
-**已知问题与下次测试建议**：填写有效 `REDIS_PASSWORD` 后重新运行 Compose，确认 worker 稳定加入 Redis；随后运行一次真实训练任务，验证队列领取、日志、完成状态及产物。修改 S3 endpoint 识别或对象存储客户端初始化时，重新运行 `tests/test_storage.py`、完整 `tests/`、真实 OSS 回环及 `docker compose up --build -d`。
+```bash
+docker run --rm --env-file .env --entrypoint python emdash-hot-boxes-clean-y9u6p-trainer:latest -c 'from app.storage import S3ArtifactStore; import uuid; st=S3ArtifactStore(); prefix="jobs/it-s3-endpoint-prefix/"; key=prefix+uuid.uuid4().hex+".txt"; value=b"s3-endpoint-roundtrip"; wrote=False
+try:
+ st.write_bytes(key,value); wrote=True
+ assert st.read_bytes(key)==value
+ assert st.exists(key)
+ assert key in st.list_keys(prefix)
+ print("s3_endpoint_roundtrip=passed")
+finally:
+ if wrote: st.delete(key)
+assert not st.exists(key)
+print("s3_endpoint_cleanup=passed")'
+docker compose up -d
+curl -fsS --max-time 5 http://127.0.0.1:8000/api/health
+```
+
+结果：S3 网关 endpoint 回环与清理通过；Compose 按新 endpoint 重建容器；健康检查暂时返回 502，trainer 等待不可达的 MySQL。
+
+**已知问题与下次测试建议**：恢复 MySQL 可达性并在本地 `.env` 填写有效 `REDIS_PASSWORD` 后重新运行 Compose，确认 trainer API 和 worker 稳定；随后运行一次真实训练任务，验证队列领取、日志、完成状态及产物。修改 S3 endpoint 识别或对象存储客户端初始化时，重新运行 `tests/test_storage.py`、完整 `tests/`、真实 OSS 回环及 `docker compose up --build -d`。
 
 **Git基准点**：`63bc551`（Fix Aliyun OSS region detection）；测试报告单独提交。
 
