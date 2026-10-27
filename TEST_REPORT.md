@@ -2,10 +2,71 @@
 
 ## Git基准点
 
-- **Commit Hash**: 1c1812c（实时远程 worker 部署诊断日志）
-- **提交信息**: Add live remote worker diagnostics
+- **Commit Hash**: 85b9bfb（目标机自行构建远程 worker 镜像）
+- **提交信息**: Build remote worker images on target
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：目标机从构建上下文构建 worker 镜像（2026-10-27）
+
+**变更范围**：远程安装时不再从平台 Docker 导出并经 SSH 传输完整 worker 镜像。平台将精简构建上下文作为二进制 tar 经 SSH 发送给目标机，由目标 Docker 使用 BuildKit 构建目标架构镜像；通用基础镜像与 Python 依赖由目标机拉取或使用本地缓存。构建输出进入现有脱敏进度日志，构建失败或取消时不会执行安装脚本。实际上下文为 665,600 字节（0.63 MiB）。
+
+**测试环境**：Docker Compose；容器 Python 3.12.15。完整套件包含工作区原有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动，这两个文件未纳入本次提交。
+
+**测试执行结果**：
+- 定向远程 worker 测试：`tests/test_remote_workers.py` 为 62 通过、0 失败、0 错误、0 跳过。
+- 完整测试：249 通过、6 跳过、0 失败、0 错误。6 项为 Redis、S3 与 Supervisor 子进程环境门控测试。
+- `docker compose up --build -d`：通过，trainer、worker 和 frontend 重建启动。
+- GPU 与 CPU 远程 Compose 配置检查：`docker compose -f docker-compose.yml -f docker-compose.remote.yml config -q`、`docker compose -f docker-compose.cpu.yml -f docker-compose.remote.yml config -q` 均通过。
+- 运行容器生成的构建上下文：665,600 字节（0.63 MiB）；归档不含 `data/` 和 `tests/`。
+- `git diff --check`：通过。保留既有 SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 弃用警告。
+- 未连接真实 Linux 目标机执行 SSH 构建与启动；目标机上的 Docker Hub、PyPI 镜像连通性和 BuildKit 实际行为仍需部署环境确认。
+
+**实际执行命令**：
+
+```bash
+docker compose up --build -d
+```
+
+结果：构建和启动成功。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q -p no:cacheprovider
+```
+
+结果：62 passed。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider
+```
+
+结果：249 passed、6 skipped。
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.remote.yml config -q
+docker compose -f docker-compose.cpu.yml -f docker-compose.remote.yml config -q
+docker compose exec -T trainer python -c 'from app.remote_workers import _worker_build_context; data = _worker_build_context(); print(f"build_context_bytes={len(data)} ({len(data) / 1048576:.2f} MiB)")'
+git diff --check
+```
+
+结果：两种远程 Compose 配置检查通过；构建上下文 665,600 字节（0.63 MiB）；差异空白检查通过。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 安装只经 SSH 发送精简构建上下文，由目标机执行目标架构构建 | 单元：`test_remote_worker_build_sends_minimal_context_and_quotes_docker_args`、`test_run_remote_action_builds_worker_on_target_before_install`；二进制输入：`test_run_remote_subprocess_preserves_binary_build_context` | tar 仅含 Dockerfile、依赖和项目文件；远端命令以安全引用的参数执行 `docker build --platform linux/amd64`，随后才运行安装脚本 | 正常、输入安全、数据隔离、兼容 |
+| 构建错误被脱敏并阻止启动 | 单元/集成：`test_remote_worker_build_reports_redacted_target_error`、`test_run_remote_action_stops_when_remote_worker_build_fails` | Docker 拉取失败时保留错误原因、隐藏 SSH 密码，且不执行安装脚本 | 异常、敏感数据保护、状态冲突 |
+| 构建可取消，且拒绝不支持的平台 | 单元/集成：`test_run_remote_action_stops_when_remote_worker_build_is_cancelled`、`test_remote_worker_build_rejects_unsupported_platform_before_ssh` | 取消或输入 Windows 平台时不继续构建/安装 | 中断、非法参数 |
+| 远程 SSH、安全日志和现有 worker 功能继续通过 | `tests/test_remote_workers.py` 与完整 `tests/` | 62 项定向测试通过；全套 249 通过、6 环境门控跳过 | 回归、安全、兼容 |
+
+**关键模块测试**：远程 worker 与 SSH 构建流程 62/62 通过；全套测试 249 通过、6 个环境门控用例跳过。
+
+**已知问题与限制**：首次目标机构建仍需要远端 Docker 访问基础镜像源和 Dockerfile 配置的 PyPI 镜像；镜像仍会占用目标机磁盘，但平台到目标机的 SSH 构建输入约 0.63 MiB。未进行真实 Linux 服务器端到端安装。
+
+**下次测试建议**：在可访问 Docker Hub 与 PyPI 镜像的 Linux 服务器上执行远程重新部署，确认首次构建成功；再次部署时检查目标 Docker 缓存是否复用 Python 依赖层，并确认 worker 心跳正常。
+
+**重测触发条件**：修改远程 Docker 构建命令、构建上下文筛选、SSH 二进制输入、取消处理或 worker 安装脚本时，运行 `tests/test_remote_workers.py` 与完整 `tests/`，并重建 Compose 服务。
 
 ## 本次变更测试结果：实时远程 worker 部署诊断日志（2026-10-27）
 
