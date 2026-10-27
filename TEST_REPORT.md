@@ -1163,3 +1163,30 @@ MTP_TEST_S3=localhost:9000 python3 -m pytest tests/test_storage.py -q  # 22/22
 **覆盖范围与限制**：覆盖凭证 CRUD、加密存储、三种认证组合、用户名继承/覆盖、秘密脱敏、引用保护、旧数据兼容及无 `.env` 回退。没有对真实 SSH 主机做端到端连接；6 项外部服务门控测试未执行。
 
 **下次测试建议**：在部署环境使用真实 SSH 主机验证 OpenSSH 密钥算法、加密私钥口令与密码回退行为；配置 `MTP_TEST_REDIS`、`MTP_TEST_S3` 后运行被门控的集成测试。
+
+## Compose Redis 密码透传验证（2026-10-27）
+
+**变更范围**：在 `docker-compose.yml` 与 `docker-compose.cpu.yml` 的共享后端环境配置中透传 `REDIS_PASSWORD`。配置变更提交为 `716c3d7`。
+
+**验证结果**：
+- 两份 Compose 配置校验通过；脱敏检查确认 trainer 和 worker 的展开配置均收到非空 `REDIS_PASSWORD`。
+- `docker compose up --build -d` 构建并重建服务成功；worker 容器内变量检查返回 `set`。
+- 从 worker 容器调用 `create_redis_client().ping()` 未通过，报 `Timeout connecting to server`。TCP 建连阶段超时，尚未验证 Redis 密码；worker 仍因 Redis 不可达而重启。
+- `git diff --check` 通过。未运行 pytest：本次仅修改 Compose 配置，业务代码未变更。
+
+**实际执行命令**：
+
+```bash
+set -o pipefail; docker compose config --format json | ruby -rjson -e 'cfg=JSON.parse(STDIN.read); %w[trainer worker].each { |s| v=cfg.dig("services",s,"environment","REDIS_PASSWORD"); puts "#{s} REDIS_PASSWORD: #{v.nil? || v.empty? ? "missing" : "set"}" }'
+set -o pipefail; docker compose -f docker-compose.cpu.yml config --format json | ruby -rjson -e 'cfg=JSON.parse(STDIN.read); %w[trainer worker].each { |s| v=cfg.dig("services",s,"environment","REDIS_PASSWORD"); puts "cpu #{s} REDIS_PASSWORD: #{v.nil? || v.empty? ? "missing" : "set"}" }'
+docker compose up --build -d
+docker compose exec worker sh -lc 'test -n "$REDIS_PASSWORD" && echo REDIS_PASSWORD=set'
+docker compose run --rm --no-deps worker python -c 'from app.coordination import create_redis_client; print(create_redis_client().ping())'
+git diff --check
+```
+
+结果：配置展开与 worker 环境检查通过；容器内 PING 因 TCP 连接超时失败；`git diff --check` 通过。
+
+**验收标准—验证映射**：密码变量由 Compose 传入 trainer/worker：通过配置展开检查与容器环境检查；worker 对 `47.101.33.133:6379` 完成认证 PING：未通过，当前阻塞在容器到 Redis 的网络连接。
+
+**已知问题与下次验证建议**：检查 Redis 主机安全组、防火墙及 worker 所在网络的出站路径，确保 Docker worker 能连接目标 `6379`。网络连通后重新执行 worker 内 `create_redis_client().ping()`；若返回认证错误，再核对 Redis 密码或 ACL 用户。业务代码测试基准仍为 `63bc551`，本次配置变更未触发完整业务测试。
