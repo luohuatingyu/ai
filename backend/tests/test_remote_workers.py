@@ -1454,7 +1454,7 @@ def test_run_remote_action_config_overwrites_remote_config_without_code_archive(
     assert result["stdout"] == "config applied\n"
     assert len(calls) == 1
     assert "export MTP_ACTION=config" in calls[0][1]["input_data"]
-    assert re.search(r"MTP_WORKER_APP_ARCHIVE_B64", calls[0][1]["input_data"]) is None
+    assert re.search(r"MTP_WORKER_APP_ARCHIVE_B64=\\$\\(cat", calls[0][1]["input_data"]) is None
 
 
 def test_run_remote_action_stops_when_remote_worker_build_fails(tmp_path, monkeypatch):
