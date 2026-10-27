@@ -7,8 +7,8 @@
 **测试环境**：Docker Compose，容器 Python 3.12.15。完整测试基于当前已提交版本临时归档运行；工作区预先存在、未纳入本次提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 修改未参与测试。
 
 **测试执行结果**：
-- API 与远程 Worker 定向测试：129 通过、0 失败、0 错误、0 跳过。
-- 完整测试套件：267 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- 训练 Worker 定向测试：23 通过、0 失败、0 错误、0 跳过；远程 Worker 定向测试：71 通过、0 失败、0 错误、0 跳过。
+- 最新代码提交后的完整测试套件：276 项；270 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
 - `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
 - `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health` 返回 `{"ok":true}`。
 - `git diff --check`：通过。
@@ -26,7 +26,7 @@
 | 远程配置摘要展示实际非敏感配置 | Shell：`test_remote_bootstrap_script_config_overwrites_env_without_touching_container` | `config` 动作输出模式、机器标识、CPU 槽位、Redis 目标、S3 参数和凭证已配置状态 | 正常、回归 |
 | 两类日志保持现有执行行为和 API 兼容 | 完整 `tests/` 套件、容器健康检查 | 训练、远程配置/部署/生命周期及日志读取接口保持通过 | 兼容、回归 |
 
-**关键模块测试**：API 与远程 Worker 129/129 通过；完整套件 267/273 通过。
+**关键模块测试**：训练 Worker 23/23 通过；远程 Worker 71/71 通过；完整套件 270/276 通过。
 
 **已知问题与限制**：未连接真实 SSH 服务器；远程启动配置和脚本输出通过隔离执行器及脱敏断言验证。
 
@@ -38,7 +38,7 @@
 
 - **Commit Hash**: 8a65551（远程操作日志显示脚本输出）
 - **提交信息**: Include remote script output in operation logs
-- **测试日期**: 2026-10-27
+- **测试日期**: 2026-10-28
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
 ## 本次变更测试结果：远程执行日志清除（2026-10-27）
