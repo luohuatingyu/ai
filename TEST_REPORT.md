@@ -1,27 +1,37 @@
 # 测试报告
 
-## 本次变更测试结果：显示远程配置摘要（2026-10-27）
+## 本次变更测试结果：区分远程服务器与训练任务启动配置日志（2026-10-27）
 
-**变更范围**：远程 `config` 动作覆盖目标机 worker 配置后，追加实际生效配置摘要；远程操作和训练任务启动时记录脱敏配置；Redis 仅显示目标地址，S3 凭证只显示是否已配置，不输出密钥明文。
+**变更范围**：远程服务器执行日志增加 `[远程服务器启动配置]` 摘要；训练任务执行日志增加 `[训练任务启动配置]` 摘要。两类日志均记录可追踪的动作、任务、资源和运行节点配置，连接凭证、令牌和密钥字段脱敏；远程 `config` 动作同时输出目标机实际生效的非敏感配置摘要。
+
+**测试环境**：Docker Compose，容器 Python 3.12.15。完整测试包含工作区预先存在、未纳入本次提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 修改。
 
 **测试执行结果**：
-- 远程 worker 定向测试：71 通过、0 失败、0 错误、0 跳过。
-- API 定向测试：58 通过、0 失败、0 错误、0 跳过。
-- 当前已提交版本临时归档运行完整测试：267 通过、6 跳过、0 失败、0 错误；跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
-- 当前已提交版本包含远程操作和训练任务启动配置日志回归断言；工作区中另有未提交的 `storage.py` 与 `test_storage.py`，未纳入本次测试归档。
-- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建并启动成功。
-- `curl -fsS http://127.0.0.1:8000/api/health`：重试后返回 `{"ok":true}`。
+- 训练 Worker 定向测试：23 通过、0 失败、0 错误、0 跳过。
+- 远程 Worker 定向测试：71 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：276 项；270 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- 一次将两个定向文件合并运行时出现 6 个 Worker 长任务时序失败；将 `test_worker.py` 与 `test_remote_workers.py` 分开复跑后分别 23/23、71/71 通过，完整套件随后 270/270 通过。该波动与新增日志断言无关，未复现。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
+- `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health` 返回 `{"ok":true}`。
 - `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
 
 **验收标准—测试用例映射**：
 
 | 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
 |---|---|---|---|
-| 更新配置后可查看目标机实际配置 | Shell：`test_remote_bootstrap_script_config_overwrites_env_without_touching_container` | 配置覆盖后日志包含模式、机器标识、CPU 槽位、Redis 目标、S3 参数和凭证已配置状态 | 正常、回归 |
-| 配置摘要不泄露敏感值 | Shell：同上；远程操作：`test_execute_remote_operation_persists_success_and_failure` | Redis 认证信息不出现在日志；S3 密钥只输出 `[已配置]` 或 `[未配置]` | 安全、异常 |
-| 远程和训练启动日志可区分配置来源 | 远程操作：`test_execute_remote_operation_persists_success_and_failure`；训练 worker：`test_worker_completes_job` | 分别写入 `[远程服务器启动配置]` 与 `[训练任务启动配置]`，并对凭证脱敏 | 正常、安全、回归 |
+| 训练任务执行日志打印并标识启动配置 | Worker 集成：`tests/test_worker.py::test_worker_completes_job`；本地状态平面与真实训练流程 | 完成分类训练后日志包含 `[训练任务启动配置]`、数据集 ID 和任务参数 | 正常、回归 |
+| 训练启动配置不泄露敏感参数 | 同上；任务参数注入 `api_token` | 日志显示 `"api_token":"[redacted]"`，不包含原始 token | 安全、异常输入 |
+| 远程服务器执行日志打印并标识启动配置 | 远程操作集成：`tests/test_remote_workers.py::test_execute_remote_operation_persists_success_and_failure`；隔离 SQLite、远程动作替身 | `start` 操作完成后日志包含 `[远程服务器启动配置]`、动作、模式和 Redis 非敏感 endpoint | 正常、兼容 |
+| 远程连接凭证不进入执行日志 | 同上；Redis URL 含密码 | 日志保留主机/端口/数据库路径，不包含 Redis 密码 | 权限与安全 |
+| 远程配置摘要展示实际非敏感配置 | Shell：`test_remote_bootstrap_script_config_overwrites_env_without_touching_container` | `config` 动作输出模式、机器标识、CPU 槽位、Redis 目标、S3 参数和凭证已配置状态 | 正常、回归 |
+| 两类日志保持现有执行行为和 API 兼容 | 完整 `tests/` 套件、容器健康检查 | 训练、远程配置/部署/生命周期及日志读取接口保持通过 | 兼容、回归 |
 
-**已知问题与限制**：未连接真实远程 SSH 主机；未提交的存储改动未纳入本次测试归档。
+**关键模块测试**：训练 Worker 23/23 通过；远程 Worker 71/71 通过；完整套件 270/276 通过。
+
+**已知问题与限制**：未连接真实 SSH 服务器；远程启动配置日志通过隔离执行器和脱敏断言验证。混合定向运行在容器资源竞争下曾出现长任务超时，分组复跑和完整套件均通过。
+
+**下次测试建议**：连接一台测试 Linux 主机，确认真实 start/restart 后日志窗口能看到启动配置摘要，并核对目标机实际生效的 worker `.env` 与日志脱敏结果。
 
 **Git基准点**：`72d997a`（Log startup configuration for executions）。
 
