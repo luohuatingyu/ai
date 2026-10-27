@@ -1839,6 +1839,16 @@ def execute_remote_operation(
             server.update({"status": "running", "operation_id": operation_id})
             remote_config_repository.save_remote_server(server)
             result = run_remote_action(server, action, operation_id)
+            # 远端脚本的最终 stdout/stderr 也写入操作日志；日志窗口优先展示 log，避免配置摘要只停留在 output 字段而不可见。
+            for stream_name, phase in (("stdout", "远端脚本输出"), ("stderr", "远端脚本错误")):
+                stream_output = str(result.get(stream_name, "") or "").strip()
+                if stream_output:
+                    _append_remote_operation_log(
+                        operation_id,
+                        phase,
+                        stream_output,
+                        server=server,
+                    )
             if _remote_operation_cancel_requested(operation_id):
                 raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
             terminal_update = {
