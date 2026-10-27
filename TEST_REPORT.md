@@ -1196,3 +1196,20 @@ git diff --check
 **只读检查结果**：ECS 上运行 Redis 8.0.5，监听 `0.0.0.0:6379`，配置为 `bind 0.0.0.0`、`protected-mode yes` 且已配置密码；未读取或记录密码。未认证的本机 `PING` 返回 `NOAUTH`，证明 Redis 进程可响应并要求认证。UFW 正在运行，默认拒绝入站；6379 仅允许来源 `59.152.38.247`。因此安全组截图中的 `0.0.0.0/0` 放行不会覆盖主机 UFW；若 worker 出口 IP 不是 `59.152.38.247`，主机防火墙会丢弃连接，表现为 TCP 超时。未修改 ECS 防火墙规则。
 
 **结论与后续**：当前最可能阻塞点是 UFW 来源白名单，而非 Redis 密码验证。核对 worker 实际出口 IP，并仅为该地址添加 6379 入站规则；网络连通后再做密码 PING。保留安全组全网来源并非必要。
+
+## Redis UFW 白名单修复与连通验证（2026-10-27）
+
+**操作结果**：抓包确认 worker 的 TCP SYN 来源不在 UFW 原有的 Redis 来源白名单内。已仅为抓获的 worker 出口地址添加 TCP 6379 入站规则；UFW 默认拒绝策略及既有规则保持不变。未修改阿里云安全组，也未读取或记录 Redis 密码。
+
+**验证结果**：从 worker 容器连接 `47.101.33.133:6379` 成功；调用项目 `create_redis_client().ping()` 返回 `True`，证明网络连通与当前认证配置均有效。Compose worker 随后保持运行并启动 CPU 槽。
+
+**实际执行命令**：
+
+```bash
+docker compose run --rm --no-deps worker python -c 'import socket; s=socket.create_connection(("47.101.33.133", 6379), timeout=5); print("TCP connected"); s.close()'
+docker compose run --rm --no-deps worker python -c 'from app.coordination import create_redis_client; print("Redis ping:", create_redis_client().ping())'
+docker compose ps --format table
+docker compose logs --tail=15 worker
+```
+
+**遗留项**：阿里云安全组仍允许 `0.0.0.0/0`，虽然 UFW 已按 worker 来源限制访问，仍建议将安全组入方向同步收窄到实际所需的固定来源。业务代码测试基准未变，本次为主机防火墙操作及容器连通验证。
