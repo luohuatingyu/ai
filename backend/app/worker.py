@@ -483,6 +483,16 @@ class TrainingWorker:
             shutil.rmtree(scratch, ignore_errors=True)
             scratch.mkdir(parents=True, exist_ok=True)
             params = spec.get("params") or {}
+            log_revision = int(record.get("log_revision", 0))
+
+            def reconcile_log_revision() -> None:
+                """发现控制面清日志后，丢弃本地旧快照，防止同步时恢复旧日志。"""
+                nonlocal log_revision
+                latest = jobstore.read_job(store, job_id) or {}
+                latest_revision = int(latest.get("log_revision", 0))
+                if latest_revision != log_revision:
+                    (scratch / "log.txt").write_text("", encoding="utf-8")
+                    log_revision = latest_revision
 
             def joblog(msg: str) -> None:
                 """统一任务日志通道：本地 scratch 追加 + 整文件同步到状态平面。
@@ -490,6 +500,7 @@ class TrainingWorker:
                 不能直接 append 到状态平面：finally 的 _flush_final 会用
                 scratch 副本整文件覆盖状态平面日志，直接 append 的行会被冲掉。
                 """
+                reconcile_log_revision()
                 stamp = time.strftime("%H:%M:%S")
                 try:
                     with (scratch / "log.txt").open("a", encoding="utf-8") as f:
@@ -551,11 +562,13 @@ class TrainingWorker:
 
             def scratch_log(msg: str) -> None:
                 """训练器日志：写本地 scratch，随 on_epoch_end 整文件幂等同步到状态平面。"""
+                reconcile_log_revision()
                 with (scratch / "log.txt").open("a", encoding="utf-8") as f:
                     f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
 
             def on_epoch_end(rec: dict) -> None:
                 """每 epoch 结束：同步 metrics/日志到状态平面（读方写后即可见）。"""
+                reconcile_log_revision()
                 store.write_file(job_key(job_id, "metrics.jsonl"), scratch / "metrics.jsonl")
                 store.write_file(job_key(job_id, "log.txt"), scratch / "log.txt")
                 controller.set_progress(int(rec.get("epoch", 0)), "training")
@@ -655,6 +668,7 @@ class TrainingWorker:
             if controller is not None:
                 controller.stop()
             self._controller = None
+            reconcile_log_revision()
             self._flush_final(scratch, job_id)
             shutil.rmtree(scratch, ignore_errors=True)
 

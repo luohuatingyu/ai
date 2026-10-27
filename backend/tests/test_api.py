@@ -98,6 +98,46 @@ def test_train_e2e_classification(client, make_dataset):
     assert dl.status_code == 200 and len(dl.content) > 0
 
 
+def test_clear_job_logs_removes_file_and_database_logs(client, monkeypatch):
+    """清除任务日志后，文件存储、数据库镜像和读取接口都应为空。"""
+    from app import database
+    from app.models import Dataset, JobLog, TrainingJob
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "clear-logs-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed", "log_revision": 0})
+    jobstore.append_job_log(manager.store, job_id, "需要清除")
+    with database.SessionLocal() as db:
+        db.add(Dataset(id=job_id, name="clear logs", rows=0, columns=[]))
+        db.add(TrainingJob(
+            id=job_id, dataset_id=job_id, dataset_name="clear logs", target="",
+            task="classification", params={},
+        ))
+        db.add(JobLog(job_id=job_id, message="数据库中的旧日志"))
+        db.commit()
+    monkeypatch.setattr(config, "DB_AVAILABLE", True)
+    try:
+        response = client.delete(f"/api/jobs/{job_id}/logs")
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+        assert client.get(f"/api/jobs/{job_id}/logs").json() == {
+            "lines": [], "next_offset": 0, "total": 0,
+        }
+        assert jobstore.read_job_log(manager.store, job_id) == ""
+        assert jobstore.read_job(manager.store, job_id)["log_revision"] == 1
+        with database.SessionLocal() as db:
+            assert db.query(JobLog).filter(JobLog.job_id == job_id).count() == 0
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_clear_job_logs_returns_404_for_missing_job(client):
+    """不存在的任务不得创建日志文件或返回成功。"""
+    response = client.delete("/api/jobs/missing-clear-logs-test/logs")
+    assert response.status_code == 404
+
+
 def test_train_e2e_regression(client, make_dataset):
     ds = make_dataset(kind="regression")
     r = client.post("/api/train", json=_train_payload(ds, epochs=3,
@@ -518,7 +558,8 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
         f"/api/remote-operations/{updated.json()['operation_id']}"
     ).json()
     assert update_operation["status"] == "completed"
-    assert calls[-1] == (machine_id, "install", "worker")
+    assert update_operation["action"] == "update"
+    assert calls[-1] == (machine_id, "update", "worker")
     assert remote_config_repository.get_remote_server(machine_id)["worker_image_override"] == "registry.example.net/remote/worker:v4"
 
     for action in ("install", "start", "stop", "restart"):
@@ -528,7 +569,8 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
             f"/api/remote-operations/{result.json()['operation_id']}"
         ).json()
         assert current["status"] == "completed"
-        assert calls[-1] == (machine_id, action, "worker")
+        expected_remote_action = "update" if action == "install" else action
+        assert calls[-1] == (machine_id, expected_remote_action, "worker")
         current_server = next(
             item for item in client.get("/api/remote-servers").json()["servers"]
             if item["machine_id"] == machine_id
@@ -1367,6 +1409,7 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
         'deployed ? "重新部署" : "部署"',
         "更新配置并重启",
         "应用当前已保存配置",
+        "不会重建镜像",
         "openEditRemoteServer",
     ):
         assert marker in html

@@ -136,3 +136,10 @@ def get_job_logs(db: Session, job_id: str, offset: int = 0, limit: int = 500) ->
         .limit(limit)
         .all()
     )
+
+
+def delete_job_logs(db: Session, job_id: str) -> int:
+    """删除指定任务的数据库日志，并返回删除条数。"""
+    deleted = db.query(JobLog).filter(JobLog.job_id == job_id).delete(synchronize_session=False)
+    db.commit()
+    return int(deleted or 0)

@@ -13,7 +13,7 @@ import app.config as config
 from app import jobstore
 from app import remote_config_repository
 from app.database import db_session
-from app.db_utils import get_job_logs
+from app.db_utils import delete_job_logs, get_job_logs
 from app.jobs import api_view
 from app.state import manager
 from app.storage import job_key
@@ -158,6 +158,25 @@ def job_logs(job_id: str, offset: int = 0) -> dict:
     offset = max(0, min(offset, total))
     batch = lines[offset : offset + 500]
     return {"lines": batch, "next_offset": offset + len(batch), "total": total}
+
+
+@router.delete("/jobs/{job_id}/logs")
+def clear_job_logs(job_id: str) -> dict:
+    """清空任务文件日志和数据库镜像日志。"""
+    _check_id(job_id, "任务")
+    if not manager.get(job_id):
+        raise HTTPException(404, "任务不存在")
+
+    if config.DB_AVAILABLE:
+        try:
+            with db_session() as db:
+                delete_job_logs(db, job_id)
+        except Exception:
+            raise HTTPException(503, "数据库日志清除失败，请稍后重试")
+    record = jobstore.read_job(manager.store, job_id) or {}
+    jobstore.update_job(manager.store, job_id, log_revision=int(record.get("log_revision", 0)) + 1)
+    jobstore.clear_job_log(manager.store, job_id)
+    return {"ok": True}
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -355,6 +374,7 @@ def _start_remote_operation(
     server["deployed"] = remote_server_is_deployed(server)
     server["status"] = {
         "install": "provisioning",
+        "update": "updating",
         "start": "starting",
         "stop": "stopping",
         "restart": "restarting",
@@ -615,7 +635,7 @@ def update_remote_server(
     _remote_config_db_call(remote_config_repository.save_remote_server, candidate)
     if candidate["deployed"]:
         response.status_code = 202
-        return _start_remote_operation(candidate, "install", background_tasks)
+        return _start_remote_operation(candidate, "update", background_tasks)
     return {"server": remote_server_public_view(candidate)}
 
 
@@ -625,7 +645,7 @@ def manage_remote_server(
     action: Literal["install", "start", "stop", "restart"],
     background_tasks: BackgroundTasks,
 ) -> dict:
-    """经 SSH 重装、启动、优雅停止或重启目标服务器上的 worker 容器。"""
+    """经 SSH 首次部署或同步代码更新、启动、停止和重启 worker 容器。"""
     _check_id(machine_id, "服务器")
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
@@ -642,7 +662,10 @@ def manage_remote_server(
     previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
     if previous and previous.get("status") in {"queued", "running"}:
         raise HTTPException(409, "该服务器已有远程操作正在执行")
-    return _start_remote_operation(server, action, background_tasks)
+    operation_action = (
+        "update" if action == "install" and remote_server_is_deployed(server) else action
+    )
+    return _start_remote_operation(server, operation_action, background_tasks)
 
 
 @router.get("/remote-operations/{operation_id}")

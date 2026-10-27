@@ -479,7 +479,10 @@
         <div class="hint" id="chartNote"></div>
       </div>
 
-      <div id="tab-logs" hidden><pre id="logBox"></pre></div>
+      <div id="tab-logs" hidden>
+        <div class="row" style="justify-content:flex-end;margin:8px 0;"><button id="btnClearJobLogs" type="button">清除日志</button></div>
+        <pre id="logBox"></pre>
+      </div>
 
       <div id="tab-result" hidden><div id="resultBox" class="empty">任务完成后展示评估结果</div></div>
 
@@ -1305,6 +1308,21 @@ async function tailLogs(id) {
   } catch { /* 静默 */ }
 }
 
+// 清空当前任务日志并重置轮询偏移，避免继续使用旧游标。
+async function clearJobLogs() {
+  const id = state.jobId;
+  if (!id) return;
+  try {
+    await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs`, { method: "DELETE" });
+    if (id !== state.jobId) return;
+    state.logOffset = 0;
+    $("logBox").textContent = "";
+    toast("任务日志已清除", "ok");
+  } catch (error) {
+    toast(error.message || "清除日志失败", "error");
+  }
+}
+
 /* ---------- 结果 ---------- */
 function renderResult(j) {
   const box = $("resultBox");
@@ -1501,17 +1519,19 @@ function workerServerCard(machineId, slots, remoteServer = null) {
   const cancelRequested = Boolean(operation && operation.cancel_requested);
   const remoteStatus = remoteServer ? {
     provisioning: "正在安装并检测资源", starting: "正在启动 worker", stopping: "正在停止 worker",
-    restarting: "正在重启 worker", online: "worker 已启动", stopped: "worker 已停止",
+    restarting: "正在重启 worker", updating: "正在同步代码并更新容器",
+    online: "worker 已启动", stopped: "worker 已停止",
     not_deployed: "尚未部署", error: "上次远程操作失败",
   }[remoteServer.status] || "SSH 服务器已登记" : "";
   const operationLabel = operation ? {
-    queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "install" ? (deployed ? "正在重新部署并应用配置…" : "正在部署并检测…") : `正在远程${operation.action}…`,
+    queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "update" ? "正在同步代码并更新容器…" : operation.action === "install" ? "正在首次部署并构建镜像…" : `正在远程${operation.action}…`,
     completed: "最近操作已完成", failed: "最近操作失败", cancelled: "最近操作已中断",
   }[operation.status] || remoteStatus : remoteStatus;
   const operationPhaseLabels = {
     "检查部署配置": "检查部署配置", "检查远端 Docker 平台": "检查远端 Docker",
     "检查镜像架构": "比较镜像架构", "构建目标架构镜像": "构建目标架构镜像",
     "传输并加载 worker 镜像": "传输并加载镜像", "远端 docker load": "远端加载镜像",
+    "同步 worker 代码": "同步 worker 代码",
     "执行远程部署脚本": "执行远端部署脚本", "等待资源心跳": "等待资源心跳",
   };
   const phaseLabel = operation && operationPhaseLabels[operation.phase];
@@ -1839,7 +1859,7 @@ async function openEditRemoteServer(machineId) {
   $("addServerTitle").textContent = `编辑服务器 ${machineId}`;
   $("btnSubmitRemoteServer").textContent = server.deployed ? "更新配置并重启" : "保存配置";
   $("remoteConfigApplyHint").textContent = server.deployed
-    ? "保存后会应用新配置并重建 worker 容器。"
+    ? "保存后会同步 worker 代码、复用现有镜像并重建容器；不会重建镜像。依赖或 Dockerfile 改动需另行构建镜像。"
     : "服务器尚未部署；保存后可在服务器卡片上点击“部署”。";
   modal.hidden = false;
   modal.classList.add("open");
@@ -1883,7 +1903,7 @@ async function submitRemoteServer(event) {
       headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     toast(editingMachineId
-      ? result.operation_id ? "配置已保存，worker 容器正在重建并应用新配置" : "配置已保存；服务器部署后才会应用新配置"
+      ? result.operation_id ? "配置已保存，正在同步代码并复用现有镜像更新容器" : "配置已保存；服务器部署后才会应用新配置"
       : "服务器配置已登记；请在服务器卡片上点击“部署”", "ok");
     closeAddServerModal();
     await refreshWorkers();
@@ -2164,6 +2184,7 @@ document.querySelectorAll(".tabs button").forEach((b) => {
     refreshJobsSoon();
   };
 });
+$("btnClearJobLogs").onclick = clearJobLogs;
 let detailTimer = null;
 function refreshJobsSoon() { clearTimeout(detailTimer); detailTimer = setTimeout(refreshJobs, 30); }
 $("btnDownload").onclick = () => { if (state.jobId) location.href = `/api/jobs/${state.jobId}/model`; };
