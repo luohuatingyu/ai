@@ -7,6 +7,7 @@
 **测试执行结果**：
 - 远程 worker 定向测试：71 通过、0 失败、0 错误、0 跳过。
 - API 定向测试：58 通过、0 失败、0 错误、0 跳过。
+- 当前已提交版本临时归档运行完整测试：267 通过、6 跳过、0 失败、0 错误；跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
 - 远程 worker 与训练 worker 组合测试：89 通过、5 失败；失败来自工作区中预先存在的 `worker.py`、`storage.py` 并行改动导致的任务领取、断点续训和存储重试行为，本次配置摘要相关测试均通过。
 - `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建并启动成功。
 - `curl -fsS http://127.0.0.1:8000/api/health`：重试后返回 `{"ok":true}`。
