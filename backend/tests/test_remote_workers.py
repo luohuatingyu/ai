@@ -1390,8 +1390,8 @@ def test_run_remote_action_builds_worker_on_target_before_install(tmp_path, monk
     assert calls[0][-1].startswith("docker info")
 
 
-def test_run_remote_action_updates_code_without_rebuilding_image(tmp_path, monkeypatch):
-    """已部署更新只传 app 源码并复用现有镜像，不查询架构或运行 Docker build。"""
+def test_run_remote_action_deploys_code_without_rebuilding_image(tmp_path, monkeypatch):
+    """部署只传 app 源码，不查询架构、写配置或等待容器心跳。"""
     import base64
     import io
     import re
@@ -1409,12 +1409,6 @@ def test_run_remote_action_updates_code_without_rebuilding_image(tmp_path, monke
         "_build_worker_image_on_remote",
         lambda *_args, **_kwargs: pytest.fail("代码更新不应构建 Docker 镜像"),
     )
-    heartbeats = []
-    monkeypatch.setattr(
-        remote_workers,
-        "_wait_for_remote_worker_heartbeat",
-        lambda operation_id, machine_id, _progress: heartbeats.append((operation_id, machine_id)),
-    )
     calls = []
 
     def fake_run(command, **kwargs):
@@ -1423,14 +1417,14 @@ def test_run_remote_action_updates_code_without_rebuilding_image(tmp_path, monke
 
     monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
     operation_id = "c" * 32
-    result = remote_workers.run_remote_action(_server(), "update", operation_id)
+    result = remote_workers.run_remote_action(_server(), "deploy", operation_id)
 
     assert result["stdout"] == "worker updated\n"
     assert len(calls) == 1
     command, options = calls[0]
     assert command[-1] == "bash -s"
     assert options["timeout"] == 180
-    assert "export MTP_ACTION=update" in options["input_data"]
+    assert "export MTP_ACTION=deploy" in options["input_data"]
     encoded_archive = re.search(
         r"MTP_WORKER_APP_ARCHIVE_B64=\$\(cat <<'MTP_WORKER_APP_ARCHIVE'\n"
         r"([A-Za-z0-9+/=]+)\nMTP_WORKER_APP_ARCHIVE\n\)",
@@ -1440,7 +1434,27 @@ def test_run_remote_action_updates_code_without_rebuilding_image(tmp_path, monke
     archive_bytes = base64.b64decode(encoded_archive.group(1))
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
         assert "app/worker.py" in archive.getnames()
-    assert heartbeats == [(operation_id, "remote-test-01")]
+
+
+def test_run_remote_action_config_overwrites_remote_config_without_code_archive(tmp_path, monkeypatch):
+    """配置动作只发送配置脚本，不携带 worker 代码包。"""
+    import re
+
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="config applied\n", stderr="")
+
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+    result = remote_workers.run_remote_action(_server(), "config")
+
+    assert result["stdout"] == "config applied\n"
+    assert len(calls) == 1
+    assert "export MTP_ACTION=config" in calls[0][1]["input_data"]
+    assert re.search(r"MTP_WORKER_APP_ARCHIVE_B64", calls[0][1]["input_data"]) is None
 
 
 def test_run_remote_action_stops_when_remote_worker_build_fails(tmp_path, monkeypatch):
@@ -1944,12 +1958,8 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
         assert "mtp-worker-remote-" in commands
 
 
-@pytest.mark.parametrize(("mode", "expected_gpu"), [("cpu", False), ("gpu", True)])
-@pytest.mark.parametrize("fail_run", [False, True])
-def test_remote_bootstrap_script_updates_code_with_existing_image(
-    tmp_path: Path, mode: str, expected_gpu: bool, fail_run: bool
-):
-    """更新先写新配置再切换容器，启动失败时恢复旧配置和容器。"""
+def test_remote_bootstrap_script_config_overwrites_env_without_touching_container(tmp_path: Path):
+    """配置动作原子覆盖环境文件，不上传代码或调用 Docker。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
@@ -1957,23 +1967,13 @@ def test_remote_bootstrap_script_updates_code_with_existing_image(
     docker_stub.write_text(
         "#!/usr/bin/env bash\n"
         "printf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n"
-        "if [[ \"$1\" == inspect && \"$2\" == --format ]]; then\n"
-        "  case \"$3\" in\n"
-        "    '{{.Image}}') printf 'sha256:existing-image\\n' ;;\n"
-        "    '{{.Config.Image}}') printf '%s\\n' \"$MTP_WORKER_IMAGE\" ;;\n"
-        "    *) printf 'state=running restart_count=0 exit_code=0 error=\\n' ;;\n"
-        "  esac\n"
-        "fi\n"
-        "if [[ \"$1\" == logs ]]; then printf 'worker startup diagnostic\\n'; fi\n"
-        "if [[ \"$1\" == stop ]]; then grep '^S3_ENDPOINT=' \"$HOME/.config/mtp-worker/remote-update.env\" >> \"$DOCKER_LOG\"; fi\n"
-        "if [[ \"$1\" == run && \"${DOCKER_FAIL_RUN:-0}\" == 1 ]]; then exit 1; fi\n"
         "exit 0\n",
         encoding="utf-8",
     )
     docker_stub.chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
-    env_file = home / ".config" / "mtp-worker" / "remote-update.env"
+    env_file = home / ".config" / "mtp-worker" / "remote-config.env"
     env_file.parent.mkdir(parents=True)
     env_file.write_text("S3_ENDPOINT=old-storage.example.net:9000\n", encoding="utf-8")
     env = os.environ.copy()
@@ -1981,68 +1981,8 @@ def test_remote_bootstrap_script_updates_code_with_existing_image(
         "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
         "HOME": str(home),
         "DOCKER_LOG": str(docker_log),
-        "DOCKER_FAIL_RUN": "1" if fail_run else "0",
-        "MTP_ACTION": "update",
-        "MTP_MACHINE_ID": "remote-update",
-        "MTP_MODE": mode,
-        "MTP_CPU_SLOTS": "4",
-        "MTP_WORKER_IMAGE": "registry.example.net/ml/worker:unit",
-        "MTP_REDIS_URL": "rediss://redis.example.net:6380/0",
-        "MTP_S3_ENDPOINT": "storage.example.net:9000",
-        "MTP_S3_ACCESS_KEY": "access-test",
-        "MTP_S3_SECRET_KEY": "secret-test",
-        "MTP_S3_BUCKET": "models-test",
-        "MTP_S3_SECURE": "true",
-        "MTP_WORKER_APP_ARCHIVE_B64": _test_worker_app_archive_base64(),
-    })
-    script = Path(remote_workers.__file__).with_name("remote_worker.sh")
-
-    result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
-
-    assert result.returncode == (1 if fail_run else 0), result.stderr
-    app_dir = home / ".config" / "mtp-worker" / "remote-update" / "app"
-    if fail_run:
-        assert "已恢复原容器" in result.stderr
-        assert env_file.read_text(encoding="utf-8") == "S3_ENDPOINT=old-storage.example.net:9000\n"
-    else:
-        assert "worker 代码已更新并重启" in result.stdout
-        assert (app_dir / "worker.py").is_file()
-        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
-        assert "WORKER_CPU_SLOTS=4" in env_file.read_text(encoding="utf-8")
-    commands = docker_log.read_text(encoding="utf-8")
-    assert "sha256:existing-image" in commands
-    assert f"{app_dir}:/app/app:ro" in commands
-    assert "/app/data" in commands
-    assert "stop --time 45 mtp-worker-remote-update" in commands
-    assert "S3_ENDPOINT=storage.example.net:9000" in commands
-    assert "rename mtp-worker-remote-update mtp-worker-remote-update-previous" in commands
-    assert "build" not in commands
-    assert "--gpus all" in commands if expected_gpu else "--gpus all" not in commands
-
-
-def _remote_update_script_fixture(tmp_path: Path, docker_stub_body: str, **overrides):
-    """构造隔离的远程更新脚本环境和可记录 Docker 命令的替身。"""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    docker_log = tmp_path / "docker.log"
-    docker_stub = bin_dir / "docker"
-    docker_stub.write_text(
-        "#!/usr/bin/env bash\n"
-        "printf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n"
-        f"{docker_stub_body}\n"
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    docker_stub.chmod(0o755)
-    home = tmp_path / "home"
-    home.mkdir()
-    env = os.environ.copy()
-    env.update({
-        "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
-        "HOME": str(home),
-        "DOCKER_LOG": str(docker_log),
-        "MTP_ACTION": "update",
-        "MTP_MACHINE_ID": "remote-update",
+        "MTP_ACTION": "config",
+        "MTP_MACHINE_ID": "remote-config",
         "MTP_MODE": "cpu",
         "MTP_CPU_SLOTS": "4",
         "MTP_WORKER_IMAGE": "registry.example.net/ml/worker:unit",
@@ -2052,98 +1992,53 @@ def _remote_update_script_fixture(tmp_path: Path, docker_stub_body: str, **overr
         "MTP_S3_SECRET_KEY": "secret-test",
         "MTP_S3_BUCKET": "models-test",
         "MTP_S3_SECURE": "true",
-        "MTP_WORKER_APP_ARCHIVE_B64": _test_worker_app_archive_base64(),
     })
-    env.update(overrides)
     script = Path(remote_workers.__file__).with_name("remote_worker.sh")
-    return script, env, docker_log, home
-
-
-def test_remote_update_uses_loaded_image_when_container_or_image_tag_changes(tmp_path: Path):
-    """更新可从已加载镜像恢复缺失容器，或改用目标机已有的新镜像标签。"""
-    docker_stub_body = r'''
-if [[ "$1" == inspect && "$#" -eq 2 && "$2" == "mtp-worker-${MTP_MACHINE_ID}" && "${DOCKER_CONTAINER_MISSING:-false}" == true ]]; then exit 1; fi
-if [[ "$1" == inspect && "$2" == --format ]]; then
-  case "$3" in
-    "{{.Image}}") printf 'sha256:existing-image\n' ;;
-    "{{.Config.Image}}") printf '%s\n' "${DOCKER_CURRENT_IMAGE_TAG:-$MTP_WORKER_IMAGE}" ;;
-    *) printf 'state=running restart_count=0 exit_code=0 error=\n' ;;
-  esac
-fi
-if [[ "$1" == image && "$2" == inspect ]]; then
-  if [[ "${DOCKER_MISSING_IMAGE:-false}" == true ]]; then exit 1; fi
-  printf 'sha256:configured-image\n'
-fi
-if [[ "$1" == logs ]]; then printf 'worker startup diagnostic\n'; fi
-'''
-    script, env, docker_log, home = _remote_update_script_fixture(
-        tmp_path,
-        docker_stub_body,
-        DOCKER_CONTAINER_MISSING="true",
-    )
 
     result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
 
     assert result.returncode == 0, result.stderr
-    commands = docker_log.read_text(encoding="utf-8")
-    assert "sha256:configured-image" in commands
-    assert "build" not in commands
-    assert "stop --time 45" not in commands
-    assert (home / ".config/mtp-worker/remote-update/app/worker.py").is_file()
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    saved = env_file.read_text(encoding="utf-8")
+    assert "S3_ENDPOINT=storage.example.net:9000" in saved
+    assert "WORKER_CPU_SLOTS=4" in saved
+    assert not (home / ".config" / "mtp-worker" / "remote-config" / "app").exists()
+    assert not docker_log.exists()
 
 
-def test_remote_update_fails_cleanly_when_no_container_or_image_is_available(tmp_path: Path):
-    """目标机既无容器也无已加载镜像时，更新明确失败且不写入代码目录。"""
-    docker_stub_body = r'''
-if [[ "$1" == inspect && "$#" -eq 2 && "$2" == "mtp-worker-${MTP_MACHINE_ID}" ]]; then exit 1; fi
-if [[ "$1" == image && "$2" == inspect ]]; then exit 1; fi
-'''
-    script, env, docker_log, home = _remote_update_script_fixture(
-        tmp_path,
-        docker_stub_body,
-        DOCKER_CONTAINER_MISSING="true",
-        DOCKER_MISSING_IMAGE="true",
-    )
-
-    result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
-
-    assert result.returncode == 1
-    assert "没有可复用的 worker 镜像" in result.stderr
-    assert "run --detach" not in docker_log.read_text(encoding="utf-8")
-    assert not (home / ".config/mtp-worker/remote-update/app").exists()
-
-
-def test_remote_update_rolls_back_code_and_container_when_start_fails(tmp_path: Path):
-    """复用镜像启动失败时恢复旧源码和容器，不留下半更新部署。"""
-    docker_stub_body = r'''
-if [[ "$1" == inspect && "$2" == --format ]]; then
-  case "$3" in
-    "{{.Image}}") printf 'sha256:existing-image\n' ;;
-    "{{.Config.Image}}") printf '%s\n' "$MTP_WORKER_IMAGE" ;;
-    *) printf 'state=running restart_count=0 exit_code=0 error=\n' ;;
-  esac
-fi
-if [[ "$1" == run ]]; then exit 1; fi
-if [[ "$1" == logs ]]; then printf 'worker startup diagnostic\n'; fi
-'''
-    script, env, docker_log, home = _remote_update_script_fixture(
-        tmp_path,
-        docker_stub_body,
-        DOCKER_RUN_FAIL="true",
-    )
-    app_dir = home / ".config/mtp-worker/remote-update/app"
-    app_dir.mkdir(parents=True)
-    (app_dir / "worker.py").write_text("old worker code\n", encoding="utf-8")
+def test_remote_bootstrap_script_deploys_code_without_config_or_container_operations(tmp_path: Path):
+    """部署只切换源码目录，保留已有配置且不操作容器。"""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\nexit 0\n", encoding="utf-8")
+    docker_stub.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    env_file = home / ".config" / "mtp-worker" / "remote-deploy.env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text("S3_ENDPOINT=old-storage.example.net:9000\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+        "HOME": str(home),
+        "DOCKER_LOG": str(docker_log),
+        "MTP_ACTION": "deploy",
+        "MTP_MACHINE_ID": "remote-deploy",
+        "MTP_MODE": "cpu",
+        "MTP_CPU_SLOTS": "4",
+        "MTP_WORKER_APP_ARCHIVE_B64": _test_worker_app_archive_base64(),
+    })
+    script = Path(remote_workers.__file__).with_name("remote_worker.sh")
 
     result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
 
-    assert result.returncode == 1
-    assert "已恢复原容器" in result.stderr
-    assert (app_dir / "worker.py").read_text(encoding="utf-8") == "old worker code\n"
-    commands = docker_log.read_text(encoding="utf-8")
-    assert "rename mtp-worker-remote-update mtp-worker-remote-update-previous" in commands
-    assert "rename mtp-worker-remote-update-previous mtp-worker-remote-update" in commands
-    assert "start mtp-worker-remote-update" in commands
+    assert result.returncode == 0, result.stderr
+    assert "worker 代码已更新" in result.stdout
+    assert env_file.read_text(encoding="utf-8") == "S3_ENDPOINT=old-storage.example.net:9000\n"
+    assert (home / ".config" / "mtp-worker" / "remote-deploy" / "app" / "worker.py").is_file()
+    assert not docker_log.exists()
 
 
 @pytest.mark.parametrize(

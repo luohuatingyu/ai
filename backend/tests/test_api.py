@@ -374,6 +374,46 @@ def test_remote_operation_cancel_cancels_queued_operation(
     assert server["status"] == "error"
 
 
+def test_remote_operation_logs_can_be_cleared_without_changing_state(client):
+    """清除远程执行日志后保留操作状态和阶段元数据。"""
+    from app.state import manager
+
+    operation_id = "a" * 32
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": "remote-clear-logs-api",
+            "action": "restart",
+            "status": "running",
+            "phase": "执行远程部署脚本",
+            "log": "旧阶段输出",
+            "output": "旧标准输出",
+            "stderr": "旧错误输出",
+            "error": "旧错误",
+        },
+    )
+
+    response = client.delete(f"/api/remote-operations/{operation_id}/logs")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "operation_id": operation_id}
+    cleared = manager.lease.get_remote_operation(operation_id)
+    assert cleared["status"] == "running"
+    assert cleared["phase"] == "执行远程部署脚本"
+    assert cleared["log"] == ""
+    assert cleared["output"] == ""
+    assert cleared["stderr"] == ""
+    assert cleared["error"] is None
+
+
+def test_remote_operation_log_clear_returns_404_for_missing_operation(client):
+    """不存在的远程操作不得创建记录或返回清除成功。"""
+    response = client.delete(f"/api/remote-operations/{'b' * 32}/logs")
+
+    assert response.status_code == 404
+
+
 def test_remote_operation_cancel_marks_active_operation_as_cancelling(client, monkeypatch):
     """执行中的操作收到取消请求后保留忙碌状态，直到 SSH 执行器确认退出。"""
     from app import remote_workers
@@ -440,7 +480,7 @@ def test_remote_operation_cancel_clears_stale_running_state(client, monkeypatch)
 
 
 def test_remote_server_api_separates_registration_deployment_and_config_update(client, monkeypatch, request):
-    """新增只登记配置；部署后更新配置会触发异步容器重建。"""
+    """新增只登记配置；已部署修改配置和部署代码分别触发独立远程动作。"""
     from app.routers import jobs as jobs_router
     from app import remote_workers
     from app import remote_config_repository
@@ -558,18 +598,18 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
         f"/api/remote-operations/{updated.json()['operation_id']}"
     ).json()
     assert update_operation["status"] == "completed"
-    assert update_operation["action"] == "update"
-    assert calls[-1] == (machine_id, "update", "worker")
+    assert update_operation["action"] == "config"
+    assert calls[-1] == (machine_id, "config", "worker")
     assert remote_config_repository.get_remote_server(machine_id)["worker_image_override"] == "registry.example.net/remote/worker:v4"
 
-    for action in ("install", "start", "stop", "restart"):
+    for action in ("install", "deploy", "start", "stop", "restart"):
         result = client.post(f"/api/remote-servers/{machine_id}/{action}")
         assert result.status_code == 202
         current = client.get(
             f"/api/remote-operations/{result.json()['operation_id']}"
         ).json()
         assert current["status"] == "completed"
-        expected_remote_action = "update" if action == "install" else action
+        expected_remote_action = "deploy" if action == "install" else action
         assert calls[-1] == (machine_id, expected_remote_action, "worker")
         current_server = next(
             item for item in client.get("/api/remote-servers").json()["servers"]
@@ -1405,11 +1445,12 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
         'id="remoteS3Endpoint"',
         'id="clearRemoteRedisOverride"',
         "data-edit-remote-machine-id",
-        'data-remote-action="install"',
+        'data-remote-action="deploy"',
         'deployed ? "重新部署" : "部署"',
-        "更新配置并重启",
+        "更新配置",
+        "部署代码",
         "应用当前已保存配置",
-        "不会重建镜像",
+        "不会上传代码或重启容器",
         "openEditRemoteServer",
     ):
         assert marker in html
@@ -1487,6 +1528,10 @@ def test_remote_server_card_exposes_live_operation_logs():
     assert "text.textContent = line || \" \"" in html
     assert 'id="remoteLogModal"' in html
     assert 'id="btnCopyRemoteLog" type="button">复制全部</button>' in html
+    assert 'id="btnClearRemoteLog" type="button">清除日志</button>' in html
+    assert "async function clearRemoteOperationLogs()" in html
+    assert "/logs" in logs_handler or "/logs" in html
+    assert "清除执行日志失败" in html
     assert "user-select:text" in html
     assert "data-copy-remote-log-line" in html
     assert "copyRemoteLogText(line.textContent" in html
