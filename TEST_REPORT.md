@@ -1,5 +1,41 @@
 # 测试报告
 
+## 本次变更测试结果：更新远程配置时重建 worker 容器（2026-10-28）
+
+**变更范围**：远程 `config` 动作在覆盖目标机 `~/.config/mtp-worker/<machine_id>.env` 后，复用现有 worker 镜像重建容器，使容器通过 `--env-file` 读取新配置；容器启动失败时恢复旧配置和旧容器。无现有容器时只更新配置文件，不创建新容器。页面提示同步更新。`deploy` 仍只同步 worker 代码。
+
+**测试环境**：Docker Compose，容器 Python 3.12.15。
+
+**测试执行结果**：
+- 远程 Worker 定向测试：73 通过、0 失败、0 错误、0 跳过。
+- API 定向测试：58 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：278 项；272 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- 首次运行远程 Worker 定向测试时未挂载仓库根目录 Compose 文件，1 项环境性失败；补齐只读挂载后 73 项全部通过。
+- 首次合并运行 API 与远程 Worker 定向文件时有 1 项既有远程日志 404 状态隔离波动；单独复跑 API 文件 58 项全部通过。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
+- `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 已有 `Linux.env` 更新后容器使用新配置 | Shell：`test_remote_bootstrap_script_config_recreates_existing_container_with_new_env` | 原有容器复用原镜像 ID，停止并重建；新容器使用 `--env-file` 指向更新后的文件 | 正常、回归 |
+| 容器启动失败时不留下半更新状态 | Shell：`test_remote_bootstrap_script_config_rolls_back_when_recreated_container_fails` | 新容器启动失败后恢复旧 `.env`、旧容器名称并重新启动旧容器 | 异常、恢复 |
+| 无容器时仍可保存配置但不盲目创建容器 | Shell：`test_remote_bootstrap_script_config_writes_env_without_container` | 文件更新成功，不执行 `docker run` | 边界 |
+| 部署代码不覆盖配置 | Shell：`test_remote_bootstrap_script_deploys_code_without_config_or_container_operations`；远程执行器测试 | `deploy` 只切换代码目录，不写 `.env` 或重建容器 | 兼容、回归 |
+| 页面文案与实际动作一致 | API 页面契约：`test_remote_server_form_exposes_network_overrides_and_effective_config_action` | 已部署服务器提示会重建 worker 容器且不上传代码 | 正常、回归 |
+| 训练、数据、API 和生命周期行为保持通过 | 完整 `tests/` 套件 | 272 通过、6 跳过 | 兼容、回归 |
+
+**关键模块测试**：远程 Worker 73/73 通过；API 58/58 通过；完整套件 272/278 通过。
+
+**已知问题与限制**：未连接真实 SSH 目标机；容器重建、`--env-file` 加载和失败回滚通过隔离 Docker 替身验证。测试时工作区另有既存的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 修改，未纳入本次功能提交，但完整测试包含这些工作区改动。
+
+**下次测试建议**：在真实 Linux 目标机执行一次配置更新，确认目标机 `docker inspect mtp-worker-<machine_id>` 的 `Config.Env` 与新 `Linux.env` 一致，并验证任务 checkpoint 恢复行为。
+
+**Git基准点**：`84118f4`（Apply remote config by recreating worker）。
+
 ## 本次变更测试结果：增加远程服务器生效配置查看（2026-10-28）
 
 **变更范围**：远程服务器卡片增加“生效配置”入口，新增只读 `GET /api/remote-servers/{machine_id}/effective-config` 接口。页面显示平台当前解析出的 Worker 镜像、Redis/S3 地址、配置来源、目标状态和连接参数；Redis 认证信息、S3 密钥和 SSH 凭证均脱敏。结果明确标注为待下发配置，不读取目标机上的敏感配置文件。
@@ -101,8 +137,8 @@
 
 ## Git基准点
 
-- **Commit Hash**: 8a65551（远程操作日志显示脚本输出）
-- **提交信息**: Include remote script output in operation logs
+- **Commit Hash**: 84118f4（更新远程配置时重建 worker 容器）
+- **提交信息**: Apply remote config by recreating worker
 - **测试日期**: 2026-10-28
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
