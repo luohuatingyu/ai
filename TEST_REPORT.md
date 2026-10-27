@@ -1,5 +1,28 @@
 # 测试报告
 
+## 本次变更测试结果：显示远程配置摘要（2026-10-27）
+
+**变更范围**：远程 `config` 动作覆盖目标机 worker 配置后，追加实际生效配置摘要；Redis 仅显示目标地址，S3 凭证只显示是否已配置，不输出密钥明文。
+
+**测试执行结果**：
+- 远程 worker 定向测试：71 通过、0 失败、0 错误、0 跳过。
+- API 定向测试：58 通过、0 失败、0 错误、0 跳过。
+- 远程 worker 与训练 worker 组合测试：89 通过、5 失败；失败来自工作区中预先存在的 `worker.py`、`storage.py` 并行改动导致的任务领取、断点续训和存储重试行为，本次配置摘要相关测试均通过。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建并启动成功。
+- `curl -fsS http://127.0.0.1:8000/api/health`：重试后返回 `{"ok":true}`。
+- `git diff --check`：通过。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 更新配置后可查看目标机实际配置 | Shell：`test_remote_bootstrap_script_config_overwrites_env_without_touching_container` | 配置覆盖后日志包含模式、机器标识、CPU 槽位、Redis 目标、S3 参数和凭证已配置状态 | 正常、回归 |
+| 配置摘要不泄露敏感值 | Shell：同上；远程操作：`test_execute_remote_operation_persists_success_and_failure` | Redis 认证信息不出现在日志；S3 密钥只输出 `[已配置]` 或 `[未配置]` | 安全、异常 |
+
+**已知问题与限制**：未连接真实远程 SSH 主机；组合测试中的 5 个失败属于并行未提交改动，未纳入本次提交。
+
+**Git基准点**：`47efffa`（Show effective remote worker config）。
+
 ## Git基准点
 
 - **Commit Hash**: cf6afcd（远程执行日志清除）
