@@ -2,10 +2,38 @@
 
 ## Git基准点
 
-- **Commit Hash**: c21da75（校验远程 worker 镜像构建上下文）
-- **提交信息**: Validate worker Docker build context
+- **Commit Hash**: c3b2a04（显示远程服务器命令输出）
+- **提交信息**: Show remote server command output
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：显示远程服务器命令日志（2026-10-27）
+
+**变更范围**：远程操作结束后，服务器卡片提供可展开的执行日志，显示 stdout、stderr 和失败信息；后端保留成功操作的 stdout 与 stderr。日志文本在页面渲染前转义。命令执行期间提示输出将在完成后显示。
+
+**测试环境**：Docker 测试镜像 Python 3.12。工作区存在既有未提交的 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 改动；这些改动参与完整测试，但未纳入本次提交。
+
+**测试执行结果**：
+- 日志功能定向用例：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_api.py::test_remote_server_card_displays_command_output_and_error_logs tests/test_remote_workers.py::test_execute_remote_operation_persists_success_and_failure -q -p no:cacheprovider`：2 通过。
+- 远程 API 与 worker 测试：同 Docker 命令运行 `tests/test_api.py tests/test_remote_workers.py`：106 通过、0 失败。
+- 完整测试：同 Docker 命令运行 `tests/`：233 通过、6 跳过、0 失败、0 错误；跳过项受 Redis、S3 与 Supervisor 子进程环境门控。
+- `docker compose up --build -d` 和远程管理覆盖配置重建启动：通过。
+- 运行中的 frontend 容器检查：页面含“查看执行日志”控件与日志样式。
+- `git diff --check`：通过；保留 SQLAlchemy 与 Pandas 两条既有弃用警告。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 完成的服务器命令可查看 stdout、stderr 和失败信息 | 前端契约：`test_remote_server_card_displays_command_output_and_error_logs` | 渲染器读取三类输出，经过 `esc()` 后放入可展开的 `<pre>`；运行中显示状态提示 | 正常、错误显示、恶意 HTML 防护 |
+| 后端保留成功命令的 stdout 与 stderr | 远程操作单测：`test_execute_remote_operation_persists_success_and_failure` | 模拟命令返回 stdout 与 stderr，完成状态中都可读取 | 正常、兼容 |
+| 远程 API 与其他业务不回归 | `tests/test_api.py`、`tests/test_remote_workers.py`、完整 `tests/` | 定向 106 项通过；完整 233 项通过、6 项环境门控跳过 | 回归 |
+
+**已知问题与限制**：远程命令通过 SSH 完成后显示完整截断输出（stdout/stderr 各最多 2000 字符）；执行中不逐行流式更新日志。
+
+**下次测试建议**：从页面对测试服务器执行启动或重启，展开“查看执行日志”，确认远端输出可读且敏感凭证仍被脱敏。
+
+**Git基准点**：`c3b2a04`（Show remote server command output）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：校验并选择有效的 worker Docker 构建上下文（2026-10-27）
 
