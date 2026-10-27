@@ -1,3 +1,47 @@
+## 本次变更测试结果：远程服务器操作整体流程加固（2026-10-28）
+
+**Git基准点**：`a94cb00`（Harden remote server operation flow: executor heartbeat recovery, post-rebuild heartbeat checks, scoped Redis password propagation, lifecycle action validation relaxation, resilient status persistence）
+**分支**：`emdash/hot-boxes-clean-y9u6p`
+**测试环境**：Docker Compose，容器 Python 3.12.15。
+
+**变更范围**（远程服务器操作全流程审查后的修复）：
+- P1-1 远程 Redis 密码来源：新增 `WORKER_REMOTE_REDIS_PASSWORD` 独立配置，平台 `REDIS_PASSWORD` 仅在远程 worker 复用平台 `REDIS_URL` 时沿用；服务器级 URL 覆盖与远程专用 URL 不再泄露平台密码。
+- P1-2 操作执行进程崩溃恢复：执行者心跳（Redis TTL 90s，20s 续写）+ 宽限期判定，`queued/running` 且执行者消失的操作自动收敛为 failed 并恢复服务器状态，解除后续操作 409 死锁（轮询/编辑/新操作/取消入口均触发恢复）。
+- P1-3 S3 故障重试分类：`classify_retryable` 显式把 `ArtifactStoreUnavailableError` 判为环境性可重试错误。
+- P2-1 重建后心跳验证：install/deploy/update/config/start/restart 成功后等待资源心跳（30s），未收到时 operation 记 `heartbeat_ok=false`、服务器状态标记 error 并给出排查提示。
+- P2-2 生命周期操作放宽校验：start/stop/restart 只校验 SSH 凭证与服务器记录，Redis 覆盖不可解密或平台配置缺失不再阻塞停止/启动。
+- P2-3 终态持久化兜底：MySQL 写入失败只记操作日志警告，不破坏操作终态。
+- P3-1 Redis 密码加入控制字符校验；P3-3 配置摘要输出密码配置状态；P3-4 重建失败时回滚 env 文件快照，保持"配置=运行容器"一致；P3-5 写终态前二次取消检查。
+- 配置面：`docker-compose.yml` / `docker-compose.cpu.yml` / `.env.example` / README 补充 `WORKER_REMOTE_REDIS_PASSWORD` 并修正镜像传输流程描述（现网为目标机构建）。
+
+**测试执行结果**：
+- 远程 Worker 定向测试（`tests/test_remote_workers.py`）：83 通过、0 失败、0 错误、0 跳过。
+- 协调/存储/Worker/API 定向测试（`tests/test_coordination.py tests/test_storage.py tests/test_worker.py tests/test_api.py`）：131 通过、0 失败、0 错误、5 跳过（Redis/S3 环境条件控制）。
+- 完整测试套件（`tests/`）：284 通过、6 跳过、0 失败、0 错误。跳过项由 MTP_TEST_REDIS / MTP_TEST_S3 / Supervisor 子进程环境条件控制。
+- 配置 `MTP_TEST_REDIS=redis://host.docker.internal:6399/0` 复跑协调层：Redis 语义一致性、注册往返、幽灵槽清理及新增执行者存活标记用例全部通过；`test_supervisor_parallel_and_child_restart` 因临时测试容器缺 `pgrep`（slim 镜像）无法执行，属环境限制，与既有跳过类别一致，非本次变更引入。
+- `docker compose up --build -d`：trainer、worker、frontend、SeaweedFS 重建与启动成功。
+- `curl -fsS http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- `bash -n backend/app/remote_worker.sh`、`python -m py_compile`、`git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 远程 Redis 密码不泄露给其他 Redis | 单元：`test_remote_redis_password_priority_chain`、`test_remote_deployment_settings_apply_platform_fallback_and_server_network_overrides` | 远程专用 URL 未配远程密码时 `redis_password=""`；显式 `WORKER_REMOTE_REDIS_PASSWORD` 优先；复用平台 URL 时沿用 `REDIS_PASSWORD`；生效配置标注 `redis_auth_source` 且无明文 | 正常、边界、权限与安全 |
+| 执行进程崩溃后操作自动收敛 | 单元：`test_recover_stale_remote_operation_marks_failed_and_restores_server`、`..._ignores_active_or_recent_operations`；协调：`test_remote_operation_executor_heartbeat_embedded_and_redis` | 过期无执行者的 running 操作标记 failed、服务器恢复 error；活跃/宽限期内操作不受影响 | 异常、恢复、回归 |
+| 重建后心跳验证 | 单元：`test_execute_remote_operation_records_missing_worker_heartbeat`、`..._records_healthy_worker_heartbeat`、`test_run_remote_action_deploys_code_without_rebuilding_image` | 心跳缺失→completed+heartbeat_ok=false+服务器 error；心跳正常→completed+heartbeat_ok=true+在线；部署完成等待心跳 | 正常、异常 |
+| 生命周期操作不被平台配置阻塞 | 单元：`test_run_remote_action_lifecycle_skips_platform_config`、`test_remote_configuration_errors_lifecycle_skips_platform_checks` | Redis 覆盖不可解密时 stop 仍可执行，config 必须拒绝；生命周期校验跳过 Redis/S3/镜像 | 边界、异常、兼容 |
+| S3 故障按环境性错误重试 | 单元：`test_classify_retryable` 增补 `ArtifactStoreUnavailableError` 用例；`test_s3_outage_is_not_treated_as_missing` 等 | 对象存储不可用判定为可重试；仅 NoSuchKey 保持缺失语义 | 异常、回归 |
+| 失败回滚保持配置一致性 | Shell：`test_remote_bootstrap_script_config_rolls_back_when_new_container_fails` | 重建失败恢复旧容器并回滚 env 文件，`.previous` 快照清除 | 异常、恢复 |
+| 业务回归保持通过 | 完整 `backend/tests` 套件 | 284 通过、6 跳过 | 数据、训练、API、远程管理回归 |
+
+**关键模块测试**：远程 Worker 83/83 通过；协调/存储/Worker/API 定向 131 通过、5 环境跳过；完整套件 284/284 通过（6 环境跳过）。
+
+**已知问题与限制**：未连接真实 SSH 目标机，心跳验证与执行者恢复通过隔离替身与单元断言验证；`WORKER_REMOTE_REDIS_PASSWORD` 未在真实远程 Redis 上端到端验证认证；Supervisor 多进程 E2E 在临时测试容器中因缺少 `pgrep` 未执行（正式测试建议在带 procps 的容器或宿主机执行）。
+
+**下次测试建议**：在真实 Linux 目标机分别验证 ① 平台密码 ≠ 远程 Redis 密码场景下 worker 认证失败不再发生；② 操作执行中重启 trainer 容器后，轮询页面能在宽限期内自动把操作标记失败并允许重新操作；③ deploy 引入错误代码后操作显示 heartbeat_ok=false 且服务器状态为 error。
+
 ## 本次变更测试结果：下发远程 worker 的 Redis 密码（2026-10-28）
 
 **Git基准点**：`82ae738`（Forward REDIS_PASSWORD to remote workers）  
