@@ -2,10 +2,40 @@
 
 ## Git基准点
 
-- **Commit Hash**: 8c5e8b9（按目标平台自动构建远程 worker 镜像）
-- **提交信息**: Build remote worker images for target architecture
+- **Commit Hash**: a0ebcd6（移除远程管理令牌配置与校验）
+- **提交信息**: Remove remote management token requirements
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：移除远程管理令牌并默认启用（2026-10-27）
+
+**变更范围**：移除 `WORKER_REMOTE_TOKEN` 和 `WORKER_REMOTE_ENABLED` 配置、Compose 环境变量、远程 API 自定义令牌认证及前端令牌输入；远程管理页面与 API 默认可用。README 说明平台 API 无认证，部署时须通过网络边界限制访问。服务器和 SSH 凭证仍由 MySQL 持久化，不涉及数据库数据迁移或删除。
+
+**测试环境**：Docker 测试镜像 Python 3.12。工作区还存在既有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动；它们包含在完整测试中，但不属于本次代码提交。
+
+**测试执行结果**：
+- 定向 API 与远程 worker 测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_api.py tests/test_remote_workers.py -q -p no:cacheprovider`：104 通过、0 失败。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：231 通过、6 跳过、0 失败、0 错误。跳过项为 Redis、S3 和 Supervisor 子进程环境门控测试。
+- `docker compose up --build -d`：通过。
+- `docker compose -f docker-compose.yml -f docker-compose.remote.yml -f - up --build -d`（将 Docker Desktop socket 覆盖到 trainer）：通过；GPU 和 CPU 远程覆盖配置 `config -q` 检查通过。
+- 运行容器页面检查：未发现令牌表单；不带令牌请求 `/api/remote-servers` 返回 HTTP 200，响应包含现存 `Linux` 服务器记录。
+- `git diff --check`：通过。保留 SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 两条既有弃用警告。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 远程管理无需启用开关或自定义令牌即可使用 | API：`test_remote_management_is_enabled_without_admin_token`、`test_remote_server_api_installs_and_manages_with_nonsecret_records` | 不提供认证头读取服务器、登记服务器、编辑配置和执行生命周期动作成功；缺失记录仍返回 404，重复登记返回 409 | 正常、兼容、状态冲突 |
+| SSH 凭证目录和设置可不带令牌管理，同时秘密仍加密且不回显 | API：`test_remote_ssh_credential_catalog_supports_all_auth_modes_without_secret_echo`、`test_remote_ssh_settings_encrypt_credentials_and_never_return_secrets`、`test_remote_ssh_settings_save_private_key_without_echo` | 无认证头读写/删除凭证成功；MySQL 密文可解密验证；API 响应不含秘密 | 正常、敏感数据保护 |
+| 远程操作轮询和取消无需令牌，状态逻辑保持正确 | API：三个 `test_remote_operation_cancel_*` 用例 | 不带认证头读取或取消排队/执行中/残留操作，状态及服务器锁按预期更新 | 正常、并发状态、边界 |
+| 前端不再要求或发送远程管理令牌 | 前端契约：`test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads`；运行容器静态页面检查 | 页面不包含令牌输入、自定义请求头或旧令牌提示；容器 API 不带令牌返回成功 | 兼容、界面回归 |
+| 既有 SSH 配置校验、输入安全和其他业务功能继续通过 | `tests/test_remote_workers.py` 与完整 `tests/` | SSH 凭证验证、主机字段注入校验、远程 worker 与其他业务回归通过 | 异常、安全、回归 |
+
+**已知问题与限制**：平台 API 目前没有身份认证，移除管理令牌后，能访问平台的客户端可以管理远程服务器及 SSH 凭证。部署必须通过可信内网、VPN 或反向代理访问控制限制平台管理入口。6 项环境门控测试未执行其外部依赖路径。
+
+**下次测试建议**：在目标部署环境检查网络访问策略，然后从管理页面确认 MySQL 中现有服务器和 SSH 凭证正常显示，并执行预期的远程重部署流程。
+
+**Git基准点**：`a0ebcd6`（Remove remote management token requirements）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：自动构建目标架构的远程 worker 镜像（2026-10-27）
 
