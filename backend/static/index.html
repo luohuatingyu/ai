@@ -1544,7 +1544,7 @@ function workerServerCard(machineId, slots, remoteServer = null) {
   const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
       <button class="server-log-button" data-remote-server-logs="${esc(machineId)}">日志</button>
       <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>更新配置</button>
-      <button title="只同步 worker 代码，不修改配置或启动容器" data-remote-machine-id="${esc(machineId)}" data-remote-action="deploy" ${operationBusy ? "disabled" : ""}>${deployed ? "部署代码" : "部署"}</button>
+      <button title="${deployed ? "只同步 worker 代码，不修改配置或启动容器" : "首次部署 worker 镜像、配置和代码"}" data-remote-machine-id="${esc(machineId)}" data-remote-action="deploy" ${operationBusy ? "disabled" : ""}>${deployed ? "部署代码" : "部署"}</button>
       ${lifecycleControls}
       ${operationBusy ? `<button data-cancel-remote-operation="${esc(operation.operation_id)}" ${cancelRequested ? "disabled" : ""}>${cancelRequested ? "正在中断…" : "中断操作"}</button>` : ""}
     </div>` : "";
