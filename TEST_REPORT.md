@@ -2,8 +2,8 @@
 
 ## Git基准点
 
-- **Commit Hash**: a728181（计算资源远程配置、部署和启动动作隔离）
-- **提交信息**: Keep unrelated log controls out of deployment change
+- **Commit Hash**: 489b222（计算资源远程配置、部署和启动动作隔离）
+- **提交信息**: Clarify initial remote deployment action
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
