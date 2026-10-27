@@ -72,23 +72,62 @@ git diff --check
 
 **下次测试建议**：连接一台测试 Linux 主机，分别验证首次部署、在线节点更新配置后的容器重建、离线节点启动与配置失败后的重新部署。
 
-## 本次变更测试结果：远程配置先更新并回滚（2026-10-27）
+## 本次变更测试结果：重新部署复用已有镜像（2026-10-27）
 
-**变更范围**：已部署远程服务器使用 update 流程；更新先以原子方式写入新环境配置，再切换 worker 容器；启动失败时恢复旧配置、代码目录和容器；兼容 `deployed: null` 的旧记录。
+**变更范围**：首次部署继续构建并加载 worker 镜像；已部署服务器的重新部署或配置更新只同步 `backend/app` 代码，复用目标机已有镜像并重建容器，不执行 Docker build。更新前保留旧代码、配置和容器，启动失败时回滚。业务代码提交为 `c0e03d1`。
+
+**测试环境**：Docker Compose，容器 Python 3.12.15。测试包含工作区原有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动；这两个文件未纳入本次提交。
 
 **测试执行结果**：
-- 定向测试：6 通过、0 失败。
-- 完整测试：272 通过、6 跳过、0 失败、0 错误；2 条既有弃用警告。
-- `docker compose up --build -d`：构建和启动成功；首次健康检查因服务刚启动返回 502，等待服务就绪后 `curl http://localhost:8000/api/health` 返回 `{"ok":true}`。
+- API 与远程 worker 定向测试：131 通过、0 失败、0 错误、0 跳过。
+- 初次新增回归组合运行出现 4 个测试替身断言失败，原因是 Bash stub 的换行转义和日志断言；修正测试替身后整组复跑通过。
+- 完整测试：278 项；272 通过、6 跳过、0 失败、0 错误。6 项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- `docker compose up --build -d`：构建和启动成功；`curl -fsS --retry 5 http://127.0.0.1:8000/api/health` 返回 `{"ok":true}`。
 - `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
 
-**覆盖范围**：远程服务器状态兼容、CPU/GPU 更新、配置写入顺序、容器启动失败回滚、API 更新动作选择及全量回归。
+**验收标准—测试用例映射**：
 
-**已知限制**：未对真实远程 Linux 主机执行本次代码变更后的更新回环；此前目标机仍需修复 Docker Buildx 和 S3 地址配置后再验证心跳。
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 首次部署和重新部署路径分开 | API/远程 worker：`test_run_remote_action_builds_worker_on_target_before_install`、`test_run_remote_action_updates_code_without_rebuilding_image` | `install` 执行目标机镜像构建；`update` 同步代码且命令中没有 `build` | 正常、兼容、回归 |
+| 更新配置重建容器但复用镜像 | Shell：`test_remote_bootstrap_script_updates_code_with_existing_image`、`test_remote_update_uses_loaded_image_when_container_or_image_tag_changes` | CPU/GPU 更新写入新配置、挂载新代码目录并复用已有镜像 ID | 正常、边界、资源状态 |
+| 目标机缺少可复用镜像时明确失败 | Shell：`test_remote_update_fails_cleanly_when_no_container_or_image_is_available` | 无容器且无镜像时返回错误，不创建代码目录或容器 | 异常、状态冲突 |
+| 更新启动失败可安全回滚 | Shell：`test_remote_update_rolls_back_code_and_container_when_start_fails` | 新容器启动失败后恢复旧源码、旧配置和旧容器 | 异常、回归 |
+| 页面与 API 区分更新动作及状态 | API/页面：`test_remote_server_api_separates_registration_deployment_and_config_update`、`test_remote_server_form_exposes_host_overrides_and_edit_action` | 已部署配置更新使用 `update`，页面提示复用镜像且不重建镜像 | 正常、兼容 |
 
-**重测触发条件**：修改远程服务器创建、部署标记、配置更新后台操作或卡片生命周期按钮逻辑时，运行 `tests/test_api.py`、`tests/test_remote_workers.py`、完整 `tests/` 和 `docker compose up --build -d`。
+**关键模块测试**：API 与远程 worker 131/131 通过；完整套件 272/278 通过，6 项按环境门控跳过。
 
-**Git基准点**：`59ca2fa`（Separate remote deployment and config updates）；测试报告作为单独提交更新。
+**实际执行命令**：
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_api.py tests/test_remote_workers.py -q -p no:cacheprovider
+```
+
+结果：131 passed、0 failed。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider
+```
+
+结果：272 passed、6 skipped、0 failed。
+
+```bash
+docker compose up --build -d
+docker compose ps
+curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 20 http://127.0.0.1:8000/api/health
+git diff --check
+```
+
+结果：Compose 构建和启动成功；trainer、worker、frontend、SeaweedFS 正常运行；健康检查返回 `{"ok":true}`；差异空白检查通过。
+
+**已知问题与限制**：尚未连接真实远程 Linux 主机执行 SSH 更新回环；目标机必须已有可复用的 worker 镜像，依赖或 Dockerfile 变更仍需另行构建并加载新镜像。
+
+**下次测试建议**：在测试 Linux 主机上分别验证首次部署、已部署 CPU/GPU 重新部署、镜像缺失提示和启动失败回滚，并确认更新后的 worker 心跳。
+
+**重测触发条件**：修改远程部署动作、代码归档、目标机更新脚本、容器挂载/回滚或页面更新提示时，运行 `tests/test_api.py`、`tests/test_remote_workers.py`、完整 `tests/` 和 `docker compose up --build -d`。
+
+**Git基准点**：`c0e03d1`（Apply remote worker config before restart）；测试报告作为单独提交更新。
 
 ## 本次变更测试结果：显示远程目标镜像构建进度（2026-10-27）
 
