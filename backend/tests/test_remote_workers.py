@@ -2000,6 +2000,11 @@ def test_remote_bootstrap_script_config_overwrites_env_without_touching_containe
     saved = env_file.read_text(encoding="utf-8")
     assert "S3_ENDPOINT=storage.example.net:9000" in saved
     assert "WORKER_CPU_SLOTS=4" in saved
+    assert "WORKER_MODE=cpu" in result.stdout
+    assert "REDIS_TARGET=redis.example.net:6380/0" in result.stdout
+    assert "S3_ENDPOINT=storage.example.net:9000" in result.stdout
+    assert "S3_ACCESS_KEY=[已配置]" in result.stdout
+    assert "S3_SECRET_KEY=[已配置]" in result.stdout
     assert not (home / ".config" / "mtp-worker" / "remote-config" / "app").exists()
     assert not docker_log.exists()
 
