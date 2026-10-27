@@ -553,11 +553,11 @@
         <label for="remoteS3Endpoint">S3 地址（可选覆盖）</label>
         <input id="remoteS3Endpoint" name="remote_s3_endpoint" maxlength="512" placeholder="留空时使用平台默认 S3_ENDPOINT">
       </div>
-      <div class="field wide hint">保存后点击服务器卡片上的“重新部署并应用配置”，让目标 worker 使用新设置。</div>
+      <div class="field wide hint" id="remoteConfigApplyHint">登记配置后，可在服务器卡片上单独部署。</div>
       <div class="field wide hint">SSH 凭证在页面统一配置；主机密钥首次连接时自动信任并持久化。</div>
       <div class="server-form-actions">
         <button type="button" id="btnCancelAddServer">取消</button>
-        <button type="submit" id="btnSubmitRemoteServer" class="primary">远程添加并检测资源</button>
+        <button type="submit" id="btnSubmitRemoteServer" class="primary">登记服务器配置</button>
       </div>
     </form>
     <details class="ssh-credential-settings" id="remoteSshSettings">
@@ -1495,15 +1495,17 @@ function workerServerCard(machineId, slots, remoteServer = null) {
   const lastSeen = heartbeat.length ? `${Math.min(...heartbeat).toFixed(0)} 秒前更新` : "等待首次心跳";
   const summary = [gpuCount ? `${gpuCount} 个 GPU 槽` : "", cpuCount ? `${cpuCount} 个 CPU 槽` : ""]
     .filter(Boolean).join(" · ") || "未发现计算槽";
+  const deployed = Boolean(remoteServer && remoteServer.deployed);
   const operation = remoteServer && remoteServer.operation;
   const operationBusy = operation && ["queued", "running"].includes(operation.status);
   const cancelRequested = Boolean(operation && operation.cancel_requested);
   const remoteStatus = remoteServer ? {
     provisioning: "正在安装并检测资源", starting: "正在启动 worker", stopping: "正在停止 worker",
-    restarting: "正在重启 worker", online: "worker 已启动", stopped: "worker 已停止", error: "上次远程操作失败",
+    restarting: "正在重启 worker", online: "worker 已启动", stopped: "worker 已停止",
+    not_deployed: "尚未部署", error: "上次远程操作失败",
   }[remoteServer.status] || "SSH 服务器已登记" : "";
   const operationLabel = operation ? {
-    queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "install" ? "正在远程安装并检测…" : `正在远程${operation.action}…`,
+    queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "install" ? (deployed ? "正在重新部署并应用配置…" : "正在部署并检测…") : `正在远程${operation.action}…`,
     completed: "最近操作已完成", failed: "最近操作失败", cancelled: "最近操作已中断",
   }[operation.status] || remoteStatus : remoteStatus;
   const operationPhaseLabels = {
@@ -1515,13 +1517,15 @@ function workerServerCard(machineId, slots, remoteServer = null) {
   const phaseLabel = operation && operationPhaseLabels[operation.phase];
   const phaseElapsed = operation && operation.phase_started_at
     ? Math.max(0, Math.floor(Date.now() / 1000 - Number(operation.phase_started_at))) : null;
+  const lifecycleControls = !deployed ? "" : online
+    ? `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop" ${operationBusy ? "disabled" : ""}>停止</button>`
+    : `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="start" ${operationBusy ? "disabled" : ""}>启动</button>
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="restart" ${operationBusy ? "disabled" : ""}>重启</button>`;
   const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
       <button class="server-log-button" data-remote-server-logs="${esc(machineId)}">日志</button>
-      <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>编辑</button>
-      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="install" ${operationBusy ? "disabled" : ""}>重新部署并应用配置</button>
-      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="start" ${operationBusy ? "disabled" : ""}>启动</button>
-      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop" ${operationBusy ? "disabled" : ""}>停止</button>
-      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="restart" ${operationBusy ? "disabled" : ""}>重启</button>
+      <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>更新配置</button>
+      <button title="应用当前已保存配置" data-remote-machine-id="${esc(machineId)}" data-remote-action="install" ${operationBusy ? "disabled" : ""}>${deployed ? "重新部署" : "部署"}</button>
+      ${lifecycleControls}
       ${operationBusy ? `<button data-cancel-remote-operation="${esc(operation.operation_id)}" ${cancelRequested ? "disabled" : ""}>${cancelRequested ? "正在中断…" : "中断操作"}</button>` : ""}
     </div>` : "";
   const endpoint = remoteServer ? `${remoteServer.username}@${remoteServer.host}:${remoteServer.port} · ${remoteServer.mode.toUpperCase()}` : "";
@@ -1789,7 +1793,8 @@ function openAddServerModal() {
   $("remoteServerForm").reset();
   $("remoteMachineId").readOnly = false;
   $("addServerTitle").textContent = "通过 SSH 添加服务器";
-  $("btnSubmitRemoteServer").textContent = "远程添加并检测资源";
+  $("btnSubmitRemoteServer").textContent = "登记服务器配置";
+  $("remoteConfigApplyHint").textContent = "登记配置后，可在服务器卡片上单独部署。";
   $("clearRemoteRedisOverrideField").hidden = true;
   $("clearRemoteRedisOverride").checked = false;
   $("remoteRedisUrl").disabled = false;
@@ -1832,7 +1837,10 @@ async function openEditRemoteServer(machineId) {
   $("remoteRedisUrl").disabled = false;
   $("remoteS3Endpoint").value = server.remote_s3_endpoint_override || "";
   $("addServerTitle").textContent = `编辑服务器 ${machineId}`;
-  $("btnSubmitRemoteServer").textContent = "保存服务器配置";
+  $("btnSubmitRemoteServer").textContent = server.deployed ? "更新配置并重启" : "保存配置";
+  $("remoteConfigApplyHint").textContent = server.deployed
+    ? "保存后会应用新配置并重建 worker 容器。"
+    : "服务器尚未部署；保存后可在服务器卡片上点击“部署”。";
   modal.hidden = false;
   modal.classList.add("open");
   $("remoteHost").focus();
@@ -1850,7 +1858,7 @@ function closeAddServerModal() {
   $("btnAddServer").focus();
 }
 
-// 提交 SSH 服务器配置，后台接入完成后继续读取自动检测到的资源。
+// 登记未部署服务器，或保存配置后按已部署状态应用更新。
 async function submitRemoteServer(event) {
   event.preventDefault();
   const form = $("remoteServerForm");
@@ -1868,22 +1876,25 @@ async function submitRemoteServer(event) {
   submit.disabled = true;
   submit.textContent = "正在提交…";
   try {
-    await apiJson(editingMachineId
+    const result = await apiJson(editingMachineId
       ? `/api/remote-servers/${encodeURIComponent(editingMachineId)}`
       : "/api/remote-servers", {
       method: editingMachineId ? "PATCH" : "POST",
       headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     toast(editingMachineId
-      ? "服务器配置已保存；请点击服务器卡片上的“重新部署并应用配置”"
-      : "服务器已登记，平台正在通过 SSH 安装并检测资源", "ok");
+      ? result.operation_id ? "配置已保存，worker 容器正在重建并应用新配置" : "配置已保存；服务器部署后才会应用新配置"
+      : "服务器配置已登记；请在服务器卡片上点击“部署”", "ok");
     closeAddServerModal();
     await refreshWorkers();
   } catch (error) {
     toast(error.message, "err");
   } finally {
     submit.disabled = false;
-    submit.textContent = editingMachineId ? "保存服务器配置" : "远程添加并检测资源";
+    const savedServer = state.remoteServers.find((server) => server.machine_id === editingMachineId);
+    submit.textContent = editingMachineId
+      ? savedServer && savedServer.deployed ? "更新配置并重启" : "保存配置"
+      : "登记服务器配置";
   }
 }
 
@@ -1891,7 +1902,9 @@ async function submitRemoteServer(event) {
 async function manageRemoteServer(button) {
   const machineId = button.dataset.remoteMachineId;
   const action = button.dataset.remoteAction;
-  const actionText = { install: "重新部署", start: "启动", stop: "停止", restart: "重启" }[action];
+  const actionText = action === "install"
+    ? button.textContent.trim()
+    : { start: "启动", stop: "停止", restart: "重启" }[action];
   if (action !== "start" && !window.confirm(`确认${actionText} ${machineId} 上的 worker？`)) return;
   button.disabled = true;
   try {

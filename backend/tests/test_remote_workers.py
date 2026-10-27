@@ -532,6 +532,11 @@ def test_remote_deployment_settings_apply_per_server_overrides_and_platform_fall
     assert public["has_remote_redis_url_override"] is True
     assert "remote_redis_url_encrypted" not in public
     assert redis_url not in repr(public)
+    assert remote_workers.remote_server_public_view({"status": "online"})["deployed"] is True
+    assert remote_workers.remote_server_public_view({"status": "stopped"})["deployed"] is True
+    assert remote_workers.remote_server_public_view(
+        {"status": "online", "deployed": False}
+    )["deployed"] is False
 
 
 def test_remote_configuration_accepts_complete_server_overrides_without_remote_env_values(tmp_path, monkeypatch):
@@ -1678,7 +1683,7 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     monkeypatch.setattr(config, "USE_DATABASE", True)
     machine_id = "remote-operation-test"
     operation_id = "operation-test"
-    server = _server(machine_id=machine_id)
+    server = _server(machine_id=machine_id, deployed=True)
     request.addfinalizer(lambda: remote_config_repository.delete_remote_server(machine_id))
     remote_config_repository.save_remote_server(server)
     manager.lease.set_remote_operation(
@@ -1700,6 +1705,7 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     assert result["duration_sec"] >= 0
     assert "远程操作已成功完成" in result["log"]
     assert remote_config_repository.get_remote_server(machine_id)["status"] == "online"
+    assert remote_config_repository.get_remote_server(machine_id)["deployed"] is True
 
     def fail_remote(*_args):
         raise remote_workers.RemoteWorkerError("SSH 登录失败")
@@ -1712,6 +1718,7 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     assert result["error"] == "SSH 登录失败"
     assert "SSH 登录失败" in result["log"]
     assert remote_config_repository.get_remote_server(machine_id)["status"] == "error"
+    assert remote_config_repository.get_remote_server(machine_id)["deployed"] is True
 
 
 def test_remote_subprocess_stops_when_operation_is_cancelled():

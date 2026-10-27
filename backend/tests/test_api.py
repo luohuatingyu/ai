@@ -399,8 +399,8 @@ def test_remote_operation_cancel_clears_stale_running_state(client, monkeypatch)
     manager.lease.clear_remote_operation_cancel(operation_id)
 
 
-def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, monkeypatch, request):
-    """无需令牌的远程添加与生命周期 API 仅保存 SSH 目标元数据并记录异步操作。"""
+def test_remote_server_api_separates_registration_deployment_and_config_update(client, monkeypatch, request):
+    """新增只登记配置；部署后更新配置会触发异步容器重建。"""
     from app.routers import jobs as jobs_router
     from app import remote_workers
     from app import remote_config_repository
@@ -445,12 +445,10 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
         "remote_s3_endpoint": "remote-storage.example.net:9000",
     }
     added = client.post("/api/remote-servers", json=payload)
-    assert added.status_code == 202
-    operation_id = added.json()["operation_id"]
-    operation = client.get(f"/api/remote-operations/{operation_id}").json()
-    assert operation["status"] == "completed"
-    assert operation["output"] == "done"
-    assert calls == [(machine_id, "install", "worker")]
+    assert added.status_code == 201
+    assert "operation_id" not in added.json()
+    assert calls == []
+    assert added.json()["server"]["deployed"] is False
 
     stored_server = remote_config_repository.get_remote_server(machine_id)
     assert stored_server["remote_redis_url_encrypted"] != payload["remote_redis_url"]
@@ -464,6 +462,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     assert server["worker_image_override"] == payload["worker_image"]
     assert server["remote_s3_endpoint_override"] == payload["remote_s3_endpoint"]
     assert server["has_remote_redis_url_override"] is True
+    assert server["deployed"] is False
     assert "remote_redis_url_encrypted" not in server
     assert payload["remote_redis_url"] not in repr(server)
     assert "private_key" not in server and "token" not in server
@@ -482,6 +481,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     assert edited_server["remote_s3_endpoint_override"] == "storage-v2.example.net:9000"
     assert edited_server["remote_redis_url_encrypted"] == stored_server["remote_redis_url_encrypted"]
     assert edited.json()["server"]["has_remote_redis_url_override"] is True
+    assert calls == []
 
     cleared = client.patch(
         f"/api/remote-servers/{machine_id}",
@@ -492,6 +492,35 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     assert cleared.json()["server"]["has_remote_redis_url_override"] is False
     assert client.post("/api/remote-servers", json=payload).status_code == 409
 
+    deployed = client.post(f"/api/remote-servers/{machine_id}/install")
+    assert deployed.status_code == 202
+    operation_id = deployed.json()["operation_id"]
+    operation = client.get(f"/api/remote-operations/{operation_id}").json()
+    assert operation["status"] == "completed"
+    assert operation["output"] == "done"
+    assert calls == [(machine_id, "install", "worker")]
+    servers = client.get("/api/remote-servers").json()["servers"]
+    server = next(item for item in servers if item["machine_id"] == machine_id)
+    assert server["deployed"] is True
+    assert "remote_redis_url_encrypted" not in server
+    assert payload["remote_redis_url"] not in repr(server)
+    assert "private_key" not in server and "token" not in server
+
+    updated = client.patch(
+        f"/api/remote-servers/{machine_id}",
+        json={
+            "worker_image": "registry.example.net/remote/worker:v4",
+            "remote_s3_endpoint": "storage-v3.example.net:9000",
+        },
+    )
+    assert updated.status_code == 202, updated.text
+    update_operation = client.get(
+        f"/api/remote-operations/{updated.json()['operation_id']}"
+    ).json()
+    assert update_operation["status"] == "completed"
+    assert calls[-1] == (machine_id, "install", "worker")
+    assert remote_config_repository.get_remote_server(machine_id)["worker_image_override"] == "registry.example.net/remote/worker:v4"
+
     for action in ("install", "start", "stop", "restart"):
         result = client.post(f"/api/remote-servers/{machine_id}/{action}")
         assert result.status_code == 202
@@ -500,6 +529,11 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
         ).json()
         assert current["status"] == "completed"
         assert calls[-1] == (machine_id, action, "worker")
+        current_server = next(
+            item for item in client.get("/api/remote-servers").json()["servers"]
+            if item["machine_id"] == machine_id
+        )
+        assert current_server["deployed"] is True
 
     assert client.post(
         f"/api/remote-servers/missing-{machine_id}/start"
@@ -572,8 +606,9 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
         },
     )
 
-    assert response.status_code == 202, response.text
-    assert run_calls == [("credential-user", "install")]
+    assert response.status_code == 201, response.text
+    assert run_calls == []
+    assert response.json()["server"]["deployed"] is False
     server = remote_config_repository.get_remote_server(machine_id)
     assert server["username"] == "credential-user"
     assert server["username_override"] is None
@@ -1329,10 +1364,33 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
         'id="clearRemoteRedisOverride"',
         "data-edit-remote-machine-id",
         'data-remote-action="install"',
-        "重新部署并应用配置",
+        'deployed ? "重新部署" : "部署"',
+        "更新配置并重启",
+        "应用当前已保存配置",
         "openEditRemoteServer",
     ):
         assert marker in html
+
+
+def test_remote_server_card_filters_lifecycle_actions_by_presence():
+    """在线卡片隐藏启动和重启，离线卡片隐藏停止；未部署时不显示生命周期操作。"""
+    backend_dir = Path(__file__).resolve().parents[1]
+    static_dir = backend_dir / "static"
+    if not static_dir.is_dir():
+        static_dir = backend_dir.parent / "static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    card_renderer = html.split("function workerServerCard(", 1)[1].split(
+        "// 读取仅在当前会话授权的远程服务器状态", 1
+    )[0]
+
+    assert 'const deployed = Boolean(remoteServer && remoteServer.deployed);' in card_renderer
+    assert 'const lifecycleControls = !deployed ? "" : online' in card_renderer
+    lifecycle_controls = card_renderer.split("const lifecycleControls", 1)[1].split(
+        "const serverControls", 1
+    )[0]
+    assert "? `<button data-remote-machine-id=\"${esc(machineId)}\" data-remote-action=\"stop\"" in lifecycle_controls
+    assert ': `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="start"' in lifecycle_controls
+    assert 'data-remote-action="restart"' in lifecycle_controls
 
 
 def test_remote_server_cards_expose_interrupt_action_for_active_operations():

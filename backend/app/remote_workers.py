@@ -1050,13 +1050,23 @@ def apply_remote_server_overrides(
 
 
 def remote_server_public_view(server: Dict[str, object]) -> Dict[str, object]:
-    """返回服务器可公开配置，隐藏加密 Redis URL 并只暴露是否设置覆盖值。"""
+    """返回公开服务器配置，隐藏 Redis 密文并兼容旧记录的部署状态。"""
     public = dict(server)
     encrypted_redis_url = public.pop("remote_redis_url_encrypted", None)
     public.pop("remote_redis_url", None)
     public.pop("clear_remote_redis_url_override", None)
     public["has_remote_redis_url_override"] = bool(encrypted_redis_url)
+    public["deployed"] = remote_server_is_deployed(server)
     return public
+
+
+def remote_server_is_deployed(server: Dict[str, object]) -> bool:
+    """读取持久化部署标记，并从旧状态推断已部署服务器。"""
+    if "deployed" in server:
+        return bool(server.get("deployed"))
+    return str(server.get("status", "")) in {
+        "online", "stopped", "running", "starting", "stopping", "restarting"
+    }
 
 
 def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[str, str]:
@@ -1711,6 +1721,8 @@ def execute_remote_operation(
                 "phase": "操作完成",
             }
             server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"
+            if action == "install":
+                server["deployed"] = True
             terminal_log = ("操作完成", "远程操作已成功完成。")
         except RemoteWorkerCancelledError as exc:
             terminal_update = {

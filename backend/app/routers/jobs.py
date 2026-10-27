@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Literal, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
 import app.config as config
@@ -34,6 +34,7 @@ from app.remote_workers import (
     execute_remote_operation,
     request_remote_operation_cancel,
     remote_configuration_errors,
+    remote_server_is_deployed,
     remote_server_public_view,
     resolve_remote_server_credentials,
     validate_server_record,
@@ -351,6 +352,7 @@ def _start_remote_operation(
         "error": None,
     }
     server = dict(server)
+    server["deployed"] = remote_server_is_deployed(server)
     server["status"] = {
         "install": "provisioning",
         "start": "starting",
@@ -532,12 +534,11 @@ def delete_remote_ssh_settings() -> dict:
         raise HTTPException(503, "平台 SSH 凭证清除失败；请检查 MySQL 连接") from exc
 
 
-@router.post("/remote-servers", status_code=202)
+@router.post("/remote-servers", status_code=201)
 def add_remote_server(
     request: RemoteServerRequest,
-    background_tasks: BackgroundTasks,
 ) -> dict:
-    """经平台 SSH 远程安装 worker；目标主机只接收单文件脚本和容器镜像。"""
+    """登记远程服务器配置；部署由服务器卡片上的单独操作触发。"""
     from app.remote_workers import RemoteWorkerError
 
     server = request.model_dump()
@@ -557,16 +558,19 @@ def add_remote_server(
         raise HTTPException(409, "服务器标识已登记")
     server["username"] = credentials["username"]
     server["ssh_credential_id"] = credentials["id"]
-    server.update({"status": "provisioning", "created_at": time.time()})
-    return _start_remote_operation(server, "install", background_tasks)
+    server.update({"status": "not_deployed", "deployed": False, "created_at": time.time()})
+    _remote_config_db_call(remote_config_repository.save_remote_server, server)
+    return {"server": remote_server_public_view(server)}
 
 
 @router.patch("/remote-servers/{machine_id}")
 def update_remote_server(
     machine_id: str,
     request: RemoteServerUpdateRequest,
+    background_tasks: BackgroundTasks,
+    response: Response,
 ) -> dict:
-    """更新一台远程服务器的连接参数和部署覆盖值，不自动重启目标 worker。"""
+    """保存服务器配置；已部署服务器随后异步重建容器以应用新配置。"""
     _check_id(machine_id, "服务器")
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
@@ -598,6 +602,7 @@ def update_remote_server(
     except RemoteWorkerError as exc:
         raise HTTPException(422, str(exc)) from exc
     candidate["username"] = credentials["username"]
+    candidate["deployed"] = remote_server_is_deployed(server)
     try:
         validate_server_record(candidate)
     except RemoteWorkerError as exc:
@@ -608,6 +613,9 @@ def update_remote_server(
 
     candidate["updated_at"] = time.time()
     _remote_config_db_call(remote_config_repository.save_remote_server, candidate)
+    if candidate["deployed"]:
+        response.status_code = 202
+        return _start_remote_operation(candidate, "install", background_tasks)
     return {"server": remote_server_public_view(candidate)}
 
 
