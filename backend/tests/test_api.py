@@ -1474,7 +1474,8 @@ def test_remote_server_form_exposes_network_overrides_and_effective_config_actio
         "更新配置",
         "部署代码",
         "只同步 worker 代码，不修改配置或启动容器",
-        "重建 worker 容器",
+        "不上传代码或重启容器",
+        "启动或重启",
         "openEditRemoteServer",
     ):
         assert marker in html

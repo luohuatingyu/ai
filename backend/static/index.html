@@ -634,7 +634,7 @@
     </div>
     <div id="remoteEffectiveConfigStatus" class="server-effective-config-status" role="status"></div>
     <div id="remoteEffectiveConfigOutput" class="server-effective-config" aria-live="polite"></div>
-    <div class="server-modal-note">这里显示平台当前解析出的配置。更新配置会写入目标机配置文件并重建 worker 容器；密码和密钥不会显示。</div>
+    <div class="server-modal-note">这里显示平台当前解析出的配置。更新配置会写入目标机配置文件，但运行中的容器需执行“启动”或“重启”后才会使用新值；密码和密钥不会显示。</div>
   </div>
 </div>
 
@@ -1876,7 +1876,7 @@ async function openEditRemoteServer(machineId) {
   $("addServerTitle").textContent = `编辑服务器 ${machineId}`;
   $("btnSubmitRemoteServer").textContent = server.deployed ? "更新配置" : "保存配置";
   $("remoteConfigApplyHint").textContent = server.deployed
-    ? "保存后会覆盖服务器配置并重建 worker 容器；不会上传 worker 代码。"
+    ? "保存后只覆盖服务器配置，不上传代码或重启容器；需要应用到运行中的 worker 时请单独启动或重启。"
     : "服务器尚未部署；保存后可在服务器卡片上点击“部署”。";
   modal.hidden = false;
   modal.classList.add("open");
