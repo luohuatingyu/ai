@@ -518,7 +518,7 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     )
     assert credential.status_code == 200, credential.text
     credential_id = credential.json()["credentials"][0]["id"]
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         remote_workers,
         "run_remote_action",
@@ -650,7 +650,7 @@ def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatc
     """非法主机字段由请求模型拒绝，不进入 SSH 执行器。"""
     from app.routers import jobs as jobs_router
 
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda *_args, **_kwargs: [])
     response = client.post(
         "/api/remote-servers",
         json={
@@ -690,7 +690,7 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
     )
     assert credential_response.status_code == 200, credential_response.text
     credential_id = credential_response.json()["credentials"][0]["id"]
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda *_args, **_kwargs: [])
     run_calls = []
     monkeypatch.setattr(
         remote_workers,

@@ -13,6 +13,8 @@ import pytest
 
 from app import config, jobstore
 from app.storage import (
+    ArtifactStoreUnavailableError,
+    S3ArtifactStore,
     checkpoint_key,
     get_store,
     job_key,
@@ -65,6 +67,68 @@ def test_append_text(store):
     st.append_text(job_key("j4", "log.txt"), "a\n")
     st.append_text(job_key("j4", "log.txt"), "b\n")
     assert st.read_text(job_key("j4", "log.txt")) == "a\nb\n"
+
+
+def test_s3_outage_is_not_treated_as_missing():
+    """S3 网络或鉴权故障必须向上抛出，不能伪装成产物不存在。"""
+    class FailingClient:
+        def get_object(self, *args, **kwargs):
+            raise ConnectionError("connection reset")
+
+        def stat_object(self, *args, **kwargs):
+            raise ConnectionError("connection reset")
+
+        def remove_object(self, *args, **kwargs):
+            raise ConnectionError("connection reset")
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = FailingClient()
+    st.bucket = "test-bucket"
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="读取对象存储"):
+        st.read_bytes("jobs/j4/log.txt")
+    with pytest.raises(ArtifactStoreUnavailableError, match="检查对象存储"):
+        st.exists("jobs/j4/log.txt")
+    with pytest.raises(ArtifactStoreUnavailableError, match="删除对象存储"):
+        st.delete("jobs/j4/log.txt")
+
+
+def test_s3_missing_object_keeps_missing_semantics():
+    """仅 NoSuchKey 继续表示对象不存在，避免把正常缺失当成基础设施故障。"""
+    class MissingObject(Exception):
+        code = "NoSuchKey"
+
+    class MissingClient:
+        def get_object(self, *args, **kwargs):
+            raise MissingObject()
+
+        def stat_object(self, *args, **kwargs):
+            raise MissingObject()
+
+        def remove_object(self, *args, **kwargs):
+            raise MissingObject()
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = MissingClient()
+    st.bucket = "test-bucket"
+
+    assert st.read_bytes("jobs/j4/missing.txt") is None
+    assert st.exists("jobs/j4/missing.txt") is False
+    st.delete("jobs/j4/missing.txt")
+
+
+def test_dataset_sync_propagates_remote_failure(monkeypatch, tmp_path):
+    """S3 同步失败应让导入调用方回滚，不能留下无法被远端 worker 使用的数据集。"""
+    class FailingRemoteStore:
+        def write_file(self, *args, **kwargs):
+            raise ArtifactStoreUnavailableError("对象存储暂时不可用")
+
+    csv = tmp_path / "dataset.csv"
+    csv.write_text("feature,target\n1,0\n", encoding="utf-8")
+    monkeypatch.setattr("app.storage.get_store", lambda: FailingRemoteStore())
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="暂时不可用"):
+        sync_dataset_to_store("ds-remote-failure", csv)
 
 
 # ---------------------------------------------------------------------------

@@ -311,7 +311,7 @@ def test_run_remote_subprocess_preserves_binary_build_context(monkeypatch):
 
 
 def test_worker_heartbeat_probe_reports_present_and_missing_slots(monkeypatch):
-    """启动探测能报告收到心跳及 15 秒内未收到心跳两种结果。"""
+    """启动探测能报告收到心跳及等待期内未收到心跳两种结果。"""
     operation_id = "e" * 32
     manager.lease.clear_remote_operation_cancel(operation_id)
     monkeypatch.setattr(remote_workers, "_WORKER_STARTUP_HEARTBEAT_TIMEOUT", 0.0)
@@ -321,17 +321,17 @@ def test_worker_heartbeat_probe_reports_present_and_missing_slots(monkeypatch):
         "list_workers",
         lambda: [{"worker_id": "remote-a-cpu0", "machine_id": "remote-a", "active": True}],
     )
-    remote_workers._wait_for_remote_worker_heartbeat(
+    assert remote_workers._wait_for_remote_worker_heartbeat(
         operation_id, "remote-a", lambda phase, message: emitted.append((phase, message))
-    )
+    ) is True
     assert any("已收到 1 个资源槽心跳" in message for _phase, message in emitted)
 
     emitted.clear()
     monkeypatch.setattr(manager.lease, "list_workers", lambda: [])
-    remote_workers._wait_for_remote_worker_heartbeat(
+    assert remote_workers._wait_for_remote_worker_heartbeat(
         operation_id, "remote-a", lambda phase, message: emitted.append((phase, message))
-    )
-    assert any("15 秒内未收到资源心跳" in message for _phase, message in emitted)
+    ) is False
+    assert any("未收到资源心跳" in message for _phase, message in emitted)
 
 
 def test_run_remote_install_records_stages_and_worker_heartbeat(tmp_path, monkeypatch):
@@ -532,7 +532,7 @@ def test_render_remote_script_includes_redis_password_and_effective_config_marks
 
 
 def test_remote_deployment_settings_apply_platform_fallback_and_server_network_overrides(tmp_path, monkeypatch):
-    """Worker 镜像只取平台配置，Redis/S3 未覆盖时回退平台 .env。"""
+    """Worker 镜像只取平台配置，Redis/S3 未覆盖时回退平台 .env；服务器级覆盖不沿用平台 Redis 密码。"""
     _remote_config(tmp_path, monkeypatch)
     monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/platform/worker:default")
     monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
@@ -558,10 +558,11 @@ def test_remote_deployment_settings_apply_platform_fallback_and_server_network_o
     )
     assert server["remote_redis_url_encrypted"] != redis_url
     assert "remote_redis_url" not in server
+    # 服务器级覆盖 URL 自带认证；平台 Redis 密码不得泄露给其他 Redis。
     assert remote_workers.remote_deployment_settings(server) == {
         "worker_image": "registry.example.net/platform/worker:default",
         "redis_url": redis_url,
-        "redis_password": "redis-password-test",
+        "redis_password": "",
         "s3_endpoint": "remote-s3.example.net:9000",
     }
     assert "worker_image_override" not in server
@@ -581,6 +582,41 @@ def test_remote_deployment_settings_apply_platform_fallback_and_server_network_o
     assert remote_workers.remote_server_public_view(
         {"status": "running", "deployed": None}
     )["deployed"] is True
+
+
+def test_remote_redis_password_priority_chain(tmp_path, monkeypatch):
+    """远程 Redis 密码按"远程专用 > 平台密码（仅共用平台 URL 时）"解析，不泄露平台密码给其他 Redis。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
+    monkeypatch.setattr(config, "REDIS_URL", "redis://platform-redis.example.net:6379/0")
+    monkeypatch.setattr(config, "REDIS_PASSWORD", "platform-pass")
+
+    # 复用平台 REDIS_URL：自动沿用平台密码（历史兼容）。
+    assert remote_workers.remote_deployment_settings({})["redis_password"] == "platform-pass"
+
+    # 配置了远程专用 URL 但未配置远程密码：不再沿用平台密码。
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "redis://remote-redis.example.net:6379/0")
+    assert remote_workers.remote_deployment_settings({})["redis_password"] == ""
+
+    # 显式远程密码优先于平台密码。
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_PASSWORD", "remote-pass")
+    assert remote_workers.remote_deployment_settings({})["redis_password"] == "remote-pass"
+
+    # 远程专用 URL + 远程密码：脚本下发远程密码。
+    rendered = remote_workers.render_remote_script(_server(), "config")
+    assert "export MTP_REDIS_PASSWORD=remote-pass" in rendered
+
+    # 生效配置标注认证来源且不泄露密码。
+    effective = remote_workers.remote_effective_config(_server())
+    assert effective["redis_auth_configured"] is True
+    assert effective["redis_auth_source"] == "WORKER_REMOTE_REDIS_PASSWORD"
+    assert "remote-pass" not in repr(effective)
+
+    # URL 内嵌认证时来源标注为 url。
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "redis://:inline-pass@remote-redis.example.net:6379/0")
+    effective = remote_workers.remote_effective_config(_server())
+    assert effective["redis_auth_source"] == "url"
+    assert "inline-pass" not in repr(effective)
 
 
 def test_remote_configuration_accepts_server_network_overrides_without_remote_env_values(tmp_path, monkeypatch):
@@ -1416,7 +1452,7 @@ def test_run_remote_action_builds_worker_on_target_before_install(tmp_path, monk
 
 
 def test_run_remote_action_deploys_code_without_rebuilding_image(tmp_path, monkeypatch):
-    """部署只传 app 源码，不查询架构、写配置或等待容器心跳。"""
+    """部署只传 app 源码，不查询架构、重建镜像；完成后等待资源心跳。"""
     import base64
     import io
     import re
@@ -1434,6 +1470,12 @@ def test_run_remote_action_deploys_code_without_rebuilding_image(tmp_path, monke
         "_build_worker_image_on_remote",
         lambda *_args, **_kwargs: pytest.fail("代码更新不应构建 Docker 镜像"),
     )
+    heartbeat_waits = []
+    monkeypatch.setattr(
+        remote_workers,
+        "_wait_for_remote_worker_heartbeat",
+        lambda _operation_id, _machine_id, _callback: heartbeat_waits.append(_machine_id) or True,
+    )
     calls = []
 
     def fake_run(command, **kwargs):
@@ -1445,6 +1487,8 @@ def test_run_remote_action_deploys_code_without_rebuilding_image(tmp_path, monke
     result = remote_workers.run_remote_action(_server(), "deploy", operation_id)
 
     assert result["stdout"] == "worker updated\n"
+    assert result["heartbeat_ok"] is True
+    assert heartbeat_waits == ["remote-test-01"]
     assert len(calls) == 1
     command, options = calls[0]
     assert command[-1] == "bash -s"
@@ -1932,6 +1976,195 @@ def test_execute_remote_operation_records_running_cancel(monkeypatch):
     assert manager.lease.is_remote_operation_cancel_requested(operation_id) is False
 
 
+def test_execute_remote_operation_records_missing_worker_heartbeat(monkeypatch, request):
+    """重建容器后未收到资源心跳：操作完成但服务器标记 error，心跳结果可见。"""
+    from app import remote_config_repository
+
+    monkeypatch.setattr(config, "USE_DATABASE", True)
+    monkeypatch.setattr(
+        config,
+        "WORKER_REMOTE_REDIS_URL",
+        "rediss://:redis-secret@redis.example.net:6380/0",
+    )
+    machine_id = "remote-heartbeat-miss"
+    operation_id = "e" * 32
+    server = _server(machine_id=machine_id, deployed=True, status="online")
+    request.addfinalizer(lambda: remote_config_repository.delete_remote_server(machine_id))
+    remote_config_repository.save_remote_server(server)
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": machine_id,
+            "action": "deploy",
+            "status": "queued",
+            "previous_server_status": "online",
+        },
+    )
+    monkeypatch.setattr(
+        remote_workers,
+        "run_remote_action",
+        lambda *_args: {"stdout": "deployed", "stderr": "", "heartbeat_ok": False},
+    )
+
+    remote_workers.execute_remote_operation(operation_id, server, "deploy")
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert result["status"] == "completed"
+    assert result["heartbeat_ok"] is False
+    assert "未收到资源心跳" in result["log"]
+    assert remote_config_repository.get_remote_server(machine_id)["status"] == "error"
+    assert remote_config_repository.get_remote_server(machine_id)["deployed"] is True
+
+
+def test_execute_remote_operation_records_healthy_worker_heartbeat(monkeypatch, request):
+    """收到资源心跳时操作正常完成，服务器恢复在线。"""
+    from app import remote_config_repository
+
+    monkeypatch.setattr(config, "USE_DATABASE", True)
+    monkeypatch.setattr(
+        config,
+        "WORKER_REMOTE_REDIS_URL",
+        "rediss://:redis-secret@redis.example.net:6380/0",
+    )
+    machine_id = "remote-heartbeat-ok"
+    operation_id = "f" * 32
+    server = _server(machine_id=machine_id, deployed=True, status="stopped")
+    request.addfinalizer(lambda: remote_config_repository.delete_remote_server(machine_id))
+    remote_config_repository.save_remote_server(server)
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": machine_id,
+            "action": "restart",
+            "status": "queued",
+        },
+    )
+    monkeypatch.setattr(
+        remote_workers,
+        "run_remote_action",
+        lambda *_args: {"stdout": "restarted", "stderr": "", "heartbeat_ok": True},
+    )
+
+    remote_workers.execute_remote_operation(operation_id, server, "restart")
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert result["status"] == "completed"
+    assert result["heartbeat_ok"] is True
+    assert remote_config_repository.get_remote_server(machine_id)["status"] == "online"
+
+
+def test_recover_stale_remote_operation_marks_failed_and_restores_server(monkeypatch, request):
+    """执行进程消失后，过期操作自动收敛为失败并恢复服务器状态，解除后续操作死锁。"""
+    from app import remote_config_repository
+
+    monkeypatch.setattr(config, "USE_DATABASE", True)
+    machine_id = "remote-stale-op"
+    operation_id = "5" * 32
+    server = _server(machine_id=machine_id, status="provisioning")
+    server["operation_id"] = operation_id
+    request.addfinalizer(lambda: remote_config_repository.delete_remote_server(machine_id))
+    remote_config_repository.save_remote_server(server)
+
+    stale = {
+        "operation_id": operation_id,
+        "machine_id": machine_id,
+        "action": "install",
+        "status": "running",
+        "created_at": time.time() - 400,
+        "started_at": time.time() - 400,
+    }
+    manager.lease.set_remote_operation(operation_id, stale)
+
+    recovered = remote_workers.recover_stale_remote_operation(operation_id, dict(stale))
+    assert recovered["status"] == "failed"
+    assert "执行进程已中断" in recovered["error"]
+    assert recovered["heartbeat_ok"] is False
+    assert remote_config_repository.get_remote_server(machine_id)["status"] == "error"
+    # 已收敛的操作保持终态，不会被重复改写。
+    assert remote_workers.recover_stale_remote_operation(operation_id, recovered) == recovered
+
+
+def test_recover_stale_remote_operation_ignores_active_or_recent_operations(monkeypatch):
+    """仍在执行或刚创建的远程操作不受恢复逻辑影响。"""
+    operation_id = "6" * 32
+
+    # 宽限期内的排队操作不收敛。
+    fresh = {
+        "operation_id": operation_id,
+        "machine_id": "remote-fresh",
+        "action": "start",
+        "status": "queued",
+        "created_at": time.time(),
+    }
+    manager.lease.set_remote_operation(operation_id, fresh)
+    assert remote_workers.recover_stale_remote_operation(operation_id, dict(fresh))["status"] == "queued"
+
+    # 当前进程正在执行的操作不收敛（进程内注册表判定为活跃）。
+    stale = dict(fresh, status="running", started_at=time.time() - 400)
+    manager.lease.set_remote_operation(operation_id, stale)
+    monkeypatch.setattr(remote_workers, "is_remote_operation_active", lambda _operation_id: True)
+    assert remote_workers.recover_stale_remote_operation(operation_id, dict(stale))["status"] == "running"
+
+    # 协调存储中存在执行者存活标记的操作不收敛。
+    monkeypatch.setattr(remote_workers, "is_remote_operation_active", lambda _operation_id: False)
+    monkeypatch.setattr(
+        manager.lease, "is_remote_operation_executor_active", lambda _operation_id: True
+    )
+    assert remote_workers.recover_stale_remote_operation(operation_id, dict(stale))["status"] == "running"
+
+
+def test_run_remote_action_lifecycle_skips_platform_config(tmp_path, monkeypatch):
+    """start/stop/restart 只依赖 SSH 与服务器记录；Redis 覆盖不可解密时仍可执行，部署类动作必须拒绝。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    server = _server()
+    server["remote_redis_url_encrypted"] = "invalid-ciphertext"
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="stopped\n", stderr="")
+
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+
+    result = remote_workers.run_remote_action(server, "stop")
+    assert result["stdout"] == "stopped\n"
+    assert "export MTP_ACTION=stop" in calls[0][1]["input_data"]
+
+    with pytest.raises(remote_workers.RemoteWorkerError, match="无法解密"):
+        remote_workers.run_remote_action(server, "config")
+
+
+def test_remote_configuration_errors_lifecycle_skips_platform_checks(tmp_path, monkeypatch):
+    """生命周期动作不要求 Redis/S3/镜像配置；部署类动作仍需完整平台配置。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    credentials = {"auth_method": "key", "private_key": "private-key-content", "password": "", "passphrase": ""}
+    monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "")
+    monkeypatch.setattr(config, "REDIS_URL", "")
+    monkeypatch.setattr(config, "STORAGE_BACKEND", "local")
+
+    assert remote_workers.remote_configuration_errors(
+        credentials, _server(), require_platform_config=False
+    ) == []
+    errors = remote_workers.remote_configuration_errors(credentials, _server())
+    assert any("WORKER_IMAGE" in item for item in errors)
+    assert any("共享 REDIS_URL" in item for item in errors)
+    assert any("共享 S3 存储" in item for item in errors)
+
+
+def test_remote_configuration_rejects_control_characters_in_redis_password(tmp_path, monkeypatch):
+    """Redis 密码与其余部署值一样不允许控制字符，避免污染远端 env 文件。"""
+    _remote_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
+    monkeypatch.setattr(config, "REDIS_PASSWORD", "bad\x01pass")
+    errors = remote_workers.remote_configuration_errors()
+    assert any("控制字符" in item for item in errors)
+
+
 def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
     """远程单文件脚本验证已加载镜像、写私有配置并按 CPU/GPU 模式启动容器。"""
     bin_dir = tmp_path / "bin"
@@ -2169,7 +2402,7 @@ def test_remote_bootstrap_script_lifecycle_controls_container_only(
 
 
 def test_remote_bootstrap_script_config_rolls_back_when_new_container_fails(tmp_path: Path):
-    """更新配置重建容器失败时恢复旧容器，并保留新配置供下次重试。"""
+    """更新配置重建容器失败时恢复旧容器和原配置，保持环境文件与运行容器一致。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
@@ -2192,8 +2425,8 @@ def test_remote_bootstrap_script_config_rolls_back_when_new_container_fails(tmp_
     home.mkdir()
     env_file = home / ".config" / "mtp-worker" / "remote-config.env"
     env_file.parent.mkdir(parents=True)
-    latest_env = "S3_ENDPOINT=latest-storage.example.net:9000\n"
-    env_file.write_text(latest_env, encoding="utf-8")
+    previous_env = "S3_ENDPOINT=previous-storage.example.net:9000\n"
+    env_file.write_text(previous_env, encoding="utf-8")
     env = os.environ.copy()
     env.update({
         "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
@@ -2216,7 +2449,9 @@ def test_remote_bootstrap_script_config_rolls_back_when_new_container_fails(tmp_
     result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
 
     assert result.returncode == 1
-    assert "S3_ENDPOINT=storage.example.net:9000" in env_file.read_text(encoding="utf-8")
+    # 失败回滚后环境文件恢复为覆盖前的旧配置。
+    assert env_file.read_text(encoding="utf-8") == previous_env
+    assert not (env_file.parent / f"{env_file.name}.previous").exists()
     commands = docker_log.read_text(encoding="utf-8")
     assert "rename mtp-worker-remote-config mtp-worker-remote-config-previous" in commands
     assert "rename mtp-worker-remote-config-previous mtp-worker-remote-config" in commands

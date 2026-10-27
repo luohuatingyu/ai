@@ -32,7 +32,9 @@ _REMOTE_SERVERS = "mtp:remote:servers"
 _REMOTE_SSH_CREDENTIALS = "mtp:remote:ssh_credentials"
 _REMOTE_OPERATION = "mtp:remote:operation:{operation_id}"
 _REMOTE_OPERATION_CANCEL = "mtp:remote:operation:cancel:{operation_id}"
+_REMOTE_OPERATION_EXECUTOR = "mtp:remote:operation:executor:{operation_id}"
 _REMOTE_OPERATION_TTL = 7 * 24 * 3600
+_REMOTE_EXECUTOR_TTL = 90
 
 # 信号 TTL：控制信号 1 小时后自动清理，避免遗留脏信号影响后续轮次
 _SIGNAL_TTL = 3600
@@ -286,6 +288,18 @@ class LeaseStore:
         """清除远程 SSH 操作的中断请求。"""
         raise NotImplementedError
 
+    def set_remote_operation_executor(self, operation_id: str) -> None:
+        """写入远程操作执行者的存活标记（带 TTL，执行进程周期性续写）。"""
+        raise NotImplementedError
+
+    def is_remote_operation_executor_active(self, operation_id: str) -> bool:
+        """检查远程操作执行者是否仍在存活周期内。"""
+        raise NotImplementedError
+
+    def clear_remote_operation_executor(self, operation_id: str) -> None:
+        """清除远程操作执行者存活标记（操作正常结束时调用）。"""
+        raise NotImplementedError
+
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的 worker 注册条目（崩溃/未优雅退出残留），返回清除数量。"""
         raise NotImplementedError
@@ -461,6 +475,16 @@ class EmbeddedLeaseStore(LeaseStore):
         with self._lock:
             self._remote_operation_cancellations.discard(operation_id)
 
+    def set_remote_operation_executor(self, operation_id: str) -> None:
+        """嵌入式实现无跨进程存活信息，执行者活性由调用方进程内注册表判断。"""
+        return
+
+    def is_remote_operation_executor_active(self, operation_id: str) -> bool:
+        return False
+
+    def clear_remote_operation_executor(self, operation_id: str) -> None:
+        return
+
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的注册条目（存活 worker 心跳远短于宽限期）。"""
         now = time.time()
@@ -632,6 +656,24 @@ class RedisLeaseStore(LeaseStore):
     def clear_remote_operation_cancel(self, operation_id: str) -> None:
         """清除 Redis 中远程操作的中断请求。"""
         self._redis.delete(_REMOTE_OPERATION_CANCEL.format(operation_id=operation_id))
+
+    def set_remote_operation_executor(self, operation_id: str) -> None:
+        """写入远程操作执行者存活标记；TTL 到期即判定执行进程已消失。"""
+        self._redis.set(
+            _REMOTE_OPERATION_EXECUTOR.format(operation_id=operation_id),
+            "1",
+            ex=_REMOTE_EXECUTOR_TTL,
+        )
+
+    def is_remote_operation_executor_active(self, operation_id: str) -> bool:
+        """执行者存活标记存在即视为仍在执行。"""
+        return bool(
+            self._redis.get(_REMOTE_OPERATION_EXECUTOR.format(operation_id=operation_id))
+        )
+
+    def clear_remote_operation_executor(self, operation_id: str) -> None:
+        """操作正常结束后移除执行者存活标记。"""
+        self._redis.delete(_REMOTE_OPERATION_EXECUTOR.format(operation_id=operation_id))
 
     def delete_remote_server(self, machine_id: str) -> None:
         """从 Redis 删除远程服务器元数据，不访问目标服务器。"""

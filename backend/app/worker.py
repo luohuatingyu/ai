@@ -34,6 +34,7 @@ from app import jobstore
 from app.coordination import JobQueue, LeaseStore, build_coordination
 from app.storage import (
     ArtifactStore,
+    ArtifactStoreUnavailableError,
     checkpoint_key,
     get_store,
     job_key,
@@ -213,9 +214,12 @@ def classify_retryable(exc: BaseException) -> bool:
     规则：
     - FileNotFoundError / ValueError / KeyError 视为业务性错误（数据集缺失、
       超参/格式非法、续训不兼容等），重试无意义；
+    - 对象存储不可用（网络/鉴权故障）属于环境性错误，一律可重试；
     - 其余异常（RuntimeError/OSError/ConnectionError 等）按错误文本匹配
       环境性特征词（CUDA/OOM/网络瞬断/存储故障）判定可重试。
     """
+    if isinstance(exc, ArtifactStoreUnavailableError):
+        return True
     if isinstance(exc, _FATAL_EXCEPTION_TYPES):
         return False
     text = f"{exc}".lower()

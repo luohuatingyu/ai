@@ -33,6 +33,7 @@ from app.remote_workers import (
     apply_remote_server_overrides,
     clear_remote_operation_log,
     execute_remote_operation,
+    recover_stale_remote_operation,
     request_remote_operation_cancel,
     remote_configuration_errors,
     remote_effective_config,
@@ -613,7 +614,10 @@ def update_remote_server(
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
         raise HTTPException(404, "远程服务器不存在")
-    previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
+    previous_operation_id = str(server.get("operation_id", ""))
+    previous = manager.lease.get_remote_operation(previous_operation_id)
+    if previous:
+        previous = recover_stale_remote_operation(previous_operation_id, previous)
     if previous and previous.get("status") in {"queued", "running"}:
         raise HTTPException(409, "该服务器已有远程操作正在执行，暂时不能编辑")
 
@@ -674,18 +678,32 @@ def manage_remote_server(
         credentials = resolve_remote_server_credentials(server)
     except RemoteWorkerError as exc:
         raise HTTPException(409, str(exc)) from exc
-    errors = remote_configuration_errors(credentials, server)
-    if errors:
-        raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
-    previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
-    if previous and previous.get("status") in {"queued", "running"}:
-        raise HTTPException(409, "该服务器已有远程操作正在执行")
     if action == "install" and remote_server_is_deployed(server):
         operation_action = "deploy"
     elif action == "deploy" and not remote_server_is_deployed(server):
         operation_action = "install"
     else:
         operation_action = action
+    candidate = dict(server)
+    candidate["username"] = credentials["username"]
+    try:
+        validate_server_record(candidate)
+    except RemoteWorkerError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    # start/stop/restart 只操作远端容器，不依赖 Redis/S3/镜像等部署配置可用。
+    errors = remote_configuration_errors(
+        credentials,
+        server,
+        require_platform_config=operation_action in {"install", "deploy", "config"},
+    )
+    if errors:
+        raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
+    previous_operation_id = str(server.get("operation_id", ""))
+    previous = manager.lease.get_remote_operation(previous_operation_id)
+    if previous:
+        previous = recover_stale_remote_operation(previous_operation_id, previous)
+    if previous and previous.get("status") in {"queued", "running"}:
+        raise HTTPException(409, "该服务器已有远程操作正在执行")
     return _start_remote_operation(server, operation_action, background_tasks)
 
 
@@ -699,6 +717,7 @@ def get_remote_operation(
     operation = manager.lease.get_remote_operation(operation_id)
     if operation is None:
         raise HTTPException(404, "远程操作不存在")
+    operation = recover_stale_remote_operation(operation_id, operation)
     operation["cancel_requested"] = manager.lease.is_remote_operation_cancel_requested(
         operation_id
     )
@@ -725,6 +744,7 @@ def cancel_remote_operation(
     operation = manager.lease.get_remote_operation(operation_id)
     if operation is None:
         raise HTTPException(404, "远程操作不存在")
+    operation = recover_stale_remote_operation(operation_id, operation)
     if operation.get("status") == "cancelled":
         return {"ok": True, "operation_id": operation_id, "status": "cancelled"}
     if operation.get("status") not in {"queued", "running"}:

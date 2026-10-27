@@ -11,7 +11,7 @@ import time
 import pytest
 
 from app import config, jobstore
-from app.storage import checkpoint_key, job_key
+from app.storage import ArtifactStoreUnavailableError, checkpoint_key, job_key
 from app.worker import classify_retryable, detect_capabilities, probe_visible_gpu
 from tests.conftest import job_epochs, job_status, wait_until
 
@@ -25,6 +25,7 @@ from tests.conftest import job_epochs, job_status, wait_until
     (RuntimeError("NCCL timeout"), True),
     (ConnectionError("connection refused"), True),
     (OSError("storage connection reset"), True),
+    (ArtifactStoreUnavailableError("读取对象存储产物失败: bucket 不可达"), True),
     (FileNotFoundError("dataset missing"), False),   # 业务性：数据缺失
     (ValueError("bad hyper-params"), False),         # 业务性：超参非法
     (KeyError("target column"), False),              # 业务性：字段缺失

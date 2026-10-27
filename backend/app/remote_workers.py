@@ -46,7 +46,9 @@ _ACTIVE_REMOTE_OPERATIONS_LOCK = threading.Lock()
 _REMOTE_OPERATION_LOG_LOCK = threading.Lock()
 _REMOTE_OPERATION_LOG_LIMIT = 24_000
 _REMOTE_BUILD_IDLE_PROGRESS_INTERVAL = 30.0
-_WORKER_STARTUP_HEARTBEAT_TIMEOUT = 15.0
+_WORKER_STARTUP_HEARTBEAT_TIMEOUT = 30.0
+_REMOTE_EXECUTOR_HEARTBEAT_INTERVAL = 20.0
+_REMOTE_OPERATION_STALE_GRACE = 120.0
 
 
 def _safe_startup_endpoint(value: object) -> str:
@@ -207,6 +209,63 @@ def _remote_operation_cancel_requested(operation_id: str | None) -> bool:
         if cancellation_event is not None and cancellation_event.is_set():
             return True
     return manager.lease.is_remote_operation_cancel_requested(operation_id)
+
+
+def _executor_heartbeat_loop(operation_id: str, stop_event: threading.Event) -> None:
+    """周期性续写执行者存活标记；写失败不影响远程操作本身。"""
+    while not stop_event.wait(_REMOTE_EXECUTOR_HEARTBEAT_INTERVAL):
+        try:
+            manager.lease.set_remote_operation_executor(operation_id)
+        except Exception:
+            continue
+
+
+def recover_stale_remote_operation(
+    operation_id: str, operation: Dict[str, object]
+) -> Dict[str, object]:
+    """把执行进程已消失（API 服务重启/崩溃）的操作收敛为失败状态。
+
+    判定依据：操作仍处于 queued/running，但协调存储中不存在执行者存活标记
+    （Redis TTL 到期）且当前进程也不在执行；超过宽限期后标记失败并恢复服务器
+    状态，避免服务器永久停留在"远程操作中"而拒绝一切后续操作。
+    """
+    if operation.get("status") not in {"queued", "running"}:
+        return operation
+    if is_remote_operation_active(operation_id):
+        return operation
+    if manager.lease.is_remote_operation_executor_active(operation_id):
+        return operation
+    reference = float(operation.get("started_at") or operation.get("created_at") or 0)
+    if not reference or time.time() - reference < _REMOTE_OPERATION_STALE_GRACE:
+        return operation
+    error_message = "远程操作执行进程已中断（API 服务可能重启），请检查服务器状态后重新操作"
+    latest = manager.lease.get_remote_operation(operation_id) or operation
+    latest.update(
+        {
+            "status": "failed",
+            "updated_at": time.time(),
+            "error": error_message,
+            "phase": "操作失败",
+            "heartbeat_ok": False,
+        }
+    )
+    manager.lease.set_remote_operation(operation_id, latest)
+    manager.lease.clear_remote_operation_cancel(operation_id)
+    machine_id = str(latest.get("machine_id", ""))
+    if machine_id:
+        try:
+            server = remote_config_repository.get_remote_server(machine_id)
+        except remote_config_repository.RemoteConfigPersistenceError:
+            server = None
+        # 仅当服务器记录仍指向本操作时才恢复状态，避免覆盖更新的操作。
+        if server and str(server.get("operation_id", "")) == operation_id:
+            server["status"] = "error"
+            try:
+                remote_config_repository.save_remote_server(server)
+            except remote_config_repository.RemoteConfigPersistenceError:
+                pass
+    _append_remote_operation_log(operation_id, "操作失败", error_message)
+    return latest
 
 
 def _terminate_remote_process(process: subprocess.Popen) -> None:
@@ -647,7 +706,12 @@ def _build_local_docker_image_for_platform(
     operation_id: str | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> None:
-    """通过平台 Docker Engine 为目标架构重建 worker 镜像并校验结果。"""
+    """通过平台 Docker Engine 为目标架构重建 worker 镜像并校验结果。
+
+    保留的备用路径（当前未接入操作流程）：现网安装走目标机构建
+    （_build_worker_image_on_remote），本函数与 _stream_worker_image_to_remote
+    构成"平台导出镜像再 SSH 传输"的旧传输链路，供回退与测试使用。
+    """
     canonical_platform = _canonical_docker_platform(platform)
     if not canonical_platform.startswith("linux/"):
         raise RemoteWorkerError(f"远程 worker 暂不支持目标镜像平台 {platform}")
@@ -1169,12 +1233,21 @@ def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[
             ).decode("utf-8")
         except (InvalidToken, ValueError, UnicodeError) as exc:
             raise RemoteWorkerError("服务器 Redis 覆盖配置无法解密；请检查平台加密主密钥") from exc
+    redis_url = str(
+        redis_override or config.WORKER_REMOTE_REDIS_URL or config.REDIS_URL or ""
+    ).strip()
+    # Redis 密码按"远程专用 > 平台密码"解析：平台密码只在远程 worker 复用平台
+    # REDIS_URL（未配置远程专用 URL）时沿用，避免把平台密码误发给其他 Redis。
+    if config.WORKER_REMOTE_REDIS_PASSWORD:
+        redis_password = str(config.WORKER_REMOTE_REDIS_PASSWORD).strip()
+    elif not redis_override and not config.WORKER_REMOTE_REDIS_URL:
+        redis_password = str(config.REDIS_PASSWORD or "").strip()
+    else:
+        redis_password = ""
     return {
         "worker_image": str(config.WORKER_REMOTE_IMAGE or "").strip(),
-        "redis_url": str(
-            redis_override or config.WORKER_REMOTE_REDIS_URL or config.REDIS_URL or ""
-        ).strip(),
-        "redis_password": str(config.REDIS_PASSWORD or "").strip(),
+        "redis_url": redis_url,
+        "redis_password": redis_password,
         "s3_endpoint": str(
             server.get("remote_s3_endpoint_override")
             or config.WORKER_REMOTE_S3_ENDPOINT
@@ -1200,6 +1273,15 @@ def remote_effective_config(server: Dict[str, object]) -> Dict[str, object]:
         s3_source = "WORKER_REMOTE_S3_ENDPOINT"
     else:
         s3_source = "S3_ENDPOINT"
+    redis_url = deployment["redis_url"]
+    if "@" in redis_url:
+        redis_auth_source = "url"
+    elif config.WORKER_REMOTE_REDIS_PASSWORD:
+        redis_auth_source = "WORKER_REMOTE_REDIS_PASSWORD"
+    elif deployment.get("redis_password"):
+        redis_auth_source = "REDIS_PASSWORD"
+    else:
+        redis_auth_source = None
     return {
         "machine_id": str(server.get("machine_id", "")),
         "host": str(server.get("host", "")),
@@ -1212,9 +1294,8 @@ def remote_effective_config(server: Dict[str, object]) -> Dict[str, object]:
         "worker_image_source": "WORKER_REMOTE_IMAGE",
         "redis_endpoint": _safe_startup_endpoint(deployment["redis_url"]),
         "redis_configured": bool(deployment["redis_url"]),
-        "redis_auth_configured": "@" in deployment["redis_url"] or bool(
-            deployment.get("redis_password")
-        ),
+        "redis_auth_configured": bool(redis_auth_source),
+        "redis_auth_source": redis_auth_source,
         "redis_source": redis_source,
         "s3_endpoint": _safe_startup_endpoint(deployment["s3_endpoint"]),
         "s3_source": s3_source,
@@ -1226,7 +1307,11 @@ def remote_effective_config(server: Dict[str, object]) -> Dict[str, object]:
 def _open_local_docker_image_archive(
     image: str,
 ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
-    """通过宿主 Docker Engine API 打开指定本地镜像的 tar 流。"""
+    """通过宿主 Docker Engine API 打开指定本地镜像的 tar 流。
+
+    保留的备用路径（当前未接入操作流程）：仅被旧镜像传输链路
+    _stream_worker_image_to_remote 使用，见该函数说明。
+    """
     socket_path = config.WORKER_DOCKER_SOCKET_PATH
     if not socket_path or not Path(socket_path).exists():
         raise RemoteWorkerError(
@@ -1282,7 +1367,11 @@ def _stream_worker_image_to_remote(
     operation_id: str | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> Dict[str, str]:
-    """把 Docker Engine 镜像 tar 流经 SSH stdin 传给目标机 docker load。"""
+    """把 Docker Engine 镜像 tar 流经 SSH stdin 传给目标机 docker load。
+
+    保留的备用路径（当前未接入操作流程）：现网安装走目标机构建
+    （_build_worker_image_on_remote），本链路供回退与测试使用。
+    """
     docker_connection, image_response = _open_local_docker_image_archive(image)
     read_fd = -1
     write_fd = -1
@@ -1390,9 +1479,14 @@ def _wait_for_remote_worker_heartbeat(
     operation_id: str,
     machine_id: str,
     progress_callback: Callable[[str, str], None],
-) -> None:
-    """短暂等待远程 worker 注册，并记录有无心跳供安装诊断。"""
-    _emit_progress(progress_callback, "等待资源心跳", "等待远程 worker 注册资源槽（最多 15 秒）。")
+) -> bool:
+    """短暂等待远程 worker 注册，返回是否收到资源心跳供操作结果诊断。"""
+    timeout_seconds = int(_WORKER_STARTUP_HEARTBEAT_TIMEOUT)
+    _emit_progress(
+        progress_callback,
+        "等待资源心跳",
+        f"等待远程 worker 注册资源槽（最多 {timeout_seconds} 秒）。",
+    )
     deadline = time.monotonic() + _WORKER_STARTUP_HEARTBEAT_TIMEOUT
     while True:
         if _remote_operation_cancel_requested(operation_id):
@@ -1405,7 +1499,7 @@ def _wait_for_remote_worker_heartbeat(
                 "等待资源心跳",
                 f"无法读取平台 worker 心跳：{exc}",
             )
-            return
+            return False
         matches = [
             item for item in workers
             if str(item.get("machine_id", "")) == machine_id and item.get("active")
@@ -1417,15 +1511,16 @@ def _wait_for_remote_worker_heartbeat(
                 "等待资源心跳",
                 f"已收到 {len(matches)} 个资源槽心跳：{worker_ids}。",
             )
-            return
+            return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _emit_progress(
                 progress_callback,
                 "等待资源心跳",
-                "15 秒内未收到资源心跳。请查看下方容器启动日志，并检查目标机到 Redis、S3 的连通性。",
+                f"{timeout_seconds} 秒内未收到资源心跳。请查看下方容器启动日志，"
+                "并检查目标机到 Redis、S3 的连通性。",
             )
-            return
+            return False
         time.sleep(min(1.0, remaining))
 
 
@@ -1497,8 +1592,14 @@ def clear_platform_ssh_credentials() -> Dict[str, object]:
 def remote_configuration_errors(
     credentials: Dict[str, str] | None = None,
     server: Dict[str, object] | None = None,
+    *,
+    require_platform_config: bool = True,
 ) -> List[str]:
-    """列出远程执行缺少的配置，不读取或返回平台 SSH 凭证内容。"""
+    """列出远程执行缺少的配置，不读取或返回平台 SSH 凭证内容。
+
+    require_platform_config=False 用于 start/stop/restart 等纯容器生命周期操作：
+    只校验 SSH 可达性与凭证，不要求 Redis/S3/镜像等部署配置可用。
+    """
     errors: List[str] = []
     if credentials is None:
         try:
@@ -1512,9 +1613,9 @@ def remote_configuration_errors(
                 "passphrase": "",
                 "private_key": "",
             }
-    if not config.REDIS_URL:
+    if not config.REDIS_URL and require_platform_config:
         errors.append("平台必须配置共享 REDIS_URL，远程 worker 才能加入同一任务队列")
-    if config.STORAGE_BACKEND != "s3":
+    if config.STORAGE_BACKEND != "s3" and require_platform_config:
         errors.append("平台必须使用共享 S3 存储，远程 worker 才能读取数据集和写入产物")
     if not shutil.which("ssh"):
         errors.append("平台后端容器未安装 OpenSSH 客户端")
@@ -1526,6 +1627,8 @@ def remote_configuration_errors(
             errors.append("页面未配置 SSH 私钥")
     if auth_method in {"password", "key_password"} and not credentials.get("password"):
         errors.append("页面凭证缺少 SSH 登录密码")
+    if not require_platform_config:
+        return errors
     try:
         settings = remote_deployment_settings(server)
     except RemoteWorkerError as exc:
@@ -1543,6 +1646,7 @@ def remote_configuration_errors(
     values = (
         settings["worker_image"],
         settings["redis_url"],
+        settings["redis_password"],
         settings["s3_endpoint"],
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
@@ -1575,6 +1679,27 @@ def validate_server_record(server: Dict[str, object]) -> None:
         raise RemoteWorkerError("SSH 端口必须在 1 到 65535 之间")
 
 
+_LIFECYCLE_ACTIONS = ("start", "stop", "restart", "status")
+
+
+def _deployment_settings_for_action(
+    server: Dict[str, object], action: str
+) -> Dict[str, str]:
+    """按动作解析部署配置：纯容器生命周期操作不依赖 Redis/S3 配置可解密。"""
+    try:
+        return remote_deployment_settings(server)
+    except RemoteWorkerError:
+        if action in _LIFECYCLE_ACTIONS:
+            # start/stop/restart 只操作容器，远端脚本不读取这些值；配置不可解密时置空继续。
+            return {
+                "worker_image": "",
+                "redis_url": "",
+                "redis_password": "",
+                "s3_endpoint": "",
+            }
+        raise
+
+
 def render_remote_script(
     server: Dict[str, object], action: str, code_archive_base64: str | None = None
 ) -> str:
@@ -1595,7 +1720,7 @@ def render_remote_script(
     if not 0 <= cpu_slots <= 256:
         raise RemoteWorkerError("CPU 执行槽数量必须在 0 到 256 之间")
 
-    deployment = remote_deployment_settings(server)
+    deployment = _deployment_settings_for_action(server, action)
     settings = {
         "MTP_ACTION": action,
         "MTP_MACHINE_ID": str(server["machine_id"]),
@@ -1648,7 +1773,11 @@ def run_remote_action(
 
     progress_callback = report if operation_id else None
     _emit_progress(progress_callback, "检查部署配置", "检查 SSH、Redis、S3 和 worker 镜像配置。")
-    errors = remote_configuration_errors(credentials, server)
+    errors = remote_configuration_errors(
+        credentials,
+        server,
+        require_platform_config=action not in _LIFECYCLE_ACTIONS,
+    )
     if errors:
         raise RemoteWorkerError("；".join(errors))
     validate_server_record(resolved_server)
@@ -1821,13 +1950,33 @@ def run_remote_action(
         detail = (output["stderr"] or output["stdout"] or "远程脚本返回错误").strip()
         raise RemoteWorkerError(detail[-2000:])
     _emit_progress(progress_callback, "执行远程部署脚本", "远端脚本已成功返回。")
-    if action == "install" and operation_id:
-        _wait_for_remote_worker_heartbeat(
+    # 重建/重启容器后等待资源心跳，确认 worker 真的注册成功（stop 无需等待）。
+    heartbeat_ok: bool | None = None
+    if operation_id and action in {
+        "install", "deploy", "update", "config", "start", "restart"
+    }:
+        heartbeat_ok = _wait_for_remote_worker_heartbeat(
             operation_id,
             str(server.get("machine_id", "")),
             progress_callback or report,
         )
+    output["heartbeat_ok"] = heartbeat_ok
     return output
+
+
+def _persist_remote_server_status(
+    operation_id: str, server: Dict[str, object], phase: str
+) -> None:
+    """保存服务器状态到 MySQL；失败只记入操作日志，不破坏操作终态。"""
+    try:
+        remote_config_repository.save_remote_server(server)
+    except remote_config_repository.RemoteConfigPersistenceError as exc:
+        _append_remote_operation_log(
+            operation_id,
+            phase,
+            f"服务器状态写入 MySQL 失败（不影响远端执行结果）：{exc}",
+            server=server,
+        )
 
 
 def execute_remote_operation(
@@ -1835,7 +1984,16 @@ def execute_remote_operation(
 ) -> None:
     """在后台执行 SSH 操作并将可轮询状态写入协调存储。"""
     cancellation_event = _register_remote_operation(operation_id)
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_executor_heartbeat_loop,
+        args=(operation_id, heartbeat_stop),
+        name="remote-operation-executor-heartbeat",
+        daemon=True,
+    )
     try:
+        manager.lease.set_remote_operation_executor(operation_id)
+        heartbeat_thread.start()
         operation = manager.lease.get_remote_operation(operation_id) or {
             "operation_id": operation_id,
             "machine_id": str(server.get("machine_id", "")),
@@ -1873,7 +2031,7 @@ def execute_remote_operation(
                 server=server,
             )
             server.update({"status": "running", "operation_id": operation_id})
-            remote_config_repository.save_remote_server(server)
+            _persist_remote_server_status(operation_id, server, "准备远程操作")
             result = run_remote_action(server, action, operation_id)
             # 远端脚本的最终 stdout/stderr 也写入操作日志；日志窗口优先展示 log，避免配置摘要只停留在 output 字段而不可见。
             for stream_name, phase in (("stdout", "远端脚本输出"), ("stderr", "远端脚本错误")):
@@ -1904,6 +2062,20 @@ def execute_remote_operation(
             if action in {"install", "deploy", "update"}:
                 server["deployed"] = True
             terminal_log = ("操作完成", "远程操作已成功完成。")
+            heartbeat_ok = result.get("heartbeat_ok")
+            if heartbeat_ok is True:
+                terminal_update["heartbeat_ok"] = True
+            elif heartbeat_ok is False:
+                # 容器已重建但 worker 未在等待期内注册：如实标记状态，避免误导为在线。
+                terminal_update["heartbeat_ok"] = False
+                server["status"] = "error"
+                terminal_log = (
+                    "操作完成",
+                    "远端脚本已成功执行，但等待期内未收到资源心跳：worker 容器可能启动失败，"
+                    "请查看容器启动日志并检查目标机到 Redis、S3 的连通性。",
+                )
+            if _remote_operation_cancel_requested(operation_id):
+                raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
         except RemoteWorkerCancelledError as exc:
             terminal_update = {
                 "status": "cancelled",
@@ -1943,8 +2115,13 @@ def execute_remote_operation(
         operation = manager.lease.get_remote_operation(operation_id) or operation
         operation.update(terminal_update)
         manager.lease.set_remote_operation(operation_id, operation)
-        remote_config_repository.save_remote_server(server)
+        _persist_remote_server_status(operation_id, server, terminal_log[0])
     finally:
+        heartbeat_stop.set()
+        try:
+            manager.lease.clear_remote_operation_executor(operation_id)
+        except Exception:
+            pass
         _unregister_remote_operation(operation_id, cancellation_event)
 
 
@@ -1965,6 +2142,7 @@ def _redact_output(
         config.WORKER_REMOTE_REDIS_URL,
         config.REDIS_URL,
         config.REDIS_PASSWORD,
+        config.WORKER_REMOTE_REDIS_PASSWORD,
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
         credentials.get("password", ""),

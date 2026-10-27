@@ -69,6 +69,9 @@ WORKER_DOCKER_SOCKET_PATH = os.environ.get(
     "WORKER_DOCKER_SOCKET_PATH", "/var/run/docker.sock"
 ).strip()
 WORKER_REMOTE_REDIS_URL = os.environ.get("WORKER_REMOTE_REDIS_URL", "").strip()
+# 远程 worker 所用 Redis 的独立密码：仅当远程 Redis 与平台 Redis 不同（或认证不同）时配置；
+# 平台密码 REDIS_PASSWORD 只在远程 worker 复用平台 REDIS_URL 时才自动沿用，避免泄露给其他 Redis。
+WORKER_REMOTE_REDIS_PASSWORD = os.environ.get("WORKER_REMOTE_REDIS_PASSWORD", "").strip()
 WORKER_REMOTE_S3_ENDPOINT = os.environ.get("WORKER_REMOTE_S3_ENDPOINT", "").strip()
 WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY = os.environ.get(
     "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", ""

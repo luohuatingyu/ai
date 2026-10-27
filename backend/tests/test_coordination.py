@@ -143,6 +143,35 @@ def test_redis_remote_operation_cancel_signal_is_shared_and_clearable():
     assert lease.is_remote_operation_cancel_requested("operation-a") is False
 
 
+def test_remote_operation_executor_heartbeat_embedded_and_redis():
+    """执行者存活标记：嵌入式实现不提供跨进程存活信息，Redis 实现可写读清。"""
+    embedded = EmbeddedLeaseStore()
+    embedded.set_remote_operation_executor("operation-a")
+    assert embedded.is_remote_operation_executor_active("operation-a") is False
+    embedded.clear_remote_operation_executor("operation-a")
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, key, value, ex=None):
+            self.values[key] = value
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+    redis_client = FakeRedis()
+    lease = RedisLeaseStore(redis_client)
+    assert lease.is_remote_operation_executor_active("operation-b") is False
+    lease.set_remote_operation_executor("operation-b")
+    assert lease.is_remote_operation_executor_active("operation-b") is True
+    lease.clear_remote_operation_executor("operation-b")
+    assert lease.is_remote_operation_executor_active("operation-b") is False
+
+
 # ---------------------------------------------------------------------------
 # worker 注册（/api/workers 数据源）
 # ---------------------------------------------------------------------------

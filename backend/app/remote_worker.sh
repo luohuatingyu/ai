@@ -21,6 +21,10 @@ write_worker_env() {
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
   umask 077
+  # 覆盖前保留上一版配置快照，供容器重建失败时连同旧容器一起回滚。
+  if [[ -f "$ENV_FILE" ]]; then
+    cp -p "$ENV_FILE" "${ENV_FILE}.previous"
+  fi
   staging_env="${ENV_FILE}.tmp-${BASHPID}"
   {
     printf 'REDIS_URL=%s\n' "$MTP_REDIS_URL"
@@ -72,6 +76,7 @@ show_worker_config() {
   printf 'WORKER_MACHINE_ID=%s\n' "$MTP_MACHINE_ID"
   printf 'WORKER_CPU_SLOTS=%s\n' "$CPU_SLOTS"
   printf 'REDIS_TARGET=%s\n' "$(redis_target "$MTP_REDIS_URL")"
+  printf 'REDIS_PASSWORD=%s\n' "$(secret_state "$MTP_REDIS_PASSWORD")"
   printf 'S3_ENDPOINT=%s\n' "$MTP_S3_ENDPOINT"
   printf 'S3_BUCKET=%s\n' "$MTP_S3_BUCKET"
   printf 'S3_SECURE=%s\n' "$MTP_S3_SECURE"
@@ -167,6 +172,7 @@ install_worker() {
   fi
   write_worker_env
   run_worker_container "$MTP_WORKER_IMAGE"
+  rm -f "${ENV_FILE}.previous"
   printf 'worker 已安装并启动：%s\n' "$CONTAINER"
   show_worker_startup
 }
@@ -222,9 +228,14 @@ recreate_worker_container() {
     if [[ "$start_flag" == "1" ]]; then
       docker start "$CONTAINER" >/dev/null 2>&1 || true
     fi
-    printf '最新配置启动失败，已恢复旧容器；请修复后再次执行更新配置或部署。\n' >&2
+    # 恢复覆盖前的配置文件，保持环境文件与恢复后的运行容器一致。
+    if [[ -f "${ENV_FILE}.previous" ]]; then
+      mv -f "${ENV_FILE}.previous" "$ENV_FILE"
+    fi
+    printf '最新配置启动失败，已恢复旧容器和原配置；请修复后再次执行更新配置或部署。\n' >&2
     exit 1
   fi
+  rm -f "${ENV_FILE}.previous"
   docker rm --force "$previous_container" >/dev/null
   if [[ "$start_flag" == "1" ]]; then
     printf 'worker 已重建并运行（保持原运行状态）：%s\n' "$CONTAINER"

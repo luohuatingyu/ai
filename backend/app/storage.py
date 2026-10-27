@@ -24,6 +24,23 @@ import app.config as config
 _KEY_RE = re.compile(r"^[A-Za-z0-9._\-/]+$")
 
 
+class ArtifactStoreUnavailableError(OSError):
+    """对象存储无法完成请求。
+
+    ``None`` 只表示产物确实不存在。网络、鉴权和服务端故障必须保留为
+    可识别异常，调用方才能将训练任务按环境性故障重试，而不是误报文件缺失。
+    """
+
+
+def _is_s3_object_missing(exc: BaseException) -> bool:
+    """仅把 S3 的对象不存在响应归类为缺失，避免吞掉基础设施故障。"""
+    return str(getattr(exc, "code", "")) in {
+        "NoSuchKey",
+        "NoSuchObject",
+        "NoSuchVersion",
+    }
+
+
 def validate_key(key: str) -> str:
     """校验产物 key 的合法性，非法 key（含路径穿越等）直接抛错。"""
     if not key or not _KEY_RE.match(key):
@@ -245,8 +262,12 @@ class S3ArtifactStore(ArtifactStore):
             finally:
                 response.close()
                 response.release_conn()
-        except Exception:
-            return None
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return None
+            raise ArtifactStoreUnavailableError(
+                f"读取对象存储产物失败: {key}: {exc}"
+            ) from exc
 
     def write_bytes(self, key: str, data: bytes) -> None:
         validate_key(key)
@@ -259,15 +280,23 @@ class S3ArtifactStore(ArtifactStore):
         try:
             self._client.stat_object(self.bucket, key)
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return False
+            raise ArtifactStoreUnavailableError(
+                f"检查对象存储产物失败: {key}: {exc}"
+            ) from exc
 
     def delete(self, key: str) -> None:
         validate_key(key)
         try:
             self._client.remove_object(self.bucket, key)
-        except Exception:
-            pass  # 不存在时静默
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return
+            raise ArtifactStoreUnavailableError(
+                f"删除对象存储产物失败: {key}: {exc}"
+            ) from exc
 
     def list_keys(self, prefix: str) -> List[str]:
         validate_key(prefix)
@@ -361,16 +390,14 @@ def sync_dataset_to_store(ds_id: str, local_csv: Path) -> bool:
     """数据集入库时同步一份到对象存储（多机 worker 需要自行拉取数据）。
 
     local 后端本身就在共享文件系统上，无需同步，直接返回 False。
-    同步失败不阻塞主流程（上传接口不受影响），返回 False 并由调用方记录。
+    S3 同步失败向调用方抛出异常：若只保存本地副本，远端 worker 会在
+    领取任务后必然失败，导入接口应在成功响应前回滚本地数据集。
     """
     store = get_store()
     if isinstance(store, LocalArtifactStore):
         return False
-    try:
-        store.write_file(f"datasets/{ds_id}.csv", local_csv)
-        return True
-    except Exception:
-        return False
+    store.write_file(f"datasets/{ds_id}.csv", local_csv)
+    return True
 
 
 def resolve_dataset_csv_local(ds_id: str) -> Path:
