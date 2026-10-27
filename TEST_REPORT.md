@@ -1,5 +1,37 @@
 # 测试报告
 
+## 本次变更测试结果：移除服务器级 Worker 镜像配置并回退平台环境（2026-10-28）
+
+**变更范围**：服务器新增/编辑页面和 API 不再提供或保存 Worker 镜像覆盖；远程部署统一使用平台 `WORKER_REMOTE_IMAGE`。服务器未配置专属 Redis URL 或 S3 地址时，配置覆盖回退到平台 `.env` 注入的 `REDIS_URL` 和 `S3_ENDPOINT`；编辑时留空会清除旧的服务器级网络覆盖。更新了远程配置文档和测试。
+
+**测试环境**：Docker Compose，容器 Python 3.12.15。
+
+**测试执行结果**：
+- 远程 Worker 定向测试：71 通过、0 失败、0 错误、0 跳过。
+- API 定向测试：58 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：276 项；270 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- 合并运行两个定向文件时出现 1 项既有状态隔离波动（远程日志清除 404 用例返回 200）；单独运行 API 文件通过，完整套件也通过，未复现本次变更相关失败。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
+- `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 编辑服务器不配置 Worker 镜像 | API：`test_remote_server_api_separates_registration_deployment_and_config_update`；页面契约：`test_remote_server_form_exposes_host_overrides_and_edit_action` | 服务器记录和公开 API 不包含镜像覆盖；页面无 Worker 镜像字段，部署使用平台镜像 | 正常、回归、兼容 |
+| Redis/S3 未配置时回退平台 `.env` | 单元：`test_remote_deployment_settings_apply_platform_fallback_and_server_network_overrides`、`test_remote_server_redis_override_can_be_preserved_replaced_or_cleared` | 清空服务器级覆盖后，生成的远程配置使用 `REDIS_URL`/`S3_ENDPOINT`；专属值仍可显式覆盖 | 正常、边界、回归 |
+| 远程配置脚本和生命周期行为保持有效 | `tests/test_remote_workers.py`、`tests/test_api.py` 及完整 `tests/` | 远程安装、配置、部署、启动/停止/重启和敏感信息脱敏均通过 | 异常、安全、兼容、回归 |
+
+**关键模块测试**：远程 Worker 71/71 通过；API 58/58 通过；完整套件 270/276 通过。
+
+**已知问题与限制**：未连接真实 SSH 服务器；远程目标机实际 `.env` 覆盖通过远程脚本和隔离测试验证。两个定向文件合并运行时的远程日志 404 用例存在状态隔离波动，单文件和完整套件均通过。
+
+**下次测试建议**：在测试远程主机执行一次配置覆盖，确认目标机 worker `.env` 在 Redis/S3 留空时实际写入平台值，并验证已部署 worker 在下一次启动后读取新配置。
+
+**Git基准点**：`a26cf58`（Use platform defaults for remote workers）。
+
 ## 本次变更测试结果：远程操作日志显示脚本输出（2026-10-28）
 
 **变更范围**：远程服务器执行日志增加 `[远程服务器启动配置]` 摘要，并把远端脚本最终 stdout/stderr 追加到 `operation.log`，确保配置更新后的实际配置摘要在日志窗口可见；训练任务日志增加 `[训练任务启动配置]` 摘要。所有日志均对连接凭证、令牌和密钥字段脱敏。
