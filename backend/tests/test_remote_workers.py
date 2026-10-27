@@ -910,6 +910,10 @@ def test_worker_build_context_skips_invalid_same_named_dockerfile(tmp_path):
 
     assert dockerfile.startswith("FROM python:3.12-slim")
     assert "dict(os.environ)" not in dockerfile
+    with pytest.raises(remote_workers.RemoteWorkerError, match="缓存挂载语法"):
+        remote_workers._worker_build_context(
+            [invalid_root, valid_root], legacy_builder=True
+        )
 
 
 def test_target_platform_worker_build_failure_is_reported(tmp_path, monkeypatch):
