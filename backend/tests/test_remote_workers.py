@@ -848,7 +848,7 @@ def test_remote_worker_build_falls_back_when_buildx_is_missing(monkeypatch):
 
     assert len(calls) == 2
     assert calls[0][0][-1] == (
-        "DOCKER_BUILDKIT=1 docker build --platform linux/amd64 "
+        "DOCKER_BUILDKIT=1 docker build --progress=plain --platform linux/amd64 "
         "--tag 'worker:stable;touch /tmp/pwn' -"
     )
     assert calls[1][0][-1] == (
