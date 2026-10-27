@@ -1,3 +1,34 @@
+## 本次变更测试结果：下发远程 worker 的 Redis 密码（2026-10-28）
+
+**Git基准点**：`82ae738`（Forward REDIS_PASSWORD to remote workers）  
+**分支**：`emdash/hot-boxes-clean-y9u6p`  
+**测试环境**：Docker Compose，容器 Python 3.12.15。
+
+**变更范围**：远程 worker 配置下发链路补齐 `REDIS_PASSWORD`。当 Redis 密码通过 `REDIS_PASSWORD` 环境变量单独配置（而非内嵌在 URL 中）时，`config`/`install` 动作会把密码一并写入目标机 `~/.config/mtp-worker/<machine_id>.env`，使远程 worker 能通过 Redis 认证加入任务队列；`remote_deployment_settings`、脚本环境前缀、操作日志脱敏与“生效配置”的认证状态判断同步更新。
+
+**测试执行结果**：
+- 远程 Worker 定向测试：75 通过、0 失败、0 错误、0 跳过。
+- API 定向测试：58 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：280 项；274 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
+- `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| Redis 密码单独配置时随配置下发 | 单元：`test_render_remote_script_includes_redis_password_and_effective_config_marks_auth` | URL 不含认证、`REDIS_PASSWORD` 非空时，脚本前缀含 `MTP_REDIS_PASSWORD`，`remote_deployment_settings` 返回密码，生效配置 `redis_auth_configured=True` | 正常、回归 |
+| env 文件写入 Redis 密码 | Shell：`test_remote_bootstrap_script_installs_cpu_and_gpu_workers` | `MTP_REDIS_PASSWORD` 非空时写出 `REDIS_PASSWORD=...` | 正常 |
+| 密码不泄露到页面与日志 | 单元：`test_render_remote_script_includes_redis_password_and_effective_config_marks_auth`；`_redact_output` secrets 增补 | 生效配置与操作日志不含密码明文 | 权限与安全 |
+| 既有远程部署/配置/训练行为回归 | 完整 `backend/tests` 套件 | 274 通过、6 跳过 | 数据、训练、API、远程管理回归 |
+
+**关键模块测试**：远程 Worker 75/75 通过；API 58/58 通过；完整套件 274/280 通过。
+
+**已知问题与限制**：未连接真实 SSH 目标机；`REDIS_PASSWORD` 下发通过隔离 Docker 替身与单元断言验证，未在真实 Redis 上端到端验证认证。工作区另有 `backend/app/storage.py` 与 `backend/tests/test_storage.py` 的既有未提交改动，未纳入本次提交。
+
+**下次测试建议**：在真实 Linux 目标机执行一次“更新配置”，确认 `~/.config/mtp-worker/<machine_id>.env` 出现 `REDIS_PASSWORD`，worker 启动日志无 `Authentication required` 并能正常领取任务。
+
 ## 本次变更测试结果：更新配置后由 start/restart 应用最新 worker 配置（2026-10-28）
 
 **Git基准点**：`bb93970`（Apply remote config on worker restart）  
