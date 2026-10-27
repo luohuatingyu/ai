@@ -2,10 +2,46 @@
 
 ## Git基准点
 
-- **Commit Hash**: 85b9bfb（目标机自行构建远程 worker 镜像）
-- **提交信息**: Build remote worker images on target
+- **Commit Hash**: 311652f（合并 emdash/hot-boxes-clean-y9u6p）
+- **提交信息**: Merge branch 'emdash/hot-boxes-clean-y9u6p'
 - **测试日期**: 2026-10-27
-- **分支**: emdash/hot-boxes-clean-y9u6p
+- **分支**: master
+
+## 本次合并测试结果：emdash/hot-boxes-clean-y9u6p 合并至 master（2026-10-27）
+
+**变更范围**：合并远程 worker 构建、实时日志和计算资源管理等分支提交至 master；同步工作树 `.env` 至主 checkout（`.env` 被 Git 忽略，不纳入提交）。
+
+**测试环境**：Docker Compose v5.5.1；测试容器 Python 3.12.15。
+
+**测试执行结果**：
+- 完整 pytest 套件：252 项收集，246 通过、6 跳过、0 失败、0 错误；6 项跳过为 Redis、S3 和 Supervisor 外部服务门控测试。
+- SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 弃用警告各 1 项。
+- `docker compose up --build -d`：三个镜像构建成功；启动阶段因仍运行的 worktree 容器占用固定名称 `/mtp-seaweedfs` 而失败。为避免中断当前服务，没有停止或删除这些容器；master Compose 服务未启动。
+- 首次完整测试因将测试目录挂载到 `/app/tests`，导致仓库根路径相关的 6 个测试无法定位文件；按仓库路径挂载后复跑通过，未修改或弱化测试。
+
+**实际执行命令**：
+
+```bash
+docker compose up --build -d
+```
+
+结果：镜像构建成功；启动因固定容器名冲突失败。
+
+```bash
+docker compose run --rm --no-deps \
+  -v ./backend/tests:/app/backend/tests:ro \
+  -v ./scripts:/app/scripts:ro \
+  -v ./docker-compose.yml:/app/docker-compose.yml:ro \
+  -v ./docker-compose.cpu.yml:/app/docker-compose.cpu.yml:ro \
+  -v ./docker-compose.remote.yml:/app/docker-compose.remote.yml:ro \
+  trainer python -m pytest /app/backend/tests -q
+```
+
+结果：246 passed、6 skipped、0 failed、0 errors。
+
+**未验证内容**：本次未连接真实 Aliyun OSS（`MTP_TEST_S3` 未启用）、真实 NVIDIA GPU 或远程 Linux worker；master 容器栈因同名容器冲突未启动。
+
+**后续建议**：需要在 master Compose 环境运行服务时，先安排现有 worktree 栈停机或为 master 服务设置不同的 `container_name`；轮换已暴露的 OSS AccessKey 后再执行 S3 集成验证。
 
 ## 本次变更测试结果：目标机从构建上下文构建 worker 镜像（2026-10-27）
 
