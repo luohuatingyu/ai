@@ -2,10 +2,42 @@
 
 ## Git基准点
 
-- **Commit Hash**: d261d53（增加远程 worker 操作中断）
-- **提交信息**: Add cancellation for remote worker operations
-- **测试日期**: 2026-10-26
+- **Commit Hash**: 8c5e8b9（按目标平台自动构建远程 worker 镜像）
+- **提交信息**: Build remote worker images for target architecture
+- **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：自动构建目标架构的远程 worker 镜像（2026-10-27）
+
+**变更范围**：重新部署时读取目标 Docker 架构；平台镜像不匹配时通过 Docker Engine Build API，使用打包在 trainer 容器中的最小后端构建上下文，自动构建并校验目标 Linux 架构镜像，然后按既有 SSH 流程传输和安装。构建阶段支持取消；构建失败不会传输或安装错误架构镜像。
+
+**测试环境**：Docker Compose；测试容器 Python 3.12.15。测试时工作区仍有既有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动；完整测试包含这些改动，但本次提交未纳入它们。
+
+**测试执行结果**：
+- 定向远程 worker 测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q -p no:cacheprovider`：52 通过、0 失败。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：231 通过、6 跳过、0 失败、0 错误。跳过项为 Redis、S3 和 Supervisor 子进程的环境门控测试。
+- `docker compose up --build -d`：通过；使用远程管理覆盖配置重建启动也通过。trainer 内 Docker socket ping 返回 HTTP 200，构建用 `Dockerfile` 已打包到 `/app/Dockerfile`。
+- `git diff --check`：通过。保留 SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 两条既有弃用警告。
+- 真实 Linux 远程部署未完成：目标服务器的 SSH 架构探测成功，返回 `linux/x86_64`；本机 Docker Engine 拉取 `python:3.12-slim` 的 amd64 基础镜像时无法解析/连接 Docker Hub。自动构建请求在取消后终止，未向目标机传输镜像，远程 worker 未改变。容器化目标架构构建尚未得到真实网络环境验证。
+- 初次定向运行有两项失败：一次测试容器未挂载 Compose 文件，一次新增断言未去除输出换行；修正挂载命令和断言后通过。后续测试运行发现模拟构建器未接受新的可选操作 ID 参数；更新模拟器后定向与完整测试通过。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 架构一致时沿用现有传输流程；架构不一致时自动构建后再传输 | 远程 worker：`test_run_remote_action_trusts_host_key_once_and_keeps_secrets_out_of_argv`、`test_run_remote_action_builds_target_architecture_before_transfer` | 相同平台不触发构建；ARM64 平台对 x86_64 目标自动请求 `linux/amd64` 构建，然后传输镜像并执行安装脚本 | 兼容、正常、架构边界 |
+| 最小构建上下文只包含镜像所需文件 | Docker API：`test_builds_worker_image_for_requested_platform_with_minimal_context` | 构建请求包含 Dockerfile、依赖和 worker 代码，不包含数据目录及测试文件；构建结果平台需与目标一致 | 数据隔离、兼容 |
+| Docker 构建失败或 Engine 拒绝请求时不部署错误镜像 | Docker API/远程执行器：`test_target_platform_worker_build_failure_is_reported`、`test_target_platform_worker_build_rejects_engine_http_errors`、`test_run_remote_action_stops_when_target_architecture_build_fails` | Docker 返回构建错误或 HTTP 错误时记录明确失败；不传输镜像，不执行远端安装 | 异常、回归 |
+| 构建期间可中断操作；拒绝不支持的目标系统 | 远程 worker：`test_target_platform_worker_build_can_be_cancelled`、`test_target_platform_build_rejects_non_linux_targets` | 取消会关闭 Docker 构建连接；非 Linux 目标在构建前被拒绝 | 中断、错误输入 |
+| 既有远程安装和 worker 功能继续通过 | `tests/test_remote_workers.py` 与完整 `tests/` | 远程 SSH、镜像传输和全套业务测试无新增失败 | 兼容、回归 |
+
+**已知问题与限制**：自动构建依赖平台 Docker Engine 能访问 Docker Hub 和 Dockerfile 配置的 PyPI 镜像。当前环境 DNS 受限，未完成真实目标镜像构建及 Linux 服务器端到端安装。若目标架构构建失败，远程操作会失败并保留明确错误；不会回退到发送错误架构镜像。
+
+**下次测试建议**：在可访问 Docker Hub 与 PyPI 的平台 Docker 环境中，对 x86_64 Linux 目标点击“重新部署并应用配置”，确认自动构建、SSH 镜像流传输及 worker 启动完整通过。
+
+**重测触发条件**：修改 Docker Engine 构建 API、worker 构建上下文、架构判定、镜像流传输或远程安装流程时，运行 `tests/test_remote_workers.py` 和完整 `tests/`，并重建 Compose 服务。
+
+**Git基准点**：`8c5e8b9`（Build remote worker images for target architecture）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：支持中断远程 SSH 操作（2026-10-26）
 
