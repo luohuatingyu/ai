@@ -27,8 +27,8 @@
 
 ## Git基准点
 
-- **Commit Hash**: cf6afcd（远程执行日志清除）
-- **提交信息**: Add remote log clear control
+- **Commit Hash**: 72d997a（显示远程与训练启动配置）
+- **提交信息**: Log startup configuration for executions
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
