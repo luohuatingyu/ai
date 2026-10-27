@@ -186,11 +186,13 @@
   .server-modal-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
   .server-modal-head h3 { margin:0; font-size:18px; }
   .server-modal-card p { color:var(--muted); font-size:13px; line-height:1.6; }
-  .server-log-modal-card { width:min(900px,100%); }
+  .server-log-modal-card { width:min(1120px,100%); }
   .server-log-status { margin:10px 0; color:var(--muted); font-size:12px; }
-  .server-log-output { max-height:65vh; min-height:150px; overflow:auto; margin:0; padding:14px;
+  .server-log-actions { display:flex; justify-content:flex-end; margin:10px 0 8px; }
+  .server-log-output { max-height:65vh; min-height:220px; overflow:auto; margin:0; padding:16px;
     border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.6); color:var(--text);
-    font:12px/1.6 ui-monospace,SFMono-Regular,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+    font:13px/1.65 ui-monospace,SFMono-Regular,monospace; white-space:pre; overflow-wrap:normal;
+    user-select:text; -webkit-user-select:text; cursor:text; }
   .server-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:15px; }
   .server-form .field { min-width:0; }
   .server-form .field.wide { grid-column:1/-1; }
@@ -606,6 +608,7 @@
       <button id="btnCloseRemoteLog" class="close-btn" aria-label="关闭">×</button>
     </div>
     <div id="remoteLogStatus" class="server-log-status" role="status"></div>
+    <div class="server-log-actions"><button id="btnCopyRemoteLog" type="button">复制日志</button></div>
     <pre id="remoteLogOutput" class="server-log-output">正在读取日志…</pre>
   </div>
 </div>
@@ -2023,6 +2026,14 @@ $("addServerModal").addEventListener("click", (event) => {
   if (event.target === $("addServerModal")) closeAddServerModal();
 });
 $("btnCloseRemoteLog").onclick = closeRemoteLogModal;
+$("btnCopyRemoteLog").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($("remoteLogOutput").textContent || "");
+    toast("日志已复制", "ok");
+  } catch (error) {
+    toast("复制失败，请选中日志后使用快捷键复制", "err");
+  }
+};
 $("remoteLogModal").addEventListener("click", (event) => {
   if (event.target === $("remoteLogModal")) closeRemoteLogModal();
 });
