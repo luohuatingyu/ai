@@ -1,5 +1,38 @@
 # 测试报告
 
+## 本次变更测试结果：增加远程服务器生效配置查看（2026-10-28）
+
+**变更范围**：远程服务器卡片增加“生效配置”入口，新增只读 `GET /api/remote-servers/{machine_id}/effective-config` 接口。页面显示平台当前解析出的 Worker 镜像、Redis/S3 地址、配置来源、目标状态和连接参数；Redis 认证信息、S3 密钥和 SSH 凭证均脱敏。结果明确标注为待下发配置，不读取目标机上的敏感配置文件。
+
+**测试环境**：Docker Compose，容器 Python 3.12.15。
+
+**测试执行结果**：
+- 远程 Worker 定向测试：71 通过、0 失败、0 错误、0 跳过。
+- API 定向测试：58 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：276 项；270 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
+- 首次合并运行定向文件时有 2 项失败：1 项为已有远程日志 404 状态隔离波动，1 项为新增断言中的测试主机名错误；修正断言后分文件复跑和完整套件均通过。
+- `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
+- `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- `git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 页面可查看远程服务器生效配置 | 页面契约：`test_remote_server_form_exposes_network_overrides_and_effective_config_action` | 卡片存在“生效配置”按钮、配置弹窗和接口入口 | 正常、回归 |
+| 接口返回解析后的镜像、Redis/S3、来源和状态 | API：`test_remote_server_api_separates_registration_deployment_and_config_update` | 服务器专属覆盖和清空后 `.env` 回退均返回正确结果；不存在服务器返回 404 | 正常、边界、异常 |
+| 敏感信息不泄露 | 同上；Redis URL 含密码 | 返回只包含安全 endpoint 和认证状态，不包含 Redis 密码；S3/SSH 密钥不进入响应 | 权限与安全 |
+| 既有远程部署和训练行为保持通过 | 完整 `tests/` 套件 | 远程生命周期、训练、数据链路和 API 回归通过 | 兼容、回归 |
+
+**关键模块测试**：远程 Worker 71/71 通过；API 58/58 通过；完整套件 270/276 通过。
+
+**已知问题与限制**：该查看接口展示平台当前解析出的待下发配置，不会主动 SSH 读取目标机当前文件；密码和密钥不可在页面查看。真实远程主机验证未执行。
+
+**下次测试建议**：在测试远程主机上执行配置覆盖后打开“生效配置”，核对平台摘要与目标机 `~/.config/mtp-worker/<machine_id>.env` 的非敏感字段一致。
+
+**Git基准点**：`512b0ff`（Add effective remote config viewer）。
+
 ## 本次变更测试结果：移除服务器级 Worker 镜像配置并回退平台环境（2026-10-28）
 
 **变更范围**：服务器新增/编辑页面和 API 不再提供或保存 Worker 镜像覆盖；远程部署统一使用平台 `WORKER_REMOTE_IMAGE`。服务器未配置专属 Redis URL 或 S3 地址时，配置覆盖回退到平台 `.env` 注入的 `REDIS_URL` 和 `S3_ENDPOINT`；编辑时留空会清除旧的服务器级网络覆盖。更新了远程配置文档和测试。
