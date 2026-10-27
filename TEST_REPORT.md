@@ -1,16 +1,14 @@
 # 测试报告
 
-## 本次变更测试结果：区分远程服务器与训练任务启动配置日志（2026-10-27）
+## 本次变更测试结果：远程操作日志显示脚本输出（2026-10-28）
 
-**变更范围**：远程服务器执行日志增加 `[远程服务器启动配置]` 摘要；训练任务执行日志增加 `[训练任务启动配置]` 摘要。两类日志均记录可追踪的动作、任务、资源和运行节点配置，连接凭证、令牌和密钥字段脱敏；远程 `config` 动作同时输出目标机实际生效的非敏感配置摘要。
+**变更范围**：远程服务器执行日志增加 `[远程服务器启动配置]` 摘要，并把远端脚本最终 stdout/stderr 追加到 `operation.log`，确保配置更新后的实际配置摘要在日志窗口可见；训练任务日志增加 `[训练任务启动配置]` 摘要。所有日志均对连接凭证、令牌和密钥字段脱敏。
 
-**测试环境**：Docker Compose，容器 Python 3.12.15。完整测试包含工作区预先存在、未纳入本次提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 修改。
+**测试环境**：Docker Compose，容器 Python 3.12.15。完整测试基于当前已提交版本临时归档运行；工作区预先存在、未纳入本次提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 修改未参与测试。
 
 **测试执行结果**：
-- 训练 Worker 定向测试：23 通过、0 失败、0 错误、0 跳过。
-- 远程 Worker 定向测试：71 通过、0 失败、0 错误、0 跳过。
-- 完整测试套件：276 项；270 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
-- 一次将两个定向文件合并运行时出现 6 个 Worker 长任务时序失败；将 `test_worker.py` 与 `test_remote_workers.py` 分开复跑后分别 23/23、71/71 通过，完整套件随后 270/270 通过。该波动与新增日志断言无关，未复现。
+- API 与远程 Worker 定向测试：129 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：267 通过、6 跳过、0 失败、0 错误。跳过项由 Redis、S3 与 Supervisor 子进程环境条件控制。
 - `docker compose up --build -d`：trainer、worker、frontend 和 SeaweedFS 构建及启动成功。
 - `curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 30 http://127.0.0.1:8000/api/health` 返回 `{"ok":true}`。
 - `git diff --check`：通过。
@@ -23,22 +21,23 @@
 | 训练任务执行日志打印并标识启动配置 | Worker 集成：`tests/test_worker.py::test_worker_completes_job`；本地状态平面与真实训练流程 | 完成分类训练后日志包含 `[训练任务启动配置]`、数据集 ID 和任务参数 | 正常、回归 |
 | 训练启动配置不泄露敏感参数 | 同上；任务参数注入 `api_token` | 日志显示 `"api_token":"[redacted]"`，不包含原始 token | 安全、异常输入 |
 | 远程服务器执行日志打印并标识启动配置 | 远程操作集成：`tests/test_remote_workers.py::test_execute_remote_operation_persists_success_and_failure`；隔离 SQLite、远程动作替身 | `start` 操作完成后日志包含 `[远程服务器启动配置]`、动作、模式和 Redis 非敏感 endpoint | 正常、兼容 |
+| 配置更新的远端脚本输出在日志窗口可见 | 同上；远程动作替身返回配置摘要 stdout | `operation.output` 与 `operation.log` 都包含配置摘要，前端优先读取日志时仍能显示摘要 | 缺陷回归、正常 |
 | 远程连接凭证不进入执行日志 | 同上；Redis URL 含密码 | 日志保留主机/端口/数据库路径，不包含 Redis 密码 | 权限与安全 |
 | 远程配置摘要展示实际非敏感配置 | Shell：`test_remote_bootstrap_script_config_overwrites_env_without_touching_container` | `config` 动作输出模式、机器标识、CPU 槽位、Redis 目标、S3 参数和凭证已配置状态 | 正常、回归 |
 | 两类日志保持现有执行行为和 API 兼容 | 完整 `tests/` 套件、容器健康检查 | 训练、远程配置/部署/生命周期及日志读取接口保持通过 | 兼容、回归 |
 
-**关键模块测试**：训练 Worker 23/23 通过；远程 Worker 71/71 通过；完整套件 270/276 通过。
+**关键模块测试**：API 与远程 Worker 129/129 通过；完整套件 267/273 通过。
 
-**已知问题与限制**：未连接真实 SSH 服务器；远程启动配置日志通过隔离执行器和脱敏断言验证。混合定向运行在容器资源竞争下曾出现长任务超时，分组复跑和完整套件均通过。
+**已知问题与限制**：未连接真实 SSH 服务器；远程启动配置和脚本输出通过隔离执行器及脱敏断言验证。
 
 **下次测试建议**：连接一台测试 Linux 主机，确认真实 start/restart 后日志窗口能看到启动配置摘要，并核对目标机实际生效的 worker `.env` 与日志脱敏结果。
 
-**Git基准点**：`72d997a`（Log startup configuration for executions）。
+**Git基准点**：`8a65551`（Include remote script output in operation logs）。
 
 ## Git基准点
 
-- **Commit Hash**: 72d997a（显示远程与训练启动配置）
-- **提交信息**: Log startup configuration for executions
+- **Commit Hash**: 8a65551（远程操作日志显示脚本输出）
+- **提交信息**: Include remote script output in operation logs
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
 
