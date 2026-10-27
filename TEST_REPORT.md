@@ -2,10 +2,40 @@
 
 ## Git基准点
 
-- **Commit Hash**: 55ec8dc（使用 Docker 可识别的 worker 构建归档格式）
-- **提交信息**: Use Docker compatible worker build archive
+- **Commit Hash**: 3256e7a（新增按模式选择 Compose 的平台启动脚本）
+- **提交信息**: Add mode-aware platform Compose launcher
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：按硬件模式选择平台 Compose 启动（2026-10-27）
+
+**变更范围**：新增 `scripts/start-platform.sh`，按 `PLATFORM_MODE=gpu|cpu` 选择基础 Compose 文件，按 `REMOTE_MANAGEMENT=true|false` 独立选择是否加载远程 socket 覆盖；更新 README 启动说明并添加脚本选择测试。
+
+**测试环境**：Python 3.12 Docker 镜像；Docker Desktop。测试工作区还包含未提交的 `backend/app/remote_workers.py`、`backend/app/storage.py` 与 `backend/tests/test_storage.py` 改动；全量测试和镜像构建包含这些改动，但本次提交未包含它们。
+
+**测试执行结果**：
+- 启动脚本定向测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_platform_launcher.py -q -p no:cacheprovider`：7 通过、0 失败。
+- 完整测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider`：246 项，240 通过、6 跳过、0 失败、0 错误；保留 2 条既有弃用警告。
+- `bash -n scripts/start-platform.sh`：通过。
+- GPU/CPU × 远程覆盖开/关的四种 Compose 配置解析与 socket 挂载断言：全部通过；无远程覆盖时 trainer 不挂载 socket，开启时挂载 `/var/run/docker.sock`。
+- `docker compose up --build -d`：通过；随后 `PLATFORM_MODE=gpu REMOTE_MANAGEMENT=true bash scripts/start-platform.sh`：通过。
+- 运行态验证：trainer 挂载 Docker socket，平台 Docker API 可读取 `mtp-worker:local` 镜像平台 `linux/arm64`，`/api/health` 返回 200。
+- `git diff --check`：通过。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 默认或 CPU 模式选择 CPU Compose，GPU 模式选择 GPU Compose | 启动脚本测试：`test_launcher_selects_compose_files`；用临时 Docker shim 捕获命令 | 未设置模式、CPU、GPU；脚本传入对应基础文件 | 正常、默认行为、兼容 |
+| 远程管理独立可选 | 同上及四种 Compose 配置断言 | 开启时追加远程覆盖；关闭时不挂载 Docker socket | 正常、权限边界、兼容 |
+| 非法模式与开关在调用 Docker 前失败 | 启动脚本测试：`test_launcher_rejects_invalid_selection_without_running_docker` | `PLATFORM_MODE=auto` 或 `REMOTE_MANAGEMENT=yes`；退出码 2，Docker shim 未运行 | 异常、输入校验 |
+| 远程管理启动后 trainer 可访问 Docker Engine | GPU + 远程覆盖真实 Compose 启动、容器检查与 API 验证 | `PLATFORM_MODE=gpu REMOTE_MANAGEMENT=true`；socket、镜像平台查询和健康接口均成功 | 集成、回归 |
+
+**已知问题与限制**：本次未验证 NVIDIA GPU 设备可见性；CPU 模式通过脚本参数测试和 Compose 解析验证，未切换运行中的服务实际启动 CPU 堆栈。平台外部部署器的设置不在仓库中，需配置其调用 `scripts/start-platform.sh` 并设置所选环境变量。
+
+**下次测试建议**：在平台部署器中配置 `PLATFORM_MODE` 与 `REMOTE_MANAGEMENT` 后分别执行 CPU/GPU 部署；确认后续自动重启仍调用本脚本，并在有 NVIDIA GPU 的主机验证 GPU 设备可见性。
+
+**Git基准点**：`3256e7a`（Add mode-aware platform Compose launcher）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：修复 Docker 自动构建 tar 上下文识别（2026-10-27）
 
