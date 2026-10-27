@@ -1182,6 +1182,43 @@ def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[
     }
 
 
+def remote_effective_config(server: Dict[str, object]) -> Dict[str, object]:
+    """生成页面可查看的生效配置摘要，隐藏 Redis 认证信息和所有密钥。"""
+    deployment = remote_deployment_settings(server)
+    encrypted_redis_url = bool(str(server.get("remote_redis_url_encrypted", "") or ""))
+    if encrypted_redis_url:
+        redis_source = "server_override"
+    elif config.WORKER_REMOTE_REDIS_URL:
+        redis_source = "WORKER_REMOTE_REDIS_URL"
+    else:
+        redis_source = "REDIS_URL"
+    if server.get("remote_s3_endpoint_override"):
+        s3_source = "server_override"
+    elif config.WORKER_REMOTE_S3_ENDPOINT:
+        s3_source = "WORKER_REMOTE_S3_ENDPOINT"
+    else:
+        s3_source = "S3_ENDPOINT"
+    return {
+        "machine_id": str(server.get("machine_id", "")),
+        "host": str(server.get("host", "")),
+        "port": int(server.get("port", 22)),
+        "mode": str(server.get("mode", "cpu")),
+        "cpu_slots": int(server.get("cpu_slots", 2)),
+        "deployed": remote_server_is_deployed(server),
+        "status": str(server.get("status", "")),
+        "worker_image": deployment["worker_image"],
+        "worker_image_source": "WORKER_REMOTE_IMAGE",
+        "redis_endpoint": _safe_startup_endpoint(deployment["redis_url"]),
+        "redis_configured": bool(deployment["redis_url"]),
+        "redis_auth_configured": "@" in deployment["redis_url"],
+        "redis_source": redis_source,
+        "s3_endpoint": _safe_startup_endpoint(deployment["s3_endpoint"]),
+        "s3_source": s3_source,
+        "s3_bucket": config.S3_BUCKET,
+        "s3_secure": config.S3_SECURE,
+    }
+
+
 def _open_local_docker_image_archive(
     image: str,
 ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:

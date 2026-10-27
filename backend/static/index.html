@@ -198,6 +198,13 @@
   .server-log-line-text { user-select:text; -webkit-user-select:text; cursor:text; }
   .server-log-line-copy { position:sticky; right:0; margin-left:8px; padding:3px 7px; font-size:11px; opacity:.68; }
   .server-log-line-copy:hover,.server-log-line-copy:focus-visible { opacity:1; }
+  .server-effective-config-card { width:min(720px,100%); }
+  .server-effective-config-status { margin:10px 0 14px; color:var(--muted); font-size:12px; }
+  .server-effective-config { display:grid; gap:8px; margin:0; }
+  .server-effective-config-row { display:grid; grid-template-columns:minmax(125px, .4fr) minmax(0, 1fr); gap:14px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:rgba(13,17,23,.32); }
+  .server-effective-config-label { color:var(--muted); }
+  .server-effective-config-value { min-width:0; color:var(--text); font:12px/1.5 ui-monospace,SFMono-Regular,monospace; overflow-wrap:anywhere; }
+  .server-effective-config-source { display:block; margin-top:2px; color:var(--muted); font:11px/1.4 inherit; }
   .server-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:15px; }
   .server-form .field { min-width:0; }
   .server-form .field.wide { grid-column:1/-1; }
@@ -616,6 +623,18 @@
       <button id="btnCopyRemoteLog" type="button">复制全部</button>
     </div>
     <div id="remoteLogOutput" class="server-log-output" aria-label="远程操作日志" aria-live="polite"></div>
+  </div>
+</div>
+
+<div id="remoteEffectiveConfigModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="remoteEffectiveConfigTitle" hidden>
+  <div class="server-modal-card server-effective-config-card">
+    <div class="server-modal-head">
+      <h3 id="remoteEffectiveConfigTitle">生效配置</h3>
+      <button id="btnCloseRemoteEffectiveConfig" class="close-btn" aria-label="关闭">×</button>
+    </div>
+    <div id="remoteEffectiveConfigStatus" class="server-effective-config-status" role="status"></div>
+    <div id="remoteEffectiveConfigOutput" class="server-effective-config" aria-live="polite"></div>
+    <div class="server-modal-note">这里显示平台当前解析出的待下发配置。目标机已有配置只有在配置、部署或启动操作后才会更新；密码和密钥不会显示。</div>
   </div>
 </div>
 
@@ -1541,6 +1560,7 @@ function workerServerCard(machineId, slots, remoteServer = null) {
       <button data-remote-machine-id="${esc(machineId)}" data-remote-action="restart" ${operationBusy ? "disabled" : ""}>重启</button>`;
   const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
       <button class="server-log-button" data-remote-server-logs="${esc(machineId)}">日志</button>
+      <button data-remote-effective-config="${esc(machineId)}">生效配置</button>
       <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>更新配置</button>
       <button title="${deployed ? "只同步 worker 代码，不修改配置或启动容器" : "首次部署 worker 镜像、配置和代码"}" data-remote-machine-id="${esc(machineId)}" data-remote-action="deploy" ${operationBusy ? "disabled" : ""}>${deployed ? "部署代码" : "部署"}</button>
       ${lifecycleControls}
@@ -1957,6 +1977,53 @@ async function showRemoteServerLogs(button) {
   await refreshRemoteOperationLogs();
 }
 
+// 打开只读配置窗口，并读取平台当前解析出的远程配置摘要。
+async function showRemoteEffectiveConfig(button) {
+  const machineId = button.dataset.remoteEffectiveConfig;
+  const modal = $("remoteEffectiveConfigModal");
+  const status = $("remoteEffectiveConfigStatus");
+  const output = $("remoteEffectiveConfigOutput");
+  modal.hidden = false;
+  modal.classList.add("open");
+  status.textContent = "正在读取生效配置…";
+  output.innerHTML = "";
+  try {
+    const result = await apiJson("/api/remote-servers/" + encodeURIComponent(machineId) + "/effective-config");
+    renderRemoteEffectiveConfig(result.config || {});
+    status.textContent = machineId + " · 平台当前解析结果";
+  } catch (error) {
+    status.textContent = "读取生效配置失败。";
+    output.innerHTML = "<div class=\"server-modal-note\">" + esc(error.message) + "</div>";
+  }
+}
+
+// 将配置摘要渲染为只读键值行，并为来源与敏感字段提供明确提示。
+function renderRemoteEffectiveConfig(config) {
+  const sourceLabels = {
+    server_override: "服务器专属覆盖",
+    WORKER_REMOTE_REDIS_URL: "平台 WORKER_REMOTE_REDIS_URL",
+    REDIS_URL: "平台 .env REDIS_URL",
+    WORKER_REMOTE_S3_ENDPOINT: "平台 WORKER_REMOTE_S3_ENDPOINT",
+    S3_ENDPOINT: "平台 .env S3_ENDPOINT",
+    WORKER_REMOTE_IMAGE: "平台 WORKER_REMOTE_IMAGE / WORKER_IMAGE",
+  };
+  const rows = [
+    ["目标状态", config.deployed ? "已部署 · " + (config.status || "未知") : "尚未部署", ""],
+    ["SSH 地址", (config.host || "未知") + ":" + (config.port ?? "未知"), ""],
+    ["计算类型", String(config.mode || "未知").toUpperCase(), "CPU 槽位：" + (config.cpu_slots ?? "未知")],
+    ["Worker 镜像", config.worker_image || "未配置", sourceLabels[config.worker_image_source] || "平台配置"],
+    ["Redis 地址", config.redis_configured ? (config.redis_endpoint || "已配置但无法解析") : "未配置", (sourceLabels[config.redis_source] || "平台配置") + " · " + (config.redis_auth_configured ? "认证信息已配置且隐藏" : "未检测到认证信息")],
+    ["S3 地址", config.s3_endpoint || "未配置", sourceLabels[config.s3_source] || "平台配置"],
+    ["S3 Bucket", config.s3_bucket || "未配置", config.s3_secure ? "HTTPS" : "HTTP"],
+  ];
+  $("remoteEffectiveConfigOutput").innerHTML = rows.map(([label, value, source]) =>
+    "<div class=\"server-effective-config-row\"><div class=\"server-effective-config-label\">" +
+    esc(label) + "</div><div class=\"server-effective-config-value\">" + esc(value) +
+    (source ? "<span class=\"server-effective-config-source\">" + esc(source) + "</span>" : "") +
+    "</div></div>"
+  ).join("");
+}
+
 // 轮询当前远程操作日志，使运行阶段和命令输出在操作过程中可见。
 async function refreshRemoteOperationLogs() {
   const operationId = state.remoteLogOperationId;
@@ -2075,6 +2142,13 @@ function closeRemoteLogModal() {
   modal.hidden = true;
 }
 
+// 关闭只读远程生效配置窗口。
+function closeRemoteEffectiveConfigModal() {
+  const modal = $("remoteEffectiveConfigModal");
+  modal.classList.remove("open");
+  modal.hidden = true;
+}
+
 // 中断当前 SSH 操作；远端已经产生的部分变更不会自动回滚。
 async function cancelRemoteOperation(button) {
   const operationId = button.dataset.cancelRemoteOperation;
@@ -2148,6 +2222,11 @@ $("workerGrid").addEventListener("click", (event) => {
     showRemoteServerLogs(logsButton);
     return;
   }
+  const effectiveConfigButton = event.target.closest("[data-remote-effective-config]");
+  if (effectiveConfigButton && !effectiveConfigButton.disabled) {
+    showRemoteEffectiveConfig(effectiveConfigButton);
+    return;
+  }
   const editRemoteButton = event.target.closest("[data-edit-remote-machine-id]");
   if (editRemoteButton && !editRemoteButton.disabled) {
     openEditRemoteServer(editRemoteButton.dataset.editRemoteMachineId);
@@ -2168,6 +2247,7 @@ $("addServerModal").addEventListener("click", (event) => {
   if (event.target === $("addServerModal")) closeAddServerModal();
 });
 $("btnCloseRemoteLog").onclick = closeRemoteLogModal;
+$("btnCloseRemoteEffectiveConfig").onclick = closeRemoteEffectiveConfigModal;
 $("btnClearRemoteLog").onclick = clearRemoteOperationLogs;
 $("btnCopyRemoteLog").onclick = () => copyRemoteLogText($("remoteLogOutput").dataset.rawLog || "");
 $("remoteLogOutput").addEventListener("click", (event) => {
@@ -2178,6 +2258,9 @@ $("remoteLogOutput").addEventListener("click", (event) => {
 });
 $("remoteLogModal").addEventListener("click", (event) => {
   if (event.target === $("remoteLogModal")) closeRemoteLogModal();
+});
+$("remoteEffectiveConfigModal").addEventListener("click", (event) => {
+  if (event.target === $("remoteEffectiveConfigModal")) closeRemoteEffectiveConfigModal();
 });
 document.querySelectorAll("[data-worker-mode]").forEach((button) => {
   button.onclick = () => {
@@ -2190,6 +2273,7 @@ document.querySelectorAll("[data-worker-mode]").forEach((button) => {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && $("addServerModal").classList.contains("open")) closeAddServerModal();
   if (event.key === "Escape" && $("remoteLogModal").classList.contains("open")) closeRemoteLogModal();
+  if (event.key === "Escape" && $("remoteEffectiveConfigModal").classList.contains("open")) closeRemoteEffectiveConfigModal();
 });
 
 /* ---------- Tab 切换 ---------- */

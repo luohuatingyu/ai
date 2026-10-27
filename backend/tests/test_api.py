@@ -498,6 +498,12 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     _enable_remote_mysql(monkeypatch)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
+    monkeypatch.setattr(config, "WORKER_REMOTE_S3_ENDPOINT", "")
+    monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/platform/worker:unit")
+    monkeypatch.setattr(config, "S3_ENDPOINT", "platform-s3.example.net:9000")
+    monkeypatch.setattr(config, "S3_BUCKET", "platform-artifacts")
+    monkeypatch.setattr(config, "S3_SECURE", True)
     monkeypatch.setattr(manager, "distributed", True)
     manager.lease.delete_remote_ssh_credentials()
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
@@ -552,6 +558,18 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     assert payload["remote_redis_url"] not in repr(server)
     assert "private_key" not in server and "token" not in server
 
+    effective = client.get(f"/api/remote-servers/{machine_id}/effective-config")
+    assert effective.status_code == 200, effective.text
+    effective_config = effective.json()["config"]
+    assert effective_config["worker_image"] == "registry.example.net/platform/worker:unit"
+    assert effective_config["worker_image_source"] == "WORKER_REMOTE_IMAGE"
+    assert effective_config["redis_endpoint"] == "rediss://redis.example.net:6380/4"
+    assert effective_config["redis_source"] == "server_override"
+    assert effective_config["redis_auth_configured"] is True
+    assert effective_config["s3_endpoint"] == "remote-storage.example.net:9000"
+    assert effective_config["s3_source"] == "server_override"
+    assert "synthetic-redis-password" not in repr(effective_config)
+
     edited = client.patch(
         f"/api/remote-servers/{machine_id}",
         json={
@@ -566,6 +584,15 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     assert "remote_redis_url_encrypted" not in edited_server
     assert edited.json()["server"]["has_remote_redis_url_override"] is False
     assert calls == []
+
+    fallback_config = client.get(
+        f"/api/remote-servers/{machine_id}/effective-config"
+    ).json()["config"]
+    assert fallback_config["redis_endpoint"] == "redis://redis.example.net:6379/0"
+    assert fallback_config["redis_source"] == "REDIS_URL"
+    assert fallback_config["s3_endpoint"] == "platform-s3.example.net:9000"
+    assert fallback_config["s3_source"] == "S3_ENDPOINT"
+    assert client.get("/api/remote-servers/missing-effective-config/effective-config").status_code == 404
 
     assert client.post("/api/remote-servers", json=payload).status_code == 409
 
@@ -1425,8 +1452,8 @@ def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads()
     assert "button.disabled = false" in save_handler
 
 
-def test_remote_server_form_exposes_host_overrides_and_edit_action():
-    """远程服务器页面提供镜像、Redis、S3 单机覆盖入口和现有服务器编辑动作。"""
+def test_remote_server_form_exposes_network_overrides_and_effective_config_action():
+    """远程服务器页面提供 Redis/S3 覆盖、生效配置查看和编辑动作。"""
     backend_dir = Path(__file__).resolve().parents[1]
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
@@ -1435,6 +1462,9 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
 
     for marker in (
         "页面不单独配置镜像",
+        "生效配置",
+        "data-remote-effective-config",
+        "remoteEffectiveConfigModal",
         'id="remoteRedisUrl"',
         'id="remoteS3Endpoint"',
         'id="clearRemoteRedisOverride"',
@@ -1449,7 +1479,7 @@ def test_remote_server_form_exposes_host_overrides_and_edit_action():
     ):
         assert marker in html
     assert 'id="remoteWorkerImage"' not in html
-    assert "worker_image" not in html
+    assert 'name="worker_image"' not in html
 
 
 def test_remote_server_card_filters_lifecycle_actions_by_presence():

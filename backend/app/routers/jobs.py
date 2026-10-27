@@ -35,6 +35,7 @@ from app.remote_workers import (
     execute_remote_operation,
     request_remote_operation_cancel,
     remote_configuration_errors,
+    remote_effective_config,
     remote_server_is_deployed,
     remote_server_public_view,
     resolve_remote_server_credentials,
@@ -395,6 +396,19 @@ def list_remote_servers() -> dict:
     """列出经 SSH 接入的远程服务器管理元数据。"""
     servers = _remote_config_db_call(remote_config_repository.list_remote_servers)
     return {"servers": [remote_server_public_view(server) for server in servers]}
+
+
+@router.get("/remote-servers/{machine_id}/effective-config")
+def get_remote_server_effective_config(machine_id: str) -> dict:
+    """返回平台解析出的远程配置摘要，不读取或返回任何配置密钥。"""
+    _check_id(machine_id, "服务器")
+    server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
+    if server is None:
+        raise HTTPException(404, "远程服务器不存在")
+    try:
+        return {"config": remote_effective_config(server)}
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @router.get("/remote-ssh-settings")
