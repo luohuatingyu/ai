@@ -62,6 +62,11 @@ install_worker() {
   fi
   docker "${args[@]}" "$MTP_WORKER_IMAGE" python -m app.worker
   printf 'worker 已安装并启动：%s\n' "$CONTAINER"
+  printf 'worker 容器启动快照：\n'
+  docker inspect --format 'state={{.State.Status}} restart_count={{.RestartCount}} exit_code={{.State.ExitCode}} error={{.State.Error}}' "$CONTAINER" \
+    || printf '无法读取 worker 容器状态。\n'
+  printf 'worker 最近启动日志（最多 80 行）：\n'
+  docker logs --tail=80 "$CONTAINER" 2>&1 || printf '暂时无法读取 worker 容器日志。\n'
 }
 
 # 对目标服务器现有 worker 容器执行有限生命周期操作。

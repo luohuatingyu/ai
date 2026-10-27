@@ -82,6 +82,190 @@ def _server(**overrides) -> dict:
     return value
 
 
+def test_remote_operation_log_is_redacted_and_bounded(tmp_path: Path, monkeypatch):
+    """实时操作日志过滤 SSH/Redis/S3 凭证，并只保留最近的有界内容。"""
+    _remote_config(tmp_path, monkeypatch)
+    operation_id = "d" * 32
+    private_key = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "verysecretpayloadline\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    credentials = {"password": "ssh-secret", "passphrase": "", "private_key": private_key}
+    manager.lease.set_remote_operation(
+        operation_id,
+        {"operation_id": operation_id, "status": "running", "phase": "queued", "log": ""},
+    )
+    monkeypatch.setattr(remote_workers, "_REMOTE_OPERATION_LOG_LIMIT", 256)
+
+    remote_workers._append_remote_operation_log(
+        operation_id,
+        "执行远程脚本",
+        f"ssh-secret {config.REDIS_URL} {config.S3_SECRET_KEY} verysecretpayloadline",
+        credentials=credentials,
+        server=_server(),
+    )
+    redacted_log = manager.lease.get_remote_operation(operation_id)["log"]
+    assert "[redacted]" in redacted_log
+    assert "verysecretpayloadline" not in redacted_log
+    for index in range(5):
+        remote_workers._append_remote_operation_log(
+            operation_id, "执行远程脚本", f"line-{index}-" + ("x" * 120), server=_server()
+        )
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert len(result["log"]) <= 256
+    assert result["log"].startswith("[较早日志已截断]")
+    assert "ssh-secret" not in result["log"]
+    assert config.REDIS_URL not in result["log"]
+    assert config.S3_SECRET_KEY not in result["log"]
+    assert "private-key" not in result["log"]
+    assert "line-4" in result["log"]
+    assert result["phase"] == "执行远程脚本"
+
+
+def test_communicate_remote_process_streams_only_new_output_lines():
+    """SSH 子进程超时轮询期间逐行发送新增 stdout/stderr，不重复整段输出。"""
+    command = ["ssh", "worker@example.net", "bash -s"]
+
+    class FakeProcess:
+        args = command
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, input=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(
+                    command,
+                    timeout,
+                    output="setup complete\nimage 50%",
+                    stderr="warning: slow transfer\n",
+                )
+            return "setup complete\nimage 50% loaded\n", "warning: slow transfer\n"
+
+    emitted = []
+    process = FakeProcess()
+    result = remote_workers._communicate_remote_process(
+        process,
+        operation_id=None,
+        timeout=10,
+        progress_callback=lambda phase, message: emitted.append((phase, message)),
+        progress_phase="镜像加载",
+    )
+
+    assert result == ("setup complete\nimage 50% loaded\n", "warning: slow transfer\n")
+    assert emitted == [
+        ("镜像加载", "stdout: setup complete"),
+        ("镜像加载", "stderr: warning: slow transfer"),
+        ("镜像加载", "stdout: image 50% loaded"),
+    ]
+
+    class TimedOutProcess:
+        args = command
+
+        def __init__(self):
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+
+        def communicate(self):
+            return "docker load stalled\n", "connection timed out\n"
+
+    timed_out = TimedOutProcess()
+    timeout_lines = []
+    with pytest.raises(subprocess.TimeoutExpired):
+        remote_workers._communicate_remote_process(
+            timed_out,
+            operation_id=None,
+            timeout=0,
+            progress_callback=lambda phase, message: timeout_lines.append(message),
+        )
+    assert timed_out.killed is True
+    assert "stdout: docker load stalled" in timeout_lines
+    assert "stderr: connection timed out" in timeout_lines
+
+
+def test_worker_heartbeat_probe_reports_present_and_missing_slots(monkeypatch):
+    """启动探测能报告收到心跳及 15 秒内未收到心跳两种结果。"""
+    operation_id = "e" * 32
+    manager.lease.clear_remote_operation_cancel(operation_id)
+    monkeypatch.setattr(remote_workers, "_WORKER_STARTUP_HEARTBEAT_TIMEOUT", 0.0)
+    emitted = []
+    monkeypatch.setattr(
+        manager.lease,
+        "list_workers",
+        lambda: [{"worker_id": "remote-a-cpu0", "machine_id": "remote-a", "active": True}],
+    )
+    remote_workers._wait_for_remote_worker_heartbeat(
+        operation_id, "remote-a", lambda phase, message: emitted.append((phase, message))
+    )
+    assert any("已收到 1 个资源槽心跳" in message for _phase, message in emitted)
+
+    emitted.clear()
+    monkeypatch.setattr(manager.lease, "list_workers", lambda: [])
+    remote_workers._wait_for_remote_worker_heartbeat(
+        operation_id, "remote-a", lambda phase, message: emitted.append((phase, message))
+    )
+    assert any("15 秒内未收到资源心跳" in message for _phase, message in emitted)
+
+
+def test_run_remote_install_records_stages_and_worker_heartbeat(tmp_path, monkeypatch):
+    """远程安装日志记录目标架构、镜像传输、远端启动和首次资源心跳。"""
+    _remote_config(tmp_path, monkeypatch)
+    operation_id = "f" * 32
+    server = _server()
+    manager.lease.clear_remote_operation_cancel(operation_id)
+    manager.lease.set_remote_operation(
+        operation_id,
+        {"operation_id": operation_id, "machine_id": server["machine_id"], "status": "running"},
+    )
+    monkeypatch.setattr(remote_workers.shutil, "which", lambda _name: "/usr/bin/ssh")
+    monkeypatch.setattr(remote_workers, "_local_docker_image_platform", lambda _image: "linux/amd64")
+    monkeypatch.setattr(
+        manager.lease,
+        "list_workers",
+        lambda: [{
+            "worker_id": "remote-test-01-cpu0",
+            "machine_id": "remote-test-01",
+            "active": True,
+        }],
+    )
+
+    def fake_run(command, **kwargs):
+        if command[-1].startswith("docker info"):
+            result = subprocess.CompletedProcess(command, 0, stdout="linux/x86_64\n", stderr="")
+        else:
+            result = subprocess.CompletedProcess(
+                command, 0, stdout=f"worker started\n{config.REDIS_URL}\n", stderr=""
+            )
+        callback = kwargs.get("progress_callback")
+        if callback:
+            for line in result.stdout.splitlines():
+                callback(kwargs.get("progress_phase", "远程命令"), f"stdout: {line}")
+        return result
+
+    def fake_transfer(*_args, progress_callback=None, **_kwargs):
+        if progress_callback:
+            progress_callback("传输并加载 worker 镜像", "镜像已加载。")
+        return {"stdout": "Loaded image", "stderr": ""}
+
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+    monkeypatch.setattr(remote_workers, "_stream_worker_image_to_remote", fake_transfer)
+
+    remote_workers.run_remote_action(server, "install", operation_id)
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert "检查镜像架构" in result["log"]
+    assert "传输并加载 worker 镜像" in result["log"]
+    assert "stdout: worker started" in result["log"]
+    assert config.REDIS_URL not in result["log"]
+    assert "[redacted]" in result["log"]
+    assert "已收到 1 个资源槽心跳" in result["log"]
+
+
 def _set_page_credential(auth_method: str, **overrides) -> dict:
     """替换测试用默认页面凭证，覆盖三类认证组合。"""
     manager.lease.delete_remote_ssh_credentials()
@@ -560,9 +744,15 @@ def test_target_platform_worker_build_failure_is_reported(tmp_path, monkeypatch)
             pass
 
     monkeypatch.setattr(remote_workers, "_DockerSocketHTTPConnection", FakeConnection)
+    emitted = []
 
     with pytest.raises(remote_workers.RemoteWorkerError, match="base image unavailable"):
-        remote_workers._build_local_docker_image_for_platform("worker:local", "linux/amd64")
+        remote_workers._build_local_docker_image_for_platform(
+            "worker:local",
+            "linux/amd64",
+            progress_callback=lambda phase, message: emitted.append((phase, message)),
+        )
+    assert any("base image unavailable" in message for _phase, message in emitted)
 
 
 def test_target_platform_worker_build_rejects_engine_http_errors(tmp_path, monkeypatch):
@@ -1203,6 +1393,9 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     assert result["status"] == "completed"
     assert result["output"] == "container started"
     assert result["stderr"] == "worker boot warning"
+    assert result["phase"] == "操作完成"
+    assert result["duration_sec"] >= 0
+    assert "远程操作已成功完成" in result["log"]
     assert remote_config_repository.get_remote_server(machine_id)["status"] == "online"
 
     def fail_remote(*_args):
@@ -1214,6 +1407,7 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     result = manager.lease.get_remote_operation(operation_id)
     assert result["status"] == "failed"
     assert result["error"] == "SSH 登录失败"
+    assert "SSH 登录失败" in result["log"]
     assert remote_config_repository.get_remote_server(machine_id)["status"] == "error"
 
 
@@ -1300,6 +1494,8 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
         "printf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n"
         "if [[ \"$1 $2\" == 'image inspect' && \"${DOCKER_MISSING:-false}\" == true ]]; then exit 1; fi\n"
         "if [[ \"$1\" == inspect && \"${DOCKER_MISSING:-false}\" == true ]]; then exit 1; fi\n"
+        "if [[ \"$1\" == inspect ]]; then printf 'state=running restart_count=0 exit_code=0 error=\\n'; fi\n"
+        "if [[ \"$1\" == logs ]]; then printf 'worker startup diagnostic\\n'; fi\n"
         "exit \"${DOCKER_STUB_EXIT:-0}\"\n",
         encoding="utf-8",
     )
@@ -1329,6 +1525,9 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
         result = subprocess.run(["bash", str(script)], text=True, capture_output=True, env=env)
 
         assert result.returncode == 0, result.stderr
+        assert "worker 容器启动快照" in result.stdout
+        assert "restart_count=" in result.stdout
+        assert "worker startup diagnostic" in result.stdout
         env_file = home / ".config" / "mtp-worker" / f"remote-{mode}.env"
         assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
         saved = env_file.read_text(encoding="utf-8")
@@ -1338,6 +1537,8 @@ def test_remote_bootstrap_script_installs_cpu_and_gpu_workers(tmp_path: Path):
         assert "image inspect registry.example.net/ml/worker:unit" in commands
         assert "pull registry.example.net/ml/worker:unit" not in commands
         assert "git clone" not in commands
+        assert "inspect --format state={{.State.Status}}" in commands
+        assert "logs --tail=80" in commands
         assert ("--gpus all" in commands) is expected_gpu
         assert "mtp-worker-remote-" in commands
 

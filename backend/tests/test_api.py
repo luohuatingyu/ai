@@ -1357,8 +1357,8 @@ def test_remote_server_cards_expose_interrupt_action_for_active_operations():
     assert "/cancel" in cancel_handler
 
 
-def test_remote_server_card_exposes_log_button_and_fetches_latest_output():
-    """远程服务器卡片展示日志按钮，窗口读取并安全渲染最新操作输出。"""
+def test_remote_server_card_exposes_live_operation_logs():
+    """远程服务器卡片展示部署阶段，日志窗口轮询并安全渲染实时输出。"""
     backend_dir = Path(__file__).resolve().parents[1]
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
@@ -1373,12 +1373,17 @@ def test_remote_server_card_exposes_log_button_and_fetches_latest_output():
     )[0]
     assert 'data-remote-server-logs="${esc(machineId)}">日志</button>' in card_renderer
     assert 'event.target.closest("[data-remote-server-logs]")' in html
+    assert "operation.phase_started_at" in card_renderer
+    assert "operation.log" in logs_handler
     assert "operation.output" in logs_handler
     assert "operation.stderr" in logs_handler
     assert "operation.error" in logs_handler
     assert "output.dataset.rawLog = displayLog" in logs_handler
     assert "renderRemoteLogLines(output, displayLog.split(\"\\n\"))" in logs_handler
-    assert "当前接口在命令结束后返回完整输出" in logs_handler
+    assert "日志会自动刷新" in logs_handler
+    assert "setTimeout(refreshRemoteOperationLogs, 1500)" in logs_handler
+    assert "stopRemoteLogPolling()" in logs_handler
+    assert "text.textContent = line || \" \"" in html
     assert 'id="remoteLogModal"' in html
     assert 'id="btnCopyRemoteLog" type="button">复制全部</button>' in html
     assert "user-select:text" in html

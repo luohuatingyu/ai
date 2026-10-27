@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List
+from typing import Callable, Dict, List
 from urllib.parse import quote, urlencode
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -42,6 +42,59 @@ class RemoteCredentialConflictError(RemoteWorkerError):
 
 _ACTIVE_REMOTE_OPERATIONS: Dict[str, threading.Event] = {}
 _ACTIVE_REMOTE_OPERATIONS_LOCK = threading.Lock()
+_REMOTE_OPERATION_LOG_LOCK = threading.Lock()
+_REMOTE_OPERATION_LOG_LIMIT = 24_000
+_WORKER_STARTUP_HEARTBEAT_TIMEOUT = 15.0
+
+
+def _append_remote_operation_log(
+    operation_id: str | None,
+    phase: str,
+    message: str,
+    *,
+    credentials: Dict[str, str] | None = None,
+    server: Dict[str, object] | None = None,
+) -> None:
+    """追加有界且脱敏的远程操作日志，并同步更新界面展示阶段。"""
+    if not operation_id:
+        return
+    try:
+        with _REMOTE_OPERATION_LOG_LOCK:
+            safe_message = _redact_output(str(message), "", credentials, server)["stdout"].strip()
+            if not safe_message:
+                return
+            operation = manager.lease.get_remote_operation(operation_id)
+            if operation is None:
+                return
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            entry = f"[{timestamp}] [{phase}] {safe_message}"
+            current = str(operation.get("log", ""))
+            updated = f"{current}\n{entry}" if current else entry
+            if len(updated) > _REMOTE_OPERATION_LOG_LIMIT:
+                marker = "[较早日志已截断]\n"
+                updated = marker + updated[-(_REMOTE_OPERATION_LOG_LIMIT - len(marker)):]
+            now = time.time()
+            if operation.get("phase") != phase:
+                operation["phase_started_at"] = now
+            operation.update({"phase": phase, "log": updated, "updated_at": now})
+            manager.lease.set_remote_operation(operation_id, operation)
+    except Exception:
+        # 诊断日志失败不能中断实际 SSH 部署。
+        return
+
+
+def _emit_progress(
+    callback: Callable[[str, str], None] | None,
+    phase: str,
+    message: str,
+) -> None:
+    """向操作记录发送进度；日志存储异常不影响远程命令执行。"""
+    if callback is None:
+        return
+    try:
+        callback(phase, message)
+    except Exception:
+        return
 
 
 def request_remote_operation_cancel(operation_id: str) -> bool:
@@ -111,10 +164,47 @@ def _communicate_remote_process(
     operation_id: str | None,
     timeout: int | None,
     input_data: str | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
+    progress_phase: str = "远程命令",
 ):
-    """轮询 SSH 子进程，响应用户中断并保留原有命令超时语义。"""
+    """轮询 SSH 子进程，实时转发输出并保留中断与超时语义。"""
     started_at = time.monotonic()
     pending_input = input_data
+    seen_output = {"stdout": "", "stderr": ""}
+    pending_lines = {"stdout": "", "stderr": ""}
+
+    def consume_output(name: str, value: object, flush: bool = False) -> None:
+        """仅将新增完整行发送给进度回调，避免重复显示 communicate 缓冲区。"""
+        if value is None:
+            return
+        if isinstance(value, bytes):
+            current = value.decode("utf-8", "replace")
+        else:
+            current = str(value)
+        previous = seen_output[name]
+        if current.startswith(previous):
+            delta = current[len(previous):]
+            seen_output[name] = current
+        elif previous.startswith(current):
+            # 某些 Python 版本在重复 communicate 超时时只返回本轮新增字节。
+            delta = current
+            seen_output[name] = previous + current
+        else:
+            delta = current
+            seen_output[name] = current
+        pending_lines[name] += delta
+        chunks = pending_lines[name].split("\n")
+        pending_lines[name] = chunks.pop()
+        for line in chunks:
+            line = line.rstrip("\r")
+            if line:
+                _emit_progress(progress_callback, progress_phase, f"{name}: {line}")
+        if flush and pending_lines[name]:
+            line = pending_lines[name].rstrip("\r")
+            pending_lines[name] = ""
+            if line:
+                _emit_progress(progress_callback, progress_phase, f"{name}: {line}")
+
     while True:
         if _remote_operation_cancel_requested(operation_id):
             _terminate_remote_process(process)
@@ -123,13 +213,20 @@ def _communicate_remote_process(
         if remaining is not None and remaining <= 0:
             process.kill()
             stdout, stderr = process.communicate()
+            consume_output("stdout", stdout, flush=True)
+            consume_output("stderr", stderr, flush=True)
             raise subprocess.TimeoutExpired(
                 process.args, timeout, output=stdout, stderr=stderr
             )
         poll_interval = 0.25 if remaining is None else min(0.25, remaining)
         try:
-            return process.communicate(input=pending_input, timeout=poll_interval)
-        except subprocess.TimeoutExpired:
+            output = process.communicate(input=pending_input, timeout=poll_interval)
+            consume_output("stdout", output[0], flush=True)
+            consume_output("stderr", output[1], flush=True)
+            return output
+        except subprocess.TimeoutExpired as exc:
+            consume_output("stdout", exc.output)
+            consume_output("stderr", exc.stderr)
             pending_input = None
 
 
@@ -140,8 +237,10 @@ def _run_remote_subprocess(
     timeout: int,
     environment: Dict[str, str] | None,
     operation_id: str | None,
+    progress_callback: Callable[[str, str], None] | None = None,
+    progress_phase: str = "远程命令",
 ) -> subprocess.CompletedProcess:
-    """启动可中断的 SSH 命令，并返回与 subprocess.run 一致的结果对象。"""
+    """启动可中断的 SSH 命令，实时转发 stdout/stderr 并返回结果对象。"""
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -152,7 +251,12 @@ def _run_remote_subprocess(
     )
     try:
         stdout, stderr = _communicate_remote_process(
-            process, operation_id, timeout, input_data=input_data
+            process,
+            operation_id,
+            timeout,
+            input_data=input_data,
+            progress_callback=progress_callback,
+            progress_phase=progress_phase,
         )
     except BaseException:
         if process.poll() is None:
@@ -314,7 +418,10 @@ def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
 
 
 def _build_local_docker_image_for_platform(
-    image: str, platform: str, operation_id: str | None = None
+    image: str,
+    platform: str,
+    operation_id: str | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> None:
     """通过平台 Docker Engine 为目标架构重建 worker 镜像并校验结果。"""
     canonical_platform = _canonical_docker_platform(platform)
@@ -376,10 +483,14 @@ def _build_local_docker_image_for_platform(
                     event = json.loads(line.decode("utf-8"))
                 except (ValueError, UnicodeError):
                     continue
+                stream = str(event.get("stream") or "").strip()
+                if stream:
+                    _emit_progress(progress_callback, "构建目标架构镜像", stream)
                 if event.get("error"):
                     error_detail = event.get("errorDetail") or {}
                     detail = str(error_detail.get("message") or event["error"])
                     errors.append(detail.strip())
+                    _emit_progress(progress_callback, "构建目标架构镜像", f"Docker 构建错误：{detail.strip()}")
             if errors:
                 detail = errors[-1]
                 raise RemoteWorkerError(
@@ -437,16 +548,22 @@ def _remote_docker_image_platform(
     server: Dict[str, object],
     timeout: int,
     operation_id: str | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> str:
     """通过 SSH 读取目标 Docker 平台，并对错误输出做凭证脱敏。"""
     command = ssh_command[:-1] + ["docker info --format '{{.OSType}}/{{.Architecture}}'"]
     try:
+        progress_options = (
+            {"progress_callback": progress_callback, "progress_phase": "检查远端 Docker 平台"}
+            if progress_callback is not None else {}
+        )
         result = _run_remote_subprocess(
             command,
             input_data="",
             timeout=min(timeout, 60),
             environment=environment,
             operation_id=operation_id,
+            **progress_options,
         )
     except subprocess.TimeoutExpired as exc:
         raise RemoteWorkerError("读取目标 Docker 平台信息超时") from exc
@@ -893,6 +1010,7 @@ def _stream_worker_image_to_remote(
     server: Dict[str, object],
     timeout: int,
     operation_id: str | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> Dict[str, str]:
     """把 Docker Engine 镜像 tar 流经 SSH stdin 传给目标机 docker load。"""
     docker_connection, image_response = _open_local_docker_image_archive(image)
@@ -901,6 +1019,12 @@ def _stream_worker_image_to_remote(
     process: subprocess.Popen[bytes] | None = None
     writer: threading.Thread | None = None
     writer_errors: List[Exception] = []
+    transferred_bytes = 0
+    next_progress_bytes = 64 * 1024 * 1024
+    try:
+        content_length = int(image_response.getheader("Content-Length") or 0)
+    except (AttributeError, TypeError, ValueError):
+        content_length = 0
     try:
         read_fd, write_fd = os.pipe()
         try:
@@ -918,6 +1042,7 @@ def _stream_worker_image_to_remote(
 
         def pump_image_archive(pipe_fd: int) -> None:
             """按块复制 Docker Engine 响应到 SSH 管道，避免缓存整个镜像。"""
+            nonlocal transferred_bytes, next_progress_bytes
             try:
                 with os.fdopen(pipe_fd, "wb") as destination:
                     while True:
@@ -925,6 +1050,16 @@ def _stream_worker_image_to_remote(
                         if not chunk:
                             break
                         destination.write(chunk)
+                        transferred_bytes += len(chunk)
+                        if transferred_bytes >= next_progress_bytes:
+                            transferred_mb = transferred_bytes / (1024 * 1024)
+                            if content_length:
+                                total_mb = content_length / (1024 * 1024)
+                                message = f"已发送 {transferred_mb:.0f}/{total_mb:.0f} MiB"
+                            else:
+                                message = f"已发送 {transferred_mb:.0f} MiB"
+                            _emit_progress(progress_callback, "传输并加载 worker 镜像", message)
+                            next_progress_bytes += 64 * 1024 * 1024
             except (OSError, http.client.HTTPException, ValueError) as exc:
                 writer_errors.append(exc)
 
@@ -934,7 +1069,14 @@ def _stream_worker_image_to_remote(
         writer.start()
         write_fd = -1
         try:
-            stdout, stderr = _communicate_remote_process(process, operation_id, timeout)
+            _emit_progress(progress_callback, "传输并加载 worker 镜像", "远端正在执行 docker load。")
+            stdout, stderr = _communicate_remote_process(
+                process,
+                operation_id,
+                timeout,
+                progress_callback=progress_callback,
+                progress_phase="远端 docker load",
+            )
         except subprocess.TimeoutExpired as exc:
             raise RemoteWorkerError("经 SSH 传输 worker 镜像超时") from exc
         writer.join(timeout=65)
@@ -954,6 +1096,11 @@ def _stream_worker_image_to_remote(
             raise RemoteWorkerError(detail[-2000:])
         if writer_errors:
             raise RemoteWorkerError("读取平台 worker 镜像归档失败")
+        _emit_progress(
+            progress_callback,
+            "传输并加载 worker 镜像",
+            f"镜像传输完成，共 {transferred_bytes / (1024 * 1024):.0f} MiB。",
+        )
         return output
     finally:
         if read_fd >= 0:
@@ -967,6 +1114,49 @@ def _stream_worker_image_to_remote(
         docker_connection.close()
         if writer is not None:
             writer.join(timeout=5)
+
+
+def _wait_for_remote_worker_heartbeat(
+    operation_id: str,
+    machine_id: str,
+    progress_callback: Callable[[str, str], None],
+) -> None:
+    """短暂等待远程 worker 注册，并记录有无心跳供安装诊断。"""
+    _emit_progress(progress_callback, "等待资源心跳", "等待远程 worker 注册资源槽（最多 15 秒）。")
+    deadline = time.monotonic() + _WORKER_STARTUP_HEARTBEAT_TIMEOUT
+    while True:
+        if _remote_operation_cancel_requested(operation_id):
+            raise RemoteWorkerCancelledError("操作已中断；worker 容器可能已经启动")
+        try:
+            workers = manager.lease.list_workers()
+        except Exception as exc:
+            _emit_progress(
+                progress_callback,
+                "等待资源心跳",
+                f"无法读取平台 worker 心跳：{exc}",
+            )
+            return
+        matches = [
+            item for item in workers
+            if str(item.get("machine_id", "")) == machine_id and item.get("active")
+        ]
+        if matches:
+            worker_ids = ", ".join(str(item.get("worker_id", "未知槽位")) for item in matches)
+            _emit_progress(
+                progress_callback,
+                "等待资源心跳",
+                f"已收到 {len(matches)} 个资源槽心跳：{worker_ids}。",
+            )
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _emit_progress(
+                progress_callback,
+                "等待资源心跳",
+                "15 秒内未收到资源心跳。请查看下方容器启动日志，并检查目标机到 Redis、S3 的连通性。",
+            )
+            return
+        time.sleep(min(1.0, remaining))
 
 
 def _platform_ssh_credentials() -> Dict[str, str]:
@@ -1161,13 +1351,26 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
 def run_remote_action(
     server: Dict[str, object], action: str, operation_id: str | None = None
 ) -> Dict[str, str]:
-    """用首次连接自动信任的 OpenSSH 执行脚本，并过滤输出中的平台凭证。"""
+    """用 OpenSSH 执行远程脚本，记录可读阶段与脱敏命令输出。"""
     credentials = _ssh_credentials_for_server(server)
+    resolved_server = dict(server)
+    resolved_server["username"] = credentials["username"]
+
+    def report(phase: str, message: str) -> None:
+        """保存经过 SSH 凭证和部署密钥过滤的阶段进度。"""
+        _append_remote_operation_log(
+            operation_id,
+            phase,
+            message,
+            credentials=credentials,
+            server=resolved_server,
+        )
+
+    progress_callback = report if operation_id else None
+    _emit_progress(progress_callback, "检查部署配置", "检查 SSH、Redis、S3 和本地 worker 镜像配置。")
     errors = remote_configuration_errors(credentials, server)
     if errors:
         raise RemoteWorkerError("；".join(errors))
-    resolved_server = dict(server)
-    resolved_server["username"] = credentials["username"]
     validate_server_record(resolved_server)
     ssh_path = shutil.which("ssh")
     if not ssh_path:
@@ -1268,22 +1471,54 @@ def run_remote_action(
         if action == "install":
             image_command = command[:-1] + ["docker load"]
             image = remote_deployment_settings(server)["worker_image"]
+            _emit_progress(progress_callback, "检查远端 Docker 平台", "读取目标机 Docker 操作系统和 CPU 架构。")
             local_platform = _local_docker_image_platform(image)
+            progress_options = (
+                {"progress_callback": progress_callback}
+                if progress_callback is not None else {}
+            )
             remote_platform = _remote_docker_image_platform(
-                command, environment, credentials, server, timeout, operation_id
+                command, environment, credentials, server, timeout, operation_id,
+                **progress_options,
             )
             target_platform = _canonical_docker_platform(remote_platform)
-            if _canonical_docker_platform(local_platform) != target_platform:
-                _build_local_docker_image_for_platform(image, target_platform, operation_id)
-            _stream_worker_image_to_remote(
-                image, image_command, environment, credentials, server, timeout, operation_id
+            _emit_progress(
+                progress_callback,
+                "检查镜像架构",
+                f"平台镜像架构：{local_platform}；目标 Docker 架构：{target_platform}。",
             )
+            if _canonical_docker_platform(local_platform) != target_platform:
+                _emit_progress(
+                    progress_callback,
+                    "构建目标架构镜像",
+                    f"架构不一致，开始构建 {target_platform} worker 镜像。",
+                )
+                _build_local_docker_image_for_platform(
+                    image, target_platform, operation_id, **progress_options
+                )
+                _emit_progress(progress_callback, "构建目标架构镜像", "目标架构镜像构建完成。")
+            else:
+                _emit_progress(progress_callback, "构建目标架构镜像", "架构一致，跳过重新构建。")
+            _emit_progress(progress_callback, "传输并加载 worker 镜像", "开始从平台 Docker 导出镜像并经 SSH 发送。")
+            _stream_worker_image_to_remote(
+                image, image_command, environment, credentials, server, timeout,
+                operation_id, **progress_options,
+            )
+        _emit_progress(progress_callback, "执行远程部署脚本", f"开始执行远端 {action} 脚本。")
+        progress_options = (
+            {
+                "progress_callback": progress_callback,
+                "progress_phase": "执行远程部署脚本",
+            }
+            if progress_callback is not None else {}
+        )
         result = _run_remote_subprocess(
             command,
             input_data=str(run_options["input"]),
             timeout=int(run_options["timeout"]),
             environment=run_options.get("env"),
             operation_id=operation_id,
+            **progress_options,
         )
     except subprocess.TimeoutExpired as exc:
         raise RemoteWorkerError("远程 SSH 操作超时") from exc
@@ -1296,6 +1531,13 @@ def run_remote_action(
     if result.returncode != 0:
         detail = (output["stderr"] or output["stdout"] or "远程脚本返回错误").strip()
         raise RemoteWorkerError(detail[-2000:])
+    _emit_progress(progress_callback, "执行远程部署脚本", "远端脚本已成功返回。")
+    if action == "install" and operation_id:
+        _wait_for_remote_worker_heartbeat(
+            operation_id,
+            str(server.get("machine_id", "")),
+            progress_callback or report,
+        )
     return output
 
 
@@ -1317,33 +1559,71 @@ def execute_remote_operation(
             if _remote_operation_cancel_requested(operation_id):
                 raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
             now = time.time()
-            operation.update({"status": "running", "updated_at": now, "error": None})
+            operation.update({
+                "status": "running",
+                "started_at": now,
+                "updated_at": now,
+                "error": None,
+            })
             manager.lease.set_remote_operation(operation_id, operation)
+            _append_remote_operation_log(
+                operation_id,
+                "准备远程操作",
+                f"开始执行 {action} 操作。",
+                server=server,
+            )
             server.update({"status": "running", "operation_id": operation_id})
             remote_config_repository.save_remote_server(server)
             result = run_remote_action(server, action, operation_id)
             if _remote_operation_cancel_requested(operation_id):
                 raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
-            operation.update(
-                {
-                    "status": "completed",
-                    "updated_at": time.time(),
-                    "output": result.get("stdout", "")[-2000:],
-                    "stderr": result.get("stderr", "")[-2000:],
-                }
-            )
+            terminal_update = {
+                "status": "completed",
+                "updated_at": time.time(),
+                "output": result.get("stdout", "")[-2000:],
+                "stderr": result.get("stderr", "")[-2000:],
+                "phase": "操作完成",
+            }
             server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"
+            terminal_log = ("操作完成", "远程操作已成功完成。")
         except RemoteWorkerCancelledError as exc:
-            operation.update({"status": "cancelled", "updated_at": time.time(), "error": str(exc)})
+            terminal_update = {
+                "status": "cancelled",
+                "updated_at": time.time(),
+                "error": str(exc),
+                "phase": "操作已中断",
+            }
+            terminal_log = ("操作已中断", str(exc))
             server["status"] = "error"
         except RemoteWorkerError as exc:
-            operation.update({"status": "failed", "updated_at": time.time(), "error": str(exc)})
+            terminal_update = {
+                "status": "failed",
+                "updated_at": time.time(),
+                "error": str(exc),
+                "phase": "操作失败",
+            }
+            terminal_log = ("操作失败", str(exc))
             server["status"] = "error"
-        except Exception:
-            operation.update(
-                {"status": "failed", "updated_at": time.time(), "error": "远程操作发生未预期错误"}
-            )
+        except Exception as exc:
+            terminal_update = {
+                "status": "failed",
+                "updated_at": time.time(),
+                "error": "远程操作发生未预期错误",
+                "phase": "操作失败",
+            }
+            terminal_log = ("操作失败", f"远程操作发生未预期错误（{type(exc).__name__}）")
             server["status"] = "error"
+        elapsed = max(0.0, time.time() - float(operation.get("started_at", time.time())))
+        terminal_log = (terminal_log[0], f"{terminal_log[1]} 总耗时 {elapsed:.1f} 秒。")
+        terminal_update["duration_sec"] = round(elapsed, 1)
+        _append_remote_operation_log(
+            operation_id,
+            terminal_log[0],
+            terminal_log[1],
+            server=server,
+        )
+        operation = manager.lease.get_remote_operation(operation_id) or operation
+        operation.update(terminal_update)
         manager.lease.set_remote_operation(operation_id, operation)
         remote_config_repository.save_remote_server(server)
     finally:
@@ -1376,4 +1656,9 @@ def _redact_output(
         if secret:
             stdout = stdout.replace(secret, "[redacted]")
             stderr = stderr.replace(secret, "[redacted]")
+            if "\n" in secret or "\r" in secret:
+                for secret_line in secret.splitlines():
+                    if len(secret_line) >= 8:
+                        stdout = stdout.replace(secret_line, "[redacted]")
+                        stderr = stderr.replace(secret_line, "[redacted]")
     return {"stdout": stdout[-4000:], "stderr": stderr[-4000:]}

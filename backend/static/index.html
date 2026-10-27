@@ -631,6 +631,7 @@ const state = {
   charts: { loss: null, metric: null }, metricKind: null,
   workerSlots: [], detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
+  remoteLogOperationId: null, remoteLogPollTimer: null,
   editingRemoteMachineId: null,
   remoteCredentials: [], remoteCredentialDefaultId: null, remoteCredentialsCanConfigure: false,
 };
@@ -1505,6 +1506,15 @@ function workerServerCard(machineId, slots, remoteServer = null) {
     queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "install" ? "正在远程安装并检测…" : `正在远程${operation.action}…`,
     completed: "最近操作已完成", failed: "最近操作失败", cancelled: "最近操作已中断",
   }[operation.status] || remoteStatus : remoteStatus;
+  const operationPhaseLabels = {
+    "检查部署配置": "检查部署配置", "检查远端 Docker 平台": "检查远端 Docker",
+    "检查镜像架构": "比较镜像架构", "构建目标架构镜像": "构建目标架构镜像",
+    "传输并加载 worker 镜像": "传输并加载镜像", "远端 docker load": "远端加载镜像",
+    "执行远程部署脚本": "执行远端部署脚本", "等待资源心跳": "等待资源心跳",
+  };
+  const phaseLabel = operation && operationPhaseLabels[operation.phase];
+  const phaseElapsed = operation && operation.phase_started_at
+    ? Math.max(0, Math.floor(Date.now() / 1000 - Number(operation.phase_started_at))) : null;
   const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
       <button class="server-log-button" data-remote-server-logs="${esc(machineId)}">日志</button>
       <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>编辑</button>
@@ -1516,7 +1526,10 @@ function workerServerCard(machineId, slots, remoteServer = null) {
     </div>` : "";
   const endpoint = remoteServer ? `${remoteServer.username}@${remoteServer.host}:${remoteServer.port} · ${remoteServer.mode.toUpperCase()}` : "";
   const operationDetails = operation && ["failed", "cancelled"].includes(operation.status) && operation.error
-    ? `${operationLabel}：${operation.error}` : operationLabel;
+    ? `${operationLabel}：${operation.error}`
+    : operationBusy && phaseLabel
+      ? `${operationLabel} · ${phaseLabel}${phaseElapsed == null ? "" : ` · ${phaseElapsed} 秒`}`
+      : operationLabel;
   const operationLog = operation && [operation.output, operation.stderr, operation.error]
     .filter((part) => typeof part === "string" && part.trim())
     .join("\n");
@@ -1898,6 +1911,7 @@ async function showRemoteServerLogs(button) {
   const modal = $("remoteLogModal");
   const output = $("remoteLogOutput");
   const status = $("remoteLogStatus");
+  stopRemoteLogPolling();
   output.dataset.rawLog = "";
   $("remoteLogTitle").textContent = `${machineId} · 执行日志`;
   modal.hidden = false;
@@ -1905,33 +1919,64 @@ async function showRemoteServerLogs(button) {
   renderRemoteLogLines(output, ["正在读取日志…"]);
   status.textContent = "";
   if (!server || !server.operation_id) {
+    state.remoteLogOperationId = null;
     status.textContent = "该服务器还没有远程操作记录。";
     renderRemoteLogLines(output, ["暂无执行日志"]);
     return;
   }
+  state.remoteLogOperationId = server.operation_id;
+  await refreshRemoteOperationLogs();
+}
+
+// 轮询当前远程操作日志，使运行阶段和命令输出在操作过程中可见。
+async function refreshRemoteOperationLogs() {
+  const operationId = state.remoteLogOperationId;
+  const modal = $("remoteLogModal");
+  if (!operationId || modal.hidden) return;
+  const output = $("remoteLogOutput");
+  const status = $("remoteLogStatus");
   try {
-    const operation = await apiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`);
+    const operation = await apiJson(`/api/remote-operations/${encodeURIComponent(operationId)}`);
     state.remoteOperations.set(operation.operation_id, operation);
-    const log = [operation.output, operation.stderr, operation.error]
-      .filter((part) => typeof part === "string" && part.trim())
-      .join("\n");
+    const fallbackLog = [operation.output, operation.stderr, operation.error]
+      .filter((part) => typeof part === "string" && part.trim()).join("\n");
+    const log = typeof operation.log === "string" && operation.log.trim()
+      ? operation.log : fallbackLog;
     const stateText = {
-      queued: "操作排队中；命令结束后将显示完整输出。",
-      running: "命令执行中；当前接口在命令结束后返回完整输出。",
+      queued: "操作排队中；开始执行后会显示阶段和日志。",
+      running: "操作执行中；日志会自动刷新。",
       completed: "操作已完成。",
       failed: "操作失败。",
       cancelled: "操作已中断。",
     }[operation.status] || `操作状态：${operation.status || "未知"}`;
-    status.textContent = `${operation.action || "远程操作"} · ${stateText}`;
+    const phaseAge = operation.phase_started_at
+      ? `，已持续 ${Math.max(0, Math.floor(Date.now() / 1000 - Number(operation.phase_started_at)))} 秒` : "";
+    const phaseText = operation.phase ? ` · 当前阶段：${operation.phase}${phaseAge}` : "";
+    status.textContent = `${operation.action || "远程操作"} · ${stateText}${phaseText}`;
     const displayLog = log || (operation.status === "queued" || operation.status === "running"
-      ? "暂时没有可显示的输出。"
+      ? "等待远程命令输出；若停留在某阶段，可根据该阶段判断检查位置。"
       : "远程命令未返回输出");
+    const wasAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 48;
     output.dataset.rawLog = displayLog;
     renderRemoteLogLines(output, displayLog.split("\n"));
+    if (wasAtBottom) output.scrollTop = output.scrollHeight;
+    if (["queued", "running"].includes(operation.status)
+        && !modal.hidden && state.remoteLogOperationId === operationId) {
+      state.remoteLogPollTimer = setTimeout(refreshRemoteOperationLogs, 1500);
+    } else {
+      state.remoteLogPollTimer = null;
+    }
   } catch (error) {
     status.textContent = "读取执行日志失败。";
     renderRemoteLogLines(output, [error.message]);
+    if (!modal.hidden) state.remoteLogPollTimer = setTimeout(refreshRemoteOperationLogs, 2000);
   }
+}
+
+// 停止日志轮询，避免关闭窗口后继续请求远程操作状态。
+function stopRemoteLogPolling() {
+  if (state.remoteLogPollTimer !== null) clearTimeout(state.remoteLogPollTimer);
+  state.remoteLogPollTimer = null;
 }
 
 // 逐行创建日志文本和复制按钮，文本通过 textContent 写入避免执行远程输出内容。
@@ -1975,6 +2020,8 @@ async function copyRemoteLogText(text) {
 // 关闭远程日志窗口。
 function closeRemoteLogModal() {
   const modal = $("remoteLogModal");
+  stopRemoteLogPolling();
+  state.remoteLogOperationId = null;
   modal.classList.remove("open");
   modal.hidden = true;
 }
