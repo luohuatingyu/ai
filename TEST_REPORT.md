@@ -2,10 +2,65 @@
 
 ## Git基准点
 
-- **Commit Hash**: 3256e7a（新增按模式选择 Compose 的平台启动脚本）
-- **提交信息**: Add mode-aware platform Compose launcher
+- **Commit Hash**: 1c1812c（实时远程 worker 部署诊断日志）
+- **提交信息**: Add live remote worker diagnostics
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：实时远程 worker 部署诊断日志（2026-10-27）
+
+**变更范围**：远程部署操作实时保存带时间戳的脱敏阶段日志和命令输出；日志限制为最近 24,000 个字符。安装 worker 后记录 Docker 容器状态、重启次数及最近 80 行启动日志，并最多等待 15 秒检查资源心跳。前端卡片显示当前阶段和持续时间，日志窗口每 1.5 秒刷新，关闭后停止轮询。既有 `output`、`stderr` 和操作终态字段保持兼容。
+
+**测试环境**：Python 3.12 Docker 镜像 `emdash-hot-boxes-clean-y9u6p-trainer:latest`。完整测试包含工作区原有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动；这些文件没有纳入本次提交。
+
+**测试执行结果**：
+- 远程 worker 与 API 定向测试：110 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件：250 项；244 通过、0 失败、0 错误、6 跳过。已执行用例通过率 100%。6 项为 Redis、S3 和 Supervisor 子进程环境门控测试。
+- `docker compose up --build -d`：通过；trainer、worker、frontend 已启动，frontend 健康检查通过，SeaweedFS 健康检查通过。
+- 页面运行环境验证：`curl -fsS http://127.0.0.1:8000/` 返回的页面包含实时日志轮询和资源心跳阶段内容。
+- `git diff --check`：通过。
+- pytest 报告 2 条既有弃用警告：SQLAlchemy `declarative_base()` 和 Pandas `xlrd` 引擎。
+
+**实际执行命令**：
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py tests/test_api.py -q -p no:cacheprovider
+```
+
+结果：110 passed。
+
+```bash
+docker compose up --build -d
+```
+
+结果：构建和启动成功。
+
+```bash
+docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider
+```
+
+结果：244 passed、6 skipped。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 运行期间显示远程阶段和 SSH 输出 | 单元：`test_communicate_remote_process_streams_only_new_output_lines`；集成逻辑：`test_run_remote_install_records_stages_and_worker_heartbeat` | 模拟分段 stdout/stderr、架构检查、镜像传输和 worker 启动；日志只写新增行并显示阶段 | 正常、超时、回归 |
+| 操作日志不会泄露凭证且长度有界 | 单元：`test_remote_operation_log_is_redacted_and_bounded` | 输入 SSH 密码、私钥行、Redis URL、S3 密钥和超长日志；预期值被脱敏并截断到限制内 | 安全、边界 |
+| 构建失败和 worker 启动状态有可读诊断 | 单元：`test_target_platform_worker_build_failure_is_reported`、`test_remote_bootstrap_script_installs_cpu_and_gpu_workers` | 模拟 Docker 构建错误，验证错误事件；启动脚本验证容器状态和日志快照输出 | 异常、兼容 |
+| 资源心跳检查能区分已注册和未注册 | 单元：`test_worker_heartbeat_probe_reports_present_and_missing_slots` | 分别返回匹配的活动 worker 和空集合；预期记录心跳到达或 15 秒无心跳建议 | 正常、边界、异常 |
+| 前端日志窗口实时刷新并安全展示 | API/静态契约：`test_remote_server_card_exposes_live_operation_logs` | 检查当前阶段展示、1.5 秒轮询、关闭后停止轮询，日志通过 `textContent` 渲染 | 正常、安全、回归 |
+| 原有远程操作结果字段保持兼容 | 单元：`test_execute_remote_operation_persists_success_and_failure` | 成功仍保存 `output`/`stderr`，失败仍保存错误和终态 | 兼容、异常 |
+
+**关键模块测试**：远程部署和 SSH 输出：`tests/test_remote_workers.py`；远程 API 与前端日志契约：`tests/test_api.py`；两者合计 110 项全部通过。完整 `tests/` 为 244 通过、6 个环境门控跳过。
+
+**重测触发条件**：后续修改 `backend/app/` 业务代码、数据模型/数据库操作、数据集链路、训练器/任务管理、API 路由或核心业务配置时，重新运行相关测试及完整套件；仅前端静态文件、文档或构建配置变更按项目规则无需自动重测，用户明确要求时除外。
+
+**已知问题与限制**：没有真实连接用户的 Linux 服务器执行 SSH 安装，因此 Redis/S3 网络、目标机 Docker daemon 和实际 worker 日志尚未端到端验证。15 秒未收到心跳会记录诊断提示，但不会把 SSH 部署成功改判为失败。日志最多保留 24,000 个字符。
+
+**下次测试建议**：在目标 Linux 服务器重新部署一次，确认日志窗口显示镜像架构、传输/加载、容器状态和 worker 启动日志；再分别验证 Redis 或 S3 不可达时的日志诊断。
+
+**Git基准点**：`1c1812c`（Add live remote worker diagnostics）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：按硬件模式选择平台 Compose 启动（2026-10-27）
 
