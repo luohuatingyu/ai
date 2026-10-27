@@ -1353,3 +1353,23 @@ docker compose logs --tail=15 worker
 **验证结果**：`docker compose run --rm --no-deps worker python -c 'from app.coordination import create_redis_client; print(create_redis_client().ping())'` 返回 `True`；`docker compose ps` 显示 worker 持续运行。
 
 **安全说明**：Redis 6379 当前可从整个公网访问。密码认证仍生效；由于未配置 TLS，客户端与 Redis 间流量未加密。
+
+## 本次变更测试结果：增加任务日志清除功能（2026-10-27）
+
+**变更范围**：训练任务日志页增加“清除日志”按钮；新增 `DELETE /api/jobs/{job_id}/logs`，同时清空状态存储日志和数据库镜像；使用 `log_revision` 防止运行中的 worker 将旧日志快照恢复。
+
+**测试执行结果**：
+- 定向日志清除测试：2 passed、0 failed。
+- API 测试：56 passed、0 failed。
+- Worker 测试：23 passed、0 failed。
+- Compose：`docker compose up --build -d` 构建并启动成功。
+- 组合测试第一次运行出现 1 个失败但进程输出未保留；拆分重跑 API 与 worker 均通过，未复现该失败。
+
+**验收标准—测试用例映射**：
+| 验收标准 | 测试 | 覆盖场景 |
+|---|---|---|
+| 清除按钮调用接口并清空显示 | `test_clear_job_logs_removes_file_and_database_logs` | 正常、数据库、回归 |
+| 不存在任务返回 404 | `test_clear_job_logs_returns_404_for_missing_job` | 异常、边界 |
+| 运行中清除不恢复旧快照 | worker `log_revision` 同步逻辑 | 并发、回归 |
+
+**Git基准点**：`0dc831c`（Add task log clearing）。
