@@ -2,10 +2,39 @@
 
 ## Git基准点
 
-- **Commit Hash**: c3b2a04（显示远程服务器命令输出）
-- **提交信息**: Show remote server command output
+- **Commit Hash**: 55ec8dc（使用 Docker 可识别的 worker 构建归档格式）
+- **提交信息**: Use Docker compatible worker build archive
 - **测试日期**: 2026-10-27
 - **分支**: emdash/hot-boxes-clean-y9u6p
+
+## 本次变更测试结果：修复 Docker 自动构建 tar 上下文识别（2026-10-27）
+
+**变更范围**：将 worker Docker 构建上下文从 Python 默认 PAX tar 改为 GNU tar，首个 tar entry 为根目录 `Dockerfile`。Docker Engine API 之前将该上下文当作文本 Dockerfile，误读 `app/worker.py` 中的 `dict(os.environ)` 并报告语法错误。
+
+**测试环境**：Docker 测试镜像 Python 3.12。既有未提交的 `backend/app/storage.py` 和 `backend/tests/test_storage.py` 改动保留，并包含在完整测试中；没有纳入本次提交。
+
+**测试执行结果**：
+- 远程 worker 定向测试：`docker run --rm -v "$PWD/backend:/workspace/backend:ro" -v "$PWD/scripts:/workspace/scripts:ro" -v "$PWD/docker-compose.yml:/workspace/docker-compose.yml:ro" -v "$PWD/docker-compose.cpu.yml:/workspace/docker-compose.cpu.yml:ro" -v "$PWD/docker-compose.remote.yml:/workspace/docker-compose.remote.yml:ro" -w /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q -p no:cacheprovider`：53 通过、0 失败。
+- 完整测试：同 Docker 挂载命令运行 `python -m pytest tests/ -q -p no:cacheprovider`：233 通过、6 跳过、0 失败、0 错误。6 项为 Redis、S3 和 Supervisor 子进程的环境门控测试。
+- `docker compose up --build -d`：通过；随后以远程管理覆盖配置及当前 Docker Desktop socket 路径重新启动 trainer：通过。`docker compose -f docker-compose.yml -f docker-compose.remote.yml config -q` 通过。
+- 运行时上下文检查：归档首项为 `Dockerfile`，构建目录和 Dockerfile 均有效。
+- 真实 Docker Engine API 重放 GNU tar 上下文：Dockerfile 语法错误已消失，构建进入基础镜像拉取阶段；30 秒后因网络等待超时中止。AMD64 镜像完整构建未验证。
+- `git diff --check`：通过；保留 SQLAlchemy 与 Pandas 两条已有弃用警告。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| Docker Engine 收到标准 tar 上下文而不是 PAX 扩展头 | 远程 worker：`test_builds_worker_image_for_requested_platform_with_minimal_context` | 首个 512 字节 tar header 指向 `Dockerfile`，归档仍包含依赖与 worker 源码 | 正常、Docker API 兼容 |
+| 错误目录中的同名 Dockerfile 不进入构建上下文 | 远程 worker：`test_worker_build_context_skips_invalid_same_named_dockerfile` | 含 `dict(os.environ)` 的无效文件被跳过，打包有效项目 Dockerfile | 异常、回归 |
+| 构建错误仍停止部署且输出 Docker Engine 原因 | 远程 worker：`test_target_platform_worker_build_failure_is_reported` | 模拟 Engine 返回错误并验证清晰失败结果 | 异常 |
+| 远程功能与完整业务套件通过 | `tests/test_remote_workers.py` 与完整 `tests/` | 定向 53 通过；完整 233 通过、6 环境门控跳过 | 回归 |
+
+**已知问题与限制**：当前环境访问 Docker Hub 超时，真实 `linux/amd64` worker 镜像未完成构建。Engine API 重放已验证本次 Dockerfile 解析报错不再出现；需要在基础镜像可下载的部署环境确认构建、SSH 传输和 worker 启动。
+
+**下次测试建议**：在网络可访问 Docker Hub 的平台 Docker 环境点击远程服务器“重新部署并应用配置”，确认目标架构构建和部署完整通过。
+
+**Git基准点**：`55ec8dc`（Use Docker compatible worker build archive）；本测试报告作为单独提交更新。
 
 ## 本次变更测试结果：显示远程服务器命令日志（2026-10-27）
 
