@@ -1,3 +1,79 @@
+## 本次变更测试结果：服务器与凭证管理拆分（2026-10-29）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`60a8c67adfeb90ffda3d36ca92ab59c24d7f757e`。
+- **提交信息**：Separate server and credential management pages。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围与技术**：训练台、数据集页导航；新增服务器管理页、凭证管理页及共享原生 JavaScript/CSS；Node.js 内置测试和 pytest。后端 API、配置、依赖及数据格式未修改。
+- **行为**：服务器和凭证以独立导航页维护。服务器页管理连接、资源类型、部署/生命周期、日志和生效配置；弹窗只从凭证目录选择已有凭证，并提供跳转与刷新。凭证页独立新增、编辑、删除、设为默认，支持密码、私钥和混合认证。训练台只展示资源状态并提供管理入口。
+- **隔离验收**：共享工作区有其他并行任务的未提交改动。以独立 Git 索引从 `fd76e3756ed463a11fbb13052ce391913e09b3c6` 生成候选快照，运行完整测试后只提交本任务的 8 个文件；其他任务的工作区改动和暂存内容未纳入本提交。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、用例与前置条件 | 输入、预期和场景 |
+|---|---|---|
+| 各管理页面独立，训练台保留只读资源状态 | pytest `test_management_tabs_have_independent_pages_and_forms`；四个 HTML 页面 | 每页导航指向服务器/凭证页且当前项唯一；服务器表单只在服务器页，凭证表单只在凭证页，工作台没有管理弹窗或生命周期操作；正常、兼容、回归 |
+| 服务器表单可使用已有凭证并正确维护服务器 | Node `frontend/server-modal.test.cjs` 中校验、添加 POST、编辑 PATCH、凭证刷新、弹窗焦点/关闭用例；pytest 远程服务器静态契约用例 | 必填、主机/端口边界、GPU/CPU 切换、CPU 槽 0/256/257、加载失败重试、旧异步响应隔离；正常、边界、异常、兼容 |
+| 服务器列表能刷新并呈现管理操作 | Node“服务器页合并登记与心跳并保留远程操作”“服务器目录空状态和失败可以重试”；pytest 生命周期/中断/日志静态契约 | 合并 worker 心跳与 SSH 登记、保留部署和生命周期按钮、转义恶意字段；工作列表/远程目录失败显示重试提示，后续刷新恢复；正常、空集合、异常、安全、回归 |
+| 凭证独立维护且秘密不回显 | Node 覆盖 password/key/key_password × 新增/编辑、重复提交、失败保留、认证切换清理、删除冲突、保存期间旧目录响应；pytest SSH 凭证静态/API 契约 | 保存后秘密清空并留在本页；失败时保留输入且解锁；删除被引用凭证由服务端拒绝；正常、边界、异常、状态冲突、兼容 |
+| 离开页面保护草稿并清理秘密 | Node 凭证草稿保护、编辑切换和离开清理；服务器弹窗取消、Escape、导航与 beforeunload 用例 | 取消离开保留草稿，确认后才导航；页面离开清空秘密，不重复确认；异常/状态冲突、安全 |
+| UI 在运行环境可访问 | Safari 桌面检查 + Compose 健康及 HTTP 核对 | 服务器页、列表、添加弹窗、凭证选择、CPU 条件输入和未保存导航提示可见；两个页面和共享 JS 经运行服务提供；正常、部署、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---|
+| 相关 pytest API/页面用例 | 22 | 22 | 0 | 64 deselected | Python 3.12.15；包含服务器/凭证 API 兼容和管理页结构 |
+| 候选快照完整 pytest | 527 | 503 | 0 | 24 | 执行用例通过率 100%；含后端全部套件 |
+| 候选快照前端 Node 完整套件 | 55 | 55 | 0 | 0 | 页面交互、凭证与服务器弹窗测试 |
+| 共享工作区前端回归 | 106 | 106 | 0 | 0 | 包括其他并行任务已有的前端用例；不作为隔离候选总数 |
+| Compose 本地等价重建 | 3 服务 | 3 启动 | 0 | 0 | trainer、worker、frontend 使用已有依赖镜像重建并启动 |
+| HTTP / 内容核对 | 4 项 | 4 | 0 | 0 | `/api/health`、服务器页、凭证页、共享 JS 哈希与工作区一致 |
+
+完整 pytest 的 24 项跳过包括未配置真实 Redis 的 19 项、未配置 S3 的 2 项、Supervisor Redis E2E 1 项、真实 NVIDIA GPU/NCCL 的 2 项。保留既有 SQLAlchemy 与 Pandas 两条弃用警告。未执行真实远端服务器部署或真实凭证保存。
+
+### 实际命令与结果
+
+```bash
+node --test frontend/*.test.cjs
+node --check backend/static/remote-management.js
+git diff --check
+docker run --rm --pull=never --network none --mount type=bind,src=/tmp/mtp-management-tabs.WXcAB6/candidate,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-management-tabs-deps:local python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-management-tabs-candidate-final --tb=short -rs
+docker run --rm --pull=never --network none --mount type=bind,src=/Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-management-tabs-deps:local python -m pytest tests/test_api.py -q -p no:cacheprovider --basetemp=/tmp/mtp-management-tabs-related-final -k 'remote_server or remote_ssh or management_tabs' --tb=short
+docker compose up --build -d
+cat <<'YAML' | docker compose -f docker-compose.yml -f - up --build -d
+services:
+  trainer:
+    build: &management_build
+      context: ./backend
+      dockerfile_inline: |
+        FROM mtp-management-tabs-deps:local
+        COPY app /app/app
+        COPY static /app/static
+        COPY sample_data /app/sample_data
+        COPY Dockerfile worker.Dockerfile requirements-worker.txt /app/
+        COPY init_db.sh start.sh /app/
+        RUN chmod +x /app/init_db.sh /app/start.sh
+  worker:
+    build: *management_build
+YAML
+curl --fail --silent http://127.0.0.1:8000/api/health
+curl --fail --silent http://127.0.0.1:8000/server-manager.html
+curl --fail --silent http://127.0.0.1:8000/credential-manager.html
+```
+
+- 默认 Compose 从头构建未通过：PyTorch 下载收到不完整响应并出现 SSL record layer 错误，完整包的 SHA256 校验阻止构建继续。随后使用临时 Compose 覆盖，以本机已有 Python 3.12.15 依赖镜像（与仓库 `requirements.txt` 哈希一致）为基底，重新复制当前后端、静态文件和启动脚本；trainer、worker、frontend 构建并启动成功。未修改仓库 Compose、依赖版本或校验策略。
+- `/api/health` 返回 `{"ok":true}`；两个页面可访问，线上 `remote-management.js` SHA256 与提交内容一致。服务继续运行在 `http://localhost:8000/`。
+- Safari 已核对桌面服务器列表和添加弹窗、现有凭证选项、CPU 条件字段及未保存离开提示。凭证表单的认证切换和提交状态由 Node 测试验证。由于 Safari 窗口被并行验收任务切换，未完成窄屏浏览器实测；移动布局规则通过 CSS/页面结构检查，但不把它报告为浏览器实测通过。
+- 调试及候选快照保存在 `/tmp/mtp-management-tabs.WXcAB6/`，提交后清除；该目录只用于隔离提交和测试，不纳入 Git。
+
+### 已知限制与后续验证
+
+- 默认在线 PyTorch 下载受当前网络 SSL 传输失败影响，本次使用同依赖版本的本地 Python 3.12.15 镜像完成等价 Compose 重建。网络稳定时建议补跑标准 `docker compose up --build -d` 从头构建。
+- 24 项环境依赖测试需在配置真实 Redis、S3 和 NVIDIA GPU/NCCL 的环境补验；窄屏 Safari 实测也待补充。
+- 回滚可撤销 `60a8c67` 并重新构建服务；没有数据迁移。本次未执行 `git push`。
+
 ## 本次变更测试结果：数据集按需预览（2026-10-29）
 
 ### Git 基准点与范围
