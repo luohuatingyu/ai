@@ -1,3 +1,86 @@
+## 本次变更测试结果：本地计算资源注册自动恢复（2026-10-29）
+
+### Git 基准点、根因与范围
+
+- **Commit Hash**：`5a969d5d3a50cfaac6796e4dfb0116cbc405fa4f`。
+- **基准提交信息**：Update test report for slim remote workers。
+- **本次修复提交**：`db1d5c698ac1cf031e77a0cbc58d79f711490c9f`（Restore worker registration on every heartbeat）。最终完整套件直接运行该提交的归档；其后至基准提交只有测试报告变化，业务源码完全相同。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围**：`backend/app/coordination.py`、`backend/tests/test_coordination.py`、`backend/tests/test_worker.py`。没有新增依赖、修改部署配置、迁移数据或修改第三方代码。
+- **现场证据**：API 资源列表为空时，Redis 可连接、`mtp:workers:all` 为空，但两个槽的 info hash 仍在持续更新；Worker 日志存在 Redis 连接拒绝、连接/读取超时。旧实现仅启动注册时写索引和硬件能力，心跳只写动态字段。注册数据丢失或长时间断连后被清理时，存活 Worker 无法自行重返资源列表。尚不能仅凭这些日志区分最初触发是 Redis 数据丢失还是超时清理。
+- **实现**：按 worker_id 缓存序列化后的能力快照；每次心跳在同一 Redis 事务内补齐集合索引、能力信息、最新动态状态和 TTL；动态字段覆盖启动快照，注销时丢弃缓存。沿用现有序列化，独立的启停开关与任务租约不被恢复逻辑覆盖。
+- **技术环境**：Python **3.12.15**、pytest、redis-py / Redis 7、PyTorch 2.14.1+cu130（实际 CPU 执行）、FastAPI、Docker Compose。测试 Redis 为独立容器的 DB 15，不访问生产 Redis。
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---:|---|
+| 修复前新增回归 | 15 | 0 | 15 | 0 | 0 | 稳定复现注册丢失后无法恢复 |
+| 初次修复后新增回归 | 15 | 3 | 12 | 0 | 0 | 新测试将 CUDA 版本原始字符串与既有解码后的数值比较；改为与注册成功后的能力快照比较，未改变序列化或弱化已有测试 |
+| 工作区真实 Redis 相关套件 | 80 | 79 | 0 | 0 | 1 | 22.20 秒；协调层和 Worker 全套，包含 15 个新增恢复用例 |
+| 并发工作区完整套件 | 453 | 426 | 3 | 0 | 24 | 191.43 秒；其他会话未提交修改参与执行，失败详见下文 |
+| 原基准加修复的隔离完整套件 | 366 | 344 | 0 | 0 | 22 | 69.76 秒；`d1f4115` 加本次三个文件，无其他工作区修改 |
+| 同一隔离快照 Redis 相关套件 | 80 | 79 | 0 | 0 | 1 | 21.34 秒；相关三个文件 SHA256 与提交候选一致 |
+| 最终修复提交完整套件 | 392 | 370 | 0 | 0 | 22 | **54.90 秒**；归档 `db1d5c6`，包含期间已提交的远程 Worker 精简改动；已执行用例通过率 100%，总通过比例 94.39% |
+| Python 3.12 本地等价 API 冒烟 | 1 | 1 | 0 | 0 | 0 | 无数据库、无 Redis、本地临时存储，Uvicorn 启动后健康业务断言通过，正常关闭 |
+
+完整套件保留 SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 两条原有弃用警告。22 个跳过项包含 15 个新增 Redis 恢复场景和 4 个既有 Redis 场景，均由真实 Redis 相关套件补齐；其余为 2 个外部 S3 集成、1 个 Supervisor E2E。Redis 相关套件跳过的是该模式不适用的嵌入式回退断言，嵌入式完整套件已验证。
+
+**所有失败与中断记录**：
+
+- 并发工作区的 `test_hub_reference_trains_reproducibly_and_predicts` 未在 30 秒内进入终态；`test_remote_bootstrap_script_start_unchanged_config_keeps_pure_operation` 与 `test_remote_bootstrap_script_restart_unchanged_config_forces_restart` 的 `_CURRENT_WORKER_ENV` 与其他会话新增配置不同。三项涉及本任务之外的未提交改动；原基准隔离快照及最终已提交代码的完整测试均通过。未修改或弱化这些测试，不能据本报告宣称整个共享工作区已验收。
+- 额外尝试将最终完整套件全部切换到 Redis 模式，因未配置独立测试 Worker，`test_train_e2e_classification` 的任务保持 queued；8 通过、1 失败后中止（退出 2），不作为有效全量验收。按项目夹具约定，以嵌入式完整套件加隔离 Redis 专项验收。
+- 一次误重复启动的隔离完整测试在 36 通过后被中断，未作为完整测试结果计入；对应容器已退出。
+
+**关键模块**：协调层/Worker 79 个适用用例全部通过，验证注册恢复、TTL、启停控制、租约失效、训练控制器、恢复后进度及多槽隔离；完整套件中的数据层、训练器、API、远程管理等所有可执行用例通过，保留训练/日志/accuracy、R²、RMSE/best.pt、固定 seed、预测一致性与预处理、新旧数据布局的既有回归覆盖。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 预期业务结果及关键副作用 | 场景 |
+|---|---|---|---|
+| 注册信息丢失后恢复 | Redis 集成，先注册完整 CPU/GPU/版本/并行能力；`test_redis_heartbeat_restores_worker_registration`，索引/详情/全部缺失 × idle/training/disabled，共 9 组 | 下一心跳恢复唯一资源项、完整能力、最新进度和活动状态，TTL 为正，接单选择保持原值 | 正常、缺失、状态边界、兼容、回归 |
+| 长断连清理后不需重启 | Redis 集成；`test_redis_heartbeat_restores_after_stale_cleanup`，删除 HB 与任务租约、超宽限清理、再次心跳 | 资源重新出现、禁用状态保留；丢失的任务租约仍不可续租，不越权复活旧任务 | 超时、依赖异常、所有权安全、回归 |
+| 空输入及观察者兼容 | Redis 集成；`test_redis_heartbeat_handles_empty_fields_and_uncached_worker`，空字段/无缓存/其他实例更新 | 空心跳有效，不带入其他槽 GPU 信息；已有 Redis 能力保留、动态进度更新 | 空值、缓存边界、多槽隔离、旧行为兼容 |
+| 注销后不恢复旧能力 | Redis 集成；`test_redis_deregister_discards_cached_capabilities`，注销、同 ID 空心跳与重新注册 | 旧 GPU 信息清除，新能力可恢复 | 生命周期、状态冲突、回归 |
+| 真实 Worker 各状态自动恢复 | Worker 集成；`test_worker_heartbeat_recovers_registration_without_restart[idle/disabled/training]`，删除注册键，执行空闲循环或真实 JobController | 不重新启动即可恢复完整能力、接单选择、正确 job/epoch；训练租约仍有效；空闲不凭空产生任务 | 正常、禁用、训练中、异常、权限状态 |
+| 修复应用到实际运行环境 | Compose 重建、容器内源码校验、连续读取 `/api/workers` 与 `/api/health` | API 健康，两个 CPU 槽在线启用且空闲，心跳递增、同批采样 started_at 不变、队列为 0 | 部署、运行时、回归 |
+
+未修改认证、任务调度策略、训练算法或数据接口，因此权限断言聚焦原有禁用选择、槽隔离和任务租约所有权；不将模拟 GPU 能力恢复称为真实 GPU 硬件测试。
+
+### 实际执行命令
+
+以下命令在项目根目录执行。临时快照根为 `/tmp/mtp-registry-validation-EtEB8o`，`committed/` 为 `git archive db1d5c6` 导出的最终源码，均已清理。每个 pytest 容器只读挂载源码，测试产物留在一次性容器内。
+
+```bash
+docker run --rm --pull=never --network container:mtp-registry-test-redis --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env MTP_TEST_REDIS=redis://127.0.0.1:6379/15 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_coordination.py tests/test_worker.py -k 'restores_worker_registration or restores_after_stale_cleanup or handles_empty_fields_and_uncached_worker or discards_cached_capabilities or recovers_registration_without_restart' -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-registry-before
+docker run --rm --pull=never --network container:mtp-registry-test-redis --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env MTP_TEST_REDIS=redis://127.0.0.1:6379/15 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_coordination.py tests/test_worker.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-registry-targeted
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-registry-full
+docker run --rm --pull=never --network none --mount type=bind,src=/tmp/mtp-registry-validation-EtEB8o,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-registry-isolated
+docker run --rm --pull=never --network container:mtp-registry-test-redis --mount type=bind,src=/tmp/mtp-registry-validation-EtEB8o,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env MTP_TEST_REDIS=redis://127.0.0.1:6379/15 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_coordination.py tests/test_worker.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-registry-isolated-redis
+docker run --rm --pull=never --network container:mtp-registry-test-redis --mount type=bind,src=/tmp/mtp-registry-validation-EtEB8o/committed,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env MTP_TEST_REDIS=redis://127.0.0.1:6379/15 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-registry-committed
+docker run --rm --pull=never --network none --mount type=bind,src=/tmp/mtp-registry-validation-EtEB8o/committed,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-registry-committed-embedded
+docker compose up --build -d
+docker compose -f docker-compose.yml -f /tmp/mtp-registry-validation-EtEB8o/compose.yml up --build -d
+docker exec mtp-worker sha256sum /app/app/coordination.py
+docker exec mtp-trainer sha256sum /app/app/coordination.py
+curl -fsS http://127.0.0.1:8000/api/health
+curl -fsS http://127.0.0.1:8000/api/workers
+git diff --check -- backend/app/coordination.py backend/tests/test_coordination.py backend/tests/test_worker.py
+```
+
+本地等价 API 验证通过 `docker run --rm -i --pull=never --network none` 挂载最终快照、工作目录为 `/workspace/backend`，以 stdin 中的 Python 3.12 验证代码启动 `python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`；环境为 `USE_DATABASE=false STORAGE_BACKEND=local REDIS_URL='' EMBEDDED_WORKERS=0`、DATA_DIR 指向 `TemporaryDirectory`。等待最多 30 秒，断言 HTTP 200 与 `{"ok":true}`，finally 中终止并等待服务退出。没有宿主机 Python 版本差异，没有保留临时验证代码或数据。
+
+### 构建与现场结果、限制及清理
+
+- **默认从零构建未通过**：执行了 `docker compose up --build -d`，但阿里云 PyPI 镜像下载 454 MB 的 torch wheel 时出现 SSL `record layer failure`，首轮只获得约 8.9 MB，重试仍缓慢；主动终止，退出 130。不能将默认配方从零下载依赖标为通过。
+- **统一 Compose 重建部署通过**：临时覆盖文件分别复用正在运行的 trainer / worker 镜像作为依赖基底（`6aa174d8a769…` / `4e4286e07171…`），两者的 requirements SHA256 均与仓库一致：`7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`。仅 COPY 修复后的 `app/coordination.py`，再统一 Compose 构建并启动全部服务，退出 0。没有修改仓库 Compose 文件。
+- **运行时核对通过**：trainer、worker 内 coordination.py SHA256 均为 `cc485f98f4424f08b4f6d4e1297a4f83c180d1c929aabe4cb733cc6fea1e5fa5`，与提交源码一致。健康 API 返回 ok；两个 CPU 槽（宿主 8 核、7934 MiB）均 active/enabled/idle，队列深度 0。连续采样确认 last_seen 递增、started_at 保持一致。并发任务随后又重建服务，末次检查新容器仍含同一修复，两个槽继续在线。
+- **恢复归因**：初期两个槽曾因另一任务重启容器而重新出现，不能把那次恢复归因于本修复；本修复的不重启恢复能力由隔离 Redis 故障注入和真实 Worker 心跳测试证明。生产 Redis 未做删键/清库试验，也未改变用户启停选择。
+- **已知限制 / 未执行**：外部 Redis 的网络或服务故障仍可能短暂影响资源显示，修复保证连接恢复后的注册自愈；Redis 整库丢失时不会重建独立的持久控制设置或任务租约。外部 S3、Supervisor E2E、真实 NVIDIA GPU、远程旧 Worker 的现场升级未执行。本报告不验收其他会话尚未提交的功能，也不宣称所有远端已更新。
+- **后续验证与重测触发**：网络恢复后执行默认 Compose 从零构建；按需补测 S3/Supervisor/GPU 与远程部署。后续改动协调层、心跳、注册/清理、Worker、任务租约、序列化或相关业务配置，应重新执行 Redis 专项、完整套件及运行环境核对。用户明确要求时重测。
+- **回滚**：需要时撤销 `db1d5c6` 并统一重建；没有数据库迁移。回滚会重新失去注册自愈能力。
+- **清理与提交**：临时快照和 Compose 覆盖目录 `/tmp/mtp-registry-validation-EtEB8o` 已删除；隔离 Redis 容器已停止并自动移除，测试/API 容器及临时镜像标签已清理。本任务三个代码/测试文件已提交，报告单独提交；不执行 git push。其他会话的工作区改动保留。
+
 ## 本次变更测试结果：远程训练节点同步与 CPU 镜像精简（2026-10-29）
 
 ### Git 基准点与范围
