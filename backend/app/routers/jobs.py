@@ -192,8 +192,15 @@ def job_detail(job_id: str) -> dict:
 
 
 @router.get("/jobs/{job_id}/logs")
-def job_logs(job_id: str, offset: int = 0) -> dict:
+def job_logs(job_id: str, offset: int = 0, response: Response = None) -> dict:
     """分页读取权威文件日志，仅在旧任务没有日志文件时回退数据库镜像。"""
+    # 训练日志是持续变化的状态，禁止浏览器和反向代理复用旧响应。
+    if response is not None:
+        response.headers.update({
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        })
     _check_id(job_id, "任务")
     if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")

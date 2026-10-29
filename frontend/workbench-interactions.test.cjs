@@ -172,12 +172,45 @@ test('暂停日志跟随保留阅读位置，回到最新恢复跟随并清除�
 });
 
 test('同游标并发日志不重复追加；切换任务后的旧日志被丢弃', async () => {
-  const f = fixture(), a = deferred(), b = deferred(); f.state.jobId = 'a'; let count = 0;
-  f.context.apiJson = () => (++count === 1 ? a.promise : b.promise);
-  const p1 = f.context.tailLogs('a'), p2 = f.context.tailLogs('a'); a.resolve({ lines: ['one'], next_offset: 1 }); b.resolve({ lines: ['one'], next_offset: 1 });
-  await Promise.all([p1, p2]); assert.equal(f.$('logBox').textContent, 'one\n');
+  const f = fixture(), a = deferred(); f.state.jobId = 'a'; let count = 0;
+  f.context.apiJson = () => (++count === 1 ? a.promise : Promise.resolve({ lines: ['duplicate'], next_offset: 1 }));
+  const p1 = f.context.tailLogs('a'), p2 = f.context.tailLogs('a'); a.resolve({ lines: ['one'], next_offset: 1 });
+  await Promise.all([p1, p2]); assert.equal(count, 1); assert.equal(f.$('logBox').textContent, 'one\n');
   const old = deferred(); f.context.apiJson = () => old.promise; const pending = f.context.tailLogs('a');
   f.state.jobId = 'b'; old.resolve({ lines: ['stale'], next_offset: 2 }); await pending; assert.doesNotMatch(f.$('logBox').textContent, /stale/);
+});
+
+test('日志轮询明确绕过缓存并避免慢请求重叠', async () => {
+  const f = fixture(), pending = deferred(); f.state.jobId = 'a';
+  let count = 0, requestOptions;
+  f.context.apiJson = (url, options) => { count++; requestOptions = options; return pending.promise; };
+  const first = f.context.tailLogs('a');
+  const second = f.context.tailLogs('a');
+  assert.equal(count, 1);
+  assert.equal(requestOptions.cache, 'no-store');
+  pending.resolve({ lines: [], next_offset: 0 });
+  await Promise.all([first, second]);
+  assert.equal(f.state.logLoading, null);
+});
+
+test('旧任务日志请求挂起时，新选择仍可继续轮询', async () => {
+  const f = fixture(), old = deferred(); f.state.jobId = 'a'; let count = 0;
+  f.context.apiJson = url => {
+    count++;
+    return url.includes('/a/') ? old.promise : Promise.resolve({ lines: ['B epoch 1'], next_offset: 1 });
+  };
+  const pending = f.context.tailLogs('a');
+  f.state.jobId = 'b'; f.state.logVersion++;
+  await f.context.tailLogs('b');
+  assert.equal(count, 2);
+  assert.equal(f.$('logBox').textContent, 'B epoch 1\n');
+  old.resolve({ lines: ['stale A'], next_offset: 1 });
+  await pending;
+  assert.doesNotMatch(f.$('logBox').textContent, /stale A/);
+});
+
+test('启动时有独立日志定时器，不依赖详情请求完成', () => {
+  assert.match(html, /setInterval\(\(\) => \{ if \(state\.jobId && state\.activeTab === "logs"\) tailLogs\(state\.jobId\); \}, 1000\)/);
 });
 
 test('预测模板的旧响应不覆盖新任务或用户正在编辑的内容', async () => {

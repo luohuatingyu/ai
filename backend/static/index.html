@@ -616,7 +616,7 @@ const state = {
   editingRemoteMachineId: null,
   trainSubmitting: false, trainError: "", trainingIssue: null,
   jobsRequest: 0, detailRequest: 0, selectionVersion: 0,
-  logVersion: 0, logUnread: 0, predictTemplateRequest: 0,
+  logVersion: 0, logUnread: 0, logLoading: null, predictTemplateRequest: 0,
   remoteCredentials: [], remoteCredentialDefaultId: null, remoteCredentialsCanConfigure: false,
 };
 
@@ -1527,7 +1527,7 @@ async function loadDetail() {
 
   j.metrics = j.metrics || [];
   if (state.activeTab === "curves") renderCharts(j);
-  if (state.activeTab === "logs") await tailLogs(j.id);
+  // 日志由独立定时器持续读取，详情请求较慢时也不能阻塞日志刷新。
   if (state.activeTab === "result") renderResult(j);
 }
 
@@ -1625,10 +1625,12 @@ function renderCharts(j) {
 /* ---------- 日志 ---------- */
 // 同一游标只追加一次；暂停跟随时记录新行数而不移动阅读位置。
 async function tailLogs(id) {
-  if (state.logsClearing) return;
   const offset = state.logOffset, version = state.logVersion;
+  const loadingKey = `${id}:${version}`;
+  if (state.logsClearing || state.logLoading === loadingKey) return;
+  state.logLoading = loadingKey;
   try {
-    const data = await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs?offset=${offset}`);
+    const data = await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs?offset=${offset}`, { cache: "no-store" });
     if (id !== state.jobId || version !== state.logVersion || offset !== state.logOffset) return;
     const box = $("logBox"), top = box.scrollTop;
     if (data.lines.length) {
@@ -1639,7 +1641,7 @@ async function tailLogs(id) {
     }
   } catch {
     if (id === state.jobId && version === state.logVersion) $("logStatus").textContent = "日志更新失败，稍后自动重试。";
-  }
+  } finally { if (state.logLoading === loadingKey) state.logLoading = null; }
 }
 
 // 以简短状态展示阅读模式和积累的新日志数量。
@@ -2024,6 +2026,7 @@ function activateDetailTab(name, focus = false) {
     if (selected && focus) button.focus();
   });
   if (state.jobId) loadDetail();
+  if (state.jobId && name === "logs") tailLogs(state.jobId);
 }
 
 document.querySelectorAll(".tabs button").forEach((button, index, tabs) => {
@@ -2077,6 +2080,8 @@ $("btnDownload").onclick = () => { if (state.jobId) location.href = `/api/jobs/$
   try { await loadDatasets(); } catch (e) { toast("加载数据集失败: " + e.message, "err"); }
   await refreshJobs();
   setInterval(refreshJobs, 1500);
+  // 日志读取独立于任务详情和曲线刷新，运行期间持续取得新增行。
+  setInterval(() => { if (state.jobId && state.activeTab === "logs") tailLogs(state.jobId); }, 1000);
 })();
 </script>
 </body>
