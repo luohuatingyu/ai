@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -295,7 +296,10 @@ def _communicate_remote_process(
     """轮询 SSH 子进程，实时转发输出并保留中断与超时语义。"""
     started_at = time.monotonic()
     last_output_at = started_at
-    pending_input = input_data
+    input_stream = process.stdin if input_data is not None else None
+    input_stop = threading.Event()
+    input_errors: List[OSError] = []
+    input_thread: threading.Thread | None = None
     seen_output = {"stdout": "", "stderr": ""}
     pending_lines = {"stdout": "", "stderr": ""}
 
@@ -334,44 +338,95 @@ def _communicate_remote_process(
             if line:
                 _emit_progress(progress_callback, progress_phase, f"{name}: {line}")
 
-    while True:
-        if _remote_operation_cancel_requested(operation_id):
-            _terminate_remote_process(process)
-            raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
-        remaining = None if timeout is None else timeout - (time.monotonic() - started_at)
-        if remaining is not None and remaining <= 0:
-            process.kill()
-            stdout, stderr = process.communicate()
-            consume_output("stdout", stdout, flush=True)
-            consume_output("stderr", stderr, flush=True)
-            raise subprocess.TimeoutExpired(
-                process.args, timeout, output=stdout, stderr=stderr
-            )
-        poll_interval = 0.25 if remaining is None else min(0.25, remaining)
+    def send_input(payload: bytes) -> None:
+        """持续发送全部输入并关闭管道；非阻塞写保证取消时线程能够及时退出。"""
         try:
-            output = process.communicate(input=pending_input, timeout=poll_interval)
-            consume_output("stdout", output[0], flush=True)
-            consume_output("stderr", output[1], flush=True)
-            return output
-        except subprocess.TimeoutExpired as exc:
-            consume_output("stdout", exc.output)
-            consume_output("stderr", exc.stderr)
-            now = time.monotonic()
-            if (
-                progress_callback is not None
-                and progress_phase == "构建目标架构镜像"
-                and now - last_output_at >= _REMOTE_BUILD_IDLE_PROGRESS_INTERVAL
-            ):
-                # 无输出时定期说明仍在等待，帮助区分网络拉取耗时和操作已失联。
-                seconds = int(_REMOTE_BUILD_IDLE_PROGRESS_INTERVAL)
-                _emit_progress(
-                    progress_callback,
-                    progress_phase,
-                    f"目标机仍在构建镜像，{seconds} 秒未收到新 Docker 输出；"
-                    "可能正在下载基础镜像或 Python 依赖。",
+            with input_stream:
+                descriptor = input_stream.fileno()
+                data = memoryview(payload)
+                offset = 0
+                while offset < len(data) and not input_stop.is_set():
+                    _, writable, _ = select.select([], [descriptor], [], 0.1)
+                    if not writable:
+                        continue
+                    try:
+                        offset += os.write(descriptor, data[offset:offset + 65536])
+                    except BlockingIOError:
+                        continue
+        except BrokenPipeError:
+            # SSH 提前失败时保留进程退出码和 stderr，与 communicate 的语义一致。
+            pass
+        except OSError as exc:
+            input_errors.append(exc)
+
+    try:
+        if input_stream is not None:
+            payload = (
+                input_data.encode(input_stream.encoding, input_stream.errors)
+                if isinstance(input_data, str) else input_data
+            )
+            os.set_blocking(input_stream.fileno(), False)
+            # communicate 在超时重试时不会继续发送未完成的 input；由独立线程
+            # 独占 stdin，主线程只收输出，避免它提前 flush/close 同一个输入流。
+            process.stdin = None
+            input_thread = threading.Thread(
+                target=send_input, args=(payload,),
+                name=f"remote-ssh-input-{process.pid}", daemon=True,
+            )
+            input_thread.start()
+
+        while True:
+            if input_errors:
+                raise RemoteWorkerError("向 SSH 进程发送输入失败") from input_errors[0]
+            if _remote_operation_cancel_requested(operation_id):
+                _terminate_remote_process(process)
+                raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
+            remaining = None if timeout is None else timeout - (time.monotonic() - started_at)
+            if remaining is not None and remaining <= 0:
+                process.kill()
+                stdout, stderr = process.communicate()
+                consume_output("stdout", stdout, flush=True)
+                consume_output("stderr", stderr, flush=True)
+                raise subprocess.TimeoutExpired(
+                    process.args, timeout, output=stdout, stderr=stderr
                 )
-                last_output_at = now
-            pending_input = None
+            poll_interval = 0.25 if remaining is None else min(0.25, remaining)
+            try:
+                output = process.communicate(timeout=poll_interval)
+                if input_thread is not None:
+                    input_stop.set()
+                    input_thread.join()
+                if input_errors:
+                    raise RemoteWorkerError("向 SSH 进程发送输入失败") from input_errors[0]
+                consume_output("stdout", output[0], flush=True)
+                consume_output("stderr", output[1], flush=True)
+                return output
+            except subprocess.TimeoutExpired as exc:
+                consume_output("stdout", exc.output)
+                consume_output("stderr", exc.stderr)
+                now = time.monotonic()
+                if (
+                    progress_callback is not None
+                    and progress_phase == "构建目标架构镜像"
+                    and now - last_output_at >= _REMOTE_BUILD_IDLE_PROGRESS_INTERVAL
+                ):
+                    # 无输出时定期说明仍在等待，帮助区分网络拉取耗时和操作已失联。
+                    seconds = int(_REMOTE_BUILD_IDLE_PROGRESS_INTERVAL)
+                    _emit_progress(
+                        progress_callback,
+                        progress_phase,
+                        f"目标机仍在构建镜像，{seconds} 秒未收到新 Docker 输出；"
+                        "可能正在下载基础镜像或 Python 依赖。",
+                    )
+                    last_output_at = now
+    except BaseException:
+        if input_thread is not None and process.poll() is None:
+            _terminate_remote_process(process)
+        raise
+    finally:
+        if input_thread is not None:
+            input_stop.set()
+            input_thread.join()
 
 
 def _run_remote_subprocess(

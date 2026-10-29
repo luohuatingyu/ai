@@ -1,6 +1,7 @@
 """远程 worker 安全、SSH 命令构造、异步操作状态和单文件脚本测试。"""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import shutil
@@ -276,28 +277,10 @@ def test_communicate_remote_process_reports_idle_target_build(monkeypatch):
     ]
 
 
-def test_run_remote_subprocess_preserves_binary_build_context(monkeypatch):
+def test_run_remote_subprocess_preserves_binary_build_context():
     """SSH 子进程以二进制模式接收 tar 上下文并返回可解码的构建输出。"""
-    command = ["ssh", "worker@compute.example.net", "docker build -"]
-    payload = b"docker-build-context-tar"
-    received = {}
-
-    class FakeProcess:
-        args = command
-        returncode = 0
-
-        def communicate(self, input=None, timeout=None):
-            received["input"] = input
-            return b"built\n", b""
-
-        def poll(self):
-            return self.returncode
-
-    def fake_popen(_command, **kwargs):
-        received["text"] = kwargs["text"]
-        return FakeProcess()
-
-    monkeypatch.setattr(remote_workers.subprocess, "Popen", fake_popen)
+    command = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"]
+    payload = b"docker-build-context-tar\x00\xff\r\n"
     result = remote_workers._run_remote_subprocess(
         command,
         input_data=payload,
@@ -306,8 +289,140 @@ def test_run_remote_subprocess_preserves_binary_build_context(monkeypatch):
         operation_id=None,
     )
 
-    assert received == {"text": False, "input": payload}
-    assert result.stdout == b"built\n"
+    assert result.returncode == 0
+    assert result.stdout == payload
+    assert result.stderr == b""
+
+
+@pytest.mark.parametrize("size", [0, 1024, 716800])
+@pytest.mark.parametrize("text_mode", [False, True])
+def test_remote_input_survives_poll_timeout(size, text_mode):
+    """慢接收端跨越首轮轮询后仍收到完整输入与 EOF，日志在传输完成前实时送达。"""
+    payload = ("部署数据\n" * size) if text_mode else (b"\x00\xff\n" * size)
+    expected_bytes = payload.encode("utf-8") if text_mode else payload
+    child = (
+        "import hashlib,sys,time; "
+        "print('ready',flush=True); print('waiting',file=sys.stderr,flush=True); "
+        "time.sleep(0.6); data=sys.stdin.buffer.read(); "
+        "print(str(len(data))+' '+hashlib.sha256(data).hexdigest(),flush=True)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", child], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text_mode,
+        encoding="utf-8" if text_mode else None,
+    )
+    input_stream = process.stdin
+    progress = []
+
+    def record_progress(_phase, message):
+        """记录日志到达时进程是否仍运行，防止只在退出后补发日志。"""
+        progress.append((message, process.poll() is None))
+
+    try:
+        stdout, stderr = remote_workers._communicate_remote_process(
+            process, None, timeout=4, input_data=payload,
+            progress_callback=record_progress,
+        )
+        if not text_mode:
+            stdout, stderr = stdout.decode(), stderr.decode()
+        digest = hashlib.sha256(expected_bytes).hexdigest()
+        assert stdout == f"ready\n{len(expected_bytes)} {digest}\n"
+        assert stderr == "waiting\n"
+        assert process.returncode == 0
+        assert input_stream.closed
+        assert progress.count(("stdout: ready", True)) == 1
+        assert progress.count(("stderr: waiting", True)) == 1
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("failure", ["timeout", "cancel", "callback"])
+def test_remote_input_cleanup_when_receiver_stalls(failure):
+    """接收端不读大输入时正确清理超时或取消，日志异常也不妨碍超时回收。"""
+    operation_id = "7" * 32
+    manager.lease.clear_remote_operation_cancel(operation_id)
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; print('ready',flush=True); time.sleep(60)"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    input_stream = process.stdin
+    previous_threads = set(threading.enumerate())
+    callback_messages = []
+
+    def on_progress(_phase, _message):
+        """在发送受阻期间触发外部取消或回调错误。"""
+        callback_messages.append(_message)
+        if failure == "cancel":
+            manager.lease.request_remote_operation_cancel(operation_id)
+        elif failure == "callback":
+            raise RuntimeError("progress unavailable")
+
+    expected_error = {
+        "timeout": subprocess.TimeoutExpired,
+        "cancel": remote_workers.RemoteWorkerCancelledError,
+        "callback": subprocess.TimeoutExpired,
+    }[failure]
+    started = time.monotonic()
+    try:
+        with pytest.raises(expected_error):
+            remote_workers._communicate_remote_process(
+                process, operation_id, timeout=1,
+                input_data=b"x" * (2 * 1024 * 1024), progress_callback=on_progress,
+            )
+        assert process.poll() is not None
+        assert "stdout: ready" in callback_messages
+        assert input_stream.closed
+        assert time.monotonic() - started < 5
+        assert not [
+            thread for thread in set(threading.enumerate()) - previous_threads
+            if thread.name.startswith("remote-ssh-input-")
+        ]
+    finally:
+        manager.lease.clear_remote_operation_cancel(operation_id)
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+def test_remote_input_early_receiver_exit_preserves_error():
+    """远端提前拒绝连接时忽略管道断开，保留退出码和实际错误供上层诊断。"""
+    result = remote_workers._run_remote_subprocess(
+        [sys.executable, "-c", "import sys; sys.stdin.close(); print('authentication refused',file=sys.stderr); sys.exit(7)"],
+        input_data=b"x" * (2 * 1024 * 1024), timeout=4,
+        environment=None, operation_id=None,
+    )
+    assert result.returncode == 7
+    assert result.stderr == b"authentication refused\n"
+
+
+def test_remote_input_write_error_is_reported_and_cleaned_up(monkeypatch):
+    """真实管道发送出现 OS 错误时给出脱敏失败，并回收等待输入的子进程。"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    input_stream = process.stdin
+    descriptor = input_stream.fileno()
+    original_write = os.write
+
+    def fail_input_write(fd, data):
+        """仅替换目标进程的输入写入，保留其它系统调用和真实进程生命周期。"""
+        if fd == descriptor:
+            raise OSError("private connection detail")
+        return original_write(fd, data)
+
+    monkeypatch.setattr(remote_workers.os, "write", fail_input_write)
+    try:
+        with pytest.raises(remote_workers.RemoteWorkerError, match="^向 SSH 进程发送输入失败$"):
+            remote_workers._communicate_remote_process(process, None, 4, input_data=b"data")
+        assert process.poll() is not None
+        assert input_stream.closed
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
 
 
 def test_worker_heartbeat_probe_reports_present_and_missing_slots(monkeypatch):
