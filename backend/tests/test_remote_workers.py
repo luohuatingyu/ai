@@ -2426,7 +2426,6 @@ def test_execute_remote_operation_keeps_missing_state_when_recovery_fails(monkey
     assert current["status"] == "not_deployed"
 
 
-
 def test_remote_subprocess_stops_when_operation_is_cancelled():
     """中断信号会终止正在等待的本机 SSH 子进程并返回已中断状态。"""
     operation_id = "a" * 32
