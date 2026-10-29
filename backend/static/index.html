@@ -1549,12 +1549,12 @@ function workerServerCard(machineId, slots, remoteServer = null) {
   const cancelRequested = Boolean(operation && operation.cancel_requested);
   const remoteStatus = remoteServer ? {
     provisioning: "正在安装并检测资源", starting: "正在启动 worker", stopping: "正在停止 worker",
-    restarting: "正在重启 worker", configuring: "正在应用 worker 配置", deploying: "正在部署 worker 代码",
+    restarting: "正在重启 worker", configuring: "正在写入 worker 配置", deploying: "正在部署 worker 代码",
     online: "worker 已启动", stopped: "worker 已停止",
     not_deployed: "尚未部署", error: "上次远程操作失败",
   }[remoteServer.status] || "SSH 服务器已登记" : "";
   const operationLabel = operation ? {
-    queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "config" ? "正在更新并应用远端配置…" : ["deploy", "update"].includes(operation.action) ? "正在部署 worker 代码…" : operation.action === "install" ? "正在首次部署并构建镜像…" : `正在远程${operation.action}…`,
+    queued: "操作排队中", running: cancelRequested ? "正在中断远程操作…" : operation.action === "config" ? "正在写入远端配置，重启后生效…" : ["deploy", "update"].includes(operation.action) ? "正在部署 worker 代码…" : operation.action === "install" ? "正在首次部署并构建镜像…" : `正在远程${operation.action}…`,
     completed: "最近操作已完成", failed: "最近操作失败", cancelled: "最近操作已中断",
   }[operation.status] || remoteStatus : remoteStatus;
   const operationPhaseLabels = {
@@ -1621,7 +1621,7 @@ async function loadRemoteServers() {
           if (["completed", "failed", "cancelled"].includes(operation.status) && !state.remoteOperationNotified.has(server.operation_id)) {
             state.remoteOperationNotified.add(server.operation_id);
             const message = operation.status === "completed"
-              ? `${server.machine_id}：远程操作完成`
+              ? operation.action === "config" ? `${server.machine_id}：配置已写入，请重启后生效` : `${server.machine_id}：远程操作完成`
               : operation.status === "cancelled"
                 ? `${server.machine_id}：远程操作已中断`
                 : `${server.machine_id}：${operation.error || "远程操作失败"}`;

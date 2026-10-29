@@ -1546,6 +1546,8 @@ def test_remote_server_card_filters_lifecycle_actions_by_presence():
     assert 'data-remote-action="restart"' in offline_controls
     assert ': `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="start"' in lifecycle_controls
     assert '配置已保存，正在写入远端；操作成功后请点击“重启”使其生效' in html
+    assert '正在写入远端配置，重启后生效…' in card_renderer
+    assert '配置已写入，请重启后生效' in html
 
 
 def test_remote_server_cards_expose_interrupt_action_for_active_operations():
