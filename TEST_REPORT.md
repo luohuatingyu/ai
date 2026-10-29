@@ -1,3 +1,89 @@
+## 本次变更测试结果：训练数据内存优化（2026-10-29）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`500826aed29f34a3bcdb8b4eb0452378046dc940`。
+- **提交信息**：Reduce training data memory overhead。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围与技术**：Python 3.12.15、Pandas、NumPy、PyTorch；仅修改 `trainer.py`、`llm_trainer.py` 及对应正式测试，无新增依赖、数据库迁移或仓库配置修改。CSV/JSONL 按 max_samples 限量读取，Hub 按上限迭代；编码后释放语料。表格特征提前使用训练原有的 float32，保留原精度中位数，及时释放 DataFrame 与全量数组，原地标准化独占矩阵。
+- **验证隔离**：内存与行为对比以 `01658e9` 为基线，candidate 为该基线加本次补丁；另对包含同期联合训练、Hub 导入及前端改动的冻结 integration 快照做完整回归。提交的两个业务文件与 integration 快照及重建后 Worker 容器的 SHA256 一致；仅提交本任务四个文件的补丁。测试后其他会话继续产生的任务管理/前端改动不属于本次验收。
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---:|---|
+| 修复前 LLM 读取回归 | 10 | 1 | 9 | 0 | 0 | 复现超过上限仍解析尾部、非法上限未前置检查、Hub 迭代超限 |
+| 修复前数据生命周期回归 | 4 | 0 | 4 | 0 | 0 | 四类训练均保留原始 DataFrame |
+| 最终训练器专项 | 60 | 60 | 0 | 0 | 0 | 3.46 秒，表格训练与 LLM 全套 |
+| 最终独立快照完整套件 | 430 | 408 | 0 | 0 | 22 | 61.98 秒，已执行用例通过率 100% |
+| 工作区联合训练兼容专项 | 108 | 106 | 0 | 0 | 2 | 107.32 秒，含分类/回归/时序、LLM 四模式、暂停续训、空尾批 |
+| 冻结工作区完整套件 | 526 | 502 | 0 | 0 | 24 | 162.24 秒，已执行用例通过率 100%，含跳过的总通过比例 95.44% |
+| 修改前后业务产物对比 | 4 | 4 | 0 | 0 | 0 | 分类/回归/聚类/时序的预处理、权重张量、逐 epoch/最终指标、非法字段预测逐项完全相等 |
+| 容器健康验证 | 3 | 3 | 0 | 0 | 0 | 隔离 Python 3.12 Uvicorn、Compose API、前端 healthz |
+
+**过程中的问题**：初次专项 51 通过、1 失败，新测试误将 Pandas 的 NaN 预期为 None；修正为检查嵌套消息原样保留和原有 NaN 表示。首次完整测试 405 通过、1 失败、22 跳过，新测试的类别列需明确指定既有支持的 object 类型，避免 Pandas 3 自动推断为 str；修正夹具后全部通过。没有修改类别识别业务或弱化已有测试。四文件自定义执行顺序曾出现 3 项 Worker 竞争失败；原始基线相同顺序也出现 2 项失败，均涉及残留嵌入 Worker 消费队列。按项目标准顺序执行完整套件后相关测试全部通过，未修改或跳过这些断言。临时产物对比脚本最初漏建任务目录，补齐脚本前置条件后四类业务对比通过。
+
+**关键模块覆盖**：训练器专项 60/60；完整套件覆盖发起训练、状态、日志、指标和模型产物，固定 seed 重复训练、暂停/续训、分类/回归/聚类/时序预测、LLM 预训练/SFT/DPO/PPO、旧扁平与新结构数据集、队列/租约和远程 Worker。联合训练专项覆盖多进程实际训练、权重加权、故障、超时和空尾批。SQLAlchemy declarative_base 与 Pandas xlrd 的两条既有弃用警告保留。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 业务预期与结果 | 场景 |
+|---|---|---|---|
+| 限量读取的内容和顺序正确 | 参数化集成 `test_llm_loading_preserves_selected_rows`：CSV/JSONL/NDJSON/JSON，1/3/8 条、上限 3、中文/引号/换行 | 返回原样的前 min(N,3) 条；12/12 通过 | 正常、边界、格式兼容 |
+| 上限外不物化、上限内不吞错误 | `test_llm_sample_limit_stops_before_unused_records`、`test_llm_loading_rejects_malformed_selected_records`、`test_llm_jsonl_blank_lines_do_not_consume_sample_limit` | 上限外损坏行不解析，上限内明确失败，空行不占额度；7/7 通过 | 边界、异常、新分支 |
+| 空值与非法输入可解释 | `test_llm_loading_rejects_invalid_sample_limit`、`test_llm_loading_rejects_empty_corpus`、`test_llm_loading_reports_missing_file_and_accepts_maximum_limit` | 非法/越界上限前置拒绝；空语料、缺失文件报错；1000000 合法上限可读取小文件；9/9 通过 | 空值、最大最小值、资源不存在 |
+| Hub 与嵌套消息保持兼容和安全 | `test_hub_loading_limits_before_materializing_rows` 使用真实 Dataset/受控迭代器；`test_llm_loading_preserves_nested_messages`；既有 Hub ID/remote-code 安全测试 | 不消费超过上限的记录；嵌套消息/空值保留；非法仓库 URL 拒绝，trust_remote_code=False；通过 | 兼容、安全、异常 |
+| 训练中释放原始数据 | `test_training_releases_source_frames_before_epochs`：四类真实训练、弱引用观察；`test_llm_training_releases_raw_records_after_encoding`：真实预训练/SFT | epoch/切分时原始数据已可回收，指标有限且 best.pt/模型包非空，重复容错预测一致；6/6 通过 | 生命周期、训练链路、回归 |
+| 特征内存减半而训练精度保持 | `test_feature_memory_reduction_preserves_precision_metadata_and_source`：缺失、正负无穷、常量、类别；另四类训练前后产物对照 | 特征值等于旧 float32 矩阵，中位数/列顺序保留，输入表不变；单元素 4 bytes，产物对照完全一致 | 预处理一致性、边界、兼容 |
+| 实际内存改善 | 独立 Linux 进程、相同依赖镜像/CPU 线程、固定语料/宽表/seed，各运行三次 | RSS 中位数如下；样本计数、val_loss、accuracy 和权重产物保持一致 | 性能、可复现、真实训练 |
+
+### 内存实测
+
+环境为同一 Linux ARM64 / Python 3.12.15 镜像，PyTorch 2.14.1+cu130 实际使用 CPU，OMP/MKL/torch 均单线程。峰值取 Linux `resource.getrusage(RUSAGE_SELF).ru_maxrss`（KiB），阶段常驻量取 `/proc/self/statm`；每个负载独立进程重复三次，表内为中位数。
+
+| 负载与测量位置 | 修改前 | 修改后 | 减少 |
+|---|---:|---:|---:|
+| LLM 读取 60000 条长文本 CSV，max_samples=100；进程峰值 | 908.48 MiB | 584.98 MiB | 35.61% |
+| 60000 行 × 160 数值特征分类训练；预处理结束、模型构建后常驻内存 | 942.88 MiB | 733.32 MiB | 22.23% |
+| 同一宽表训练完整进程峰值 | 1078.27 MiB | 1056.75 MiB | 2.00% |
+
+原始三次 KiB：LLM 基线 [930280, 931832, 928104]，修改后 [597428, 599024, 599028]；宽表峰值基线 [1108556, 1104148, 1095524]，修改后 [1081264, 1084224, 1082116]；模型构建后 RSS 基线 [969496, 965512, 956656]，修改后 [747876, 750920, 754120]。首次无阶段采样的基线也已测得 LLM 峰值 [930324, 927728, 929016]，宽表 [1107804, 1095036, 1099212]，趋势一致。
+
+宽表使用固定 seed=42、batch_size=512、hidden_size=8、1 epoch，48000/12000 训练/验证行；所有运行 val_loss=1.1020245555241903、accuracy=0.3274166666666667，best.pt 非空。宽表的最高峰主要来自 CSV 解析，所以不能把阶段内存下降 22% 宣称为全程峰值下降 22%。LLM 数字是语料读取阶段，不代表任意大模型训练的总内存降幅。
+
+### 实际执行命令与运行环境
+
+临时根目录 `/private/tmp/mtp-memory-W31n7K/` 包含 base、candidate、integration 三份隔离快照及验证脚本，完成后清理。以下命令均实际执行；测试只写容器临时目录。
+
+```bash
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-memory-W31n7K/candidate,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-memory-deps:validation python -m pytest tests/test_trainer.py tests/test_llm_trainer.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/memory-targeted-final
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-memory-W31n7K/candidate,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-memory-deps:validation python -m pytest tests/ -v --tb=short -p no:cacheprovider --basetemp=/tmp/memory-full-final
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-memory-W31n7K/integration,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-memory-deps:validation python -m pytest tests/test_parallel.py tests/test_trainer.py tests/test_llm_trainer.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/memory-integration
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-memory-W31n7K/integration,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-memory-deps:validation python -m pytest tests/ -q --tb=short -p no:cacheprovider --basetemp=/tmp/memory-integration-full
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-memory-W31n7K,dst=/workspace,readonly --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env PROFILE_MEMORY=1 mtp-memory-deps:validation python /workspace/memory_bench.py /workspace/base
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-memory-W31n7K,dst=/workspace,readonly --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env PROFILE_MEMORY=1 mtp-memory-deps:validation python /workspace/memory_bench.py /workspace/candidate
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-memory-W31n7K,dst=/workspace,readonly --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-memory-deps:validation python /workspace/equivalence.py
+docker compose up --build -d
+docker compose -f docker-compose.yml -f /private/tmp/mtp-memory-W31n7K/compose-validation.yml up --build -d
+docker compose ps
+curl --fail --silent http://127.0.0.1:8000/healthz
+git diff --cached --check
+git status --short
+```
+
+- **默认从零构建未通过**：Aliyun 的 454 MB torch 下载在约 307 秒时仅收到 6.6 MB，SHA256 校验拒绝，进入第二轮重试；停止该次构建，退出 130。未降低校验要求或改动仓库下载源。
+- **等价 Compose 重建通过**：临时覆盖以现有依赖镜像 `sha256:8eb9862184e78e09be326b0f239a4bd68ab8bae94a1b67871d38c1154be03496` 为基底，重新复制当前源码、静态资源和启动脚本；基底与仓库 requirements.txt SHA256 均为 `7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`。trainer/worker/frontend 统一重建启动成功，API /api/health 返回 200 和 {"ok":true}，前端 healthz 返回 ok。临时覆盖首次因 dockerfile:null 不符合 Compose schema 被拒绝，移除多余字段后成功；仓库 Compose 未改动。
+- **本地等价启动通过**：宿主机无 Python 3.12，使用一次性无网络 Python 3.12.15 容器，在 backend 目录以 USE_DATABASE=false、STORAGE_BACKEND=local、临时 DATA_DIR、REDIS_URL 为空执行 `python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000`。首次健康请求早于启动完成而连接拒绝，启动完成后业务断言通过；没有使用旧 Python 或语法检查替代验证。容器已停止并删除。
+- **部署源码核对**：Worker 内 trainer.py SHA256=`7e2fe99c94d18bb45b1ebee34b03752ce68e972d0622ac57577686c8241bb6c3`，llm_trainer.py SHA256=`80554d6b3cdc69e598cd96a891057a0dc2cefbb638557c9839f389f8cc9ecd89`，均与本次提交和兼容快照相同。未执行真实远程服务器更新。
+
+### 限制、后续验证与清理
+
+- 24 个环境跳过项为 19 个真实 Redis、2 个 S3、1 个 Supervisor E2E、2 个真实 GPU/NCCL 场景；本次未配置对应环境补跑。未验证 GPU 显存下降、x86_64 或其他依赖版本，不能宣称所有服务器的内存降幅相同。
+- CSV/JSONL 只对选中记录进行类型推断和解析，日志明确说明采样边界；上限外损坏记录不会导致本次样本训练失败。普通 JSON 仍须解析整体结构，仅避免把未选中的行物化为字典；Hub 数据构建/下载策略未改为 streaming，只限制 Python 记录物化。单条超长文本、全量表格 CSV 解析和模型/优化器本体的峰值仍然存在。
+- 继续优化时应优先测量实际远程任务的数据解析峰值；流式全量表格训练、模型量化、混合精度、并发槽数量不在本次实现范围。修改读取规则、dtype、标准化、训练/预测、联合训练或数据布局后需重跑对应专项、完整套件与固定内存负载；稳定网络下补验默认 Compose 从零构建。
+- 回滚可撤销 `500826a` 并重新构建平台/Worker；无数据迁移。临时快照、脚本和补丁位于上述临时目录，交付前清除；一次性测试容器及数据自动删除，临时依赖镜像标签删除，运行服务保留。本任务代码和报告分开提交，未执行 git push，其他会话的未提交修改保留。
+
+
 ## 本次变更测试结果：异构多节点联合训练（2026-10-29）
 
 ### Git 基准点与实现范围
