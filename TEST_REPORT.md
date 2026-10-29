@@ -3266,7 +3266,7 @@ git diff --check
 | `pytest tests/ -q` | **574 passed，24 skipped，0 failed**；两条既有 SQLAlchemy/Pandas 弃用警告 |
 | `docker compose up --build -d` | trainer、worker、frontend 三个镜像构建并启动成功；SeaweedFS 保持 healthy |
 | 运行服务核对 | `/api/health` 返回 `{"ok":true}`；worker 心跳显示两个本机槽地址为 `worker`、在线且启用，未配置地址的远端槽仍为空 |
-| Compose 实际两槽训练 | 1 个分类任务完成，Gloo、批大小 2+1、1 epoch，最终 accuracy 0.6167；训练日志和指标已读取，临时任务随后删除并确认查询返回 404 |
+| Compose 实际两槽训练 | 1 个分类任务完成，Gloo、批大小 2+1、1 epoch，最终 accuracy 0.6167；训练日志和指标已读取。清理时任务 API 已返回 404，随后核对对象存储任务前缀为空 |
 
 首次将 worker、联合训练和远程 worker 套件合并为一次长运行时观察到两个失败标记；该命令的 `--rm` 容器退出后没有保留完整失败详情。三个套件分开重跑均通过，随后 Python 完整套件也通过；未删除或放宽任何测试。
 
@@ -3285,7 +3285,7 @@ curl --fail --silent http://127.0.0.1:8000/api/workers
 git diff --check
 ```
 
-测试容器使用 Python 3.12。临时任务使用现有示例 CSV，任务记录与产物已通过 API 删除；调试响应文件和 pytest 临时目录均位于 `/tmp`，交付前清理。
+测试容器使用 Python 3.12。临时任务使用现有示例 CSV；任务在清理请求时已不在任务 API 中，对象存储前缀检查也为空。调试响应文件和 pytest 临时目录均位于 `/tmp`，交付前清理。
 
 ### 已知限制与回滚
 
