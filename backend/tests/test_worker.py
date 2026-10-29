@@ -80,6 +80,25 @@ def test_worker_completes_job(store, make_dataset, make_job, q, ls, spawn_worker
     w.stop()
 
 
+def test_running_job_publishes_epoch_log_before_completion(
+    store, make_dataset, make_job, q, ls, spawn_worker
+):
+    """真实训练仍在运行时，共享状态平面应已能读取 epoch 日志。"""
+    ds = make_dataset(n=1500)
+    job = make_job(ds, epochs=300)
+    q.push(job)
+    w = spawn_worker("live-log-worker")
+
+    def has_live_epoch_log():
+        return (
+            job_status(store, job) == jobstore.RUNNING
+            and "[epoch 1/300]" in jobstore.read_job_log(store, job)
+        )
+
+    assert wait_until(has_live_epoch_log, timeout=30), "训练中应先发布 epoch 日志再完成任务"
+    w.stop()
+
+
 def test_managed_worker_waits_for_manual_selection(
     store, make_dataset, make_job, q, ls, spawn_worker
 ):
