@@ -192,7 +192,8 @@ def _pick_device(log_fn: LogFn) -> torch.device:
 
 def _prepare_features(df: pd.DataFrame, target: str | None) -> tuple[pd.DataFrame, dict]:
     """数值列中位数填充；类别列众数填充并 one-hot 展开；返回特征表与元信息。"""
-    X = df.drop(columns=[target]).copy() if target else df.copy()
+    # 每列清洗都会生成新列；浅拷贝即可隔离列赋值，避免先复制整张原始表。
+    X = df.drop(columns=[target]) if target else df.copy(deep=False)
     cat_cols = [c for c in X.columns if str(X[c].dtype) in ("object", "category", "bool")]
     num_cols = [c for c in X.columns if c not in cat_cols]
 
@@ -202,7 +203,8 @@ def _prepare_features(df: pd.DataFrame, target: str | None) -> tuple[pd.DataFram
         col = col.replace([np.inf, -np.inf], np.nan)
         median = col.median()
         num_medians[c] = 0.0 if pd.isna(median) else float(median)
-        X[c] = col.fillna(num_medians[c]).astype(np.float64)
+        # 中位数仍以原始精度计算，填充后直接使用训练矩阵原有的 float32 精度。
+        X[c] = col.fillna(num_medians[c]).astype(np.float32)
 
     cat_modes: dict[str, str] = {}
     for c in cat_cols:
@@ -212,7 +214,7 @@ def _prepare_features(df: pd.DataFrame, target: str | None) -> tuple[pd.DataFram
 
     if cat_cols:
         dummies = pd.get_dummies(
-            X[cat_cols], columns=cat_cols, prefix=cat_cols, prefix_sep="=", dtype=float
+            X[cat_cols], columns=cat_cols, prefix=cat_cols, prefix_sep="=", dtype=np.float32
         )
         X = pd.concat([X[num_cols], dummies], axis=1)
 
@@ -534,7 +536,11 @@ def _run_kmeans_training(
     if feature_frame.empty or feature_frame.shape[1] == 0:
         raise ValueError("数据集没有可用于聚类的特征列")
 
-    raw = feature_frame.to_numpy(dtype=np.float32)
+    feature_names = [str(column) for column in feature_frame.columns]
+    # Pandas Copy-on-Write 可能返回只读视图；聚类原地标准化需要独立可写矩阵。
+    raw = feature_frame.to_numpy(dtype=np.float32, copy=True)
+    # 后续只使用特征矩阵与元信息，避免整个训练期间同时保留两个 DataFrame。
+    del df, feature_frame
     unique_rows = np.unique(raw, axis=0).shape[0]
     if clusters >= len(raw):
         raise ValueError(f"聚类数必须小于样本数（{len(raw)}）")
@@ -546,11 +552,14 @@ def _run_kmeans_training(
     mean = raw.mean(axis=0).astype(np.float32)
     std = raw.std(axis=0).astype(np.float32)
     std[std < 1e-8] = 1.0
-    values = ((raw - mean) / std).astype(np.float32)
+    # raw 是本次预处理专用矩阵，不再用于原始值计算，可复用其存储完成标准化。
+    np.subtract(raw, mean, out=raw)
+    np.divide(raw, std, out=raw)
+    values = raw
     n_features = values.shape[1]
     arch = {"model_type": "kmeans", "in_dim": n_features, "n_clusters": clusters}
     preprocessor = {
-        "feature_names": [str(column) for column in feature_frame.columns],
+        "feature_names": feature_names,
         "num_cols": feature_meta["num_cols"],
         "cat_cols": feature_meta["cat_cols"],
         "num_medians": feature_meta["num_medians"],
@@ -866,6 +875,7 @@ def run_training(
         )
         classes = None
         feat_meta = {"num_cols": [], "cat_cols": [], "num_medians": {}, "cat_modes": {}}
+        feature_names = [f"lag_{sequence_meta['lookback'] - index}" for index in range(sequence_meta["lookback"])]
     else:
         if not target or target not in df.columns:
             raise ValueError(f"目标列 '{target}' 不在数据集中")
@@ -881,6 +891,10 @@ def run_training(
         except ValueError as exc:
             raise ValueError("回归任务要求目标列全部为数值") from exc
         X_all = X_df.to_numpy(dtype=np.float32)
+        feature_names = [str(c) for c in X_df.columns]
+        del X_df
+    # 元信息与数组已独立保存，释放原始表，降低切分和标准化阶段的峰值内存。
+    del df
 
     n_features = X_all.shape[1]
     db_log_fn(
@@ -914,12 +928,17 @@ def run_training(
             X_all, y_all, test_size=test_split, random_state=seed, stratify=stratify
         )
     db_log_fn(f"划分: 训练 {X_train.shape[0]} 条 / 验证 {X_val.shape[0]} 条")
+    # 随机切分生成独立数组；时间序列为互不重叠的行切片，底层存储由切片继续持有。
+    del X_all, y_all, stratify
 
     mean = np.asarray(X_train.mean(axis=0), dtype=np.float32)
     std = np.asarray(X_train.std(axis=0), dtype=np.float32)
     std[std < 1e-8] = 1.0
-    X_train = (X_train - mean) / std
-    X_val = (X_val - mean) / std
+    # 只修改本任务独占且训练/验证互不重叠的数组，保持运算顺序和 float32 舍入。
+    np.subtract(X_train, mean, out=X_train)
+    np.divide(X_train, std, out=X_train)
+    np.subtract(X_val, mean, out=X_val)
+    np.divide(X_val, std, out=X_val)
 
     # 回归目标标准化（避免大数值目标导致 loss 梯度过小、训练不动）
     y_scale: tuple[float, float] | None = None
@@ -930,13 +949,10 @@ def run_training(
             y_std = 1.0
         y_scale = (y_mean, y_std)
         log_fn(f"回归目标标准化: mean={y_mean:.2f}, std={y_std:.2f}（评估与预测时反归一化）")
-        y_train = ((y_train - y_mean) / y_std).astype(np.float32)
-        y_val = ((y_val - y_mean) / y_std).astype(np.float32)
-
-    feature_names = (
-        [f"lag_{sequence_meta['lookback'] - index}" for index in range(sequence_meta["lookback"])]
-        if sequence_meta else [str(c) for c in X_df.columns]
-    )
+        np.subtract(y_train, y_mean, out=y_train)
+        np.divide(y_train, y_std, out=y_train)
+        np.subtract(y_val, y_mean, out=y_val)
+        np.divide(y_val, y_std, out=y_val)
     preprocessor = {
         "feature_names": feature_names,
         "num_cols": feat_meta["num_cols"],

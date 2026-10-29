@@ -57,6 +57,74 @@ def test_regression_run_produces_r2_rmse(store, make_dataset, tmp_path):
     assert "val_r2" in summary["final"] and "val_rmse" in summary["final"]
 
 
+@pytest.mark.parametrize("task,kind", [
+    ("classification", "classification"), ("regression", "regression"),
+    ("clustering", "clustering"), ("time_series_forecasting", "time_series"),
+])
+def test_training_releases_source_frames_before_epochs(store, make_dataset, tmp_path, monkeypatch, task, kind):
+    """真实训练期间不保留已转换的数据表，同时验证指标、产物和稳定预测。"""
+    import weakref
+
+    ds = make_dataset(kind=kind, n=100)
+    source_frames = []
+    original_features = trainer._prepare_features
+    original_windows = trainer._prepare_time_series_windows
+
+    def features(frame, target):
+        """观察真实预处理的输入与结果，核心转换完全按生产逻辑执行。"""
+        result = original_features(frame, target)
+        source_frames.extend([weakref.ref(frame), weakref.ref(result[0])])
+        return result
+
+    def windows(frame, target, time_column, lookback, horizon):
+        """记录时间序列输入表的生命周期，不改变窗口与标签。"""
+        source_frames.append(weakref.ref(frame))
+        return original_windows(frame, target, time_column, lookback, horizon)
+
+    checked_epochs = []
+
+    def on_epoch(record):
+        """在实际 epoch 回调中确认原始表已释放。"""
+        assert source_frames and all(reference() is None for reference in source_frames)
+        checked_epochs.append(record["epoch"])
+
+    monkeypatch.setattr(trainer, "_prepare_features", features)
+    monkeypatch.setattr(trainer, "_prepare_time_series_windows", windows)
+    kwargs = {"time_column": "timestamp", "lookback": 8, "forecast_horizon": 2} if task == "time_series_forecasting" else {}
+    summary = run_training(
+        dataset_path=config.DATASETS_DIR / f"{ds}.csv", target="" if task == "clustering" else "target",
+        task=task, params={"epochs": 2, "batch_size": 16, "lr": 0.01, "hidden_size": 8,
+                          "hidden_layers": 1, "test_split": 0.2, "seed": 42, "n_clusters": 3, **kwargs},
+        cancel_event=threading.Event(), log_fn=lambda _: None, job_dir=tmp_path, on_epoch_end=on_epoch)
+    assert checked_epochs
+    assert summary["task"] == task and (tmp_path / "best.pt").stat().st_size > 0
+    inputs = {"history": list(range(8))} if task == "time_series_forecasting" else {"row": {"f1": "invalid"}}
+    assert trainer.predict_row(tmp_path / "best.pt", **inputs) == trainer.predict_row(tmp_path / "best.pt", **inputs)
+
+
+def test_feature_memory_reduction_preserves_precision_metadata_and_source():
+    """较小的特征矩阵保持原中位数精度、编码顺序与 float32 数值，不修改输入。"""
+    source = pd.DataFrame({
+        "number": [1.123456789, np.nan, np.inf, -np.inf, 9.987654321],
+        "category": pd.Series(["b", "a", None, "b", "a"], dtype="object"), "constant": [2.0] * 5,
+        "target": [0, 1, 0, 1, 0],
+    })
+    original = source.copy(deep=True)
+    features, metadata = trainer._prepare_features(source, "target")
+    pd.testing.assert_frame_equal(source, original)
+    median = (1.123456789 + 9.987654321) / 2
+    assert metadata["num_medians"]["number"] == median
+    assert metadata["cat_modes"]["category"] == "a"
+    expected = pd.DataFrame({"number": [1.123456789, median, median, median, 9.987654321], "constant": [2.] * 5})
+    categories = pd.get_dummies(pd.DataFrame({"category": ["b", "a", "__缺失__", "b", "a"]}),
+                                columns=["category"], prefix=["category"], prefix_sep="=", dtype=float)
+    expected = pd.concat([expected, categories], axis=1)
+    assert list(features.columns) == list(expected.columns)
+    np.testing.assert_array_equal(features.to_numpy(), expected.to_numpy(dtype=np.float32))
+    assert all(dtype == np.dtype("float32") for dtype in features.dtypes)
+    assert features.memory_usage(index=False).sum() == len(source) * len(features.columns) * 4
+
+
 def test_kmeans_run_produces_clusters_checkpoint_and_stable_predictions(
     store, make_dataset, tmp_path
 ):

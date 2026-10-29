@@ -9,6 +9,8 @@ import shutil
 import tempfile
 import time
 import zipfile
+from io import StringIO
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +31,13 @@ def _safe_hub_id(value: str, label: str) -> str:
 
 def _load_rows(dataset_path: Path | None, params: dict, task: str, log_fn: LogFn) -> list[dict]:
     """从本地表格/JSONL 或 Hugging Face Hub 读取训练样本。"""
+    # 与 API 的样本范围一致，在任何磁盘/网络读取之前拒绝无界或非法请求。
+    try:
+        limit = int(params.get("max_samples", 5000))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("max_samples 必须为 1 到 1000000 的整数") from exc
+    if not 1 <= limit <= 1_000_000:
+        raise ValueError("max_samples 必须为 1 到 1000000 的整数")
     source = str(params.get("dataset_source", "local"))
     if source == "hub":
         from datasets import load_dataset
@@ -36,7 +45,6 @@ def _load_rows(dataset_path: Path | None, params: dict, task: str, log_fn: LogFn
         dataset_id = _safe_hub_id(str(params.get("dataset_id", "")), "数据集 ID")
         dataset_config = params.get("dataset_config") or None
         split = str(params.get("dataset_split", "train"))
-        limit = int(params.get("max_samples", 5000))
         if "[" not in split:
             split = f"{split}[:{limit}]"
         cache_dir = str(_cache_dir())
@@ -48,20 +56,25 @@ def _load_rows(dataset_path: Path | None, params: dict, task: str, log_fn: LogFn
             cache_dir=cache_dir,
             trust_remote_code=False,
         )
-        rows = data.to_list() if hasattr(data, "to_list") else [dict(row) for row in data]
+        # Dataset 与 IterableDataset 都按样本迭代，显式切片 split 也不得绕过上限。
+        rows = [dict(row) for row in islice(data, limit)]
     else:
         if dataset_path is None or not Path(dataset_path).is_file():
             raise ValueError("本地 LLM 训练数据集文件不存在")
         path = Path(dataset_path)
         log_fn(f"读取本地 LLM 语料 {path.name}")
         if path.suffix.lower() in {".jsonl", ".ndjson"}:
-            rows = pd.read_json(path, lines=True).to_dict(orient="records")
+            # 只解析所选的非空记录，空行不消耗样本额度；保留 Pandas 的嵌套字段处理。
+            with path.open("r", encoding="utf-8") as stream:
+                selected = "".join(islice((line for line in stream if line.strip()), limit))
+            frame = pd.read_json(StringIO(selected), lines=True) if selected else pd.DataFrame()
         elif path.suffix.lower() == ".json":
-            rows = pd.read_json(path).to_dict(orient="records")
+            # 普通 JSON 保持原有布局兼容；截取后再转字典，避免物化未选中的记录。
+            frame = pd.read_json(path).iloc[:limit]
         else:
-            rows = pd.read_csv(path).to_dict(orient="records")
-    limit = int(params.get("max_samples", 5000))
-    rows = rows[:limit]
+            frame = pd.read_csv(path, nrows=limit)
+        rows = frame.to_dict(orient="records")
+        log_fn(f"按 max_samples={limit} 读取样本；CSV/JSONL 类型推断仅基于选中的记录")
     if not rows:
         raise ValueError("LLM 训练数据集为空")
     log_fn(f"读取到 {len(rows)} 条样本")
@@ -559,11 +572,15 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
         texts = [_text_from_row(row, params).strip() for row in rows]
         tokenizer = _make_pretraining_tokenizer(texts, int(params.get("vocab_size", 8000)))
         examples, tokenizer = _prepare_examples(rows, task, params, tokenizer, log_fn)
+        # 编码结果已包含训练所需内容，构建模型前释放语料和 tokenizer 训练文本。
+        del rows, texts
         model = _new_model(tokenizer, params)
         reference = reward_model = reward_tokenizer = value_head = None
     else:
         model, tokenizer = _load_base_components(str(params.get("base_model", "")), params)
         examples, tokenizer = _prepare_examples(rows, task, params, tokenizer, log_fn)
+        # 后续偏好/奖励模型只依赖编码样本，无需继续保留原始语料字典。
+        del rows
         reference = reward_model = reward_tokenizer = value_head = None
         if task in {"llm_dpo", "llm_ppo"}:
             reference, _ = _load_base_components(str(params.get("base_model", "")), params)

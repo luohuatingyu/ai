@@ -146,6 +146,149 @@ def test_pretraining_from_scratch_saves_metrics_bundle_and_generates(tmp_path):
     )
 
 
+@pytest.mark.parametrize("suffix", [".csv", ".jsonl", ".ndjson", ".json"])
+@pytest.mark.parametrize("count", [1, 3, 8])
+def test_llm_loading_preserves_selected_rows(tmp_path, suffix, count):
+    """限量读取保留样本内容与顺序，兼容不足、等于和超过上限的四种格式。"""
+    rows = [{"text": f"样本 {index}, 包含引号\"和换行\n下一行", "index": index} for index in range(count)]
+    path = tmp_path / f"corpus{suffix}"
+    if suffix == ".csv":
+        pd.DataFrame(rows).to_csv(path, index=False)
+    elif suffix == ".json":
+        path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    else:
+        path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+    messages = []
+    selected = llm_trainer._load_rows(path, {"max_samples": 3}, "llm_pretraining", messages.append)
+    assert selected == rows[:3]
+    assert f"读取到 {min(count, 3)} 条样本" in messages
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".jsonl", ".ndjson"])
+def test_llm_sample_limit_stops_before_unused_records(tmp_path, suffix):
+    """超过上限的损坏尾部不应被解析，采样边界内的真实内容必须保持一致。"""
+    path = tmp_path / f"corpus{suffix}"
+    if suffix == ".csv":
+        path.write_text('text,index\nfirst sample,0\nsecond sample,1\nunused,bad,extra\n', encoding="utf-8")
+    else:
+        path.write_text('{"text":"first sample","index":0}\n{"text":"second sample","index":1}\n{broken\n', encoding="utf-8")
+    assert llm_trainer._load_rows(path, {"max_samples": 2}, "llm_sft", lambda _: None) == [
+        {"text": "first sample", "index": 0}, {"text": "second sample", "index": 1}]
+
+
+@pytest.mark.parametrize("limit", [0, -1, 1_000_001, "invalid", None])
+def test_llm_loading_rejects_invalid_sample_limit(tmp_path, limit):
+    """非法样本上限在读文件和访问 Hub 之前报错，避免意外全量读取。"""
+    with pytest.raises(ValueError, match="max_samples"):
+        llm_trainer._load_rows(tmp_path / "missing.csv", {"max_samples": limit}, "llm_sft", lambda _: None)
+
+
+@pytest.mark.parametrize("suffix,content", [
+    (".csv", "text,index\n"), (".jsonl", ""), (".json", "[]"),
+])
+def test_llm_loading_rejects_empty_corpus(tmp_path, suffix, content):
+    """空语料保留明确错误，不能启动无样本训练。"""
+    path = tmp_path / f"empty{suffix}"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="为空"):
+        llm_trainer._load_rows(path, {"max_samples": 3}, "llm_sft", lambda _: None)
+
+
+def test_llm_loading_preserves_nested_messages(tmp_path):
+    """JSONL 对话、缺失字段与空值保持原样，不把嵌套结构转换成字符串。"""
+    rows = [{"messages": [{"role": "user", "content": "你好"}], "text": None},
+            {"messages": [], "text": "回答"}]
+    path = tmp_path / "messages.jsonl"
+    path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+    selected = llm_trainer._load_rows(path, {"max_samples": 2}, "llm_sft", lambda _: None)
+    assert [row["messages"] for row in selected] == [row["messages"] for row in rows]
+    assert pd.isna(selected[0]["text"]) and selected[1]["text"] == "回答"
+
+
+def test_llm_jsonl_blank_lines_do_not_consume_sample_limit(tmp_path):
+    """JSONL 的空白行不计入样本上限，超过上限的非法记录不会被读取。"""
+    path = tmp_path / "blank.jsonl"
+    path.write_text('\n {"text":"first"}\n\n {"text":"second"}\n {invalid}\n', encoding="utf-8")
+    assert llm_trainer._load_rows(path, {"max_samples": 2}, "llm_sft", lambda _: None) == [
+        {"text": "first"}, {"text": "second"}]
+
+
+@pytest.mark.parametrize("suffix,content", [
+    (".csv", 'text,index\nfirst,0\nsecond,1,extra\n'),
+    (".jsonl", '{"text":"first"}\n{broken}\n'),
+    (".json", '[{"text":"first"},broken]'),
+])
+def test_llm_loading_rejects_malformed_selected_records(tmp_path, suffix, content):
+    """采样范围内的损坏记录必须报错，不能为了省内存静默跳过。"""
+    path = tmp_path / f"broken{suffix}"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError):
+        llm_trainer._load_rows(path, {"max_samples": 3}, "llm_sft", lambda _: None)
+
+
+def test_llm_loading_reports_missing_file_and_accepts_maximum_limit(tmp_path):
+    """合法最大上限不要求文件达到该行数，缺失文件保留明确错误。"""
+    path = tmp_path / "tiny.csv"
+    path.write_text("text\nsmall corpus\n", encoding="utf-8")
+    assert llm_trainer._load_rows(path, {"max_samples": 1_000_000}, "llm_sft", lambda _: None) == [{"text": "small corpus"}]
+    with pytest.raises(ValueError, match="文件不存在"):
+        llm_trainer._load_rows(tmp_path / "missing.csv", {"max_samples": 2}, "llm_sft", lambda _: None)
+
+
+@pytest.mark.parametrize("task", ["llm_pretraining", "llm_sft"])
+def test_llm_training_releases_raw_records_after_encoding(tmp_path, monkeypatch, task):
+    """实际预训练/微调在切分编码样本前释放原始记录，并完成模型与指标保存。"""
+    import weakref
+
+    class RawRows(list):
+        """支持弱引用的记录列表，用于观察语料生命周期。"""
+
+    references = []
+    original_load = llm_trainer._load_rows
+    original_split = llm_trainer._split_examples
+
+    def load(*args, **kwargs):
+        """真实解析输入，仅增加生命周期观察。"""
+        rows = RawRows(original_load(*args, **kwargs))
+        references.append(weakref.ref(rows))
+        return rows
+
+    def split(examples, seed):
+        """核心编码和切分保留原样，断言原始语料已可回收。"""
+        assert references and all(reference() is None for reference in references)
+        return original_split(examples, seed)
+
+    monkeypatch.setattr(llm_trainer, "_load_rows", load)
+    monkeypatch.setattr(llm_trainer, "_split_examples", split)
+    model_path = _tiny_base_model(tmp_path / "base")
+    _use_local_test_models(monkeypatch)
+    params = {**_params(model_path), "vocab_size": 48}
+    if task == "llm_pretraining":
+        params["base_model"] = None
+    path = _write_rows(tmp_path / "text.csv", [{"text": f"training corpus sentence {i}"} for i in range(10)])
+    result = _run(task, path, params, tmp_path / "job")
+    assert np.isfinite(result["final"]["val_loss"])
+    assert (tmp_path / "job" / "best_model.zip").stat().st_size > 0
+
+
+@pytest.mark.parametrize("iterable", [False, True])
+def test_hub_loading_limits_before_materializing_rows(monkeypatch, iterable):
+    """真实 Dataset 和迭代式返回值都只将选中样本转为 Python 记录。"""
+    import datasets
+
+    rows = [{"text": f"sample {index}"} for index in range(5)]
+    source = datasets.Dataset.from_list(rows)
+    if iterable:
+        def records():
+            """上限之后不可消费，用于捕获全量物化回归。"""
+            yield from rows[:2]
+            raise AssertionError("读取了超过 max_samples 的 Hub 记录")
+        source = records()
+    monkeypatch.setattr(datasets, "load_dataset", lambda *args, **kwargs: source)
+    assert llm_trainer._load_rows(None, {"dataset_source": "hub", "dataset_id": "org/corpus",
+        "dataset_split": "train[:5]", "max_samples": 2}, "llm_sft", lambda _: None) == rows[:2]
+
+
 def test_full_parameter_sft_changes_weights_and_preserves_generation(tmp_path, monkeypatch):
     """全参数 SFT 更新模型权重并能重载模型包生成文本。"""
     from transformers import AutoModelForCausalLM
@@ -230,8 +373,9 @@ def test_hub_load_is_restricted_to_valid_ids_and_disables_remote_code(monkeypatc
     class FakeDataset:
         """模拟 Hugging Face Dataset 返回本地化记录。"""
 
-        def to_list(self):
-            return [{"text": "safe sample"}]
+        def __iter__(self):
+            """按真实 Dataset 接口提供记录，保留安全参数断言。"""
+            return iter([{"text": "safe sample"}])
 
     def fake_load_dataset(*args, **kwargs):
         captured["args"] = args
