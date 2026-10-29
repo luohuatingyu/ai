@@ -3233,3 +3233,63 @@ git diff --check
 - 真实 Redis/S3/GPU/NCCL 场景仍需在对应环境补验；本次完整套件的 24 个跳过项沿用仓库既有条件。
 - 日志轮询仅在“日志”标签页激活时运行；切换到日志页会立即拉取当前 offset，避免无意义后台请求。
 - 回滚可撤销 `311f6ff`、`a89f81f`、`6331ec3` 三个本次代码/测试提交并重新执行 Compose 构建；无数据迁移。
+
+## 本次变更测试结果：联合训练节点不可选修复（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`b283356`（Enable local nodes for joint training）。
+- **测试日期 / 分支**：2026-10-30 / `emdash/hot-boxes-clean-y9u6p`。
+- **变更范围**：两份 Compose 的本机 worker 默认上报 `worker` 服务名；训练页细分节点不可选原因，并为缺少互联地址的节点提供服务器管理入口；README 说明本机槽与跨机器槽的网络要求。无依赖、数据库或数据格式改动。
+- **根因**：`parallel.host` 为空会导致训练页禁用复选框，后端也会拒绝缺少 Gloo rendezvous 地址的成员。本机 Compose worker 原先没有设置 `WORKER_DISTRIBUTED_HOST`。
+- **修复行为**：同一 Compose 网络内的本机 worker 槽使用服务 DNS 名 `worker`，可选择多个本机槽联合训练。远端槽没有可达地址时仍禁选，页面给出原因与配置入口，不猜测跨机器地址。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 可执行用例与前置条件 | 预期结果与场景 |
+|---|---|---|
+| 本机 Compose worker 上报联合训练地址并允许选择两个槽 | pytest `test_detect_capabilities_reports_configured_parallel_host`、`test_compose_separates_local_worker_image_from_remote_default`；Node 联合训练节点选择用例 | 两个本机槽地址为 `worker`、Gloo 可用，前端允许提交并包含两个槽与各自批大小；正常、配置、兼容 |
+| 未配置地址的远端槽不能进入训练，且有明确修复入口 | Node 联合训练节点选择用例；远端地址为空 | 远端复选框禁用并显示“缺少可达的联合训练互联地址”，提供服务器管理链接；边界、安全、回归 |
+| 节点离线、停用、通信不兼容及非法批大小继续被拒绝 | `frontend/parallel-training.test.cjs` 节点状态用例；后端联合训练能力校验用例 | 无效节点不能提交，服务端保留协议/能力校验；异常、兼容 |
+| 两个实际 Compose worker 槽可完成同一模型训练 | 运行中的 Compose Redis/S3/worker 与示例分类数据；POST `/api/train` 选择 `cpu0`、`cpu1`，随后轮询任务、读日志和指标 | Gloo 双槽训练完成，最终准确率 0.6167，日志记录两个槽和全局批大小 3；训练链路、部署 |
+| 既有训练、产物和接口行为回归 | Python 3.12 完整 `backend/tests/`；Node 前端完整套件 | 训练、状态、日志、指标/模型产物、数据格式、设备选择及管理 API 保持通过；回归 |
+
+### 测试执行结果
+
+| 阶段与实际命令 | 结果 |
+|---|---|
+| `node --test frontend/parallel-training.test.cjs` | **10 passed，0 failed** |
+| `node --test frontend/*.test.cjs` | **104 passed，0 failed** |
+| `pytest tests/test_worker.py -q` | **48 passed，4 skipped，0 failed**；4 项依赖真实 Redis |
+| `pytest tests/test_parallel.py -q` | **55 passed，2 skipped，0 failed**；2 项依赖真实 GPU/NCCL |
+| `pytest tests/test_remote_workers.py -q` | **157 passed，0 failed** |
+| `pytest tests/ -q` | **574 passed，24 skipped，0 failed**；两条既有 SQLAlchemy/Pandas 弃用警告 |
+| `docker compose up --build -d` | trainer、worker、frontend 三个镜像构建并启动成功；SeaweedFS 保持 healthy |
+| 运行服务核对 | `/api/health` 返回 `{"ok":true}`；worker 心跳显示两个本机槽地址为 `worker`、在线且启用，未配置地址的远端槽仍为空 |
+| Compose 实际两槽训练 | 1 个分类任务完成，Gloo、批大小 2+1、1 epoch，最终 accuracy 0.6167；训练日志和指标已读取，临时任务随后删除并确认查询返回 404 |
+
+首次将 worker、联合训练和远程 worker 套件合并为一次长运行时观察到两个失败标记；该命令的 `--rm` 容器退出后没有保留完整失败详情。三个套件分开重跑均通过，随后 Python 完整套件也通过；未删除或放宽任何测试。
+
+### 实际命令与环境
+
+```bash
+node --test frontend/parallel-training.test.cjs
+node --test frontend/*.test.cjs
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer python -m pytest tests/test_worker.py -q -p no:cacheprovider --basetemp=/tmp/joint-worker --tb=short -rs
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer python -m pytest tests/test_parallel.py -q -p no:cacheprovider --basetemp=/tmp/joint-parallel --tb=short -rs
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer python -m pytest tests/test_remote_workers.py -q -p no:cacheprovider --basetemp=/tmp/joint-remote --tb=short -rs
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/joint-node-selection-full --tb=short -rs
+docker compose up --build -d
+curl --fail --silent http://127.0.0.1:8000/api/health
+curl --fail --silent http://127.0.0.1:8000/api/workers
+git diff --check
+```
+
+测试容器使用 Python 3.12。临时任务使用现有示例 CSV，任务记录与产物已通过 API 删除；调试响应文件和 pytest 临时目录均位于 `/tmp`，交付前清理。
+
+### 已知限制与回滚
+
+- `worker` 只在本 Compose 网络可解析，不能用作跨机器地址。远端受管 worker 需在服务器管理页填写可被所有成员双向访问的训练网地址并重新部署。
+- 本机 Compose worker 若要和远端节点混合训练，还需按部署网络设置主机可达地址及网络模式；本次不自动推断宿主机 LAN IP。
+- 24 项跳过包含真实 Redis、S3、Supervisor 多进程与 GPU/NCCL 环境门控项；没有将其视为通过。
+- 回滚可撤销 `b283356` 和本报告提交，再执行 Compose 重建；无数据迁移。
