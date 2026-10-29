@@ -1921,8 +1921,8 @@ docker compose logs --tail=15 worker
 **Git基准点**：`0dc831c`（Add task log clearing）。
 ## 本次变更测试结果：统一前端 UI 样式（2026-10-29）
 
-**Git基准点**：`bdaa3d9`（Refresh frontend visual design system）  
-**分支**：`emdash/hot-boxes-clean-y9u6p`  
+**Git基准点**：`bdaa3d9`（Refresh frontend visual design system）
+**分支**：`emdash/hot-boxes-clean-y9u6p`
 **变更范围**：统一训练工作台与数据集管理页的浅色设计令牌、导航、卡片、表单、按钮、状态反馈、弹窗和响应式布局；仅修改 `backend/static/` 前端静态资源，不涉及业务 API、数据模型或训练逻辑。
 
 **验收标准—测试用例映射**：
@@ -1947,4 +1947,3 @@ docker compose logs --tail=15 worker
 **已知问题与限制**：完整 Compose 重建需要修复或更换当前 PyPI 镜像中的 torch 包哈希后重新执行；前端镜像本身已成功构建并启动。
 
 **下次测试建议**：在可用的 Python 3.12 依赖镜像环境中重新执行 `docker compose up --build -d`，随后运行完整 `cd backend && python -m pytest tests/ -v` 回归套件。
-
