@@ -63,6 +63,35 @@ def test_health_and_system(client):
     assert "device" in sysinfo
 
 
+def test_running_job_logs_are_immediately_visible_and_uncacheable(client):
+    """运行中的追加日志应立即可读，响应不得被浏览器或代理缓存。"""
+    from uuid import uuid4
+
+    from app.state import manager
+
+    job_id = "live-logs-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "running"})
+    log_key = job_key(job_id, "log.txt")
+    manager.store.write_bytes(log_key, "[12:00:00] 训练启动\n".encode("utf-8"))
+    try:
+        first = client.get(f"/api/jobs/{job_id}/logs?offset=0")
+        assert first.status_code == 200
+        assert first.json() == {
+            "lines": ["[12:00:00] 训练启动"], "next_offset": 1, "total": 1,
+        }
+        assert "no-store" in first.headers.get("cache-control", "").lower()
+
+        manager.store.append_text(log_key, "[12:00:01] [epoch 1/2] train_loss=0.5\n")
+        second = client.get(f"/api/jobs/{job_id}/logs?offset=1")
+        assert second.json() == {
+            "lines": ["[12:00:01] [epoch 1/2] train_loss=0.5"],
+            "next_offset": 2, "total": 2,
+        }
+        assert jobstore.read_job(manager.store, job_id)["status"] == "running"
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
 def test_static_paths_not_shadowed_by_param_route(client):
     """回归：/api/datasets/tags 与 import-history 不得被 /datasets/{ds_id} 遮蔽。"""
     r = client.get("/api/datasets/tags")
