@@ -1468,7 +1468,7 @@ def test_training_page_resource_retry_and_chart_style_contract():
     assert "grid-column: 1 / -1" in css
     assert ".training-page #llmFields > .formgrid" in css
     assert "repeat(auto-fit, minmax(min(100%, 210px), 1fr))" in css
-    assert 'href="/app.css?v=20261029-2"' in html
+    assert 'href="/app.css?v=20261029-management-tabs-1"' in html
 
 
 def test_remote_server_feedback_toasts_render_above_add_modal():
@@ -1477,7 +1477,7 @@ def test_remote_server_feedback_toasts_render_above_add_modal():
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
     modal_css = html.split(".server-modal {", 1)[1].split("}", 1)[0]
     toast_css = html.split("#toastWrap {", 1)[1].split("}", 1)[0]
     modal_z_index = int(modal_css.split("z-index:", 1)[1].split(";", 1)[0])
@@ -1489,7 +1489,7 @@ def test_remote_server_feedback_toasts_render_above_add_modal():
 def test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_area():
     """添加与编辑共用分组表单，折叠高级项时仍可从固定操作栏提交。"""
     static_dir = Path(__file__).resolve().parents[1] / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
     css = (static_dir / "app.css").read_text(encoding="utf-8")
     modal = html.split('id="addServerModal"', 1)[1].split('id="remoteLogModal"', 1)[0]
 
@@ -1511,14 +1511,14 @@ def test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_are
 
 def test_remote_server_dialog_protects_input_and_keyboard_navigation():
     """关闭前检查未保存内容，遮罩不清空表单，键盘仅在弹窗内移动。"""
-    html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).resolve().parents[1] / "static" / "remote-management.js").read_text(encoding="utf-8")
     backdrop_handler = html.split('$("addServerModal").addEventListener("click",', 1)[1].split("});", 1)[0]
 
     assert "closeAddServerModal" not in backdrop_handler
     assert "function handleRemoteServerDialogKeydown(event)" in html
     assert "function remoteServerDialogIsDirty()" in html
     assert "function validateRemoteServerForm()" in html
-    assert 'addEventListener("keydown", handleRemoteServerDialogKeydown)' in html
+    assert "addEventListener('keydown', handleRemoteServerDialogKeydown)" in html
     assert "closeAddServerModal(true)" in html
 
 
@@ -1528,21 +1528,22 @@ def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads()
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
+    html += (static_dir / "credential-manager.html").read_text(encoding="utf-8")
     button = html.split('id="btnSaveRemoteSshSettings"', 1)[1].split(">", 1)[0]
     credential_form = html.split('id="remoteSshCredentialForm"', 1)[1].split(">", 1)[0]
     catalog_loader = html.split("async function loadRemoteSshSettings(", 1)[1].split(
-        "// 清空凭证编辑表单", 1
+        "// 绘制公开凭证元数据", 1
     )[0]
     save_handler = html.split("async function saveRemoteSshSettings()", 1)[1].split(
-        "// 把凭证元数据载入编辑表单", 1
+        "// 编辑公开元数据", 1
     )[0]
 
     assert "disabled" not in button
     assert "novalidate" in credential_form
     assert '先填写远程管理令牌，再查看或管理 SSH 凭证。' not in catalog_loader
     assert "共享 Redis" not in catalog_loader
-    assert "MySQL" in catalog_loader
+    assert "MySQL" in html
     assert 'remoteAdminToken' not in html
     assert 'X-Worker-Admin-Token' not in html
     assert "if (!token)" not in save_handler
@@ -1556,7 +1557,7 @@ def test_remote_server_form_exposes_network_overrides_and_effective_config_actio
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
 
     for marker in (
         "页面不单独配置镜像",
@@ -1615,7 +1616,7 @@ def test_remote_server_card_filters_lifecycle_actions_by_presence():
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
     card_renderer = html.split("function workerServerCard(", 1)[1].split(
         "// 读取仅在当前会话授权的远程服务器状态", 1
     )[0]
@@ -1641,7 +1642,7 @@ def test_remote_server_cards_expose_interrupt_action_for_active_operations():
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
     card_renderer = html.split("function workerServerCard(", 1)[1].split(
         "// 读取仅在当前会话授权的远程服务器状态", 1
     )[0]
@@ -1663,7 +1664,7 @@ def test_remote_server_card_exposes_live_operation_logs():
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
     card_renderer = html.split("function workerServerCard(", 1)[1].split(
         "// 读取仅在当前会话授权的远程服务器状态", 1
     )[0]
@@ -1695,3 +1696,23 @@ def test_remote_server_card_exposes_live_operation_logs():
     assert "copyRemoteLogText(line.textContent" in html
     assert 'remoteLogOutput").dataset.rawLog' in html
     assert "navigator.clipboard.writeText" in html
+
+
+def test_management_tabs_have_independent_pages_and_forms():
+    """服务器和凭证分别维护，导航可直接访问，训练台仅展示资源状态。"""
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    for name in ("index.html", "dataset-manager.html", "server-manager.html", "credential-manager.html"):
+        html = (static_dir / name).read_text(encoding="utf-8")
+        assert 'href="/server-manager.html"' in html
+        assert 'href="/credential-manager.html"' in html
+        assert html.count('aria-current="page"') == 1
+    server = (static_dir / "server-manager.html").read_text(encoding="utf-8")
+    credentials = (static_dir / "credential-manager.html").read_text(encoding="utf-8")
+    workbench = (static_dir / "index.html").read_text(encoding="utf-8")
+    assert 'id="remoteServerForm"' in server
+    assert 'id="remoteSshCredentialForm"' not in server
+    assert 'id="remoteSshCredentialForm"' in credentials
+    assert 'id="remoteServerForm"' not in credentials
+    assert 'id="addServerModal"' not in workbench
+    assert 'id="workerGrid"' in workbench
+    assert 'data-remote-action=' not in workbench
