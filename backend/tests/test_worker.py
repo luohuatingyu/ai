@@ -488,6 +488,62 @@ def test_worker_renews_lease_during_slow_startup(
     assert store.exists(job_key(job, "best.pt"))
 
 
+@pytest.mark.parametrize("state", ["idle", "disabled", "training"])
+def test_worker_heartbeat_recovers_registration_without_restart(store, q, state):
+    """真实空闲循环和训练控制器均能在注册丢失后恢复完整槽信息。"""
+    import os
+    import redis
+    from app.coordination import RedisLeaseStore
+    from app.worker import JobController, TrainingWorker
+
+    endpoint = os.environ.get("MTP_TEST_REDIS")
+    if not endpoint:
+        pytest.skip("未配置 MTP_TEST_REDIS，跳过真实 worker 注册恢复测试")
+    client = redis.Redis.from_url(endpoint, decode_responses=True,
+                                  socket_connect_timeout=3, socket_timeout=3)
+    ls = RedisLeaseStore(client)
+    worker_id = f"recover-{state}-cpu0"
+    caps = detect_capabilities(worker_id, machine_id="recover", slot="cpu0")
+    caps["managed"] = True
+    worker = TrainingWorker(store=store, queue=q, lease_store=ls, capabilities=caps,
+                            idle_poll=0.1, gpu_probe_enabled=False)
+    controller = None
+    try:
+        ls.register_worker(worker_id, caps, ttl=5)
+        registered = next(item for item in ls.list_workers() if item["worker_id"] == worker_id)
+        expected_caps = {key: registered[key] for key in caps}
+        ls.set_worker_enabled(worker_id, state != "disabled")
+        client.srem("mtp:workers:all", worker_id)
+        client.delete(f"mtp:worker:{worker_id}:info", f"mtp:worker:{worker_id}:hb")
+        if state == "training":
+            assert ls.acquire("registry-job", "registry-token", ttl=5)
+            controller = JobController(ls, "registry-job", "registry-token", worker_id,
+                                       interval=0.05, ttl=5)
+            controller.set_progress(9, state="training")
+            controller.start()
+            assert wait_until(lambda: client.sismember("mtp:workers:all", worker_id), timeout=2)
+        else:
+            worker._run_forever_iteration(hb_ttl=5)
+        recovered = next(item for item in ls.list_workers() if item["worker_id"] == worker_id)
+        for key, value in expected_caps.items():
+            assert recovered[key] == value, f"槽位恢复缺失能力字段：{key}"
+        assert recovered["active"] is True and recovered["state"] == state
+        assert ls.is_worker_enabled(worker_id) is (state != "disabled")
+        if state == "training":
+            assert recovered["current_job"] == "registry-job" and recovered["epoch"] == 9
+            assert ls.peek_holder("registry-job") == "registry-token"
+            assert not controller.lease_lost.is_set()
+        else:
+            assert recovered["current_job"] is None and q.size() == 0
+    finally:
+        if controller is not None:
+            controller.stop()
+            ls.release("registry-job", "registry-token")
+        ls.deregister_worker(worker_id)
+        client.hdel("mtp:workers:enabled", worker_id)
+        client.close()
+
+
 @pytest.mark.parametrize("loss_point", ["metrics", "checkpoint", "failure", "retry"])
 def test_superseded_worker_cannot_overwrite_successor(
     store, make_dataset, make_job, q, ls, loss_point,

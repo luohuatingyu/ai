@@ -506,7 +506,9 @@ class RedisLeaseStore(LeaseStore):
     """
 
     def __init__(self, redis_client) -> None:
+        """保留本进程注册的能力快照，供 Redis 注册信息丢失后恢复。"""
         self._redis = redis_client
+        self._worker_capabilities: Dict[str, Dict[str, str]] = {}
 
     def healthy(self) -> bool:
         try:
@@ -555,23 +557,25 @@ class RedisLeaseStore(LeaseStore):
     # ---------------- Worker 注册与心跳 ----------------
 
     def register_worker(self, worker_id: str, info: Dict[str, object], ttl: float) -> None:
-        payload = {str(k): (jsonable(v)) for k, v in info.items()}
+        """缓存序列化后的启动能力，并用同一心跳事务发布完整注册信息。"""
+        self._worker_capabilities[worker_id] = {str(k): jsonable(v) for k, v in info.items()}
+        self.heartbeat_worker(worker_id, {}, ttl)
+
+    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float) -> None:
+        """每次心跳原子补齐索引、能力、动态状态与 TTL，断连后无需重启。"""
+        # 能力快照按槽隔离；动态进度最后合并，不能被启动时的旧状态覆盖。
+        payload = dict(self._worker_capabilities.get(worker_id, {}))
+        payload.update({str(k): jsonable(v) for k, v in fields.items()})
+        payload["last_seen"] = time.time()
         pipe = self._redis.pipeline()
         pipe.sadd(_WORKERS_SET, worker_id)
         pipe.hset(_WORKER_INFO.format(worker_id=worker_id), mapping=payload)
         pipe.set(_WORKER_HB.format(worker_id=worker_id), "1", ex=int(ttl))
         pipe.execute()
 
-    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float) -> None:
-        payload = {str(k): jsonable(v) for k, v in fields.items()}
-        payload["last_seen"] = time.time()
-        pipe = self._redis.pipeline()
-        if payload:
-            pipe.hset(_WORKER_INFO.format(worker_id=worker_id), mapping=payload)
-        pipe.set(_WORKER_HB.format(worker_id=worker_id), "1", ex=int(ttl))
-        pipe.execute()
-
     def deregister_worker(self, worker_id: str) -> None:
+        """显式注销时丢弃能力缓存，避免复用槽 ID 时恢复旧硬件信息。"""
+        self._worker_capabilities.pop(worker_id, None)
         pipe = self._redis.pipeline()
         pipe.srem(_WORKERS_SET, worker_id)
         pipe.delete(_WORKER_INFO.format(worker_id=worker_id))
