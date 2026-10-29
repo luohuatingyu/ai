@@ -1,3 +1,47 @@
+## 本次变更测试结果：远程 worker 配置改为外部文件事实源（2026-10-29）
+
+**Git基准点**：`83472ed`（Apply worker config via external env file sourced at container startup）
+**分支**：`emdash/hot-boxes-clean-y9u6p`
+**测试环境**：Docker Compose，一次性容器 Python 3.12.15（整仓挂载 `/workspace`，`-w /workspace/backend` 执行 pytest）。
+
+**变更范围**（更新配置不再影响运行中的容器，外部 `.env` 为唯一事实源）：
+- 新增 `backend/app/worker-entrypoint.sh`：worker 容器入口脚本，每次启动（含 `docker restart`、宿主机重启）逐行读取外部 `.env` 并 `export`（值按字面量处理、不做 shell 求值，规避 `$`/反引号注入），随后 `exec python -m app.worker`。
+- `remote_worker.sh`：
+  - `write_worker_env` 只落盘（不再产生 `.env.previous` 回滚快照）；GPU 模式统一写 `WORKER_CPU_SLOTS=0`（原 `run` 阶段 `--env` 覆盖移入文件）。
+  - `run_worker_container` 挂载整个 `CONFIG_DIR` 到 `/app/config:ro`（目录挂载才能在 `mv` 原子替换后读到新文件），命令改为 `bash /app/app/worker-entrypoint.sh /app/config/<machine_id>.env`。
+  - `config` 动作只写文件，不重建/不重启容器；`deploy` 只同步代码并重建容器（不重写配置）；`start`/`restart` 先写最新配置再 `docker start`/`docker restart`（不再重建）；`stop`/`status` 不变。
+- `remote_workers.py`：`config` 动作退出"等待资源心跳"集合（只写文件、不重启容器，等待无意义）；更新进度文案。
+- `index.html` / README：更新"更新配置 / 部署 / 启动重启"文案，说明配置下次启动/重启生效、部署只同步代码。
+
+**测试执行结果**：
+- 远程 Worker 定向测试（`tests/test_remote_workers.py`）：87 通过、0 失败、0 错误、0 跳过。
+- API 定向测试（`tests/test_api.py`）：58 通过、0 失败、0 错误、0 跳过。
+- 完整测试套件（`tests/`）：288 通过、6 跳过、0 失败、0 错误。跳过项由 MTP_TEST_REDIS / MTP_TEST_S3 / Supervisor 子进程环境条件控制。
+- `docker compose up --build -d`：trainer、worker、frontend、SeaweedFS 重建与启动成功。
+- `curl -fsS http://127.0.0.1:8000/api/health`：返回 `{"ok":true}`。
+- `bash -n backend/app/remote_worker.sh`、`bash -n backend/app/worker-entrypoint.sh`、`git diff --check`：通过。
+- pytest 有 2 条既有弃用警告：SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 引擎。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 首次 `.env` 不存在时创建 | Shell：`test_remote_bootstrap_script_config_writes_env_without_requiring_container` | 无容器时 `config` 返回 0、写 600 权限 env 文件、不调用 Docker | 正常、边界 |
+| `config` 只写文件、不碰容器 | Shell：`..._config_overwrites_env_without_touching_container`、`..._config_keeps_stopped_container_stopped` | 运行/停止容器均不产生 stop/rename/run/start；env 更新；输出"下次启动/重启时生效" | 正常、回归 |
+| GPU 模式写 `WORKER_CPU_SLOTS=0` | Shell：`test_remote_bootstrap_script_installs_cpu_and_gpu_workers` | cpu 写 2、gpu 写 0；命令含 `--gpus all`、挂载 `/app/config:ro`、入口脚本 | 分支、边界 |
+| 入口脚本加载外部 `.env` 并 exec worker | 新增 `test_worker_entrypoint_loads_env_file_and_execs_worker` | 含 `=`/空格/`$`/注释/空值：按字面量 export，`exec python -m app.worker` | 正常、异常、安全 |
+| 每次启动/重启读最新配置 | Shell：`..._start_applies_config_change_while_running`、`..._restart_applies_config_change_without_double_restart`、`..._start_applies_config_change_to_stopped_container` | 先写 env 再 `docker start`/`docker restart`，不重建（无 stop/rename/run） | 正常、兼容 |
+| 配置无变化时保持纯操作 | Shell：`..._start_unchanged_config_keeps_pure_operation`、`..._restart_unchanged_config_forces_restart` | 不覆盖 env、不产生 `.previous`；restart 仍强制重启 | 边界、回归 |
+| 部署只同步代码 | Shell：`test_remote_bootstrap_script_deploy_syncs_code_and_recreates_container` | env 保持原样、重建容器（stop/rename/run/rm） | 兼容、回归 |
+| 部署失败回滚容器、不改配置 | Shell：`test_remote_bootstrap_script_deploy_rolls_back_container_without_touching_config` | 重建失败恢复旧容器，env 不变化 | 异常、恢复 |
+| 页面文案一致 | API：`test_remote_server_form_exposes_network_overrides_and_effective_config_action` | "同步最新 worker 代码并重建容器""保存后覆盖远端配置文件，下次启动/重启时生效" | 正常、回归 |
+
+**关键模块测试**：远程 Worker 87/87 通过；API 58/58 通过；完整套件 288/288 通过（6 环境跳过）。
+
+**已知问题与限制**：未连接真实 SSH 目标机；入口脚本的 env 覆盖、目录挂载与重建/回滚通过隔离 Docker/python 替身验证。行为变化点——`config` 动作不再立即重启容器，配置在下次启动/重启才生效（此前会立即重建并短暂重启 worker）。
+
+**下次测试建议**：在真实 Linux 目标机上 ① 修改 CPU 槽/Redis 覆盖后点"更新配置"，确认 `.env` 更新且运行中的 worker 不重启、心跳不断；② 再点"重启"，确认容器以新配置重新注册；③ 宿主机重启后确认容器用外部 `.env` 自动恢复新配置。
+
 ## 本次变更测试结果：启动/重启远程 worker 时应用最新配置（2026-10-28）
 
 **Git基准点**：`3467a3f`（Apply latest remote config on worker start/restart）
