@@ -30,11 +30,11 @@
 | 修复后同一命令 | 14 | 0 | 0 / 0 | 按需展示、列选择、旧响应、空列表、Hub、重试和转义全部通过 |
 | 隔离版本 `node --test /tmp/mtp-dataset-preview-mGzTZ0/validation/frontend/*.test.cjs` | 41 | 0 | 0 / 0 | 14 项新测试、9 项联合训练和18项服务器弹窗测试全部通过 |
 | 共享工作区首次 `node --test --test-reporter=tap frontend/*.test.cjs \| tail -12` | 72 | 18 | 0 / 0 | 服务器弹窗测试仍读取正在迁移的旧页面结构，与修改前失败一致 |
-| 共享工作区最终同一命令 | 101 | 0 | 0 / 0 | 其他并行任务更新其测试后，全前端套件通过，执行通过率 100% |
+| 共享工作区最终 `node --test --test-reporter=tap frontend/*.test.cjs \| tail -12` | 106 | 0 | 0 / 0 | 其他并行任务更新其测试后，全前端套件通过，执行通过率 100% |
 | `git diff --check`、独立索引 `git diff --cached --check`、页面脚本 `vm.Script` 解析 | 通过 | — | — | 无空白或脚本语法错误 |
 
 - 隔离快照首次生成时，临时脚本错误截断了 `updateStart` 等已有函数，导致23项测试失败；修正快照生成范围后41项全部通过。该错误仅存在于临时快照，未提交。
-- **完整容器重建未通过**：两次执行 `docker compose up --build -d`。首次后端安装 PyTorch 时下载仅约7.1/454 MB，约360秒后抛出 `ssl.SSLError: [SSL] record layer failure`；进入重试后中止（退出码130）。最终代码再次尝试仍停留在同一依赖下载，停止等待（退出码130）。不能将完整 Compose 构建标记通过。
+- **完整容器重建未通过**：三次执行 `docker compose up --build -d`。前两次后端安装 PyTorch 时下载约7.1/454 MB，约360秒后抛出 `ssl.SSLError: [SSL] record layer failure`；第三次切换到镜像中的 483.7 MB PyTorch 包后，等待约60秒仍无新增下载进度，手动停止（退出码130）。不能将完整 Compose 构建标记通过。
 - **前端部署通过**：上述构建中的 frontend 镜像成功生成；执行 `docker compose up -d --no-build --no-deps frontend` 成功重建启动。Node `fetch` 断言 `/healthz` 为 `ok`、页面包含预览按钮与默认隐藏容器、上传链接指向管理页且原上传控件不存在，全部通过；最终 `/api/health` 返回 HTTP 200。一次在容器重建完成前执行的资源断言读到旧资源而失败，等待启动完成后同一断言通过。
 - **Python 3.12 等价验证通过**：使用现有运行镜像启动临时容器 `mtp-dataset-preview-api-validation`，只读挂载本地 `backend/`，以 `USE_DATABASE=false STORAGE_BACKEND=local REDIS_URL= DATA_DIR=/tmp/dataset-preview python -m uvicorn app.main:app --host 0.0.0.0 --port 8000` 启动。`docker exec mtp-dataset-preview-api-validation python -c 'import sys, urllib.request; assert sys.version_info[:2] == (3,12); print(sys.version.split()[0]); print(urllib.request.urlopen("http://127.0.0.1:8000/api/health").read().decode())'` 返回 Python **3.12.15** 与 `{"ok":true}`，与目标容器主版本无差异。
 - **实际浏览器验证通过**：隔离容器仅映射 `127.0.0.1:18017`，通过 `POST /api/datasets/sample/classification_demo.csv` 与 `regression_demo.csv` 创建临时示例；Safari 验证初始没有数据表且目标列已填充，点击显示五行及“260 行 · 5 列”，再次点击表格和统计消失。常用入口一度返回502，后续健康检查已恢复200。
@@ -42,7 +42,7 @@
 ### 限制、重测与清理
 
 - **未执行**：后端完整 pytest、真实 Hub 网络下载和独立窄屏视觉验收。此次仅前端修改，按已确认测试范围不运行训练全套测试；Hub 网络边界以参数化测试隔离。浏览器验收期间共享 Safari 被其他任务切换，未继续调整窗口；切换数据集与请求竞态已由自动化用例覆盖。
-- **仍需验证**：网络恢复后重新执行 `docker compose up --build -d`，确认所有服务从默认依赖源构建成功；补做窄屏下的展开、横向滚动及真实 Hub 首次下载。当前前端行为与替代运行验证通过，不代表完整容器化验证通过。
+- **仍需验证**：网络恢复后重新执行 `docker compose up --build -d`，确认所有服务从默认依赖源构建成功；补做窄屏下的展开、横向滚动及真实 Hub 首次下载。当前前端行为、106 项前端测试与替代运行验证通过，不代表完整容器化验证通过。
 - **重测触发**：修改数据集列表元信息、详情 API、列配置、预览状态或相关页面事件时重跑本套件及全部前端测试；涉及后端业务时按项目规定执行完整 Python 套件并更新业务基准。
 - **回滚**：撤销 `f88ceed` 后统一重建；无数据迁移。
 - **清理**：临时快照与独立索引位于 `/tmp/mtp-dataset-preview-mGzTZ0/`，交付前删除；临时容器停止后自动删除，两个测试数据集仅存在于其临时数据目录，随容器销毁。保留正式测试，未提交运行产物；共享工作区其他任务改动保持原状，未执行 git push。
