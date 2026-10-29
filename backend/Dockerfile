@@ -19,17 +19,29 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # API 通过 OpenSSH 客户端远程执行已打包的 worker 引导脚本。
+# 外壳重试循环：网络不稳定时 apt-get update 偶发 502/连接失败，兜底重试。
 RUN if [ -n "${APT_MIRROR}" ]; then \
       sed -i "s#http://deb.debian.org#http://${APT_MIRROR}#g" /etc/apt/sources.list.d/debian.sources; \
-    fi \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends openssh-client \
+    fi; \
+    attempt=0; \
+    until apt-get update; do \
+      attempt=$((attempt + 1)); \
+      [ "$attempt" -ge 5 ] && exit 1; \
+      echo "apt-get update 失败（第 ${attempt}/5 次），3 秒后重试..."; sleep 3; \
+    done; \
+    apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-# BuildKit 缓存挂载：网络中断重试时保留已下载的 wheel，不必从头装
+# BuildKit 缓存挂载：网络中断重试时保留已下载的 wheel，不必从头装。
+# 外壳重试循环：pip 对 hash 校验失败（下载被截断）不自动重试，这里兜底重跑整次安装，
+# 已成功下载的 wheel 会命中缓存，不会重复拉取。
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --retries 10 -r requirements.txt
+    for attempt in 1 2 3 4 5; do \
+      if pip install --retries 10 -r requirements.txt; then exit 0; fi; \
+      echo "pip install 失败（第 ${attempt}/5 次），3 秒后重试..."; sleep 3; \
+    done; \
+    exit 1
 
 COPY app ./app
 COPY static ./static

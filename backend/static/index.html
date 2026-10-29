@@ -350,12 +350,8 @@
     </div>
 
     <h2>② 训练配置</h2>
-    <form id="trainForm" class="stack" onsubmit="return false;">
+    <form id="trainForm" class="stack" novalidate onsubmit="return false;">
       <div class="formgrid">
-        <div class="field" id="targetField">
-          <label>目标列（要预测的列）</label>
-          <select id="targetSelect"></select>
-        </div>
         <div class="field">
           <label>任务类型</label>
           <select id="taskSelect">
@@ -368,6 +364,10 @@
             <option value="llm_dpo">LLM DPO</option>
             <option value="llm_ppo">LLM PPO / RLHF</option>
           </select>
+        </div>
+        <div class="field" id="targetField">
+          <label>目标列（要预测的列）</label>
+          <select id="targetSelect"></select>
         </div>
         <div class="field" id="timeColumnField" hidden>
           <label>时间列（用于排序）</label>
@@ -431,6 +431,10 @@
         </div>
         <div class="field"><label id="epochLabel">轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"></div>
         <div class="field" id="batchSizeField"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"></div>
+      </div>
+      <details id="trainingAdvanced" class="training-advanced">
+        <summary>高级参数 <span>学习率、网络结构与资源要求</span></summary>
+        <div class="formgrid">
         <div class="field" id="learningRateField"><label>学习率 lr</label><input id="p_lr" type="number" value="0.001" step="0.0001" min="0.0001"></div>
         <div class="field" id="hiddenLayersField"><label>隐藏层数</label><input id="p_hidden_layers" type="number" value="3" min="0" max="8"></div>
         <div class="field" id="hiddenSizeField"><label>每层神经元</label><input id="p_hidden_size" type="number" value="128" min="1" max="2048"></div>
@@ -442,11 +446,24 @@
           </label>
           <div id="gpuResourceHint" class="hint" style="margin-top:5px;">正在读取已启用的 GPU 资源…</div>
         </div>
+        <div class="field" id="deviceBackendField">
+          <label for="p_device_backend">计算后端</label>
+          <select id="p_device_backend">
+            <option value="auto">自动选择</option>
+            <option value="cuda">NVIDIA CUDA</option>
+            <option value="rocm">AMD ROCm</option>
+            <option value="xpu">Intel XPU</option>
+            <option value="mps">Apple MPS</option>
+            <option value="cpu">CPU</option>
+          </select>
+          <div class="hint">MPS 需要 macOS 原生 worker；AMD/Intel 需安装对应 PyTorch 构建。</div>
+        </div>
         <div class="field" id="minVramField" hidden>
           <label>最低显存（MiB，可选）</label>
           <input id="p_min_vram" type="number" value="0" min="0" step="1024">
         </div>
       </div>
+      </details>
       <div class="field" id="parallelModeField">
         <label for="p_parallel">训练方式</label>
         <select id="p_parallel"><option value="single">单节点训练</option><option value="parallel">多节点联合训练一个模型</option></select>
@@ -457,6 +474,7 @@
         <div id="parallelSummary" class="hint" aria-live="polite"></div>
         <div class="field"><label for="p_parallel_timeout">节点通信超时（秒）</label><input id="p_parallel_timeout" type="number" min="10" max="3600" value="300"></div>
       </div>
+      <div class="hint" id="taskHint">分类适用于离散标签，回归适用于连续数值目标。</div>
       <div class="field" id="trainingResourceField">
         <label for="trainingResourceSelect">计算资源</label>
         <select id="trainingResourceSelect" aria-describedby="trainingResourceHint">
@@ -464,8 +482,11 @@
         </select>
         <div id="trainingResourceHint" class="hint" style="margin-top:6px;" aria-live="polite">正在读取计算资源；自动分配可排队等待资源上线。</div>
       </div>
-      <button id="btnStart" class="primary" disabled>🚀 开始训练</button>
-      <div class="hint" id="taskHint">分类适用于离散标签，回归适用于连续数值目标。</div>
+      <div class="training-submit">
+        <div id="trainFeedback" class="hint" role="status" aria-live="polite">请选择数据集并完成训练配置。</div>
+        <button id="btnLocateTrainingIssue" type="button" class="text-action" hidden>前往完善配置 →</button>
+        <button id="btnStart" type="button" class="primary" aria-describedby="trainFeedback" disabled>🚀 开始训练</button>
+      </div>
     </form>
   </aside>
 
@@ -486,8 +507,17 @@
     <div id="workerGrid" class="server-grid"><div class="empty">尚未发现计算服务器。添加服务器后，页面会显示检测到的计算资源。</div></div>
 
     <h2>③ 训练任务</h2>
+    <div class="job-filters">
+      <label class="sr-only" for="jobSearch">搜索任务</label>
+      <input id="jobSearch" type="search" placeholder="搜索数据集、目标列或任务 ID…" maxlength="200">
+      <label class="sr-only" for="jobStatusFilter">任务状态</label>
+      <select id="jobStatusFilter"><option value="all">全部状态</option><option value="running">训练中</option><option value="queued">排队中</option><option value="paused">已暂停</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select>
+      <button id="btnResetJobFilters" type="button">重置筛选</button>
+    </div>
+    <div class="job-list-feedback"><span id="jobCount" class="hint" role="status"></span><span id="jobsFeedback" class="hint" role="status"></span></div>
     <div id="jobList"><div class="empty">暂无任务，先在左侧发起训练</div></div>
 
+    <div id="detailFeedback" class="hint feedback-error" role="status"></div>
     <div id="detail" hidden>
       <div id="detailHead">
         <div class="jobline"><span id="dName" class="jobname"></span><span id="dStatus" class="chip"></span><span id="dDevice" class="chip"></span></div>
@@ -515,27 +545,32 @@
         <div id="retryHint" class="hint" aria-live="polite"></div>
       </div>
 
-      <div class="tabs">
-        <button data-tab="curves" class="active">📈 曲线</button>
-        <button data-tab="logs">📜 日志</button>
-        <button data-tab="result">🏆 结果</button>
-        <button data-tab="predict">🔮 预测</button>
+      <div class="tabs" role="tablist" aria-label="任务详情">
+        <button id="detail-tab-curves" type="button" role="tab" data-tab="curves" aria-controls="tab-curves" aria-selected="true" tabindex="0" class="active">📈 曲线</button>
+        <button id="detail-tab-logs" type="button" role="tab" data-tab="logs" aria-controls="tab-logs" aria-selected="false" tabindex="-1">📜 日志</button>
+        <button id="detail-tab-result" type="button" role="tab" data-tab="result" aria-controls="tab-result" aria-selected="false" tabindex="-1">🏆 结果</button>
+        <button id="detail-tab-predict" type="button" role="tab" data-tab="predict" aria-controls="tab-predict" aria-selected="false" tabindex="-1">🔮 预测</button>
       </div>
 
-      <div id="tab-curves">
+      <div role="tabpanel" aria-labelledby="detail-tab-curves" tabindex="0" id="tab-curves">
         <div class="chartbox"><h3>Loss（训练 / 验证）</h3><canvas id="lossChart" height="150"></canvas></div>
         <div class="chartbox"><h3 id="metricTitle">验证指标</h3><canvas id="metricChart" height="130"></canvas></div>
         <div class="hint" id="chartNote"></div>
       </div>
 
-      <div id="tab-logs" hidden>
-        <div class="row" style="justify-content:flex-end;margin:8px 0;"><button id="btnClearJobLogs" type="button">清除日志</button></div>
-        <pre id="logBox"></pre>
+      <div role="tabpanel" aria-labelledby="detail-tab-logs" tabindex="0" id="tab-logs" hidden>
+        <div class="log-toolbar">
+          <label><input id="logFollow" type="checkbox" checked> 自动跟随</label>
+          <span id="logStatus" class="hint" role="status">跟随最新日志</span>
+          <button id="btnLatestLogs" type="button">↓ 回到最新</button>
+          <button id="btnClearJobLogs" type="button">清除日志</button>
+        </div>
+        <pre id="logBox" tabindex="0" aria-label="训练日志"></pre>
       </div>
 
-      <div id="tab-result" hidden><div id="resultBox" class="empty">任务完成后展示评估结果</div></div>
+      <div role="tabpanel" aria-labelledby="detail-tab-result" tabindex="0" id="tab-result" hidden><div id="resultBox" class="empty">任务完成后展示评估结果</div></div>
 
-      <div id="tab-predict" hidden>
+      <div role="tabpanel" aria-labelledby="detail-tab-predict" tabindex="0" id="tab-predict" hidden>
         <div class="hint" style="margin-bottom:6px;">使用最佳模型进行单条预测（JSON，与数据集列同名字段）：</div>
         <textarea id="predictInput" spellcheck="false"></textarea>
         <div class="row" style="margin-top:8px;"><button id="btnPredict" class="primary">预测</button></div>
@@ -572,13 +607,16 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;"
 
 const state = {
   datasets: [], datasetId: null, preview: null, previewOpen: false, previewError: false, previewRequest: 0,
-  jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   previewPage: 1, previewPageCount: 1, previewTotalRows: 0, previewReturnFocus: null,
+  jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   charts: { loss: null, metric: null }, metricKind: null,
-  workerSlots: [], workerResourcesLoaded: false, workerResourcesError: false, trainSubmitting: false, detailRecord: null, retrySubmitting: false,
+  workerSlots: [], workerResourcesLoaded: false, workerResourcesError: false, detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
   remoteLogOperationId: null, remoteLogPollTimer: null,
   editingRemoteMachineId: null,
+  trainSubmitting: false, trainError: "", trainingIssue: null,
+  jobsRequest: 0, detailRequest: 0, selectionVersion: 0,
+  logVersion: 0, logUnread: 0, predictTemplateRequest: 0,
   remoteCredentials: [], remoteCredentialDefaultId: null, remoteCredentialsCanConfigure: false,
 };
 
@@ -766,9 +804,9 @@ async function loadSystem() {
   try {
     const sys = await apiJson("/api/system");
     const dot = $("deviceBadge").querySelector(".dot");
-    if (sys.device === "cuda") {
+    if (sys.backend && sys.backend !== "cpu") {
       dot.className = "dot ok";
-      $("deviceText").textContent = `部署节点 GPU 已就绪：${sys.device_name}${sys.gpu_count > 1 ? " ×" + sys.gpu_count : ""}（CUDA ${sys.cuda_version || ""}）`;
+      $("deviceText").textContent = `部署节点 ${String(sys.vendor || sys.backend).toUpperCase()} 已就绪：${sys.device_name}${sys.gpu_count > 1 ? " ×" + sys.gpu_count : ""}`;
     } else {
       dot.className = "dot";
       $("deviceText").textContent = "部署节点未检测到 GPU；集群资源请看右侧计算资源";
@@ -838,7 +876,7 @@ function closePreviewModal() {
   $("btnPreview").setAttribute("aria-expanded", "false");
 }
 
-/** 从列表元信息填充训练列，预览返回时保留仍有效的用户选择。 */
+/** 从列表元信息填充训练列，预览分页返回时保留仍有效的用户选择。 */
 function updateDatasetColumns(dataset, preserve = false) {
   const columns = dataset?.columns || [];
   const targetSel = $("targetSelect"), timeSel = $("timeColumnSelect");
@@ -953,6 +991,105 @@ async function loadPreviewPage(page = 1) {
   }
 }
 
+
+// 汇总配置状态与提交锁；后台轮询也必须保留进行中的提交状态。
+// 数据与资源条件同时满足后才允许发起训练。
+function updateStart() {
+  const issue = getTrainingIssue();
+  const isLLM = taskSelect.value.startsWith("llm_");
+  const selections = [...parallelSelections.entries()];
+  const parallelReady = $("p_parallel").value !== "parallel" || (selections.length >= 2 && selections.length <= 32 && selections.every(([id, batch]) =>
+    Number.isInteger(batch) && batch >= 1 && batch <= (isLLM ? 64 : 4096)
+    && state.workerSlots.some(worker => worker.worker_id === id && worker.active && worker.enabled && worker.parallel?.host && worker.parallel?.gloo && worker.parallel?.protocol === 1)));
+  state.trainingIssue = issue || (!trainingResourceReady() ? { id: "trainingResourceSelect", message: "所选计算资源已不可用，请重新选择或切回自动分配。" } : null) || (!parallelReady ? { id: "p_parallel", message: "请选择 2～32 个可用计算槽，并填写有效的节点批大小。" } : null);
+  const button = $("btnStart");
+  button.disabled = Boolean(state.trainSubmitting || state.trainingIssue);
+  button.ariaBusy = String(Boolean(state.trainSubmitting));
+  button.textContent = state.trainSubmitting ? "正在创建任务…" : "🚀 开始训练";
+  $("trainFeedback").textContent = state.trainSubmitting ? "正在提交，请稍候…" : state.trainError || state.trainingIssue?.message || "配置已就绪，创建后将自动显示任务进度。";
+  $("trainFeedback").className = "hint" + (state.trainError ? " feedback-error" : "");
+  $("btnLocateTrainingIssue").hidden = !state.trainingIssue || Boolean(state.trainSubmitting);
+}
+
+// 按当前任务检查实际使用的参数，隐藏的其他任务字段不阻塞当前流程。
+function getTrainingIssue() {
+  const task = taskSelect.value, llm = task.startsWith("llm_"), cluster = task === "clustering";
+  const hub = llm && $("p_dataset_source").value === "hub";
+  const missing = (id, message) => ({ id, message });
+  if (hub ? !$("p_hub_dataset").value.trim() : !state.datasetId) return missing(hub ? "p_hub_dataset" : "datasetSelect", "请选择或上传数据集；Hub 数据集需填写仓库 ID。");
+  if (!llm && !cluster && !$("targetSelect").value) return missing("targetSelect", "请选择目标列；远程数据集请先下载并预览。");
+  if (task === "time_series_forecasting" && (!$("timeColumnSelect").value || $("timeColumnSelect").value === $("targetSelect").value)) return missing("timeColumnSelect", "请选择与目标列不同的时间列。");
+  if (llm && task !== "llm_pretraining" && !$("p_base_model").value.trim()) return missing("p_base_model", "请填写基座模型 Hub ID。");
+  if (task === "llm_ppo" && !$("p_reward_model").value.trim()) return missing("p_reward_model", "请填写 PPO 奖励模型 Hub ID。");
+  // 数值边界与 API 请求模型一致；浮点参数不受输入框步长限制。
+  const fields = [["p_epochs", "轮数 / 迭代次数", 1, 500]];
+  if (!cluster) fields.push(["p_test_split", "验证集比例", 0.05, 0.5, true]);
+  if (!cluster && $("p_parallel").value !== "parallel") fields.push(["p_batch_size", "批大小", 1, 4096]);
+  if (!cluster && (!llm || task === "llm_pretraining")) fields.push(["p_lr", "学习率", Number.MIN_VALUE, 1, true]);
+  if (!cluster && !llm) fields.push(["p_hidden_layers", "隐藏层数", 0, 8], ["p_hidden_size", "每层神经元", 1, 2048]);
+  if (cluster) fields.push(["p_n_clusters", "聚类数", 2, 64]);
+  if (task === "time_series_forecasting") fields.push(["p_lookback", "历史窗口长度", 2, 512], ["p_forecast_horizon", "预测步数", 1, 64]);
+  if (llm) fields.push(["p_max_samples", "最大样本数", 1, 1000000], ["p_max_seq_len", "最大序列长度", 2, 8192]);
+  if (llm && task !== "llm_pretraining") fields.push(["p_llm_lr", "微调学习率", Number.MIN_VALUE, 1, true]);
+  if (task === "llm_pretraining") fields.push(["p_vocab_size", "词表大小", 32, 250000], ["p_model_hidden_size", "模型隐藏维度", 16, 8192], ["p_model_layers", "模型层数", 1, 96], ["p_model_heads", "注意力头数", 1, 128]);
+  if (task === "llm_ppo") fields.push(["p_ppo_updates", "PPO 更新次数", 1, 16]);
+  if ($("p_parallel").value === "parallel") fields.push(["p_parallel_timeout", "节点通信超时", 10, 3600]);
+  else if (!cluster && (llm || $("p_require_gpu").checked)) fields.push(["p_min_vram", "最低显存", 0, Number.MAX_SAFE_INTEGER]);
+  for (const [id, label, min, max, decimal] of fields) {
+    const raw = $(id).value.trim(), value = Number(raw);
+    if (!raw || !Number.isFinite(value) || (!decimal && !Number.isInteger(value)) || value < min || value > max) {
+      return missing(id, label + "需填写" + (decimal ? "有效数值" : "整数") + (min === Number.MIN_VALUE ? "（大于 0，且不超过 1）" : "（" + min + "～" + max + "）") + "。");
+    }
+  }
+  if (task === "llm_pretraining" && Number($("p_model_hidden_size").value) % Number($("p_model_heads").value)) return missing("p_model_heads", "模型隐藏维度必须能被注意力头数整除。");
+  return null;
+}
+
+// 展开错误所在分组并聚焦字段，让禁用原因有明确的修正入口。
+function focusTrainingIssue() {
+  const issue = state.trainingIssue;
+  if (!issue) return;
+  const field = $(issue.id);
+  const details = field.closest("details");
+  if (details) details.open = true;
+  const target = field.disabled && issue.id === "datasetSelect" ? $("btnUpload") : field;
+  field.setAttribute("aria-invalid", "true");
+  target.focus();
+  target.scrollIntoView({ block: "nearest" });
+}
+
+const parallelSelections = new Map();
+
+// 展示可选计算槽并保留用户已输入的批大小；轮询不抢占正在编辑的输入框。
+function renderParallelWorkers() {
+  $("parallelSummary").textContent = `已选 ${parallelSelections.size} 个计算槽 · 全局批大小 ${[...parallelSelections.values()].reduce((sum, value) => sum + (Number(value) || 0), 0)}。首个选中节点负责保存模型；故障后按原成员整组恢复。`;
+  if ($("parallelWorkers").contains(document.activeElement)) return;
+  const workers = state.workerSlots || [];
+  $("parallelWorkers").innerHTML = workers.map(worker => {
+    const available = worker.active && worker.enabled && worker.parallel?.host && worker.parallel?.gloo && worker.parallel?.protocol === 1;
+    const selected = parallelSelections.has(worker.worker_id);
+    const size = parallelSelections.get(worker.worker_id) ?? (taskSelect.value.startsWith("llm_") ? 1 : 32);
+    return `<div class="card" style="padding:12px;display:grid;grid-template-columns:minmax(0,1fr) 82px;gap:12px;align-items:center;">
+      <label style="display:flex;gap:8px;align-items:center;overflow-wrap:anywhere;"><input style="width:auto" type="checkbox" data-parallel-worker="${esc(worker.worker_id)}" ${selected ? "checked" : ""} ${available || selected ? "" : "disabled"}>
+      <span>${esc(worker.machine_id || worker.worker_id)} / ${esc(worker.slot || "")}<br><small>${esc(worker.gpu?.available ? worker.gpu.name : "CPU")}${available ? "" : " · 需上线、启用并配置互联地址"}</small></span></label>
+      <label>本地批大小<input type="number" data-parallel-batch="${esc(worker.worker_id)}" min="1" max="${taskSelect.value.startsWith("llm_") ? 64 : 4096}" value="${size}" ${selected ? "" : "disabled"}></label></div>`;
+  }).join("") || '<div class="empty">尚无计算槽，请先添加服务器并配置互联地址。</div>';
+}
+
+// 选择和批大小变化只影响新任务，不更改现有计算槽的接单状态。
+$("parallelWorkers").addEventListener("change", event => {
+  const id = event.target.dataset.parallelWorker || event.target.dataset.parallelBatch;
+  if (!id) return;
+  if (event.target.dataset.parallelWorker) {
+    if (event.target.checked) parallelSelections.set(id, taskSelect.value.startsWith("llm_") ? 1 : 32);
+    else parallelSelections.delete(id);
+    event.target.blur();
+  } else parallelSelections.set(id, Number(event.target.value));
+  renderParallelWorkers();
+  updateStart();
+});
+$("p_parallel").addEventListener("change", () => { updateTaskFields(); renderParallelWorkers(); });
+
 // 返回不可选原因；忙碌槽允许排队，任务类型和显存限制实时参与筛选。
 function trainingResourceUnavailable(worker) {
   if (!worker || !worker.active) return "离线或已失效";
@@ -1020,59 +1157,6 @@ function renderTrainingResources() {
   }
 }
 
-// 汇总配置状态与提交锁
-function updateStart() {
-  const task = taskSelect.value;
-  const isLLM = task.startsWith("llm_");
-  const source = isLLM ? $("p_dataset_source").value : "local";
-  const datasetReady = isLLM && source === "hub" ? Boolean($("p_hub_dataset").value.trim()) : Boolean(state.datasetId);
-  const hasTarget = Boolean($("targetSelect").value);
-  const hasTimeColumn = Boolean($("timeColumnSelect").value)
-    && $("timeColumnSelect").value !== $("targetSelect").value;
-  const hasBaseModel = !isLLM || task === "llm_pretraining" || Boolean($("p_base_model").value.trim());
-  const hasRewardModel = !isLLM || task !== "llm_ppo" || Boolean($("p_reward_model").value.trim());
-  const ready = datasetReady && hasBaseModel && hasRewardModel && (isLLM || (task === "clustering"
-    || (hasTarget && (task !== "time_series_forecasting" || hasTimeColumn))));
-
-  const selections = [...parallelSelections.entries()];
-  const parallelReady = $("p_parallel").value !== "parallel" || (selections.length >= 2 && selections.length <= 32 && selections.every(([id, batch]) =>
-    Number.isInteger(batch) && batch >= 1 && batch <= (isLLM ? 64 : 4096)
-    && state.workerSlots.some(worker => worker.worker_id === id && worker.active && worker.enabled && worker.parallel?.host && worker.parallel?.gloo && worker.parallel?.protocol === 1)));
-  $("btnStart").disabled = state.trainSubmitting || !trainingResourceReady() || !ready || !parallelReady;
-}
-
-const parallelSelections = new Map();
-
-// 展示可选计算槽并保留用户已输入的批大小；轮询不抢占正在编辑的输入框。
-function renderParallelWorkers() {
-  $("parallelSummary").textContent = `已选 ${parallelSelections.size} 个计算槽 · 全局批大小 ${[...parallelSelections.values()].reduce((sum, value) => sum + (Number(value) || 0), 0)}。首个选中节点负责保存模型；故障后按原成员整组恢复。`;
-  if ($("parallelWorkers").contains(document.activeElement)) return;
-  const workers = state.workerSlots || [];
-  $("parallelWorkers").innerHTML = workers.map(worker => {
-    const available = worker.active && worker.enabled && worker.parallel?.host && worker.parallel?.gloo && worker.parallel?.protocol === 1;
-    const selected = parallelSelections.has(worker.worker_id);
-    const size = parallelSelections.get(worker.worker_id) ?? (taskSelect.value.startsWith("llm_") ? 1 : 32);
-    return `<div class="card" style="padding:12px;display:grid;grid-template-columns:minmax(0,1fr) 82px;gap:12px;align-items:center;">
-      <label style="display:flex;gap:8px;align-items:center;overflow-wrap:anywhere;"><input style="width:auto" type="checkbox" data-parallel-worker="${esc(worker.worker_id)}" ${selected ? "checked" : ""} ${available || selected ? "" : "disabled"}>
-      <span>${esc(worker.machine_id || worker.worker_id)} / ${esc(worker.slot || "")}<br><small>${esc(worker.gpu?.available ? worker.gpu.name : "CPU")}${available ? "" : " · 需上线、启用并配置互联地址"}</small></span></label>
-      <label>本地批大小<input type="number" data-parallel-batch="${esc(worker.worker_id)}" min="1" max="${taskSelect.value.startsWith("llm_") ? 64 : 4096}" value="${size}" ${selected ? "" : "disabled"}></label></div>`;
-  }).join("") || '<div class="empty">尚无计算槽，请先添加服务器并配置互联地址。</div>';
-}
-
-// 选择和批大小变化只影响新任务，不更改现有计算槽的接单状态。
-$("parallelWorkers").addEventListener("change", event => {
-  const id = event.target.dataset.parallelWorker || event.target.dataset.parallelBatch;
-  if (!id) return;
-  if (event.target.dataset.parallelWorker) {
-    if (event.target.checked) parallelSelections.set(id, taskSelect.value.startsWith("llm_") ? 1 : 32);
-    else parallelSelections.delete(id);
-    event.target.blur();
-  } else parallelSelections.set(id, Number(event.target.value));
-  renderParallelWorkers();
-  updateStart();
-});
-$("p_parallel").addEventListener("change", () => { updateTaskFields(); renderParallelWorkers(); });
-
 function updateTaskFields() {
   const task = taskSelect.value;
   const isClustering = task === "clustering";
@@ -1115,7 +1199,7 @@ function updateTaskFields() {
   $("p_require_gpu").checked = isLLM || $("p_require_gpu").checked;
   $("minVramField").hidden = isLLM ? false : (isClustering || !$("p_require_gpu").checked);
   if (isParallel) $("minVramField").hidden = true;
-  $("btnPredict").textContent = isLLM ? "生成文本" : "预测";
+  $("trainingAdvanced").hidden = isClustering;
   if (isClustering) {
     $("p_require_gpu").checked = false;
     $("minVramField").hidden = true;
@@ -1180,11 +1264,8 @@ $("trainingResourceSelect").addEventListener("change", () => { renderTrainingRes
 
 $("btnStart").onclick = async () => {
   if (state.trainSubmitting) return;
-  if (!trainingResourceReady()) {
-    renderTrainingResources(); updateStart();
-    toast("所选计算资源已不可用，请重新选择", "err");
-    return;
-  }
+  updateStart();
+  if (state.trainingIssue) { focusTrainingIssue(); return; }
   const task = taskSelect.value;
   const isLLM = task.startsWith("llm_");
   const datasetSource = isLLM ? $("p_dataset_source").value : "local";
@@ -1203,6 +1284,7 @@ $("btnStart").onclick = async () => {
     seed: 42,
     require_gpu: $("p_require_gpu").checked,
     min_vram_mb: $("p_require_gpu").checked ? Math.max(Number($("p_min_vram").value) || 0, 0) : 0,
+    device_backend: $("p_device_backend").value,
   };
   if (task === "clustering") payload.n_clusters = Number($("p_n_clusters").value);
   if (task === "time_series_forecasting") {
@@ -1245,19 +1327,24 @@ $("btnStart").onclick = async () => {
     payload.worker_id = $("trainingResourceSelect").value;
   }
   state.trainSubmitting = true;
-  renderTrainingResources(); updateStart();
+  renderTrainingResources();
+  state.trainError = "";
+  updateStart();
   try {
     const { job_id } = await apiJson("/api/train", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     toast("训练任务已创建: " + job_id, "ok");
+    $("jobSearch").value = "";
+    $("jobStatusFilter").value = "all";
     selectJob(job_id, true);
-  } catch (e) { toast("创建任务失败: " + e.message, "err"); }
+  } catch (e) { state.trainError = "创建任务失败：" + e.message + "。请重试，配置已保留。"; }
   finally { state.trainSubmitting = false; renderTrainingResources(); updateStart(); }
 };
 
 const statusText = { queued: "排队中", running: "训练中", completed: "已完成", failed: "失败", cancelled: "已取消", paused: "已暂停" };
 
+// 生成安全转义的任务卡片内容，外层节点由列表按任务 ID 复用。
 function jobCard(j) {
   const m = j.spec.params || {};
   const last = (j.metrics || []).slice(-1)[0] || {};
@@ -1272,7 +1359,7 @@ function jobCard(j) {
   return `<div class="jobcard${active}" data-id="${esc(j.id)}">
     <div class="jobline">
       <span class="jobname">${esc(target)} · ${esc(label)}</span>
-      <span class="chip st-${esc(j.status)}">${statusText[j.status] || j.status}</span>
+      <span class="chip st-${esc(j.status)}">${esc(statusText[j.status] || j.status)}</span>
       <span class="chip">${esc(j.spec.dataset_name || "")}</span>
       ${(j.spec.resource_hint || {}).require_gpu ? `<span class="chip" title="要求 GPU 训练">GPU</span>` : ""}
       ${j.retry_count ? `<span class="chip" title="环境性错误自动重试次数">↻ ${j.retry_count}</span>` : ""}
@@ -1292,43 +1379,100 @@ function jobCard(j) {
   </div>`;
 }
 
-async function refreshJobs() {
-  try {
-    state.jobs = await apiJson("/api/jobs");
-    const box = $("jobList");
-    box.innerHTML = state.jobs.length ? state.jobs.map(jobCard).join("") : `<div class="empty">暂无任务，先在左侧发起训练</div>`;
-    box.querySelectorAll(".jobcard").forEach((el) => {
-      el.onclick = () => selectJob(el.dataset.id);
-    });
-    if (!state.jobId && state.jobs.length) selectJob(state.jobs[0].id);
-    else if (state.jobId && !state.jobs.some((j) => j.id === state.jobId)) {
-      state.jobId = null;
-      $("detail").hidden = true;
-    }
-    if ($("predictInput").value.trim() === "" && state.jobId) fillPredictTemplate();
-    if (state.jobId) loadDetail();
-  } catch (e) { /* 轮询失败静默 */ }
+// 在内存中组合筛选，按 ID 更新卡片，避免轮询销毁键盘焦点。
+function renderJobList() {
+  const query = $("jobSearch").value.trim().toLocaleLowerCase();
+  const status = $("jobStatusFilter").value;
+  const jobs = state.jobs.filter(job => (status === "all" || job.status === status)
+    && [job.id, job.spec.dataset_name, job.spec.target, taskName(job.spec.task)].some(value => String(value || "").toLocaleLowerCase().includes(query)));
+  $("jobCount").textContent = "显示 " + jobs.length + " / " + state.jobs.length + " 个任务" + (state.jobId && !jobs.some(job => job.id === state.jobId) ? " · 当前查看的任务不在筛选结果中" : "");
+  const box = $("jobList");
+  if (!jobs.length) {
+    box.innerHTML = '<div class="empty">' + (state.jobs.length ? '没有匹配的任务，请调整或重置筛选。' : '暂无任务，完成配置后即可开始训练。') + '</div>';
+    return;
+  }
+  const existing = new Map([...box.querySelectorAll(".jobcard")].map(card => [card.dataset.id, card]));
+  const ids = new Set(jobs.map(job => job.id));
+  for (const child of [...box.children]) if (!ids.has(child.dataset.id)) child.remove();
+  jobs.forEach((job, index) => {
+    const holder = document.createElement("div");
+    holder.innerHTML = jobCard(job);
+    const next = holder.firstElementChild;
+    const card = existing.get(job.id) || next;
+    if (card.innerHTML !== next.innerHTML) card.innerHTML = next.innerHTML;
+    card.className = next.className;
+    card.setAttribute("role", "button");
+    card.setAttribute("tabindex", "0");
+    card.setAttribute("aria-pressed", String(job.id === state.jobId));
+    card.setAttribute("aria-label", (job.spec.dataset_name || job.id) + "，" + (statusText[job.status] || job.status));
+    card.onclick = () => selectJob(job.id);
+    card.onkeydown = event => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectJob(job.id); }
+    };
+    if (box.children[index] !== card) box.insertBefore(card, box.children[index] || null);
+  });
 }
 
+// 只采纳最近一次任务列表响应；短暂离线保留已有任务及当前选择。
+async function refreshJobs() {
+  const request = ++state.jobsRequest;
+  const selection = state.selectionVersion;
+  try {
+    const jobs = await apiJson("/api/jobs");
+    if (request !== state.jobsRequest) return;
+    state.jobs = jobs;
+    $("jobsFeedback").textContent = "";
+    if (!state.jobId && state.jobs.length) selectJob(state.jobs[0].id);
+    else if (selection === state.selectionVersion && state.jobId && !state.jobs.some(job => job.id === state.jobId)) {
+      state.jobId = null;
+      state.selectionVersion++;
+      state.detailRecord = null;
+      $("detail").hidden = true;
+      $("detailFeedback").textContent = "该任务已不存在，请选择其他任务。";
+    }
+    renderJobList();
+    if (state.jobId) { fillPredictTemplate(); loadDetail(); }
+  } catch (error) {
+    if (request === state.jobsRequest) $("jobsFeedback").textContent = "刷新失败：" + error.message + "；已保留列表，稍后自动重试。";
+  }
+}
+
+// 切换时立即清除旧详情与输出，响应版本同时隔离 A→B→A 的快速切换。
 function selectJob(id, clearLog) {
-  if (state.jobId !== id) {
+  if (state.jobId !== id || clearLog) {
     state.jobId = id;
+    state.selectionVersion++;
+    state.logVersion++;
     state.logOffset = 0;
+    state.logUnread = 0;
+    state.detailRecord = null;
+    state.predictTemplateJob = null;
     $("logBox").textContent = "";
-    $("resultBox").innerHTML = `<div class="empty">任务完成后展示评估结果</div>`;
+    $("resultBox").innerHTML = '<div class="empty">任务完成后展示评估结果</div>';
+    $("predictInput").value = "";
     $("predictOut").hidden = true;
+    $("detail").hidden = true;
+    $("detailFeedback").textContent = "正在加载任务详情…";
     fillPredictTemplate();
   }
-  $("detail").hidden = false;
-  refreshJobsSoon();
+  renderJobList();
+  loadDetail();
 }
 
 /* ---------- 详情 ---------- */
+// 请求编号与选择版本共同防止旧响应覆盖当前任务。
 async function loadDetail() {
+  const id = state.jobId, selection = state.selectionVersion, request = ++state.detailRequest;
+  if (!id) return;
   let j;
-  try { j = await apiJson(`/api/jobs/${state.jobId}`); }
-  catch { state.jobId = null; $("detail").hidden = true; return; }
-
+  try { j = await apiJson(`/api/jobs/${encodeURIComponent(id)}`); }
+  catch (error) {
+    if (id === state.jobId && selection === state.selectionVersion && request === state.detailRequest) $("detailFeedback").textContent = "详情更新失败：" + error.message + "；稍后自动重试。";
+    return;
+  }
+  if (id !== state.jobId || selection !== state.selectionVersion || request !== state.detailRequest) return;
+  $("detailFeedback").textContent = "";
+  $("detail").hidden = false;
   state.detailRecord = j;
   const taskLabel = taskName(j.spec.task);
   $("dName").textContent = `${j.spec.target || "无目标列"} · ${taskLabel}（${j.spec.dataset_name || ""}）`;
@@ -1338,7 +1482,7 @@ async function loadDetail() {
   const latestSegment = (j.segments || []).slice(-1)[0];
   const assignedResource = j.current_attempt || latestSegment || j;
   $("dDevice").textContent = j.current_attempt || latestSegment || j.worker_id
-    ? resourceText(assignedResource) : (j.retry_worker_id ? `等待 ${j.retry_worker_id}` : "等待资源分配");
+    ? resourceText(assignedResource) : ((j.spec.resource_hint?.worker_id || j.retry_worker_id) ? `等待 ${j.spec.resource_hint?.worker_id || j.retry_worker_id}` : "等待资源分配");
   renderResourceAllocation(j);
   renderRetryControls(j);
   $("btnRetry").onclick = () => retryFailedJob(j.id);
@@ -1349,7 +1493,7 @@ async function loadDetail() {
   $("btnDownload").hidden = !j.summary;
   $("btnDelete").onclick = async () => {
     if (!confirm("确定删除该任务及其产物？")) return;
-    try { await apiJson(`/api/jobs/${j.id}`, { method: "DELETE" }); toast("任务已删除", "ok"); state.jobId = null; $("detail").hidden = true; }
+    try { await apiJson(`/api/jobs/${j.id}`, { method: "DELETE" }); toast("任务已删除", "ok"); if (state.jobId === j.id) { state.jobId = null; state.selectionVersion++; $("detail").hidden = true; } refreshJobsSoon(); }
     catch (e) { toast(e.message, "err"); }
   };
   $("btnCancel").onclick = async () => {
@@ -1479,32 +1623,55 @@ function renderCharts(j) {
 }
 
 /* ---------- 日志 ---------- */
+// 同一游标只追加一次；暂停跟随时记录新行数而不移动阅读位置。
 async function tailLogs(id) {
+  if (state.logsClearing) return;
+  const offset = state.logOffset, version = state.logVersion;
   try {
-    const d = await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs?offset=${state.logOffset}`);
-    if (id !== state.jobId) return;
-    if (d.lines.length) {
-      $("logBox").textContent += d.lines.join("\n") + "\n";
-      state.logOffset = d.next_offset;
-      const box = $("logBox");
-      box.scrollTop = box.scrollHeight;
+    const data = await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs?offset=${offset}`);
+    if (id !== state.jobId || version !== state.logVersion || offset !== state.logOffset) return;
+    const box = $("logBox"), top = box.scrollTop;
+    if (data.lines.length) {
+      box.textContent += data.lines.join("\n") + "\n";
+      state.logOffset = data.next_offset;
+      if ($("logFollow").checked) followLatestLogs();
+      else { box.scrollTop = top; state.logUnread += data.lines.length; updateLogStatus(); }
     }
-  } catch { /* 静默 */ }
+  } catch {
+    if (id === state.jobId && version === state.logVersion) $("logStatus").textContent = "日志更新失败，稍后自动重试。";
+  }
 }
 
-// 清空当前任务日志并重置轮询偏移，避免继续使用旧游标。
+// 以简短状态展示阅读模式和积累的新日志数量。
+function updateLogStatus() {
+  $("logStatus").textContent = $("logFollow").checked ? "跟随最新日志" : "已暂停跟随" + (state.logUnread ? " · " + state.logUnread + " 行新日志" : "");
+}
+
+// 用户主动返回底部时恢复跟随，不需要等待下一轮日志响应。
+function followLatestLogs() {
+  $("logFollow").checked = true;
+  state.logUnread = 0;
+  $("logBox").scrollTop = $("logBox").scrollHeight;
+  updateLogStatus();
+}
+
+// 清理期间阻止旧日志回填；任务切换不会被旧清理响应影响。
 async function clearJobLogs() {
-  const id = state.jobId;
-  if (!id) return;
+  const id = state.jobId, selection = state.selectionVersion;
+  if (!id || state.logsClearing) return;
+  state.logsClearing = true;
+  state.logVersion++;
+  $("btnClearJobLogs").disabled = true;
   try {
     await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs`, { method: "DELETE" });
-    if (id !== state.jobId) return;
+    if (id !== state.jobId || selection !== state.selectionVersion) return;
     state.logOffset = 0;
+    state.logUnread = 0;
     $("logBox").textContent = "";
+    updateLogStatus();
     toast("任务日志已清除", "ok");
-  } catch (error) {
-    toast(error.message || "清除日志失败", "error");
-  }
+  } catch (error) { toast(error.message || "清除日志失败", "err"); }
+  finally { state.logsClearing = false; $("btnClearJobLogs").disabled = false; }
 }
 
 /* ---------- 结果 ---------- */
@@ -1582,9 +1749,12 @@ function renderResult(j) {
 }
 
 /* ---------- 预测 ---------- */
+// 每次选择只填充一次模板，异步预览不得覆盖新任务或用户已输入的内容。
 async function fillPredictTemplate() {
   const j = state.jobs.find((x) => x.id === state.jobId);
-  if (!j) return;
+  if (!j || state.predictTemplateJob === j.id) return;
+  state.predictTemplateJob = j.id;
+  const selection = state.selectionVersion, initial = $("predictInput").value;
   if (j.spec.task.startsWith("llm_")) {
     $("predictInput").value = "";
     $("predictInput").placeholder = "输入 prompt，例如：用三句话介绍机器学习。";
@@ -1602,6 +1772,7 @@ async function fillPredictTemplate() {
   }
   try {
     const d = await apiJson(`/api/datasets/${j.spec.dataset_id}`);
+    if (j.id !== state.jobId || selection !== state.selectionVersion || $("predictInput").value !== initial) return;
     if (d.preview && d.preview[0]) {
       const row = { ...d.preview[0] };
       if (j.spec.target) delete row[j.spec.target];
@@ -1841,14 +2012,51 @@ async function refreshWorkers() {
 $("btnRefreshWorkers").onclick = refreshWorkers;
 
 /* ---------- Tab 切换 ---------- */
-document.querySelectorAll(".tabs button").forEach((b) => {
-  b.onclick = () => {
-    document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
-    state.activeTab = b.dataset.tab;
-    for (const t of ["curves", "logs", "result", "predict"]) $("tab-" + t).hidden = t !== state.activeTab;
-    refreshJobsSoon();
-  };
+// 同步视觉、面板可见性和 ARIA 状态，键盘激活时焦点随标签移动。
+function activateDetailTab(name, focus = false) {
+  state.activeTab = name;
+  document.querySelectorAll(".tabs button").forEach(button => {
+    const selected = button.dataset.tab === name;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+    button.setAttribute("tabindex", selected ? "0" : "-1");
+    $("tab-" + button.dataset.tab).hidden = !selected;
+    if (selected && focus) button.focus();
+  });
+  if (state.jobId) loadDetail();
+}
+
+document.querySelectorAll(".tabs button").forEach((button, index, tabs) => {
+  button.onclick = () => activateDetailTab(button.dataset.tab);
+  button.addEventListener("keydown", event => {
+    let next;
+    if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    activateDetailTab(tabs[next].dataset.tab, true);
+  });
 });
+$("jobSearch").addEventListener("input", renderJobList);
+$("jobStatusFilter").addEventListener("change", renderJobList);
+$("btnResetJobFilters").onclick = () => { $("jobSearch").value = ""; $("jobStatusFilter").value = "all"; renderJobList(); $("jobSearch").focus(); };
+$("btnLocateTrainingIssue").onclick = focusTrainingIssue;
+$("btnLatestLogs").onclick = followLatestLogs;
+$("logFollow").addEventListener("change", () => { if ($("logFollow").checked) followLatestLogs(); else updateLogStatus(); });
+$("logBox").addEventListener("scroll", () => {
+  const box = $("logBox");
+  if ($("logFollow").checked && box.scrollHeight - box.scrollTop - box.clientHeight > 24) {
+    $("logFollow").checked = false; updateLogStatus();
+  }
+});
+// 所有配置输入均刷新就绪状态，并清除已经修正的字段提示。
+["input", "change"].forEach(eventName => $("trainForm").addEventListener(eventName, event => {
+  state.trainError = "";
+  event.target.removeAttribute("aria-invalid");
+  updateStart();
+}));
 $("btnClearJobLogs").onclick = clearJobLogs;
 let detailTimer = null;
 function refreshJobsSoon() { clearTimeout(detailTimer); detailTimer = setTimeout(refreshJobs, 30); }
@@ -1856,6 +2064,11 @@ $("btnDownload").onclick = () => { if (state.jobId) location.href = `/api/jobs/$
 
 /* ---------- 启动 ---------- */
 (async function init() {
+  // 为既有字段补齐标签关联，键盘和读屏工具均能识别字段名称。
+  document.querySelectorAll("#trainForm .field").forEach(field => {
+    const label = field.querySelector("label"), input = field.querySelector("input, select");
+    if (label && input && !label.htmlFor) label.htmlFor = input.id;
+  });
   updateTaskFields();
   loadSystem();
   setInterval(loadSystem, 15000);

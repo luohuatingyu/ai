@@ -49,6 +49,18 @@
         <div id="remoteCredentialStatus" class="hint" role="status" aria-live="polite">正在读取凭证…</div>
       </div>
       <div class="field">
+        <label for="remoteDeviceBackend">设备后端</label>
+        <select id="remoteDeviceBackend" name="device_backend">
+          <option value="auto">自动检测</option>
+          <option value="cuda">NVIDIA CUDA</option>
+          <option value="rocm">AMD ROCm</option>
+          <option value="xpu">Intel XPU</option>
+          <option value="mps">Apple MPS（macOS 原生）</option>
+          <option value="cpu">CPU</option>
+        </select>
+        <div class="hint">MPS 不使用 Linux Docker；请用 scripts/worker-native.sh。</div>
+      </div>
+      <div class="field">
         <label for="remoteUsername">SSH 用户（可选覆盖）</label>
         <input id="remoteUsername" name="username" maxlength="32" pattern="[A-Za-z_][A-Za-z0-9_-]*" placeholder="留空时使用所选凭证的用户名">
         <div class="hint">填写后仅覆盖这台服务器的 SSH 用户名。</div>

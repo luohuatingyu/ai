@@ -1448,6 +1448,77 @@ html {
   gap: 10px;
 }
 
+/* 训练工作台：渐进配置、固定操作区和稳定的任务阅读体验。 */
+.training-page [hidden] { display: none !important; }
+.training-page .training-advanced {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-raised);
+}
+.training-page .training-advanced summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 600;
+  list-style-position: inside;
+}
+.training-page .training-advanced summary span {
+  display: block;
+  margin: 3px 0 0 16px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+.training-page .training-advanced[open] > .formgrid { margin-top: 16px; }
+.training-page .training-advanced summary:focus-visible,
+.training-page .jobcard:focus-visible,
+.training-page [role="tabpanel"]:focus-visible,
+.training-page #logBox:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.training-page .training-submit {
+  position: sticky;
+  bottom: -1px;
+  z-index: 2;
+  display: grid;
+  gap: 9px;
+  margin: 6px -8px -8px;
+  padding: 14px 8px 8px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -8px 16px rgba(255, 255, 255, .85);
+}
+.training-page .training-submit #btnStart { margin-top: 0; min-height: 44px; }
+.training-page .text-action {
+  justify-self: start;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  box-shadow: none;
+}
+.training-page .feedback-error { color: var(--danger); overflow-wrap: anywhere; }
+.training-page #detailFeedback:empty { display: none; }
+.training-page #detailFeedback:not(:empty) { margin-top: 16px; }
+.training-page #trainForm [aria-invalid="true"] { border-color: var(--danger); }
+.training-page .job-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 8px; }
+.training-page .job-filters input { flex: 1 1 220px; min-width: 0; }
+.training-page .job-filters select { flex: 0 1 130px; width: auto; }
+.training-page .job-filters button { white-space: nowrap; }
+.training-page .job-list-feedback { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 12px; }
+.training-page #jobsFeedback { color: var(--warning); }
+.training-page .log-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 10px 0; }
+.training-page .log-toolbar label { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; cursor: pointer; }
+.training-page .log-toolbar #logStatus { flex: 1 1 130px; }
+.training-page .log-toolbar input { width: auto; }
+.training-page #logBox { overflow-anchor: none; }
+@media (max-width: 560px) {
+  .training-page .job-filters input { flex-basis: 100%; }
+  .training-page .job-filters select { flex: 1; }
+  .training-page .training-submit { bottom: 0; }
+}
+
 .training-page .jobcard {
   margin: 0;
   padding: 14px 16px 13px;
@@ -1830,61 +1901,6 @@ html {
   }
 }
 
-/* 独立维护页沿用工作台的视觉令牌，列表与编辑区域各自清晰分组。 */
-.management-page { margin: 0; font-size: 14px; line-height: 1.6; }
-.management-page .topbar { display: flex; align-items: center; justify-content: space-between; }
-.management-page button { cursor: pointer; }
-.management-page input, .management-page select, .management-page textarea { width: 100%; font: inherit; }
-.management-page input[type="checkbox"], .management-page input[type="radio"] { width: auto; accent-color: var(--accent); }
-.management-page textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, monospace; }
-.management-page [hidden] { display: none !important; }
-.management-page .hint { color: var(--muted); font-size: 13px; }
-.management-page .field { min-width: 0; }
-.management-page .field > label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
-.management-page .chip { display: inline-block; border: 1px solid var(--border); border-radius: 99px; padding: 4px 10px; color: var(--muted); font-size: 12px; background: var(--chip); }
-.management-page .empty { padding: 40px 20px; text-align: center; color: var(--muted); }
-.management-shell { width: min(1440px, 100%); margin: auto; padding: 32px clamp(18px, 4vw, 56px) 60px; }
-.management-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 26px; }
-.management-heading h1 { font-size: 28px; margin: 0 0 8px; }
-.management-heading p { margin: 0; }
-.management-heading .management-eyebrow { font-size: 12px; color: var(--accent); margin-bottom: 8px; }
-.management-summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
-.management-summary .compute-summary { margin-top: 0; }
-.management-status { padding: 12px 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-raised); color: var(--muted); }
-.credential-workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 24px; }
-.management-panel { border-top: 1px solid var(--border); padding: 20px 0; background: transparent; min-width: 0; }
-.management-panel h2 { font-size: 18px; margin: 0 0 14px; }
-.management-panel-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; }
-.management-panel-heading h2 { margin: 0; }
-.credential-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--border); }
-.credential-row:last-child { border: 0; }
-.credential-description { min-width: 0; overflow-wrap: anywhere; }
-.credential-description strong { font-size: 15px; margin-right: 8px; }
-.credential-description p { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
-.management-page .server-form-error { color: var(--danger); margin-top: 12px; overflow-wrap: anywhere; }
-.management-page .server-log-output, .management-page .server-effective-config-row { background: #f8faff; }
-.management-page .server-controls .server-log-button { color: var(--accent); }
-.management-page .server-slots { grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); }
-.management-page .server-card { border-radius: 8px; }
-.management-page .resource-slot { border-radius: 8px; }
-.management-page #addServerModal .server-field-heading { flex-wrap: wrap; }
-.management-link { display: inline-flex; align-items: center; padding: 8px 14px; border: 1px solid var(--border); border-radius: 10px; color: var(--accent); background: #fff; text-decoration: none; font-size: 13px; }
-.management-page #addServerModal a.server-text-button { text-decoration: none; margin-left: auto; }
-.training-page .app-nav, .dataset-page .app-nav, .management-page .app-nav { max-width: 100%; overflow-x: auto; justify-content: flex-start; }
-@media (max-width: 860px) {
-  .credential-workspace { grid-template-columns: minmax(0, 1fr); }
-  .management-heading { align-items: flex-start; flex-direction: column; gap: 16px; }
-  .management-page .server-head { align-items: flex-start; flex-direction: column; }
-  .management-page .server-head-actions { justify-content: flex-start; }
-}
-@media (max-width: 560px) {
-  .management-shell { padding: 22px 12px 40px; }
-  .management-panel { padding: 18px 0; }
-  .management-summary, .credential-row { align-items: flex-start; flex-direction: column; }
-  .management-page .topbar { padding: 12px; }
-  .management-page .server-effective-config-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
-  .management-page .resource-slot { grid-template-columns: minmax(0, 1fr); }
-}
 /* 数据集展示：来源、规模、字段和操作分区，样式仅作用于维护页。 */
 .dataset-page .dataset-results { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 40px; margin: -6px 0 16px; color: var(--muted); font-size: 12px; }
 .dataset-page .dataset-results button { min-height: 32px; padding: 4px 10px; font-size: 12px; }
@@ -1966,4 +1982,60 @@ html {
   .dataset-page #datasetModal .modal-header, .dataset-page #modalBody { padding: 16px; }
   .dataset-page #datasetModal .modal-content { max-height: calc(100dvh - 20px); }
   .dataset-page .dataset-details { padding: 12px; }
+}
+
+/* 独立维护页沿用工作台的视觉令牌，列表与编辑区域各自清晰分组。 */
+.management-page { margin: 0; font-size: 14px; line-height: 1.6; }
+.management-page .topbar { display: flex; align-items: center; justify-content: space-between; }
+.management-page button { cursor: pointer; }
+.management-page input, .management-page select, .management-page textarea { width: 100%; font: inherit; }
+.management-page input[type="checkbox"], .management-page input[type="radio"] { width: auto; accent-color: var(--accent); }
+.management-page textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, monospace; }
+.management-page [hidden] { display: none !important; }
+.management-page .hint { color: var(--muted); font-size: 13px; }
+.management-page .field { min-width: 0; }
+.management-page .field > label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+.management-page .chip { display: inline-block; border: 1px solid var(--border); border-radius: 99px; padding: 4px 10px; color: var(--muted); font-size: 12px; background: var(--chip); }
+.management-page .empty { padding: 40px 20px; text-align: center; color: var(--muted); }
+.management-shell { width: min(1440px, 100%); margin: auto; padding: 32px clamp(18px, 4vw, 56px) 60px; }
+.management-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 26px; }
+.management-heading h1 { font-size: 28px; margin: 0 0 8px; }
+.management-heading p { margin: 0; }
+.management-heading .management-eyebrow { font-size: 12px; color: var(--accent); margin-bottom: 8px; }
+.management-summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.management-summary .compute-summary { margin-top: 0; }
+.management-status { padding: 12px 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-raised); color: var(--muted); }
+.credential-workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 24px; }
+.management-panel { border-top: 1px solid var(--border); padding: 20px 0; background: transparent; min-width: 0; }
+.management-panel h2 { font-size: 18px; margin: 0 0 14px; }
+.management-panel-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; }
+.management-panel-heading h2 { margin: 0; }
+.credential-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--border); }
+.credential-row:last-child { border: 0; }
+.credential-description { min-width: 0; overflow-wrap: anywhere; }
+.credential-description strong { font-size: 15px; margin-right: 8px; }
+.credential-description p { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.management-page .server-form-error { color: var(--danger); margin-top: 12px; overflow-wrap: anywhere; }
+.management-page .server-log-output, .management-page .server-effective-config-row { background: #f8faff; }
+.management-page .server-controls .server-log-button { color: var(--accent); }
+.management-page .server-slots { grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); }
+.management-page .server-card { border-radius: 8px; }
+.management-page .resource-slot { border-radius: 8px; }
+.management-page #addServerModal .server-field-heading { flex-wrap: wrap; }
+.management-link { display: inline-flex; align-items: center; padding: 8px 14px; border: 1px solid var(--border); border-radius: 10px; color: var(--accent); background: #fff; text-decoration: none; font-size: 13px; }
+.management-page #addServerModal a.server-text-button { text-decoration: none; margin-left: auto; }
+.training-page .app-nav, .dataset-page .app-nav, .management-page .app-nav { max-width: 100%; overflow-x: auto; justify-content: flex-start; }
+@media (max-width: 860px) {
+  .credential-workspace { grid-template-columns: minmax(0, 1fr); }
+  .management-heading { align-items: flex-start; flex-direction: column; gap: 16px; }
+  .management-page .server-head { align-items: flex-start; flex-direction: column; }
+  .management-page .server-head-actions { justify-content: flex-start; }
+}
+@media (max-width: 560px) {
+  .management-shell { padding: 22px 12px 40px; }
+  .management-panel { padding: 18px 0; }
+  .management-summary, .credential-row { align-items: flex-start; flex-direction: column; }
+  .management-page .topbar { padding: 12px; }
+  .management-page .server-effective-config-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .management-page .resource-slot { grid-template-columns: minmax(0, 1fr); }
 }

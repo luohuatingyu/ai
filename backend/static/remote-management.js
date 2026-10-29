@@ -383,6 +383,7 @@ async function openEditRemoteServer(machineId) {
     ? (server.username_override || "") : (server.username || "");
   $("remotePort").value = server.port || 22;
   document.querySelector(`input[name="mode"][value="${server.mode === "cpu" ? "cpu" : "gpu"}"]`).checked = true;
+  $("remoteDeviceBackend").value = server.device_backend || "auto";
   $("remoteCpuSlots").value = server.cpu_slots ?? 2;
   $("remoteDistributedHost").value = server.distributed_host || "";
   $("remoteCpuSlotsField").hidden = server.mode !== "cpu";
@@ -438,6 +439,7 @@ async function submitRemoteServer(event) {
   payload.username = payload.username.trim() || null;
   payload.port = Number(payload.port);
   payload.cpu_slots = Number($("remoteCpuSlots").value || 0);
+  payload.device_backend = $("remoteDeviceBackend").value || "auto";
   payload.remote_redis_url = String(payload.remote_redis_url || "").trim();
   payload.remote_s3_endpoint = payload.remote_s3_endpoint.trim() || null;
   payload.docker_registry = String(payload.docker_registry || "").trim() || null;
