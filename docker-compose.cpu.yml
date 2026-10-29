@@ -63,7 +63,11 @@ services:
     restart: unless-stopped
 
   trainer:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: mtp-trainer-cpu
     # 仅内网：对外入口统一走 frontend 容器（同源代理 /api）
     volumes:
@@ -119,7 +123,11 @@ services:
 
   worker:
     image: ${WORKER_IMAGE:-mtp-worker-cpu:local}
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: mtp-worker-cpu
     # 计算平面：supervisor 按 WORKER_CPU_SLOTS 拉起 CPU 执行槽（一卡一进程的 CPU 版）
     command: ["python", "-m", "app.worker"]

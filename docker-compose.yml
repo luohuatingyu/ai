@@ -80,7 +80,11 @@ services:
     restart: unless-stopped
 
   trainer:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: mtp-trainer
     # 仅内网：对外入口统一走 frontend 容器（同源代理 /api）
     # 本地单进程开发仍可直接 uvicorn app.main:app（后端自带静态兜底）
@@ -130,7 +134,11 @@ services:
 
   worker:
     image: ${WORKER_IMAGE:-mtp-worker:local}
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: mtp-worker
     # 计算平面：supervisor 按 WORKER_CPU_SLOTS 拉起 CPU 执行槽（一卡一进程的 CPU 版）
     command: ["python", "-m", "app.worker"]
