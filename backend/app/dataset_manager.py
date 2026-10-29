@@ -515,17 +515,20 @@ class DatasetManager:
             logger.error(f"删除数据集 {ds_id} 失败: {e}")
             return False
     
-    def get_dataset_preview(self, ds_id: str, rows: int = 5) -> Dict[str, Any]:
+    def get_dataset_preview(self, ds_id: str, rows: int = 5, offset: int = 0) -> Dict[str, Any]:
         """
-        获取数据集预览
+        获取数据集指定页的预览数据。
         
         Args:
             ds_id: 数据集ID
-            rows: 预览行数
+            rows: 当前页行数
+            offset: 当前页起始行（从 0 开始）
             
         Returns:
             Dict: 预览数据
         """
+        page_size = max(1, min(int(rows), 50))
+        page_offset = max(0, int(offset))
         metadata = self.ensure_local(ds_id)
         if not metadata:
             raise HTTPException(404, "数据集不存在")
@@ -535,13 +538,32 @@ class DatasetManager:
             csv_path = self._resolve_csv(ds_id)
             if csv_path is None:
                 raise HTTPException(404, f"数据集文件不存在: {ds_id}.csv")
-            df = pd.read_csv(csv_path, nrows=max(1, min(rows, 50)))
-            preview = df.astype(object).where(pd.notnull(df), None).to_dict(orient="records")
+            total_rows = max(0, int(metadata.get("rows", 0) or 0))
+            # 超出数据集末尾时返回空页，避免读取无意义的文件内容。
+            if page_offset >= total_rows:
+                preview = []
+                column_types = metadata.get("column_types") or {}
+            else:
+                df = pd.read_csv(
+                    csv_path,
+                    skiprows=range(1, page_offset + 1),
+                    nrows=page_size,
+                )
+                preview = df.astype(object).where(pd.notnull(df), None).to_dict(orient="records")
+                column_types = {str(c): str(t) for c, t in df.dtypes.items()}
+
+            page_count = max(1, (total_rows + page_size - 1) // page_size)
             
             return {
                 **metadata,
                 "preview": preview,
-                "column_types": {str(c): str(t) for c, t in df.dtypes.items()},
+                "column_types": column_types,
+                "preview_offset": page_offset,
+                "preview_limit": page_size,
+                "preview_page": min(page_offset // page_size + 1, page_count),
+                "preview_page_count": page_count,
+                "preview_has_previous": page_offset > 0,
+                "preview_has_next": page_offset + len(preview) < total_rows,
             }
         except Exception as e:
             logger.error(f"获取数据集 {ds_id} 预览失败: {e}")

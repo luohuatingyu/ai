@@ -6,16 +6,20 @@ const vm = require('node:vm');
 const test = require('node:test');
 const html = fs.readFileSync(path.join(__dirname, '../backend/static/index.html'), 'utf8');
 
-// 仅隔离 DOM 与 HTTP 边界，执行页面真实的列表、列选择和预览交互。
+// 仅隔离 DOM 与 HTTP 边界，执行页面真实的弹窗、分页、列配置和异步逻辑。
 function fixture() {
   const nodes = new Map(), requests = [];
-  // 模拟选择框的默认选项与清空行为，避免掩盖旧列残留问题。
+  const document = { activeElement: null, handlers: {}, body: { classList: { add() {}, remove() {} } },
+    addEventListener(type, fn) { this.handlers[type] = fn; }, createElement: tag => element('', tag) };
   function element(id = '', tag = 'div', attrs = '') {
     let markup = '';
-    const node = { id, tag, value: '', textContent: '', children: [], attributes: {},
-      hidden: /\bhidden\b/.test(attrs), disabled: /\bdisabled\b/.test(attrs),
+    const node = { id, tag, value: '', textContent: '', children: [], attributes: {}, hidden: /\bhidden\b/.test(attrs),
+      disabled: /\bdisabled\b/.test(attrs), handlers: {}, isConnected: true,
+      classList: { add() {}, remove() {}, contains() { return false; } },
       appendChild(child) { this.children.push(child); if (tag === 'select' && this.children.length === 1) this.value = child.value; },
+      addEventListener(type, fn) { this.handlers[type] = fn; },
       setAttribute(key, value) { this.attributes[key] = String(value); },
+      focus() { document.activeElement = this; },
       dispatchEvent(event) { return this['on' + event.type]?.({ target: this }); },
     };
     for (const match of attrs.matchAll(/([\w-]+)="([^"]*)"/g)) node.attributes[match[1]] = match[2];
@@ -23,161 +27,142 @@ function fixture() {
     return node;
   }
   for (const match of html.split('<script>')[0].matchAll(/<(\w+)\b([^>]*\bid="([^"]+)"[^>]*)>/g)) nodes.set(match[3], element(match[3], match[1], match[2]));
-  const $ = id => nodes.get(id);
-  const context = vm.createContext({ $, Event, console,
-    document: { createElement: tag => element('', tag) },
+  const $ = id => { if (!nodes.has(id)) nodes.set(id, element(id)); return nodes.get(id); };
+  const context = vm.createContext({ $, Event, console, document,
     esc: value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
     updateStart() {},
-    apiJson: async url => { requests.push(url); return url === '/api/datasets' ? { datasets: [dataset()] } : dataset(); },
+    apiJson: async url => { requests.push(url); return url === '/api/datasets' ? { datasets: [dataset()] } : page(0); },
   });
   vm.runInContext(html.slice(html.indexOf('const state ='), html.indexOf('/* ---------- 基础工具 ---------- */')), context);
   const state = vm.runInContext('state', context);
-  vm.runInContext(html.slice(html.indexOf('/* ---------- 数据集 ---------- */'), html.indexOf('function updateStart()')), context);
-  // 保留历史上传区段边界，验证新按钮绑定及旧上传入口移除。
+  vm.runInContext(html.slice(html.indexOf('/* ---------- 数据集 ---------- */'), html.indexOf('// 汇总配置状态与提交锁')), context);
   vm.runInContext(html.slice(html.indexOf('/* 上传 */'), html.indexOf('/* ---------- 训练任务 ---------- */')), context);
-  return { $, context, state, requests };
+  return { $, context, state, requests, document };
 }
 
-// 构造符合数据集列表和详情 API 的固定样本。
+// 构造 25 行数据，覆盖三页、最后不足一页和特殊字符。
 function dataset(extra = {}) {
-  return { id: 'a', name: '客户.csv', rows: 7, columns: ['time', 'value', 'target'],
-    preview: Array.from({ length: 7 }, (_, index) => ({ time: index, value: index + 10, target: index % 2 })), ...extra };
+  const rows = Array.from({ length: 25 }, (_, index) => ({ time: index, value: index + 10, target: index % 2 }));
+  return { id: 'a', name: '客户.csv', rows: 25, columns: ['time', 'value', 'target'], preview: rows, ...extra };
 }
-
-// 控制响应顺序，复现收起、重复点击和往返切换的并发场景。
+function page(offset, extra = {}) {
+  const source = dataset(extra);
+  const rows = source.preview.slice(offset, offset + 10);
+  return { ...source, preview: rows, preview_offset: offset, preview_limit: 10,
+    preview_page: Math.floor(offset / 10) + 1, preview_page_count: 3,
+    preview_has_previous: offset > 0, preview_has_next: offset + rows.length < source.rows };
+}
 function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
-
-// 通过真实下拉框事件选择数据集。
 function select(f, id) { f.$('datasetSelect').value = id; return f.$('datasetSelect').onchange({ target: f.$('datasetSelect') }); }
 
-test('首屏预览默认隐藏，按钮名称与无障碍状态正确，上传交由管理页', () => {
-  assert.match(html, /id="btnPreview"[^>]*aria-expanded="false"[^>]*>预览数据<\/button>/);
-  assert.doesNotMatch(html, /<button[^>]*id="btnUpload"|id="fileInput"/);
-  const f = fixture();
-  assert.equal(f.$('previewWrap').hidden, true);
-  assert.equal(f.$('previewMeta').hidden, true);
-  assert.equal(f.$('btnPreview').disabled, true);
-  assert.equal(f.$('btnUpload').attributes.href, '/dataset-manager.html');
+test('预览入口打开弹窗，主页面不再内联表格', () => {
+  assert.match(html, /id="btnPreview"[^>]*aria-controls="previewModal"/);
+  assert.match(html, /id="previewModal"[^>]*role="dialog"/);
+  assert.match(html, /id="previewPrev"/); assert.match(html, /id="previewNext"/);
+  assert.doesNotMatch(html.slice(html.indexOf('id="datasetLocalPanel"'), html.indexOf('<h2>② 训练配置')), /<table|preview-table/);
 });
 
-test('加载列表与切换只使用列元信息，未预览也可配置训练', async () => {
+test('列表加载只使用列元信息，未打开弹窗也可配置训练', async () => {
   const f = fixture(); await f.context.loadDatasets();
   assert.deepEqual(f.requests, ['/api/datasets']);
-  assert.equal(f.$('previewWrap').hidden, true);
+  assert.equal(f.$('previewModal').hidden, true);
   assert.equal(f.$('targetSelect').value, 'target');
   assert.equal(f.$('timeColumnSelect').value, 'time');
-  assert.equal(f.$('targetSelect').children.length, 3);
   assert.equal(f.$('btnPreview').disabled, false);
-  f.state.datasets.push(dataset({ id: 'b', columns: ['only'] })); select(f, 'b');
-  assert.equal(f.$('targetSelect').value, 'only');
-  assert.equal(f.$('timeColumnSelect').value, '');
-  assert.equal(f.$('targetSelect').children.length, 1);
-  assert.deepEqual(f.requests, ['/api/datasets']);
 });
 
-test('点击加载前五行与规模，再次点击收起并清空预览', async () => {
+test('点击打开弹窗并加载第一页，显示每页 10 行和分页状态', async () => {
   const f = fixture(); await f.context.loadDatasets();
   await f.$('btnPreview').onclick();
-  assert.deepEqual(f.requests, ['/api/datasets', '/api/datasets/a']);
-  assert.equal(f.$('previewWrap').hidden, false);
-  assert.equal((f.$('previewWrap').innerHTML.match(/<td>/g) || []).length, 15);
-  assert.equal(f.$('previewMeta').textContent, '7 行 · 3 列 · 仅展示前 5 行');
-  assert.equal(f.$('previewMeta').hidden, false);
-  assert.equal(f.$('btnPreview').textContent, '收起预览');
-  assert.equal(f.$('btnPreview').attributes['aria-expanded'], 'true');
+  assert.deepEqual(f.requests, ['/api/datasets', '/api/datasets/a?rows=10&offset=0']);
+  assert.equal(f.$('previewModal').hidden, false);
+  assert.equal((f.$('previewWrap').innerHTML.match(/<tr>/g) || []).length, 11);
+  assert.equal(f.$('previewModalMeta').textContent, '25 行 · 3 列 · 每页 10 行');
+  assert.equal(f.$('previewPageStatus').textContent, '第 1 / 3 页');
+  assert.equal(f.$('previewPrev').disabled, true);
+  assert.equal(f.$('previewNext').disabled, false);
+  assert.equal(f.document.activeElement, f.$('btnClosePreview'));
+});
+
+test('下一页和上一页按偏移请求，最后一页正确禁用下一页', async () => {
+  const f = fixture(); await f.context.loadDatasets();
+  f.context.apiJson = async url => {
+    f.requests.push(url);
+    const offset = Number(new URL('http://preview' + url).searchParams.get('offset') || 0);
+    return url === '/api/datasets' ? { datasets: [dataset()] } : page(offset);
+  };
   await f.$('btnPreview').onclick();
-  assert.equal(f.$('previewWrap').hidden, true);
-  assert.equal(f.$('previewWrap').innerHTML, '');
-  assert.equal(f.$('previewMeta').hidden, true);
+  await f.$('previewNext').onclick();
+  assert.equal(f.requests.at(-1), '/api/datasets/a?rows=10&offset=10');
+  assert.equal(f.$('previewPageStatus').textContent, '第 2 / 3 页');
+  assert.equal(f.$('previewPrev').disabled, false);
+  await f.$('previewNext').onclick();
+  assert.equal(f.requests.at(-1), '/api/datasets/a?rows=10&offset=20');
+  assert.equal(f.$('previewPageStatus').textContent, '第 3 / 3 页');
+  assert.equal((f.$('previewWrap').innerHTML.match(/<tr>/g) || []).length, 6);
+  assert.equal(f.$('previewNext').disabled, true);
+  await f.$('previewPrev').onclick();
+  assert.equal(f.$('previewPageStatus').textContent, '第 2 / 3 页');
+});
+
+test('关闭按钮、遮罩和 Escape 关闭弹窗并恢复触发焦点', async () => {
+  const f = fixture(); await f.context.loadDatasets(); await f.$('btnPreview').onclick();
+  await f.$('btnClosePreview').onclick();
+  assert.equal(f.$('previewModal').hidden, true);
   assert.equal(f.$('btnPreview').textContent, '预览数据');
-  assert.equal(f.$('btnPreview').attributes['aria-expanded'], 'false');
-});
-
-test('预览加载与完成不重置用户已选择的目标列及时间列', async () => {
-  const f = fixture(); await f.context.loadDatasets();
-  f.$('targetSelect').value = 'value'; f.$('timeColumnSelect').value = 'target';
-  const pending = deferred(); f.context.apiJson = () => pending.promise;
-  const action = f.$('btnPreview').onclick();
-  assert.equal(f.$('targetSelect').value, 'value');
-  f.$('timeColumnSelect').value = 'time'; pending.resolve(dataset()); await action;
-  assert.equal(f.$('targetSelect').value, 'value');
-  assert.equal(f.$('timeColumnSelect').value, 'time');
-});
-
-for (const failure of [false, true]) test(`收起后的旧请求${failure ? '失败' : '成功'}不会重新展开`, async () => {
-  const f = fixture(); await f.context.loadDatasets();
-  const pending = deferred(); f.context.apiJson = () => pending.promise;
-  const action = f.$('btnPreview').onclick();
-  assert.equal(f.$('previewWrap').attributes['aria-busy'], 'true');
+  assert.equal(f.document.activeElement, f.$('btnPreview'));
   await f.$('btnPreview').onclick();
-  failure ? pending.reject(new Error('旧错误')) : pending.resolve(dataset()); await action;
-  assert.equal(f.$('previewWrap').hidden, true);
-  assert.equal(f.$('previewWrap').innerHTML, '');
-  assert.equal(f.$('previewWrap').attributes['aria-busy'], 'false');
-  assert.equal(f.$('previewMeta').hidden, true);
+  f.context.document.handlers.keydown({ key: 'Escape' });
+  assert.equal(f.$('previewModal').hidden, true);
+  assert.equal(f.document.activeElement, f.$('btnPreview'));
 });
 
-for (const failure of [false, true]) test(`往返切换后旧请求${failure ? '失败' : '成功'}不覆盖最新预览`, async () => {
+test('关闭或切换后的旧响应不会污染弹窗', async () => {
   const f = fixture(); await f.context.loadDatasets();
-  f.state.datasets.push(dataset({ id: 'b' }));
+  const pending = deferred(); f.context.apiJson = url => { f.requests.push(url); return pending.promise; };
+  const action = f.$('btnPreview').onclick();
+  await f.$('btnClosePreview').onclick();
+  pending.resolve(page(0)); await action;
+  assert.equal(f.$('previewModal').hidden, true);
+  assert.equal(f.$('previewWrap').innerHTML, '');
+
   const old = deferred(), current = deferred(); let calls = 0;
-  f.context.apiJson = () => ++calls === 1 ? old.promise : current.promise;
-  const a = f.$('btnPreview').onclick(); select(f, 'b'); select(f, 'a');
-  assert.equal(f.$('previewWrap').hidden, true);
-  const b = f.$('btnPreview').onclick(); current.resolve(dataset({ rows: 99 })); await b;
-  failure ? old.reject(new Error('旧错误')) : old.resolve(dataset({ rows: 1 })); await a;
-  assert.match(f.$('previewMeta').textContent, /^99 行/);
-  assert.equal(f.$('previewWrap').hidden, false);
+  f.context.apiJson = url => { f.requests.push(url); return ++calls === 1 ? old.promise : current.promise; };
+  f.state.datasets.push(dataset({ id: 'b', name: '新数据.csv' }));
+  select(f, 'a'); const oldAction = f.$('btnPreview').onclick(); select(f, 'b');
+  const currentAction = f.$('btnPreview').onclick(); current.resolve(page(0, { id: 'b', name: '新数据.csv' })); await currentAction;
+  old.resolve(page(0)); await oldAction;
+  assert.equal(f.$('previewModalTitle').textContent, '新数据.csv · 数据预览');
   assert.doesNotMatch(f.$('previewWrap').innerHTML, /旧错误/);
 });
 
-test('空列表禁用预览并清除旧列，直接触发也不请求详情', async () => {
-  const f = fixture(); await f.context.loadDatasets(); await f.$('btnPreview').onclick();
-  f.state.datasets = []; f.context.renderDatasetSelect();
-  const count = f.requests.length; await f.$('btnPreview').onclick();
-  assert.equal(f.requests.length, count);
-  assert.equal(f.$('btnPreview').disabled, true);
-  assert.equal(f.$('datasetSelect').disabled, true);
-  assert.equal(f.$('targetSelect').children.length, 0);
-  assert.equal(f.$('previewWrap').hidden, true);
-  assert.equal(f.$('previewMeta').textContent, '');
-});
-
-for (const status of ['remote', 'error', 'ready']) test(`Hub ${status} 仅点击后请求详情，列信息在下载后补齐`, async () => {
-  const f = fixture(); f.state.datasets = [dataset({ source: 'huggingface', cache_status: status, columns: [] })];
-  f.context.renderDatasetSelect();
-  assert.equal(f.requests.length, 0);
-  assert.equal(f.$('targetSelect').value, '');
-  await f.$('btnPreview').onclick();
-  assert.deepEqual(f.requests, ['/api/datasets/a']);
-  assert.equal(f.$('targetSelect').value, 'target');
-  assert.equal(f.$('previewWrap').hidden, false);
-});
-
-test('请求失败保留列选择并显示可重试提示，重试成功清除错误', async () => {
-  const f = fixture(); await f.context.loadDatasets(); f.$('targetSelect').value = 'value';
-  f.context.apiJson = async () => { throw new Error('<img src=x>离线'); };
+test('请求失败可重试，特殊字符和空页安全展示', async () => {
+  const f = fixture(); await f.context.loadDatasets();
+  f.context.apiJson = async url => { f.requests.push(url); throw new Error('<img src=x>离线'); };
   await f.$('btnPreview').onclick();
   assert.match(f.$('previewWrap').innerHTML, /&lt;img src=x&gt;离线/);
-  assert.equal(f.$('btnPreview').textContent, '重试预览');
-  assert.equal(f.$('targetSelect').value, 'value');
-  assert.equal(f.$('previewMeta').hidden, true);
-  f.context.apiJson = async () => dataset(); await f.$('btnPreview').onclick();
-  assert.match(f.$('previewWrap').innerHTML, /<table/);
-  assert.equal(f.$('btnPreview').textContent, '收起预览');
-});
-
-test('特殊字符与缺失单元格安全展示，零行零列不崩溃', async () => {
-  const f = fixture(); await f.context.loadDatasets();
-  f.context.apiJson = async () => dataset({ columns: ['<b>'], preview: [{ '<b>': '<script>x</script>' }, {}] });
-  await f.$('btnPreview').onclick();
+  assert.equal(f.$('previewPageStatus').textContent, '当前页加载失败');
+  f.context.apiJson = async url => { f.requests.push(url); return page(0, { columns: ['<b>'], preview: [{ '<b>': '<script>x</script>' }] }); };
+  await f.$('previewRetry').onclick();
   assert.match(f.$('previewWrap').innerHTML, /&lt;b&gt;/);
   assert.match(f.$('previewWrap').innerHTML, /&lt;script&gt;x&lt;\/script&gt;/);
-  assert.match(f.$('previewWrap').innerHTML, /<td><\/td>/);
   assert.doesNotMatch(f.$('previewWrap').innerHTML, /<script>/);
-  await f.$('btnPreview').onclick();
-  f.context.apiJson = async () => dataset({ rows: 0, columns: [], preview: [] });
-  await f.$('btnPreview').onclick();
-  assert.equal(f.$('previewMeta').textContent, '0 行 · 0 列 · 仅展示前 5 行');
-  assert.equal(f.$('targetSelect').value, '');
+  assert.equal(f.$('previewNext').disabled, false);
+
+  f.context.apiJson = async url => { f.requests.push(url); return page(20, { rows: 0, preview: [] }); };
+  await f.context.loadPreviewPage(3);
+  assert.match(f.$('previewWrap').innerHTML, /当前页暂无数据/);
+});
+
+test('预览分页不重置训练列选择，切换数据集后重新从第一页开始', async () => {
+  const f = fixture(); await f.context.loadDatasets();
+  f.$('targetSelect').value = 'value'; f.$('timeColumnSelect').value = 'time';
+  await f.$('btnPreview').onclick(); await f.$('previewNext').onclick();
+  assert.equal(f.$('targetSelect').value, 'value');
+  assert.equal(f.$('timeColumnSelect').value, 'time');
+  f.state.datasets.push(dataset({ id: 'b', columns: ['only'], name: '另一个.csv' }));
+  select(f, 'b');
+  assert.equal(f.$('previewModal').hidden, true);
+  assert.equal(f.$('targetSelect').value, 'only');
+  assert.equal(f.state.previewPage, 1);
 });

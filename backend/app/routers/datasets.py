@@ -226,11 +226,15 @@ def get_all_tags() -> dict:
 # ---------------------------------------------------------------------------
 
 @router.get("/datasets/{ds_id}")
-def dataset_detail(ds_id: str, rows: int = 5) -> dict:
-    """获取数据集详情"""
+def dataset_detail(ds_id: str, rows: int = 5, offset: int = 0) -> dict:
+    """获取数据集详情的指定分页。"""
     try:
         _check_id(ds_id, "数据集")
-        return dataset_manager.get_dataset_preview(ds_id, rows)
+        if rows < 1 or rows > 50:
+            raise HTTPException(400, "每页行数须为 1～50")
+        if offset < 0:
+            raise HTTPException(400, "分页起始行不能小于 0")
+        return dataset_manager.get_dataset_preview(ds_id, rows, offset)
     except HTTPException:
         raise
     except Exception as e:

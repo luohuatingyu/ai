@@ -281,6 +281,29 @@
   .preview-table th { background: var(--panel2); color: var(--muted);
                       position: sticky; top: 0; }
   .preview-table tbody tr:nth-child(even) { background: rgba(255,255,255,.02); }
+  .preview-modal[hidden] { display: none; }
+  .preview-modal { position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center;
+    padding: 20px; background: rgba(17,29,48,.48); backdrop-filter: blur(7px); }
+  .preview-modal-card { display: flex; flex-direction: column; width: min(1120px, 100%); max-height: min(780px, calc(100vh - 40px));
+    overflow: hidden; border: 1px solid #dce5f0; border-radius: 18px; background: #fff;
+    box-shadow: 0 24px 72px rgba(17,29,48,.24); }
+  .preview-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 20px 22px 14px; border-bottom: 1px solid #e7edf5; }
+  .preview-modal-title { margin: 0; color: #1e2d43; font-size: 18px; }
+  .preview-modal-subtitle { margin: 4px 0 0; color: #718096; font-size: 12px; }
+  .preview-modal-body { min-height: 180px; padding: 16px 22px 10px; overflow: auto; }
+  .preview-modal-table { min-width: 100%; width: max-content; margin: 0; }
+  .preview-modal-table th, .preview-modal-table td { max-width: 280px; padding: 9px 12px; white-space: nowrap; }
+  .preview-modal-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 22px 18px; border-top: 1px solid #e7edf5; }
+  .preview-modal-pagination button { min-width: 84px; }
+  .preview-modal-page { color: #53647e; font-size: 12px; text-align: center; }
+  body.preview-modal-open { overflow: hidden; }
+  @media (max-width: 600px) {
+    .preview-modal { padding: 10px; }
+    .preview-modal-card { max-height: calc(100vh - 20px); border-radius: 14px; }
+    .preview-modal-head { padding: 16px 16px 12px; }
+    .preview-modal-body { padding: 12px 16px 8px; }
+    .preview-modal-pagination { padding: 10px 16px 14px; }
+  }
   #predictOut { background: var(--panel2); border: 1px solid var(--border); border-radius: var(--radius);
     padding: 12px; margin-top: 10px; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
     white-space: pre-wrap; }
@@ -319,11 +342,9 @@
     <div id="datasetLocalPanel">
       <div class="row">
         <select id="datasetSelect" aria-label="数据集" style="min-width:0;"></select>
-        <button id="btnPreview" type="button" disabled aria-controls="previewWrap previewMeta" aria-expanded="false" style="flex-shrink:0;white-space:nowrap;">预览数据</button>
+        <button id="btnPreview" type="button" disabled aria-controls="previewModal" aria-expanded="false" style="flex-shrink:0;white-space:nowrap;">预览数据</button>
       </div>
       <div id="datasetEmptyHint" class="hint" hidden>暂无数据集，请前往“数据集管理”上传或导入。</div>
-      <div id="previewWrap" role="region" aria-label="数据预览" aria-live="polite" aria-busy="false" tabindex="0" style="overflow-x:auto;" hidden></div>
-      <div id="previewMeta" class="hint" style="margin-top:6px;" hidden></div>
     </div>
 
     <h2>② 训练配置</h2>
@@ -515,6 +536,24 @@
   </section>
 </main>
 
+<div id="previewModal" class="preview-modal" role="dialog" aria-modal="true" aria-labelledby="previewModalTitle" aria-describedby="previewModalMeta" hidden>
+  <div class="preview-modal-card" tabindex="-1">
+    <div class="preview-modal-head">
+      <div>
+        <h2 id="previewModalTitle" class="preview-modal-title">数据预览</h2>
+        <p id="previewModalMeta" class="preview-modal-subtitle" role="status" aria-live="polite">正在准备数据…</p>
+      </div>
+      <button id="btnClosePreview" type="button" aria-label="关闭数据预览">×</button>
+    </div>
+    <div id="previewWrap" class="preview-modal-body" role="region" aria-label="当前页数据" aria-live="polite" aria-busy="false"></div>
+    <div class="preview-modal-pagination">
+      <button id="previewPrev" type="button" disabled>上一页</button>
+      <span id="previewPageStatus" class="preview-modal-page" aria-live="polite">第 1 / 1 页</span>
+      <button id="previewNext" type="button" disabled>下一页</button>
+    </div>
+  </div>
+</div>
+
 <div id="toastWrap"></div>
 
 <script>
@@ -525,6 +564,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;"
 const state = {
   datasets: [], datasetId: null, preview: null, previewOpen: false, previewError: false, previewRequest: 0,
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
+  previewPage: 1, previewPageCount: 1, previewTotalRows: 0, previewReturnFocus: null,
   charts: { loss: null, metric: null }, metricKind: null,
   workerSlots: [], detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
@@ -724,25 +764,65 @@ async function loadSystem() {
 }
 
 /* ---------- 数据集 ---------- */
-/** 收起并清空预览，使已发出的旧请求失效；列选项独立保留。 */
+/** 清空分页内容并关闭预览弹窗，令已发出的旧请求失效。 */
 function resetDatasetPreview() {
-  state.previewRequest++;
-  state.previewOpen = false;
-  state.previewError = false;
+  if (state.previewOpen) closePreviewModal();
+  else state.previewRequest++;
   state.preview = null;
+  state.previewError = false;
+  state.previewPage = 1;
+  state.previewPageCount = 1;
+  state.previewTotalRows = 0;
   const wrap = $("previewWrap"), button = $("btnPreview");
-  wrap.hidden = true;
   wrap.innerHTML = "";
   wrap.setAttribute("aria-busy", "false");
-  $("previewMeta").hidden = true;
-  $("previewMeta").textContent = "";
+  $("previewModalMeta").textContent = "正在准备数据…";
+  $("previewPageStatus").textContent = "第 1 / 1 页";
+  $("previewPrev").disabled = true;
+  $("previewNext").disabled = true;
   button.disabled = !state.datasetId;
   button.textContent = "预览数据";
   button.setAttribute("aria-expanded", "false");
   const selected = state.datasets.find((dataset) => dataset.id === state.datasetId);
   button.title = selected?.source === "huggingface" && selected.cache_status !== "ready"
-    ? "首次预览将下载并缓存 Hub 数据集" : "查看所选数据集的前 5 行";
+    ? "首次预览将下载并缓存 Hub 数据集" : "按页查看所选数据集";
   $("datasetEmptyHint").hidden = Boolean(state.datasetId);
+}
+
+/** 打开预览弹窗并把焦点移到关闭按钮，保留触发按钮用于关闭后恢复。 */
+function openPreviewModal() {
+  const modal = $("previewModal");
+  state.previewReturnFocus = document.activeElement;
+  state.previewOpen = true;
+  modal.hidden = false;
+  modal.classList.add("is-open");
+  if (document.body?.classList) document.body.classList.add("preview-modal-open");
+  $("btnPreview").textContent = "关闭预览";
+  $("btnPreview").setAttribute("aria-expanded", "true");
+  $("btnClosePreview").focus();
+}
+
+/** 关闭预览弹窗并恢复触发按钮焦点。 */
+function closePreviewModal() {
+  state.previewRequest++;
+  state.previewOpen = false;
+  state.previewError = false;
+  state.preview = null;
+  const modal = $("previewModal");
+  modal.hidden = true;
+  modal.classList.remove("is-open");
+  if (document.body?.classList) document.body.classList.remove("preview-modal-open");
+  $("previewWrap").innerHTML = "";
+  $("previewWrap").setAttribute("aria-busy", "false");
+  $("previewModalMeta").textContent = "正在准备数据…";
+  $("previewPageStatus").textContent = "第 1 / 1 页";
+  $("previewPrev").disabled = true;
+  $("previewNext").disabled = true;
+  const trigger = state.previewReturnFocus || $("btnPreview");
+  state.previewReturnFocus = null;
+  if (trigger && typeof trigger.focus === "function") trigger.focus();
+  $("btnPreview").textContent = "预览数据";
+  $("btnPreview").setAttribute("aria-expanded", "false");
 }
 
 /** 从列表元信息填充训练列，预览返回时保留仍有效的用户选择。 */
@@ -801,48 +881,66 @@ async function loadDatasets(keepId) {
   renderDatasetSelect();
 }
 
-/** 仅在明确点击预览时读取数据；请求序号避免切换或收起后的旧响应回写。 */
-async function loadPreview() {
-  if (!state.datasetId) return;
-  const selectedId = state.datasetId, request = ++state.previewRequest;
-  const wrap = $("previewWrap"), metaBox = $("previewMeta"), button = $("btnPreview");
-  state.previewOpen = true;
-  state.previewError = false;
-  state.preview = null;
-  wrap.hidden = false;
+/** 渲染当前页表格、状态和分页按钮，所有值均按文本转义。 */
+function renderPreviewPage(data) {
+  const wrap = $("previewWrap");
+  const columns = Array.isArray(data.columns) ? data.columns : [];
+  const rows = Array.isArray(data.preview) ? data.preview : [];
+  if (!columns.length || !rows.length) {
+    wrap.innerHTML = '<div class="empty">当前页暂无数据。</div>';
+  } else {
+    let html = `<table class="preview-table preview-modal-table"><thead><tr>${columns.map((column) => `<th scope="col">${esc(column)}</th>`).join("")}</tr></thead><tbody>`;
+    for (const row of rows) {
+      html += `<tr>${columns.map((column) => `<td>${esc(row[column] ?? "")}</td>`).join("")}</tr>`;
+    }
+    wrap.innerHTML = html + "</tbody></table>";
+  }
+}
+
+/** 请求指定页；请求序号和数据集 ID 同时校验，避免旧响应污染当前弹窗。 */
+async function loadPreviewPage(page = 1) {
+  if (!state.datasetId || !state.previewOpen) return;
+  const selectedId = state.datasetId;
+  const pageSize = 10;
+  const requestedPage = Math.max(1, Number(page) || 1);
+  const offset = (requestedPage - 1) * pageSize;
+  const request = ++state.previewRequest;
+  const wrap = $("previewWrap");
   wrap.setAttribute("aria-busy", "true");
-  wrap.innerHTML = `<div class="empty">正在准备数据，请稍候…</div>`;
-  metaBox.hidden = true;
-  metaBox.textContent = "";
-  button.textContent = "收起预览";
-  button.setAttribute("aria-expanded", "true");
+  $("previewModalMeta").textContent = `正在加载第 ${requestedPage} 页…`;
+  $("previewPageStatus").textContent = `第 ${requestedPage} 页加载中…`;
+  $("previewPrev").disabled = true;
+  $("previewNext").disabled = true;
   try {
-    const data = await apiJson(`/api/datasets/${encodeURIComponent(selectedId)}`);
+    const data = await apiJson(`/api/datasets/${encodeURIComponent(selectedId)}?rows=${pageSize}&offset=${offset}`);
     if (state.datasetId !== selectedId || state.previewRequest !== request || !state.previewOpen) return;
     state.datasets = state.datasets.map((dataset) => dataset.id === selectedId ? data : dataset);
     state.preview = data;
+    state.previewPage = data.preview_page || requestedPage;
+    state.previewPageCount = data.preview_page_count || 1;
+    state.previewTotalRows = Number(data.rows) || 0;
     updateDatasetColumns(data, true);
-    // 列名和单元格均转义，缺失值显示为空，最多展示前五行。
-    let html = `<table class="preview-table"><thead><tr>${data.columns.map((column) => `<th scope="col">${esc(column)}</th>`).join("")}</tr></thead><tbody>`;
-    for (const row of (data.preview || []).slice(0, 5)) {
-      html += `<tr>${data.columns.map((column) => `<td>${esc(row[column] ?? "")}</td>`).join("")}</tr>`;
-    }
-    wrap.innerHTML = html + "</tbody></table>";
-    metaBox.hidden = false;
-    metaBox.textContent = `${data.rows} 行 · ${data.columns.length} 列 · 仅展示前 5 行`;
+    $("previewModalTitle").textContent = `${data.name || "数据集"} · 数据预览`;
+    $("previewModalMeta").textContent = `${state.previewTotalRows} 行 · ${data.columns?.length || 0} 列 · 每页 ${pageSize} 行`;
+    $("previewPageStatus").textContent = `第 ${state.previewPage} / ${state.previewPageCount} 页`;
+    renderPreviewPage(data);
+    $("previewPrev").disabled = state.previewPage <= 1;
+    $("previewNext").disabled = state.previewPage >= state.previewPageCount;
   } catch (error) {
     if (state.datasetId !== selectedId || state.previewRequest !== request || !state.previewOpen) return;
     state.previewError = true;
-    wrap.innerHTML = `<div class="empty">预览失败：${esc(error.message)}，请点击“重试预览”。</div>`;
-    button.textContent = "重试预览";
+    wrap.innerHTML = `<div class="empty">预览失败：${esc(error.message)}<br><button id="previewRetry" type="button">重试当前页</button></div>`;
+    $("previewRetry").onclick = () => loadPreviewPage(requestedPage);
+    $("previewModalMeta").textContent = "加载失败";
+    $("previewPageStatus").textContent = "当前页加载失败";
   } finally {
     if (state.datasetId === selectedId && state.previewRequest === request && state.previewOpen) {
       wrap.setAttribute("aria-busy", "false");
-      updateStart();
     }
   }
 }
 
+// 汇总配置状态与提交锁
 function updateStart() {
   const task = taskSelect.value;
   const isLLM = task.startsWith("llm_");
@@ -961,17 +1059,29 @@ function updateTaskFields() {
 }
 
 /* 上传 */
-// 上传统一由数据集管理页提供；此处只绑定按需预览与数据集切换。
+// 上传统一由数据集管理页提供；此处绑定按需打开弹窗、分页和数据集切换。
 $("btnPreview").onclick = () => {
-  if (state.previewOpen && !state.previewError) resetDatasetPreview();
-  else return loadPreview();
+  if (state.previewOpen) closePreviewModal();
+  else {
+    openPreviewModal();
+    return loadPreviewPage(1);
+  }
 };
+$("btnClosePreview").onclick = closePreviewModal;
+$("previewPrev").onclick = () => loadPreviewPage(state.previewPage - 1);
+$("previewNext").onclick = () => loadPreviewPage(state.previewPage + 1);
+$("previewModal").addEventListener("click", (event) => {
+  if (event.target === $("previewModal")) closePreviewModal();
+});
 $("datasetSelect").onchange = (event) => {
   state.datasetId = event.target.value || null;
   resetDatasetPreview();
   updateDatasetColumns(state.datasets.find((dataset) => dataset.id === state.datasetId));
   updateStart();
 };
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.previewOpen) closePreviewModal();
+});
 
 /* ---------- 训练任务 ---------- */
 const taskSelect = $("taskSelect");
