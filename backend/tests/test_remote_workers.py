@@ -334,16 +334,29 @@ def test_worker_heartbeat_probe_reports_present_and_missing_slots(monkeypatch):
     assert any("未收到资源心跳" in message for _phase, message in emitted)
 
 
-def test_worker_heartbeat_probe_ignores_preexisting_worker_generation(monkeypatch):
+@pytest.mark.parametrize(
+    "worker_id,started_at,expected",
+    [
+        ("remote-a-cpu0", 10.0, False),
+        ("remote-a-cpu0", 9.0, False),
+        ("remote-a-cpu0", 12.0, True),
+        ("remote-a-cpu0", None, False),
+        ("remote-a-cpu0", "invalid", False),
+        ("remote-a-cpu1", 12.0, True),
+    ],
+)
+def test_worker_heartbeat_probe_ignores_preexisting_worker_generation(
+    monkeypatch, worker_id, started_at, expected
+):
     """只有启动时间晚于操作前基线的 worker 才能确认本次重启已生效。"""
     operation_id = "a" * 32
     manager.lease.clear_remote_operation_cancel(operation_id)
     monkeypatch.setattr(remote_workers, "_WORKER_STARTUP_HEARTBEAT_TIMEOUT", 0.0)
     worker = {
-        "worker_id": "remote-a-cpu0",
+        "worker_id": worker_id,
         "machine_id": "remote-a",
         "active": True,
-        "started_at": 10.0,
+        "started_at": started_at,
     }
     monkeypatch.setattr(manager.lease, "list_workers", lambda: [worker])
     assert remote_workers._wait_for_remote_worker_heartbeat(
@@ -351,7 +364,7 @@ def test_worker_heartbeat_probe_ignores_preexisting_worker_generation(monkeypatc
         "remote-a",
         lambda *_args: None,
         baseline={"remote-a-cpu0": {"started_at": 10.0, "last_seen": 11.0}},
-    ) is False
+    ) is expected
 
 
 def test_remote_worker_generation_snapshot_reads_start_time(monkeypatch):
@@ -362,11 +375,26 @@ def test_remote_worker_generation_snapshot_reads_start_time(monkeypatch):
         lambda: [
             {"worker_id": "w1", "machine_id": "m1", "started_at": 10, "last_seen": 11},
             {"worker_id": "w2", "machine_id": "m2", "started_at": 20, "last_seen": 21},
+            {"worker_id": "", "machine_id": "m1", "started_at": 10},
+            {"worker_id": "legacy", "machine_id": "m1"},
+            {"worker_id": "invalid", "machine_id": "m1", "started_at": "invalid"},
+            {"worker_id": "w3", "machine_id": "m1", "started_at": 30, "last_seen": "invalid"},
         ],
     )
     assert remote_workers._remote_worker_generation_snapshot("m1") == {
-        "w1": {"started_at": 10.0, "last_seen": 11.0}
+        "w1": {"started_at": 10.0, "last_seen": 11.0},
+        "w3": {"started_at": 30.0, "last_seen": None},
     }
+
+
+def test_remote_worker_generation_snapshot_handles_store_failure(monkeypatch):
+    """协调存储暂时不可用时，采样失败不阻止 SSH 操作。"""
+    def fail_to_list():
+        """模拟外部协调存储读取失败。"""
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(manager.lease, "list_workers", fail_to_list)
+    assert remote_workers._remote_worker_generation_snapshot("m1") == {}
 
 
 def test_run_remote_install_records_stages_and_worker_heartbeat(tmp_path, monkeypatch):
@@ -2888,15 +2916,18 @@ def test_remote_bootstrap_script_reports_config_write_failure(tmp_path: Path):
     assert "worker 配置已更新" not in result.stdout
 
 
-def test_remote_bootstrap_script_rejects_legacy_container_on_restart(tmp_path: Path):
+@pytest.mark.parametrize("legacy_field", ["command", "mount"])
+def test_remote_bootstrap_script_rejects_legacy_container_on_restart(tmp_path: Path, legacy_field):
     """旧容器没有入口脚本或外部配置挂载时，重启提示先部署代码。"""
-    legacy_stub = _RUNNING_STUB.replace(
+    command_stub = _RUNNING_STUB.replace(
         "printf '[\\\"bash\\\",\\\"/app/app/worker-entrypoint.sh\\\"]\\n'",
         "printf '[\\\"python\\\",\\\"-m\\\",\\\"app.worker\\\"]\\n'",
-    ).replace(
+    )
+    mount_stub = _RUNNING_STUB.replace(
         "printf '%s\\n' \"$HOME/.config/mtp-worker|/app/config|false\";",
         "printf '%s\\n' \"$HOME/.config/mtp-worker/data|/app/data|false\";",
     )
+    legacy_stub = command_stub if legacy_field == "command" else mount_stub
     result, docker_log, _env_file = _run_bootstrap_action(
         tmp_path, "restart", _CURRENT_WORKER_ENV, legacy_stub
     )
@@ -2905,15 +2936,46 @@ def test_remote_bootstrap_script_rejects_legacy_container_on_restart(tmp_path: P
     assert not docker_log.exists()
 
 
-def test_remote_bootstrap_script_rejects_gpu_mode_change_on_restart(tmp_path: Path):
-    """CPU 容器切换 GPU 只更新配置不足以授权设备，需先重建容器。"""
+@pytest.mark.parametrize("mode,has_gpu,expected_error", [
+    ("gpu", False, "未启用 GPU"),
+    ("cpu", True, "仍启用 GPU"),
+    ("gpu", True, None),
+])
+def test_remote_bootstrap_script_rejects_gpu_mode_change_on_restart(
+    tmp_path: Path, mode, has_gpu, expected_error
+):
+    """CPU/GPU 授权与目标类型一致才可重启，不一致必须先重建容器。"""
+    stub = _RUNNING_STUB
+    if has_gpu:
+        stub = stub.replace("printf '[]\\n'", "printf '[{\"Capabilities\":[[\"gpu\"]]}]\\n'")
     result, docker_log, _env_file = _run_bootstrap_action(
         tmp_path,
         "restart",
         _CURRENT_WORKER_ENV,
-        _RUNNING_STUB,
-        mode="gpu",
+        stub,
+        mode=mode,
+    )
+    if expected_error is None:
+        assert result.returncode == 0, result.stderr
+        assert "restart --time 45" in docker_log.read_text(encoding="utf-8")
+        assert "WORKER_CPU_SLOTS=0" in _env_file.read_text(encoding="utf-8")
+        return
+    assert result.returncode != 0
+    assert expected_error in result.stderr
+    assert not docker_log.exists()
+
+
+@pytest.mark.parametrize("field", [".Config.Cmd", ".Mounts", ".HostConfig.DeviceRequests"])
+def test_remote_bootstrap_script_inspect_failure_stops_restart(tmp_path: Path, field):
+    """容器兼容性查询失败时保留原配置，并且不执行启动/重启。"""
+    stub = _RUNNING_STUB.replace(
+        "#!/usr/bin/env bash\n",
+        f'#!/usr/bin/env bash\nif [[ "$3" == *"{field}"* ]]; then exit 1; fi\n',
+    )
+    result, docker_log, env_file = _run_bootstrap_action(
+        tmp_path, "restart", "S3_ENDPOINT=old.example\n", stub
     )
     assert result.returncode != 0
-    assert "未启用 GPU" in result.stderr
+    assert "无法读取 worker 容器" in result.stderr
+    assert env_file.read_text(encoding="utf-8") == "S3_ENDPOINT=old.example\n"
     assert not docker_log.exists()

@@ -1939,7 +1939,7 @@ async function submitRemoteServer(event) {
       headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     toast(editingMachineId
-      ? result.operation_id ? "配置已保存并写入远端；请点击“重启”后生效" : "配置已保存；服务器部署后才会写入远程配置"
+      ? result.operation_id ? "配置已保存，正在写入远端；操作成功后请点击“重启”使其生效" : "配置已保存；服务器部署后才会写入远程配置"
       : "服务器配置已登记；请在服务器卡片上点击“部署”", "ok");
     closeAddServerModal();
     await refreshWorkers();
