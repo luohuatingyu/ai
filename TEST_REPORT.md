@@ -93,7 +93,7 @@ YAML
 
 **已知限制与后续验证**：未连接真实 SSH 目标机执行保存→重启→确认槽数/地址链路，未实测 NVIDIA GPU 授权切换或旧远程容器升级；这些不能由 Shell Docker 替身测试代替。旧 worker 无 `started_at` 或操作前协调存储读取失败时兼容回退到普通心跳确认，不能保证新代次；零 CPU 槽或部署后保持停止时仍会等待心跳超时，不能据此判断配置失败。源设置只在镜像构建时生效，修改平台 `.env` 需重建平台容器。默认 Dockerfile 从头下载依赖的路径仍需网络稳定后重验。当前完整测试包括工作区已有 Dockerfile 重试及其断言调整，两处既有改动未纳入本次提交。
 
-**清理及提交范围**：验证脚本通过 stdin 运行；pytest 临时数据位于一次性容器 `/tmp/mtp-config-regression`、`/tmp/mtp-config-full`、`/tmp/mtp-config-ui`（前轮 `/tmp/mtp-remote-config-tests`），均随 `--rm` 删除；冒烟容器已停止删除。无新调试文件、数据、密钥或模型权重提交。工作区原有 `backend/Dockerfile` 和 `backend/tests/test_remote_workers.py` 的 pip 断言修改保留。
+**清理及提交范围**：验证脚本通过 stdin 运行；pytest 临时数据位于一次性容器 `/tmp/mtp-config-regression`、`/tmp/mtp-config-full`、`/tmp/mtp-config-ui`（前轮 `/tmp/mtp-remote-config-tests`），均随 `--rm` 删除；冒烟容器已停止删除。无新调试文件、数据、密钥或模型权重提交。工作区原有 `backend/Dockerfile` 和 `backend/tests/test_remote_workers.py` 的 pip 断言修改保留。收尾检查期间还出现其它任务对 `worker.py`、`test_worker.py` 及 `test_api.py` 日志测试的并行改动，均未触碰或纳入本次提交；上述测试和运行版本一致性结论仅适用于本节提交基准，不覆盖这些随后出现的改动。
 
 ## 本次变更测试结果：worker 自动补同步历史数据集（2026-10-29）
 
