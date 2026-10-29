@@ -1,3 +1,76 @@
+## 远程部署卡住与旧 worker 启动失败诊断（2026-10-29，尚未修复）
+
+**检查版本**：`eb813869fbc31fb21aae306579b4567b173b17de`；分支 `emdash/hot-boxes-clean-y9u6p`。本节是只读诊断及缺陷复现，不更新下文完整测试验收基准，不代表当前工作区通过完整测试。本次仅修改本报告；既有 Dockerfile、远程测试及其它任务的变更不纳入本次提交。
+
+**现场证据**（2026-10-29 17:12–17:24，Asia/Shanghai）：
+
+- 平台唯一登记的 `Linux` 服务器为 `deployed=false`，最近操作 `c71dfb971c3b46af84b45b90f22cae6f` 为 `install/running`，停留在“构建目标架构镜像”。09:12:31 UTC 报 Buildx 缺失，09:12:32 自动切换传统构建器，此后只有每 30 秒一次的通用等待提示。该提示不证明正在下载依赖。
+- 只读 SSH 确认目标 Docker client/server 均为 29.1.3，`docker buildx` 不存在。远端 `docker build --tag mtp-worker:local -` 已等待超过 7 分钟，stdin 为管道，读取量约 96 KB，未完成约 0.7 MiB 构建上下文的接收。平台 SSH 子进程读取量也远小于完整构建包。
+- 目标机已有 2026-10-27 创建的旧容器 `mtp-worker-Linux`；检查时短暂显示 running，但 `RestartCount=5449`，日志持续报 `NameResolutionError` / `MaxRetryError`：无法解析 `seaweedfs:8333`，失败发生在 `S3ArtifactStore._ensure_bucket()`。因此 running 快照不能证明服务正常。
+- 旧容器启动命令为 `python -m app.worker`，只挂载 `/app/data`，没有 `/app/config`；目标 SSH 用户目录下 `~/.config/mtp-worker/Linux.env` 不存在。安全筛选的容器环境为 `S3_ENDPOINT=seaweedfs:8333`、`S3_BUCKET=mtp-artifacts`、`S3_SECURE=false`、`WORKER_CPU_SLOTS=0`。
+- 平台待下发配置已是 OSS S3 地址、另一 bucket、HTTPS、CPU 槽 1。平台记录未部署时，PATCH 仅保存配置；当前 install 卡在构建阶段，尚未走到写配置和创建新容器。旧容器继续使用原始配置，可以解释“更新配置后部署仍启动不了”。
+- 运行 trainer 与工作区的 `remote_workers.py`、`remote_worker.sh`、`worker-entrypoint.sh` SHA256 一致，本次卡住不是这三个文件的运行版本落后。
+
+**代码根因**：`backend/app/remote_workers.py::_communicate_remote_process` 每 0.25 秒调用 `Popen.communicate(input=pending_input, timeout=...)`，第一次超时后把 `pending_input` 置为 `None`。Python 3.12 的 `_communicate` 仅在本轮 input 非空时注册 stdin 可写事件；大输入在首次轮询内未发送完时，后续不再发送剩余数据，也不会关闭 stdin。远端等待剩余 tar 输入，平台等待远端输出，最终只能超时。缺少 Buildx 已有兼容回退，不是唯一阻塞因素。
+
+**实际执行与结果**：Python 3.12.15；3 个行为探针，2 通过、1 个预期业务目标失败（稳定复现缺陷），0 跳过。小输入和标准 communicate 对照通过；原函数大输入失败。另一次直接用 Python 标准库复现相同轮询时序也停在 65,536/716,800 字节。
+
+以下命令在一次性、断网容器内提取并执行运行镜像的原函数；仅将取消查询和进度输出替换为无副作用边界，stdin 发送、轮询、超时及真实子进程均使用原实现。收到的完整内容用字节数和 SHA256 校验。
+
+```bash
+docker run --rm -i --network none --entrypoint python emdash-hot-boxes-clean-y9u6p-trainer:latest -u - <<'PY'
+import ast, hashlib, pathlib, re, subprocess, sys, time
+from typing import Callable
+source = pathlib.Path('/app/app/remote_workers.py').read_text()
+function = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == '_communicate_remote_process')
+namespace = {'Callable':Callable,'subprocess':subprocess,'time':time,'re':re,'_remote_operation_cancel_requested':lambda operation_id:False,'_emit_progress':lambda *args:None}
+exec(compile(ast.Module(body=[function],type_ignores=[]),'remote_workers.py','exec'),namespace)
+communicate = namespace['_communicate_remote_process']
+child = [sys.executable,'-c','import hashlib,sys,time; time.sleep(0.6); data=sys.stdin.buffer.read(); print(len(data),hashlib.sha256(data).hexdigest(),flush=True)']
+for size in (1024,716800):
+    payload=b'x'*size
+    process=subprocess.Popen(child,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    try:
+        output,_=communicate(process,None,2,input_data=payload)
+        expected=f'{size} {hashlib.sha256(payload).hexdigest()}'
+        print('actual_function',size,'PASS' if output.decode().strip()==expected else 'FAIL')
+    except subprocess.TimeoutExpired:
+        print('actual_function',size,'FAIL: timed out; sent',process._input_offset,'of',size,'bytes')
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=3)
+payload=b'x'*716800
+result=subprocess.run(child,input=payload,capture_output=True,timeout=4,check=True)
+expected=f'{len(payload)} {hashlib.sha256(payload).hexdigest()}'
+print('standard_communicate_control',len(payload),'PASS' if result.stdout.decode().strip()==expected else 'FAIL')
+PY
+```
+
+输出：`actual_function 1024 PASS`；`actual_function 716800 FAIL: timed out; sent 65536 of 716800 bytes`；`standard_communicate_control 716800 PASS`。初次探针缺少注解类型 `Callable` 导入，在执行前失败；补齐导入后得到以上结果，未修改产品代码。
+
+只读现场检查使用 `docker compose ps --all`、平台 GET `/api/remote-servers`、GET `/api/remote-operations/{id}`、GET `/api/remote-servers/Linux/effective-config`，以及现有凭证认证后的 `docker version`、`docker buildx version`、`docker ps -a --filter name=mtp-worker`、`docker inspect` 的指定状态/命令/挂载字段、`docker logs --tail=60 mtp-worker-Linux`、`ps` 和构建进程 `/proc/<pid>/io`。配置输出仅筛选上述非敏感字段；没有输出密码或私钥。第一轮诊断 SSH 使用 `/proc/self/fd` 内存密钥路径时因 SSH 关闭 fd 而认证失败，改为父进程 `/proc/<pid>/fd` 后只读查询成功。全过程未中断部署、未停止或重建远端容器、未修改远端配置。
+
+**待确认修复方案**：
+
+1. 仅修改 `backend/app/remote_workers.py`、`backend/tests/test_remote_workers.py` 和本报告。先增加真实子进程大输入失败用例，再将 stdin 持续发送与输出轮询解耦，保留实时日志、取消和超时行为；正确关闭 stdin、回收发送线程和子进程，不增加依赖、不改平台配置。
+2. 按下表验证后执行 `python -m pytest tests/test_remote_workers.py -v` 和完整 `python -m pytest tests/ -v`（backend 目录、Python 3.12、隔离数据）。执行 `docker compose up --build -d`；若环境阻碍，按项目规则记录失败与替代验证，不能标记完整部署通过。
+3. 获得远端操作确认后，中断本次挂起部署，检查并清理本次遗留构建进程，重新部署 `Linux`；验证容器通过新版入口和只读配置目录加载 OSS 配置、CPU 槽 1，重启次数不持续增长，收到新代次资源心跳。当前旧容器和平台 deployed 标记不一致，因此不能仅 docker restart。
+
+| 验收标准 | 测试层级、前置条件和输入 | 预期业务结果 | 场景 |
+|---|---|---|---|
+| 构建包完整发送 | Python 真实子进程，接收端延迟大于首轮轮询，参数化空/小/超过管道容量的 bytes 和文本 | 收到完整字节、SHA256 一致、收到 EOF、正常退出 | 正常、边界、兼容 |
+| 大输入发送期间实时输出 | 子进程接收前后向 stdout/stderr 写标记，传输大输入 | 及时回调且不重复，不丢输出、不阻塞发送 | 正常、回归 |
+| 发送中取消/超时可回收 | 接收端不消费或提前退出，触发取消/超时/BrokenPipe | 有界返回、错误准确、无遗留线程/子进程 | 异常、资源清理 |
+| 构建回退与脱敏不回归 | 既有 Buildx 缺失、传统构建失败、秘密脱敏用例及完整套件 | 兼容构建参数与秘密保护保持有效 | 兼容、安全、回归 |
+| 真机加载新配置并在线 | 确认后重部署当前旧容器，OSS/Redis 配置来自已保存记录 | 新入口、配置挂载、CPU 槽正确，日志无旧地址 DNS 错误，心跳有效 | 部署验收 |
+
+**风险与回滚**：发送线程与取消处理需防止死锁和管道泄漏；重建平台会中断当前部署操作，远端 install 会替换旧容器，应先确认运行任务。源码可 revert 本次独立修复提交；远端重部署前应保留旧镜像标识和非敏感运行元数据，失败时按旧部署参数恢复，但旧配置本身无法正常服务，不能将恢复旧容器等同于恢复服务。
+
+**未执行**：本次不运行完整 pytest、不执行 Compose 重建、不重部署远端、不验证真实 OSS/Redis 访问或修复后心跳；这些需在修复方案确认后实施。本节结论仅为根因诊断，缺陷仍存在。后续修改 SSH 发送、超时、取消或远程构建时必须重跑表中用例及完整套件并更新验收基准。
+
+**清理**：所有探针通过 stdin 运行，没有保存调试脚本；一次性容器由 `--rm` 删除；诊断 SSH 密钥仅存在 Linux memfd 内存中，已关闭；探针子进程均回收。未创建待提交的运行时产物。结束前以 `git diff --check`、`git status --short` 检查，仅提交本报告。
+
 ## 本次变更测试结果：在线服务器配置生效修复（2026-10-29）
 
 - **Commit Hash**：`99c8defd9a452f85e328b9b1e4b3bd20f84b7b25`（Keep remote config progress messages consistent）。
