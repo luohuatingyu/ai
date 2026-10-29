@@ -1,0 +1,9 @@
+# 远程 worker 运行依赖；版本范围与平台 requirements.txt 保持一致。
+pandas>=2.2
+numpy>=2.0
+scikit-learn>=1.5
+torch>=2.6,<3
+redis>=5.0
+minio>=7.2
+transformers>=4.46,<5
+datasets>=3.3,<5

@@ -1034,7 +1034,8 @@ def test_builds_worker_image_for_requested_platform_with_minimal_context(tmp_pat
         dockerfile = context.extractfile("Dockerfile").read().decode("utf-8")
     assert "Dockerfile" in names
     assert "requirements.txt" in names
-    assert "app/remote_worker.sh" in names
+    assert "app/worker-entrypoint.sh" in names
+    assert "app/remote_worker.sh" not in names
     assert not any(name.startswith(("data/", "tests/")) for name in names)
     assert "dict(os.environ)" not in dockerfile
     assert "COPY app ./app" in dockerfile
@@ -1053,6 +1054,162 @@ def test_worker_code_archive_contains_only_runtime_app_files():
     assert "app/worker.py" in names
     assert "requirements.txt" not in names
     assert not any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in names)
+
+
+@pytest.mark.parametrize("build_context", [False, True])
+def test_worker_packages_exclude_control_plane_and_keep_training(build_context):
+    """训练包保留执行入口与训练模块，排除管理代码、页面、样例及测试依赖。"""
+    import io
+    import tarfile
+
+    payload = (remote_workers._worker_build_context() if build_context
+               else remote_workers._worker_code_archive())
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+        names = set(archive.getnames())
+        assert {"app/worker.py", "app/trainer.py", "app/llm_trainer.py",
+                "app/storage.py", "app/coordination.py", "app/jobstore.py",
+                "app/worker-entrypoint.sh"} <= names
+        assert not {"app/main.py", "app/remote_workers.py", "app/remote_worker.sh",
+                    "app/database.py", "app/db_utils.py", "app/dataset_importer.py"} & names
+        assert not any(name.startswith(("static/", "sample_data/", "tests/", "data/", "app/routers/"))
+                       or name.endswith((".env", ".pt")) for name in names)
+        if build_context:
+            requirements = archive.extractfile("requirements.txt").read().decode()
+            assert "torch>=2.6,<3" in requirements
+            assert "transformers" in requirements and "datasets" in requirements
+            assert not any(name in requirements for name in
+                           ("pytest", "fastapi", "uvicorn", "mysql", "openpyxl", "httpx2"))
+
+
+@pytest.mark.parametrize("mode", ["cpu", "gpu"])
+def test_remote_build_selects_worker_runtime(mode):
+    """CPU/GPU 节点明确选择对应构建参数，不依赖平台所在机器的硬件。"""
+    assert f"--build-arg WORKER_MODE={mode}" in remote_workers._remote_build_args(_server(mode=mode))
+
+
+@pytest.mark.parametrize("mode", ["", "auto", "cpu;touch /tmp/unsafe"])
+def test_remote_build_rejects_invalid_runtime(mode):
+    """非法模式在启动远程构建前失败，不能回退成庞大的默认 GPU 镜像。"""
+    with pytest.raises(remote_workers.RemoteWorkerError, match="cpu 或 gpu"):
+        remote_workers._remote_build_args(_server(mode=mode))
+
+
+@pytest.mark.parametrize("invalid", ["missing", "symlink", "directory", "root_symlink"])
+def test_worker_runtime_rejects_unsafe_or_incomplete_sources(tmp_path, invalid):
+    """源文件缺失、目录替代或符号链接时拒绝打包，避免远端残缺或泄漏外部文件。"""
+    root = tmp_path / "app"
+    root.mkdir()
+    for source in remote_workers._worker_runtime_files(Path(remote_workers.__file__).parent):
+        (root / source.name).write_bytes(source.read_bytes())
+    target = root / "worker.py"
+    target.unlink()
+    if invalid == "symlink":
+        secret = tmp_path / "secret.env"
+        secret.write_text("SECRET=must-not-transfer")
+        target.symlink_to(secret)
+    elif invalid == "directory":
+        target.mkdir()
+    elif invalid == "root_symlink":
+        alias = tmp_path / "linked-app"
+        alias.symlink_to(root, target_is_directory=True)
+        root = alias
+    with pytest.raises(remote_workers.RemoteWorkerError, match="普通文件|符号链接"):
+        remote_workers._worker_runtime_files(root)
+
+
+@pytest.mark.parametrize("name", ["parallel.py", "parallel_worker.py"])
+@pytest.mark.parametrize("kind", ["file", "broken_symlink", "directory"])
+def test_worker_runtime_validates_optional_training_modules(tmp_path, name, kind):
+    """兼容可选训练模块；模块存在时必须打包，目录和断开的符号链接必须拒绝。"""
+    root = tmp_path / "app"
+    root.mkdir()
+    for source in remote_workers._worker_runtime_files(Path(remote_workers.__file__).parent):
+        if source.name not in {"parallel.py", "parallel_worker.py"}:
+            (root / source.name).write_bytes(source.read_bytes())
+    target = root / name
+    if kind == "file":
+        target.write_text("# optional training runtime\n")
+        assert target in remote_workers._worker_runtime_files(root)
+    else:
+        if kind == "broken_symlink":
+            target.symlink_to(tmp_path / "missing-secret.env")
+        else:
+            target.mkdir()
+        with pytest.raises(remote_workers.RemoteWorkerError, match="普通文件"):
+            remote_workers._worker_runtime_files(root)
+
+
+def test_worker_dependency_versions_match_platform():
+    """worker 精简清单沿用平台版本范围，避免训练和预测安装不兼容的依赖。"""
+    root = Path(remote_workers.__file__).resolve().parents[1]
+    platform = {line.split("#", 1)[0].strip() for line in
+                (root / "requirements.txt").read_text().splitlines()}
+    runtime = {line.strip() for line in (root / "requirements-worker.txt").read_text().splitlines()
+               if line.strip() and not line.startswith("#")}
+    assert runtime <= platform
+
+
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_packaged_worker_trains_without_control_plane(tmp_path, task):
+    """真实精简包在隔离进程中训练两次并预测，验证指标、权重、seed 与缺失字段容错。"""
+    import io
+    import tarfile
+
+    with tarfile.open(fileobj=io.BytesIO(remote_workers._worker_code_archive()), mode="r:gz") as archive:
+        archive.extractall(tmp_path, filter="data")
+    script = r'''
+import importlib.abc
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+os.environ.update(USE_DATABASE="false", DATA_DIR=str(Path.cwd() / "data"), REDIS_URL="", STORAGE_BACKEND="local")
+class RejectControlPlane(importlib.abc.MetaPathFinder):
+    """模拟精简镜像中不存在的管理端依赖，避免测试借用平台安装环境。"""
+    def find_spec(self, fullname, path=None, target=None):
+        """只阻断平台专用依赖，训练的真实第三方库继续加载。"""
+        if fullname.split('.')[0] in {'fastapi', 'uvicorn', 'sqlalchemy', 'mysql', 'openpyxl', 'pytest', 'httpx2'}:
+            raise ModuleNotFoundError(fullname)
+sys.meta_path.insert(0, RejectControlPlane())
+from app import worker, trainer, llm_trainer
+assert Path(worker.__file__).parent == Path.cwd() / 'app'
+import pandas as pd
+import torch
+torch.set_num_threads(1)
+task = sys.argv[1]
+frame = pd.DataFrame({'x': range(60), 'category': ['a', 'b', 'c'] * 20,
+                      'target': [i % 2 if task == 'classification' else i * 0.2 for i in range(60)]})
+dataset = Path('training.csv')
+frame.to_csv(dataset, index=False)
+summaries = []
+for name in ('first', 'repeat'):
+    directory = Path(name)
+    directory.mkdir()
+    summary = trainer.run_training(dataset_path=dataset, target='target', task=task,
+        params={'epochs': 2, 'batch_size': 16, 'lr': 0.01, 'hidden_size': 8, 'hidden_layers': 1,
+                'test_split': 0.2, 'seed': 42}, cancel_event=threading.Event(),
+        log_fn=lambda message: None, job_dir=directory)
+    assert (directory / 'best.pt').stat().st_size > 0
+    metrics = [json.loads(line) for line in (directory / 'metrics.jsonl').read_text().splitlines()]
+    assert [row['epoch'] for row in metrics] == [1, 2]
+    summaries.append(summary)
+assert summaries[0]['final'] == summaries[1]['final']
+metric = 'val_accuracy' if task == 'classification' else 'val_rmse'
+assert metric in summaries[0]['final']
+if task == 'regression':
+    assert 'val_r2' in summaries[0]['final']
+for row in ({'x': 10, 'category': 'a'}, {}, {'x': 'invalid', 'category': 'unknown'}):
+    first = trainer.predict_row(Path('first/best.pt'), row)
+    second = trainer.predict_row(Path('first/best.pt'), row)
+    assert first == second and 'prediction' in first
+print('packaged worker training verified')
+'''
+    result = subprocess.run([sys.executable, "-I", "-c", script, task], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "packaged worker training verified" in result.stdout
 
 
 def test_remote_worker_build_sends_minimal_context_and_quotes_docker_args(monkeypatch):
@@ -1084,7 +1241,7 @@ def test_remote_worker_build_sends_minimal_context_and_quotes_docker_args(monkey
     assert command[-2] == "worker@compute.example.net"
     assert command[-1] == (
         "DOCKER_BUILDKIT=1 docker build --progress=plain --platform linux/amd64 "
-        "--tag 'worker:stable;touch /tmp/pwn' -"
+        "--tag 'worker:stable;touch /tmp/pwn' --build-arg WORKER_MODE=cpu -"
     )
     assert options["timeout"] == 3600
     assert any("MiB" in message and "目标机将拉取" in message for _phase, message in progress)
@@ -1095,9 +1252,9 @@ def test_remote_worker_build_sends_minimal_context_and_quotes_docker_args(monkey
     assert not any(name.startswith(("data/", "tests/")) for name in names)
 
 
-def test_remote_build_args_empty_when_no_mirror_configured():
-    """未配置加速源时不追加任何 --build-arg。"""
-    assert remote_workers._remote_build_args(_server()) == ""
+def test_remote_build_args_default_when_no_mirror_configured():
+    """未配置加速源时仍显式选择目标节点的 CPU 运行依赖。"""
+    assert remote_workers._remote_build_args(_server()) == "--build-arg WORKER_MODE=cpu"
 
 
 def test_remote_worker_build_injects_repository_mirror_build_args(monkeypatch):
@@ -1131,7 +1288,7 @@ def test_remote_worker_build_injects_repository_mirror_build_args(monkeypatch):
 
 
 def test_worker_build_context_dockerfile_accepts_build_args():
-    """构建上下文 Dockerfile 使用可覆盖的 BASE_IMAGE 与 APT_MIRROR 参数。"""
+    """专用构建配方保留基础镜像和 pip 源参数，不再安装 SSH/apt 工具。"""
     import io
     import tarfile
 
@@ -1141,7 +1298,11 @@ def test_worker_build_context_dockerfile_accepts_build_args():
         dockerfile = archive.extractfile("Dockerfile").read().decode("utf-8")
     assert "FROM ${BASE_IMAGE}" in dockerfile
     assert "ARG BASE_IMAGE=python:3.12-slim" in dockerfile
-    assert "ARG APT_MIRROR=" in dockerfile
+    assert "ARG PIP_INDEX_URL=" in dockerfile
+    assert "ARG WORKER_MODE=gpu" in dockerfile
+    assert "https://download.pytorch.org/whl/cpu" in dockerfile
+    assert "apt-get" not in dockerfile
+    assert "USE_DATABASE=false" in dockerfile
 
 
 def test_remote_worker_build_falls_back_when_buildx_is_missing(monkeypatch):
@@ -1176,10 +1337,10 @@ def test_remote_worker_build_falls_back_when_buildx_is_missing(monkeypatch):
     assert len(calls) == 2
     assert calls[0][0][-1] == (
         "DOCKER_BUILDKIT=1 docker build --progress=plain --platform linux/amd64 "
-        "--tag 'worker:stable;touch /tmp/pwn' -"
+        "--tag 'worker:stable;touch /tmp/pwn' --build-arg WORKER_MODE=cpu -"
     )
     assert calls[1][0][-1] == (
-        "DOCKER_BUILDKIT=0 docker build --tag 'worker:stable;touch /tmp/pwn' -"
+        "DOCKER_BUILDKIT=0 docker build --tag 'worker:stable;touch /tmp/pwn' --build-arg WORKER_MODE=cpu -"
     )
     assert calls[1][1]["timeout"] == 3600
     with tarfile.open(fileobj=io.BytesIO(calls[0][1]["input_data"]), mode="r:") as context:
@@ -1188,7 +1349,8 @@ def test_remote_worker_build_falls_back_when_buildx_is_missing(monkeypatch):
         legacy_dockerfile = context.extractfile("Dockerfile").read().decode("utf-8")
     assert "RUN --mount=type=cache" in buildkit_dockerfile
     assert "RUN --mount=type=cache" not in legacy_dockerfile
-    assert "RUN pip install --retries 10 -r requirements.txt" in legacy_dockerfile
+    assert 'RUN case "$WORKER_MODE"' in legacy_dockerfile
+    assert "pip install --retries 10 -r requirements.txt" in legacy_dockerfile
     assert any("改用本机架构的兼容构建器重试" in message for _, message in progress)
 
 
@@ -1289,18 +1451,17 @@ def test_worker_build_context_skips_invalid_same_named_dockerfile(tmp_path):
 
     invalid_root = tmp_path / "installed-package"
     invalid_root.mkdir()
-    (invalid_root / "Dockerfile").write_text("ENV dict(os.environ)\n", encoding="utf-8")
+    (invalid_root / "worker.Dockerfile").write_text("ENV dict(os.environ)\n", encoding="utf-8")
 
     valid_root = tmp_path / "backend"
     (valid_root / "app").mkdir(parents=True)
-    (valid_root / "static").mkdir()
-    (valid_root / "sample_data").mkdir()
-    (valid_root / "Dockerfile").write_text(
-        "FROM python:3.12-slim\nCOPY app ./app\nCOPY Dockerfile ./Dockerfile\n",
+    (valid_root / "worker.Dockerfile").write_text(
+        "FROM python:3.12-slim\nCOPY app ./app\nCOPY requirements.txt ./\n",
         encoding="utf-8",
     )
-    for filename in ("requirements.txt", "init_db.sh", "start.sh"):
-        (valid_root / filename).write_text("", encoding="utf-8")
+    (valid_root / "requirements-worker.txt").write_text("", encoding="utf-8")
+    for source in remote_workers._worker_runtime_files(Path(remote_workers.__file__).parent):
+        (valid_root / "app" / source.name).write_bytes(source.read_bytes())
 
     context_bytes = remote_workers._worker_build_context([invalid_root, valid_root])
     with tarfile.open(fileobj=io.BytesIO(context_bytes), mode="r:") as context:
@@ -3078,6 +3239,28 @@ def test_remote_bootstrap_script_rejects_gpu_mode_change_on_restart(
     assert result.returncode != 0
     assert expected_error in result.stderr
     assert not docker_log.exists()
+
+
+@pytest.mark.parametrize("action", ["deploy", "restart"])
+@pytest.mark.parametrize("image_mode", ["cpu", "gpu", ""])
+def test_gpu_actions_reject_cpu_image_and_accept_legacy(tmp_path, action, image_mode):
+    """CPU 镜像不能切换 GPU；GPU 和未带标签的历史镜像继续工作，失败不停止旧容器。"""
+    stub = _RUNNING_STUB.replace(
+        "#!/usr/bin/env bash\n",
+        "#!/usr/bin/env bash\n"
+        f"if [[ \"$*\" == *org.mtp.worker.mode* ]]; then printf '%s\\n' '{image_mode}'; exit 0; fi\n",
+    ).replace("printf '[]\\n'", "printf '[{\"Capabilities\":[[\"gpu\"]]}]\\n'")
+    result, docker_log, _env_file = _run_bootstrap_action(
+        tmp_path, action, _CURRENT_WORKER_ENV, stub, mode="gpu"
+    )
+    commands = docker_log.read_text() if docker_log.exists() else ""
+    if image_mode == "cpu":
+        assert result.returncode != 0
+        assert "CPU 版 worker 镜像不支持 GPU" in result.stderr
+        assert not any(command in commands for command in ("stop --time", "run --detach", "restart --time"))
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert ("run --detach" if action == "deploy" else "restart --time") in commands
 
 
 @pytest.mark.parametrize("field", [".Config.Cmd", ".Mounts", ".HostConfig.DeviceRequests"])

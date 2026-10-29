@@ -60,6 +60,13 @@ write_worker_env() {
 # --env-file、挂载或 GPU DeviceRequests，因此旧容器必须先执行部署代码重建。
 validate_worker_container_compatibility() {
   local command mounts device_requests
+  # 容器继承镜像标签；旧镜像没有标签时沿用既有的兼容性检查。
+  local image_mode
+  image_mode="$(docker inspect --format '{{index .Config.Labels "org.mtp.worker.mode"}}' "$CONTAINER")" || return 1
+  if [[ "$MODE" == gpu && "$image_mode" == cpu ]]; then
+    printf 'CPU 版 worker 镜像不支持 GPU，请先重新构建 GPU 版镜像并替换容器。\n' >&2
+    return 1
+  fi
   command="$(docker inspect --format '{{json .Config.Cmd}}' "$CONTAINER")" || {
     printf '无法读取 worker 容器启动命令，请先执行部署代码重建容器。\n' >&2
     return 1
@@ -160,11 +167,24 @@ activate_worker_app() {
   APP_STAGING_DIR=""
 }
 
+# 校验镜像硬件类型，在停止旧容器之前拒绝不兼容的 CPU → GPU 切换。
+validate_worker_image() {
+  local image="$1"
+  # 禁止将精简 CPU 镜像当成 GPU 镜像启动；不对无标签的历史镜像作错误推断。
+  local image_mode
+  image_mode="$(docker image inspect --format '{{index .Config.Labels "org.mtp.worker.mode"}}' "$image")" || return 1
+  if [[ "$MODE" == gpu && "$image_mode" == cpu ]]; then
+    printf 'CPU 版 worker 镜像不支持 GPU，请先重新构建 GPU 版镜像并替换容器。\n' >&2
+    return 1
+  fi
+}
+
 # 用指定的现有镜像和当前部署配置创建 worker 容器；start=0 时仅创建不启动，
 # 用于保持"部署/更新配置不改变容器停止状态"的语义。
 run_worker_container() {
   local image="$1"
   local start="${2:-1}"
+  validate_worker_image "$image" || return 1
   local launch=(run --detach)
   if [[ "$start" == "0" ]]; then
     launch=(create)
@@ -251,6 +271,7 @@ recreate_worker_container() {
     printf '无法读取现有 worker 容器镜像。\n' >&2
     exit 1
   fi
+  validate_worker_image "$existing_image" || return 1
   local previous_container="${CONTAINER}-previous"
   if docker inspect "$previous_container" >/dev/null 2>&1; then
     docker rm --force "$previous_container" >/dev/null

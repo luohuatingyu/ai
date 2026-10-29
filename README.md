@@ -150,6 +150,12 @@ bash scripts/start-platform.sh   # 默认 CPU；设置 PLATFORM_MODE=gpu 选择 
 
 远程操作配置以单文件脚本通过 SSH stdin 发送；脚本会把 worker 运行所需配置以权限 `600` 保存到目标机用户的 `~/.config/mtp-worker/`，不会把平台源码复制到目标服务器。服务器记录不保存 SSH 密钥或 S3 密钥。平台 API 尚未提供身份认证，远程管理 API 默认启用且不使用独立令牌；部署时必须限制平台管理页面的网络访问，只允许可信网络访问。
 
+远程 worker 使用独立的 `backend/worker.Dockerfile` 和 `backend/requirements-worker.txt`。平台按服务器的 CPU/GPU 类型传入 `WORKER_MODE`：CPU 版从 PyTorch 官方 CPU 索引安装 torch，不安装 CUDA；GPU 版保留 CUDA 训练依赖。其余依赖继续使用服务器配置的 pip 源。CPU 索引不可访问时构建会报错，不会自动回退到 GPU 包。worker 不再需要 apt/SSH 工具，因此 apt 源设置不参与专用镜像构建。
+
+首次构建包和后续代码包只包含 worker 入口、训练器、队列/租约、存储及运行配置；不包含页面、管理 API、数据库管理、样例数据或测试工具。分类、回归、聚类、时间序列和 LLM 能力均保留。配置中的数据库功能在远程 worker 固定关闭，数据集和训练产物仍通过既有 Redis/S3 链路协作。
+
+已部署节点的“部署代码”继续复用现有镜像，不重新下载依赖，旧镜像的磁盘占用不会自动减少。要让旧节点采用精简依赖，需要在维护窗口重新构建镜像并替换容器；不要在训练期间删除现用镜像。CPU 版镜像改为 GPU 节点时，也必须先换用 GPU 版镜像；平台会明确拒绝不兼容的启动。停止、启动、重启和配置更新的既有语义保持不变。
+
 ### 3. 迁移历史数据（老版本升级）
 
 ```bash
@@ -180,7 +186,7 @@ python -m app.worker --probe-gpu     # 一次性卡健康探测（退出码 0=�
 | 启动 | 使用 `PLATFORM_MODE=gpu bash scripts/start-platform.sh` |
 | 页面确认 | 顶栏徽章显示 GPU 型号即成功；每次训练的「设备」统计也会显示 GPU/CPU |
 
-CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch.cuda.is_available()`，无 GPU 时仅打印提示并回退 CPU。
+平台默认完整镜像中的训练器会自动探测 `torch.cuda.is_available()`，无 GPU 时提示并回退 CPU。远程专用 CPU 镜像切换为 GPU 节点时，必须先换用 GPU 版镜像。
 
 ## 数据库（MySQL，可选镜像存储）
 

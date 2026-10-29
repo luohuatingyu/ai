@@ -546,22 +546,31 @@ def _canonical_docker_platform(platform: str) -> str:
     return f"{operating_system}/{architecture}"
 
 
+def _worker_runtime_files(app_root: Path) -> List[Path]:
+    """按白名单收集计算节点源码，拒绝缺失文件和符号链接，避免夹带管理端或秘密。"""
+    if app_root.is_symlink():
+        raise RemoteWorkerError("worker 源码目录不能是符号链接")
+    names = [
+        "__init__.py", "config.py", "coordination.py", "storage.py", "jobstore.py",
+        "trainer.py", "llm_trainer.py", "worker.py", "worker-entrypoint.sh",
+    ]
+    # 联合训练模块在支持该功能的版本中随 worker 一起部署，兼容未启用该功能的版本。
+    names.extend(name for name in ("parallel.py", "parallel_worker.py")
+                 if (app_root / name).exists() or (app_root / name).is_symlink())
+    files = [app_root / name for name in names]
+    for path in files:
+        if path.is_symlink() or not path.is_file():
+            raise RemoteWorkerError(f"worker 运行文件缺失或不是普通文件：{path.name}")
+    return files
+
+
 def _worker_build_context(
     context_roots: List[Path] | None = None, legacy_builder: bool = False
 ) -> bytes:
-    """打包可信 worker 构建上下文；兼容模式会移除传统构建器不支持的缓存挂载。"""
+    """打包专用 worker 配方、运行依赖和源码；兼容旧 Docker 构建器。"""
     import io
     import tarfile
 
-    context_paths = (
-        "Dockerfile",
-        "requirements.txt",
-        "app",
-        "static",
-        "sample_data",
-        "init_db.sh",
-        "start.sh",
-    )
     roots = context_roots or [
         config.APP_ROOT.parent,
         Path("/app"),
@@ -569,7 +578,9 @@ def _worker_build_context(
     ]
     context_root = None
     for candidate in dict.fromkeys(Path(root).resolve() for root in roots):
-        dockerfile = candidate / "Dockerfile"
+        dockerfile = candidate / "worker.Dockerfile"
+        if dockerfile.is_symlink():
+            continue
         try:
             dockerfile_text = dockerfile.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -578,15 +589,16 @@ def _worker_build_context(
             "dict(os.environ)" in dockerfile_text
             or not re.search(r"(?m)^FROM\s+\S+", dockerfile_text)
             or "COPY app ./app" not in dockerfile_text
-            or "COPY Dockerfile ./Dockerfile" not in dockerfile_text
+            or "COPY requirements.txt ./" not in dockerfile_text
         ):
             continue
-        if all((candidate / relative_path).exists() for relative_path in context_paths):
+        requirements = candidate / "requirements-worker.txt"
+        if requirements.is_file() and not requirements.is_symlink() and (candidate / "app").is_dir():
             context_root = candidate
             break
     if context_root is None:
         raise RemoteWorkerError(
-            "无法自动构建 worker 镜像：未找到完整且有效的后端 Docker 构建目录"
+            "无法自动构建 worker 镜像：未找到完整且有效的 worker 构建目录"
         )
 
     archive_buffer = io.BytesIO()
@@ -596,12 +608,12 @@ def _worker_build_context(
         with tarfile.open(
             fileobj=archive_buffer, mode="w", format=tarfile.GNU_FORMAT
         ) as archive:
-            for relative_path in context_paths:
-                source = context_root / relative_path
-                if not source.exists():
-                    raise RemoteWorkerError(
-                        f"无法自动构建 worker 镜像：构建文件 {relative_path} 不存在"
-                    )
+            context_files = [
+                (context_root / "worker.Dockerfile", "Dockerfile"),
+                (context_root / "requirements-worker.txt", "requirements.txt"),
+                *((path, f"app/{path.name}") for path in _worker_runtime_files(context_root / "app")),
+            ]
+            for source, relative_path in context_files:
                 if relative_path == "Dockerfile" and legacy_builder:
                     # 传统构建器不支持 RUN --mount；移除仅用于 pip 下载缓存的挂载。
                     cache_mount = re.compile(
@@ -621,15 +633,7 @@ def _worker_build_context(
                     dockerfile_info.size = len(dockerfile_bytes)
                     archive.addfile(dockerfile_info, io.BytesIO(dockerfile_bytes))
                     continue
-                archive.add(
-                    source,
-                    arcname=relative_path,
-                    recursive=True,
-                    filter=lambda item: None
-                    if Path(item.name).name in {"__pycache__", ".pytest_cache"}
-                    or item.name.endswith((".pyc", ".pyo"))
-                    else item,
-                )
+                archive.add(source, arcname=relative_path, recursive=False)
     except RemoteWorkerError:
         raise
     except (OSError, tarfile.TarError) as exc:
@@ -638,7 +642,7 @@ def _worker_build_context(
 
 
 def _worker_code_archive() -> bytes:
-    """只打包 worker Python 代码，供已部署容器更新时复用现有镜像。"""
+    """使用与首次构建相同的运行文件白名单，压缩代码并复用远端现有镜像。"""
     import io
     import tarfile
 
@@ -648,23 +652,19 @@ def _worker_code_archive() -> bytes:
         with tarfile.open(
             fileobj=archive_buffer, mode="w:gz", format=tarfile.GNU_FORMAT
         ) as archive:
-            archive.add(
-                app_root,
-                arcname="app",
-                recursive=True,
-                filter=lambda item: None
-                if Path(item.name).name in {"__pycache__", ".pytest_cache"}
-                or item.name.endswith((".pyc", ".pyo"))
-                else item,
-            )
+            for path in _worker_runtime_files(app_root):
+                archive.add(path, arcname=f"app/{path.name}", recursive=False)
     except (OSError, tarfile.TarError) as exc:
         raise RemoteWorkerError("打包 worker Python 代码失败") from exc
     return archive_buffer.getvalue()
 
 
 def _remote_build_args(server: Dict[str, object]) -> str:
-    """按服务器配置构造 docker build 的 --build-arg（Docker/pip/apt 加速源）。"""
-    args: List[str] = []
+    """按目标硬件选择 CPU/CUDA 依赖，继续支持基础镜像和 pip 加速源。"""
+    mode = str(server.get("mode", "cpu"))
+    if mode not in {"cpu", "gpu"}:
+        raise RemoteWorkerError("资源类型必须是 cpu 或 gpu")
+    args: List[str] = [f"--build-arg WORKER_MODE={mode}"]
     docker_registry = str(server.get("docker_registry") or "").strip()
     if docker_registry:
         base_image = f"{docker_registry}/library/python:3.12-slim"

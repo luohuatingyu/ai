@@ -35,6 +35,8 @@ COPY app ./app
 COPY static ./static
 COPY sample_data ./sample_data
 COPY Dockerfile ./Dockerfile
+# 平台负责打包远程 worker，保留独立的精简构建配方和依赖清单。
+COPY worker.Dockerfile requirements-worker.txt ./
 
 # 启动与数据库初始化脚本
 COPY init_db.sh start.sh ./
