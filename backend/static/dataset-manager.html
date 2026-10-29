@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>数据集管理 · 可视化模型训练平台</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="/app.css?v=20261029-management-tabs-1">
+    <link rel="stylesheet" href="/app.css?v=20261029-dataset-layout-2">
 </head>
 <body class="dataset-page">
     <header class="topbar">
@@ -67,8 +67,12 @@
             <h2 class="section-title" id="datasetTitle">数据集列表</h2>
             <p class="section-description">查看数据规模、字段和标签；可按名称、描述、字段或标签筛选。</p>
             <div class="filter-bar">
-                <input type="search" class="search-input" id="searchInput" placeholder="搜索数据集、描述或字段…" aria-label="搜索数据集">
+                <input type="search" class="search-input" id="searchInput" placeholder="搜索名称、描述、字段或标签…" aria-label="搜索数据集">
                 <div class="tag-filter" id="tagFilter" aria-label="按标签筛选"></div>
+            </div>
+            <div class="dataset-results">
+                <span id="datasetResults" role="status">正在加载数据集…</span>
+                <button type="button" id="clearDatasetFilters" class="btn-secondary" hidden>清除筛选</button>
             </div>
             <div class="dataset-grid" id="datasetGrid" aria-live="polite">
                 <div class="empty-state">正在加载数据集…</div>
@@ -108,12 +112,15 @@
         let activeDatasetId = null;
         let availableOperations = [];
         let queuedOperations = [];
+        let detailRequest = 0;
+        const modalReturnFocus = new Map();
 
         // 初始化页面事件并加载列表、标签。
         document.addEventListener("DOMContentLoaded", () => {
             initializeUpload();
             $("hubForm").addEventListener("submit", importHubDataset);
             $("searchInput").addEventListener("input", filterDatasets);
+            $("clearDatasetFilters").addEventListener("click", clearDatasetFilters);
             $("datasetGrid").addEventListener("click", handleDatasetAction);
             $("processingBody").addEventListener("click", handleProcessingAction);
             document.querySelectorAll("[data-close-modal]").forEach((button) => {
@@ -124,11 +131,7 @@
                     if (event.target === modal) closeModal(modal.id);
                 });
             });
-            document.addEventListener("keydown", (event) => {
-                if (event.key === "Escape") {
-                    document.querySelectorAll(".modal.is-open").forEach((modal) => closeModal(modal.id));
-                }
-            });
+            document.addEventListener("keydown", handleModalKeydown);
             loadDatasets();
             loadTags();
         });
@@ -278,46 +281,73 @@
                 filterDatasets();
             } catch (error) {
                 showNotification(error.message, "error");
+                $("datasetResults").textContent = "列表加载失败";
                 $("datasetGrid").innerHTML = '<div class="empty-state">数据集加载失败，请稍后重试。</div>';
             }
         }
 
-        // 创建安全转义后的数据集卡片。
+        // 把来源和缓存状态转换为固定的展示值，兼容缺少 Hub 元信息的旧记录。
+        function datasetPresentation(dataset) {
+            const isHub = dataset.source === "huggingface";
+            const needsDownload = isHub && dataset.cache_status !== "ready";
+            const labels = { remote: "待下载", downloading: "下载中", ready: "已缓存", error: "下载失败" };
+            const status = isHub && Object.hasOwn(labels, dataset.cache_status) ? dataset.cache_status : isHub ? "remote" : "local";
+            return { isHub, needsDownload, status, busy: status === "downloading",
+                label: isHub ? labels[status] : "可使用", source: isHub ? "Hugging Face" : "本地数据集" };
+        }
+
+        // 来源与状态分别显示；状态始终包含文字，不只依靠颜色表达。
+        function datasetBadges(dataset) {
+            const view = datasetPresentation(dataset);
+            return '<div class="dataset-badges"><span class="dataset-source">' + view.source + '</span>' +
+                '<span class="dataset-status status-' + view.status + '"><span aria-hidden="true"></span>' + view.label + '</span></div>';
+        }
+
+        // 统一卡片和详情中的数据规模；尚未下载的规模表示未知，真实零值保留。
+        function datasetMetrics(dataset) {
+            const pending = datasetPresentation(dataset).needsDownload;
+            const columns = Array.isArray(dataset.columns) ? dataset.columns : [];
+            const rows = Number(dataset.rows ?? dataset.row_count);
+            const values = [
+                ["行数", pending || !Number.isFinite(rows) || rows < 0 ? "—" : rows.toLocaleString("zh-CN")],
+                ["字段", pending ? "—" : columns.length.toLocaleString("zh-CN")],
+                ["大小", pending || dataset.file_size == null ? "—" : formatBytes(dataset.file_size)]
+            ];
+            return '<dl class="dataset-metrics">' + values.map(([label, value]) =>
+                '<div><dt>' + label + '</dt><dd>' + escapeHtml(value) + '</dd></div>').join("") + '</dl>';
+        }
+
+        // 创建分区明确且安全转义的卡片，操作放在底部，长名称不再受按钮挤压。
         function createDatasetCard(dataset) {
             const columns = Array.isArray(dataset.columns) ? dataset.columns : [];
             const tags = Array.isArray(dataset.tags) ? dataset.tags : [];
-            const isHub = dataset.source === "huggingface";
-            const needsDownload = isHub && dataset.cache_status !== "ready";
-            const cacheLabels = { remote: "远程引用", downloading: "正在下载", ready: "已缓存", error: "下载失败，可重试" };
-            const columnTags = columns.slice(0, 5).map((column) =>
-                '<span class="tag">' + escapeHtml(column) + "</span>"
-            ).join("");
-            const extraColumns = columns.length > 5
-                ? '<span class="tag">+' + (columns.length - 5) + " 列</span>"
-                : "";
+            const view = datasetPresentation(dataset);
+            const hub = dataset.hub || {};
+            const id = escapeHtml(dataset.id);
+            const name = escapeHtml(dataset.name || "未命名数据集");
+            const disabled = view.busy ? " disabled" : "";
             const card = document.createElement("article");
             card.className = "dataset-card";
             card.innerHTML =
-                '<div class="dataset-header">' +
-                    '<h3 class="dataset-title">' + escapeHtml(dataset.name || "未命名数据集") + "</h3>" +
-                    '<div class="dataset-actions">' +
-                        '<button type="button" data-action="detail" data-id="' + escapeHtml(dataset.id) + '">' + (needsDownload ? "下载并预览" : "详情") + '</button>' +
-                        (needsDownload ? '<button type="button" data-action="download" data-id="' + escapeHtml(dataset.id) + '">下载到本地</button>' : "") +
-                        '<button type="button" class="btn-secondary" data-action="process" data-id="' + escapeHtml(dataset.id) + '">处理</button>' +
-                        '<button type="button" class="btn-danger" data-action="delete" data-id="' + escapeHtml(dataset.id) + '">删除</button>' +
-                    "</div>" +
-                "</div>" +
-                '<div class="dataset-info">' +
-                    '<span class="dataset-meta">' + (needsDownload ? "规模将在下载后显示" : Number(dataset.rows || 0).toLocaleString("zh-CN") + " 行 · " + columns.length + " 列") + "</span>" +
-                    (isHub ? '<span class="dataset-meta">Hugging Face · ' + escapeHtml(cacheLabels[dataset.cache_status] || "远程引用") + "</span>" +
-                        '<span class="dataset-meta">' + escapeHtml(dataset.hub.subset || "默认子集") + " / " + escapeHtml(dataset.hub.split) + " · 版本 " + escapeHtml(dataset.hub.revision.slice(0, 12)) + "</span>" : "") +
-                    (dataset.last_error ? '<span class="dataset-meta">' + escapeHtml(dataset.last_error) + "</span>" : "") +
-                    '<span class="dataset-meta">创建于 ' + escapeHtml(formatDate(dataset.created_at)) + "</span>" +
-                    (dataset.description ? '<span class="dataset-meta">' + escapeHtml(dataset.description) + "</span>" : "") +
-                "</div>" +
-                '<div class="dataset-tags">' + tags.map((tag) =>
-                    '<span class="tag">' + escapeHtml(tag) + "</span>"
-                ).join("") + columnTags + extraColumns + "</div>";
+                datasetBadges(dataset) + '<h3 class="dataset-title">' + name + '</h3>' +
+                (dataset.description ? '<p class="dataset-description" title="' + escapeHtml(dataset.description) + '">' + escapeHtml(dataset.description) + '</p>' : '') +
+                datasetMetrics(dataset) +
+                (view.isHub ? '<p class="dataset-origin">' + escapeHtml(hub.subset || "默认子集") + ' / ' + escapeHtml(hub.split || "—") +
+                    '<span title="' + escapeHtml(hub.revision || "") + '">版本 ' + escapeHtml(String(hub.revision || "—").slice(0, 12)) + '</span></p>' : '') +
+                (dataset.last_error ? '<p class="dataset-error">' + escapeHtml(dataset.last_error) + '</p>' : '') +
+                '<div class="dataset-fields"><span class="dataset-section-label">字段预览</span><div class="dataset-field-list">' +
+                    (columns.length ? columns.slice(0, 4).map((column) => '<span class="dataset-field" title="' + escapeHtml(column) + '">' + escapeHtml(column) + '</span>').join('') +
+                        (columns.length > 4 ? '<span class="dataset-field-more">另 ' + (columns.length - 4) + ' 个字段</span>' : '') :
+                        '<span class="dataset-note">' + (view.needsDownload ? '下载后查看字段与数据规模' : '暂无字段信息') + '</span>') + '</div></div>' +
+                (tags.length ? '<div class="dataset-tags" aria-label="标签">' + tags.slice(0, 3).map((tag) => '<span class="tag">' + escapeHtml(tag) + '</span>').join('') +
+                    (tags.length > 3 ? '<span class="tag" title="' + escapeHtml(tags.join('、')) + '">+' + (tags.length - 3) + '</span>' : '') + '</div>' : '') +
+                '<div class="dataset-card-bottom"><p class="dataset-created">创建于 ' + escapeHtml(formatDate(dataset.created_at)) + '</p>' +
+                '<div class="dataset-actions">' +
+                    '<button type="button" class="btn-primary" data-action="detail" data-id="' + id + '"' + disabled + '>' + (view.busy ? '下载中…' : view.needsDownload ? '下载并预览' : '查看数据') + '</button>' +
+                    (view.needsDownload ? '<button type="button" data-action="download" data-id="' + id + '"' + disabled + '>' + (view.status === 'error' ? '重试下载' : '下载到本地') + '</button>' : '') +
+                    '<button type="button" class="btn-secondary" data-action="process" data-id="' + id + '"' + disabled + '>处理</button>' +
+                    '<button type="button" class="btn-danger" data-action="delete" data-id="' + id + '" aria-label="删除数据集 ' + name + '">删除</button>' +
+                '</div></div>';
             return card;
         }
 
@@ -328,7 +358,8 @@
                 const searchable = [
                     dataset.name || "",
                     dataset.description || "",
-                    ...(Array.isArray(dataset.columns) ? dataset.columns : [])
+                    ...(Array.isArray(dataset.columns) ? dataset.columns : []),
+                    ...(Array.isArray(dataset.tags) ? dataset.tags : [])
                 ].join(" ").toLocaleLowerCase();
                 const matchesSearch = !searchTerm || searchable.includes(searchTerm);
                 const tags = Array.isArray(dataset.tags) ? dataset.tags : [];
@@ -337,19 +368,29 @@
             });
 
             const grid = $("datasetGrid");
+            $("datasetResults").textContent = "显示 " + filtered.length + " / " + datasets.length + " 个数据集";
+            $("clearDatasetFilters").hidden = !searchTerm && selectedTags.length === 0;
             if (!filtered.length) {
-                grid.innerHTML = '<div class="empty-state">' +
-                    (datasets.length ? "没有符合条件的数据集。" : "暂无数据集，先从上方导入文件。") +
-                    "</div>";
+                grid.innerHTML = '<div class="empty-state"><strong>' + (datasets.length ? "没有匹配的数据集" : "还没有数据集") +
+                    '</strong><p>' + (datasets.length ? '试试其他关键词，或清除筛选条件。' : '从上方上传文件，或保存 Hugging Face Hub 引用，即可在这里管理。') + '</p></div>';
                 return;
             }
             grid.replaceChildren(...filtered.map(createDatasetCard));
         }
 
+        // 清除关键词及标签条件，恢复完整列表并把焦点交还搜索框。
+        function clearDatasetFilters() {
+            $("searchInput").value = "";
+            selectedTags = [];
+            renderTags();
+            filterDatasets();
+            $("searchInput").focus();
+        }
+
         // 从卡片操作区分派详情、处理和删除动作。
         function handleDatasetAction(event) {
             const button = event.target.closest("button[data-action]");
-            if (!button) return;
+            if (!button || button.disabled) return;
             const datasetId = button.dataset.id;
             if (button.dataset.action === "detail") showDatasetDetail(datasetId);
             if (button.dataset.action === "process") processDataset(datasetId);
@@ -359,46 +400,50 @@
 
         // 读取数据集详情并以转义文本展示字段和元信息。
         async function showDatasetDetail(datasetId) {
+            const request = ++detailRequest;
             $("modalTitle").textContent = "数据集详情";
             $("modalBody").textContent = "正在准备数据；远程引用首次使用需要下载，请稍候…";
             openModal("datasetModal");
             try {
                 const dataset = await apiJson(API_BASE + "/datasets/" + encodeURIComponent(datasetId));
+                if (request !== detailRequest) return;
                 $("modalTitle").textContent = dataset.name || "数据集详情";
                 const columns = Array.isArray(dataset.columns) ? dataset.columns : [];
                 const types = dataset.column_types || {};
                 const rows = Array.isArray(dataset.preview) ? dataset.preview : [];
-                const table = '<div class="dataset-preview"><table class="preview-table"><thead><tr>' +
-                    columns.map((column) => "<th>" + escapeHtml(column) + "</th>").join("") +
+                const table = '<div class="dataset-preview" tabindex="0" role="region" aria-label="数据预览，可横向滚动"><table class="preview-table"><thead><tr>' +
+                    columns.map((column) => '<th scope="col">' + escapeHtml(column) + '</th>').join("") +
                     "</tr></thead><tbody>" + rows.map((row) =>
                         "<tr>" + columns.map((column) =>
-                            "<td>" + escapeHtml(row[column] == null ? "" : row[column]) + "</td>"
+                            '<td><div class="preview-cell">' + escapeHtml(row[column] == null ? "" : row[column]) + '</div></td>'
                         ).join("") + "</tr>"
                     ).join("") + "</tbody></table></div>";
                 const columnTypes = columns.map((column) =>
                     "<tr><td>" + escapeHtml(column) + "</td><td>" + escapeHtml(types[column] || "未知") + "</td></tr>"
                 ).join("");
                 $("modalBody").innerHTML =
+                    datasetBadges(dataset) + datasetMetrics(dataset) +
+                    '<div class="dataset-preview-heading"><h3 class="modal-section-title">数据预览</h3><span>前 ' + rows.length + ' 行</span></div>' +
+                    (rows.length ? table : '<p class="dataset-note">暂无可预览的数据行。</p>') +
+                    (dataset.description ? '<p class="dataset-detail-description">' + escapeHtml(dataset.description) + '</p>' : '') +
+                    '<details class="dataset-details"><summary>字段与数据集信息 · ' + columns.length + ' 个字段</summary>' +
                     '<div class="dataset-info">' +
                         '<span class="dataset-meta">ID：' + escapeHtml(dataset.id) + "</span>" +
-                        '<span class="dataset-meta">行数：' + Number(dataset.rows || 0).toLocaleString("zh-CN") + "</span>" +
-                        '<span class="dataset-meta">文件大小：' + escapeHtml(formatBytes(dataset.file_size)) + "</span>" +
                         '<span class="dataset-meta">创建时间：' + escapeHtml(formatDate(dataset.created_at)) + "</span>" +
                         '<span class="dataset-meta">更新时间：' + escapeHtml(formatDate(dataset.updated_at)) + "</span>" +
+                        (dataset.hub ? '<span class="dataset-meta">子集 / Split：' + escapeHtml(dataset.hub.subset || "默认子集") + ' / ' + escapeHtml(dataset.hub.split || "—") + '</span>' +
+                            '<span class="dataset-meta">固定版本：' + escapeHtml(dataset.hub.revision || "—") + '</span>' : '') +
                     "</div>" +
-                    '<h3 class="modal-section-title">字段类型</h3>' +
-                    '<div class="dataset-preview"><table class="preview-table"><thead><tr><th>字段</th><th>类型</th></tr></thead><tbody>' +
-                        columnTypes + "</tbody></table></div>" +
-                    '<h3 class="modal-section-title">数据预览</h3>' + table +
-                    (dataset.description ? '<h3 class="modal-section-title">描述</h3><p>' + escapeHtml(dataset.description) + "</p>" : "") +
+                    '<div class="dataset-preview" tabindex="0" role="region" aria-label="字段类型"><table class="preview-table"><thead><tr><th scope="col">字段</th><th scope="col">类型</th></tr></thead><tbody>' +
+                        columnTypes + '</tbody></table></div></details>' +
                     (Array.isArray(dataset.tags) && dataset.tags.length
                         ? '<h3 class="modal-section-title">标签</h3><div class="dataset-tags">' +
                             dataset.tags.map((tag) => '<span class="tag">' + escapeHtml(tag) + "</span>").join("") +
                           "</div>"
                         : "");
-                openModal("datasetModal");
                 await loadDatasets();
             } catch (error) {
+                if (request !== detailRequest) return;
                 $("modalBody").textContent = error.message;
                 showNotification(error.message, "error");
                 await loadDatasets();
@@ -562,19 +607,46 @@
         // 显示指定的对话框并将键盘焦点放到关闭按钮。
         function openModal(id) {
             const modal = $(id);
+            if (!modal.classList.contains("is-open")) modalReturnFocus.set(id, document.activeElement);
             modal.classList.add("is-open");
+            document.body.classList.add("has-dataset-modal");
             const closeButton = modal.querySelector("[data-close-modal]");
             if (closeButton) closeButton.focus();
         }
 
-        // 关闭对话框并清除处理面板上的临时队列。
+        // 关闭后恢复焦点，并使未完成的详情响应失效，防止弹窗自动重新打开。
         function closeModal(id) {
             const modal = $(id);
-            if (!modal) return;
+            if (!modal || !modal.classList.contains("is-open")) return;
             modal.classList.remove("is-open");
+            if (id === "datasetModal") detailRequest += 1;
+            if (!document.querySelector(".modal.is-open")) document.body.classList.remove("has-dataset-modal");
+            const trigger = modalReturnFocus.get(id);
+            if (trigger && trigger.isConnected) trigger.focus();
+            else $("searchInput").focus();
+            modalReturnFocus.delete(id);
             if (id === "processingModal") {
                 activeDatasetId = null;
                 queuedOperations = [];
+            }
+        }
+
+        // 将键盘焦点保持在当前弹窗中，Escape 关闭后返回原来的操作入口。
+        function handleModalKeydown(event) {
+            const modal = document.querySelector(".modal.is-open");
+            if (!modal) return;
+            if (event.key === "Escape") {
+                event.preventDefault();
+                closeModal(modal.id);
+            } else if (event.key === "Tab") {
+                const controls = Array.from(modal.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex]:not([tabindex="-1"])'))
+                    .filter((control) => control.getClientRects().length);
+                if (!controls.length) return;
+                const first = controls[0], last = controls[controls.length - 1];
+                if (!modal.contains(document.activeElement) || (event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last)) {
+                    event.preventDefault();
+                    (event.shiftKey ? last : first).focus();
+                }
             }
         }
 
