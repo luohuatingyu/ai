@@ -1025,8 +1025,10 @@ body.server-dialog-open { overflow: hidden; }
 .dataset-page .dataset-grid { gap: 16px; }
 .dataset-page .dataset-card { padding: 18px; border-color: #e2e8f0; border-radius: 15px; background: #fff; box-shadow: 0 2px 8px rgba(25, 42, 70, .035); }
 .dataset-page .dataset-card:hover { transform: translateY(-2px); border-color: #c2d3ec; box-shadow: 0 9px 24px rgba(25, 42, 70, .08); }
+/* 标题独占卡片宽度，操作区另起一行并按可用宽度折行，避免远程数据集按钮挤压名称。 */
+.dataset-page .dataset-header { flex-direction: column; align-items: stretch; }
 .dataset-page .dataset-title { color: #24344d; font-size: 16px; font-weight: 700; }
-.dataset-page .dataset-actions { gap: 7px; }
+.dataset-page .dataset-actions { min-width: 0; justify-content: flex-start; gap: 7px; }
 .dataset-page .dataset-actions button { min-height: 33px; padding: 6px 10px; font-size: 12px; }
 .dataset-page .dataset-info { margin: 14px 0; color: #687991; font-size: 12px; line-height: 1.55; }
 .dataset-page .dataset-tags { gap: 6px; }
