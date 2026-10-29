@@ -3157,10 +3157,10 @@ docker compose logs --tail=15 worker
 
 ### 测试执行结果
 
-| 命令 | 结果 |
+| 命令（Python 3.12.15 trainer 容器内、`backend/` 工作目录；省略 Docker 启动与挂载参数） | 结果 |
 |---|---|
-| `docker run ... python -m pytest tests/test_device.py tests/test_parallel.py ...` | **68 passed，2 skipped**；跳过真实 NVIDIA GPU/NCCL |
-| `docker run ... python -m pytest tests/test_device.py tests/test_parallel.py tests/test_remote_workers.py -k 'device_info or member_selection_supports or mixed_accelerators or incompatible_members or cpu_slot or supervisor_sets or remote_build_selects_non_cuda or remote_build_rejects_mps'` | **28 passed，202 deselected** |
+| `python -m pytest tests/test_device.py tests/test_parallel.py` | **68 passed，2 skipped**；跳过真实 NVIDIA GPU/NCCL |
+| `python -m pytest tests/test_device.py tests/test_parallel.py tests/test_remote_workers.py -k 'device_info or member_selection_supports or mixed_accelerators or incompatible_members or cpu_slot or supervisor_sets or remote_build_selects_non_cuda or remote_build_rejects_mps'` | **28 passed，202 deselected** |
 | `docker run ... python -m pytest tests/ -q -rs --tb=short` | **571 passed，24 skipped，0 failed**；Python 3.12.15 |
 | `node --test frontend/parallel-training.test.cjs frontend/training-resources.test.cjs` | **25 passed，0 failed** |
 | `node --test frontend/dataset-display.test.cjs frontend/dataset-preview.test.cjs frontend/server-modal.test.cjs` | **55 passed，0 failed** |
