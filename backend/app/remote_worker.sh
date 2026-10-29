@@ -43,6 +43,9 @@ write_worker_env() {
     printf 'WORKER_MACHINE_ID=%s\n' "$MTP_MACHINE_ID"
     printf 'WORKER_MANAGED=true\n'
     printf 'WORKER_CPU_SLOTS=%s\n' "$cpu_slots_value"
+    if [[ -n "${MTP_DISTRIBUTED_HOST:-}" ]]; then
+      printf 'WORKER_DISTRIBUTED_HOST=%s\n' "$MTP_DISTRIBUTED_HOST"
+    fi
     printf 'USE_DATABASE=false\n'
     printf 'DATA_DIR=/app/data\n'
   } > "$staging_env"
@@ -59,7 +62,7 @@ write_worker_env() {
 # 检查现有容器是否由当前外部配置方案创建；Docker start/restart 不会重新读取
 # --env-file、挂载或 GPU DeviceRequests，因此旧容器必须先执行部署代码重建。
 validate_worker_container_compatibility() {
-  local command mounts device_requests
+  local command mounts device_requests network_mode
   # 容器继承镜像标签；旧镜像没有标签时沿用既有的兼容性检查。
   local image_mode
   image_mode="$(docker inspect --format '{{index .Config.Labels "org.mtp.worker.mode"}}' "$CONTAINER")" || return 1
@@ -91,6 +94,14 @@ validate_worker_container_compatibility() {
   if [[ "$MODE" == cpu && "$device_requests" == *gpu* ]]; then
     printf '当前 worker 容器仍启用 GPU，计算类型已改为 CPU；请先点击“部署代码”重建容器。\n' >&2
     return 1
+  fi
+  # Docker restart 不会改变容器网络；配置互联地址前必须先按新配置部署。
+  if [[ -n "${MTP_DISTRIBUTED_HOST:-}" ]]; then
+    network_mode="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$CONTAINER")" || return 1
+    if [[ "$network_mode" != host ]]; then
+      printf '当前 worker 容器未启用联合训练所需的 host 网络，请先点击“部署代码”重建容器。\n' >&2
+      return 1
+    fi
   fi
 }
 
@@ -200,6 +211,11 @@ run_worker_container() {
   fi
   if [[ "$MODE" == gpu ]]; then
     args+=(--gpus all)
+  fi
+  # 显式配置节点互联地址后使用 Linux host 网络，允许 Gloo/NCCL 节点间直连。
+  # 仅打开 rendezvous 端口不足以支持后续动态通信端口，节点应位于可信互通网络。
+  if [[ -n "${MTP_DISTRIBUTED_HOST:-}" ]]; then
+    args+=(--network host)
   fi
   # 入口脚本在每次容器启动时用外部 .env 覆盖环境，保证配置、宿主机重启后生效。
   docker "${args[@]}" "$image" bash /app/app/worker-entrypoint.sh "/app/config/${MTP_MACHINE_ID}.env"

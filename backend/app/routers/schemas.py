@@ -7,6 +7,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, StrictBool, model_validator
 
 
+class ParallelMember(BaseModel):
+    """联合训练的固定成员和本地批大小，允许不同算力节点承担不同数据量。"""
+
+    worker_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.-]+$")
+    batch_size: int = Field(default=32, ge=1, le=4096)
+
+
 class TrainRequest(BaseModel):
     dataset_id: str
     target: str | None = None
@@ -47,11 +54,21 @@ class TrainRequest(BaseModel):
     # 资源提示（任务分发匹配到卡级）：要求在 GPU 卡上训练 / 显存下限
     require_gpu: bool = False
     min_vram_mb: int = Field(0, ge=0, le=1024 * 1024)
+    parallel_workers: list[ParallelMember] = Field(default_factory=list, max_length=32)
+    parallel_timeout: int = Field(default=300, ge=10, le=3600)
 
     @model_validator(mode="after")
     def validate_task_fields(self) -> "TrainRequest":
         """按任务类型校验数据源、模型标识、目标列和资源参数。"""
         llm_tasks = {"llm_pretraining", "llm_sft", "llm_dpo", "llm_ppo"}
+        if self.parallel_workers:
+            identifiers = [item.worker_id for item in self.parallel_workers]
+            if len(identifiers) < 2 or len(set(identifiers)) != len(identifiers):
+                raise ValueError("联合训练必须选择 2～32 个不同的计算槽")
+            if self.task == "clustering":
+                raise ValueError("KMeans 暂不支持梯度同步，请使用单节点模式")
+            if self.task in llm_tasks and any(item.batch_size > 64 for item in self.parallel_workers):
+                raise ValueError("LLM 联合训练的各节点批大小不得超过 64")
         repo_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?$")
 
         def validate_repo_id(value: str | None, label: str, required: bool = False) -> None:
@@ -159,6 +176,7 @@ class RemoteServerRequest(BaseModel):
     port: int = Field(default=22, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] = "gpu"
     cpu_slots: int = Field(default=2, ge=0, le=256)
+    distributed_host: str = Field(default="", max_length=253, pattern=r"^[A-Za-z0-9.:-]*$")
     remote_redis_url: str | None = Field(default=None, max_length=4096)
     remote_s3_endpoint: str | None = Field(default=None, max_length=512)
     # 远程构建仓库源（可选，目标机构建 worker 镜像时注入加速源）
@@ -195,6 +213,7 @@ class RemoteServerUpdateRequest(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] | None = None
     cpu_slots: int | None = Field(default=None, ge=0, le=256)
+    distributed_host: str | None = Field(default=None, max_length=253, pattern=r"^[A-Za-z0-9.:-]*$")
     remote_redis_url: str | None = Field(default=None, max_length=4096)
     remote_s3_endpoint: str | None = Field(default=None, max_length=512)
     clear_remote_redis_url_override: bool = False

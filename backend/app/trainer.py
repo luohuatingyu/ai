@@ -765,6 +765,7 @@ def run_training(
     resume_state: dict | None = None,
     on_epoch_end: Callable[[dict], None] | None = None,
     on_checkpoint: Callable[[int], None] | None = None,
+    parallel=None,
 ) -> dict:
     """执行（或续训执行）一次训练，返回 summary。
 
@@ -808,6 +809,7 @@ def run_training(
             resume_state=resume_state,
             on_epoch_end=on_epoch_end,
             on_checkpoint=on_checkpoint,
+            parallel=parallel,
         )
     if dataset_path is None or not dataset_path.exists():
         raise ValueError("数据集文件不存在（可能已被删除）")
@@ -819,6 +821,8 @@ def run_training(
     seed = int(params.get("seed", 42))
 
     if task == "clustering":
+        if parallel is not None:
+            raise ValueError("KMeans 不使用梯度训练，请使用单节点模式")
         return _run_kmeans_training(
             dataset_path=dataset_path,
             params={**params, "epochs": epochs, "seed": seed},
@@ -839,7 +843,7 @@ def run_training(
     test_split = float(params["test_split"])
 
     # ---- 环境 ----
-    device = _pick_device(db_log_fn)
+    device = parallel.device if parallel is not None else _pick_device(db_log_fn)
     torch.manual_seed(seed)
     np.random.seed(seed)
     db_log_fn(
@@ -987,6 +991,11 @@ def run_training(
         # 随机数状态恢复必须在模型构建之后：续训的数据 shuffle 序列与未中断时完全一致
         _rng_restore(resume_state.get("rng") or {}, db_log_fn)
 
+    if parallel is not None:
+        # 每个节点必须读取同一数据快照并生成相同的特征与标签映射。
+        identity = dataset_path.read_bytes() + json.dumps(_py(preprocessor), sort_keys=True).encode()
+        parallel.initialize([model], identity)
+
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
         batch_size=batch_size,
@@ -1004,6 +1013,8 @@ def run_training(
 
     def _persist_state(finished_epoch: int) -> None:
         """保存完整训练上下文到本地 scratch，并回调 worker 上传到状态平面。"""
+        if parallel is not None and not parallel.primary:
+            return
         save_trainer_state(
             job_dir / "checkpoints" / f"ckpt-e{finished_epoch:04d}.pt",
             model=model,
@@ -1026,6 +1037,8 @@ def run_training(
             on_checkpoint(finished_epoch)
 
     for epoch in range(start_epoch + 1, epochs + 1):
+        if parallel is not None:
+            parallel.control(cancel_event, pause_event, allow_pause=True)
         if cancel_event.is_set():
             raise JobCancelled()
         if pause_event.is_set():
@@ -1035,26 +1048,44 @@ def run_training(
 
         model.train()
         running, seen = 0.0, 0
-        for X_batch, y_batch in train_loader:
-            if cancel_event.is_set():
+        batches = train_loader if parallel is None else (
+            (torch.from_numpy(X_train[indices]), torch.from_numpy(y_train[indices]))
+            for indices in parallel.indices(len(X_train), epoch)
+        )
+        for X_batch, y_batch in batches:
+            if parallel is not None:
+                parallel.control(cancel_event, pause_event)
+            elif cancel_event.is_set():
                 raise JobCancelled()
-            if pause_event.is_set():
+            if parallel is None and pause_event.is_set():
                 _persist_state(epoch - 1)
                 raise JobPaused(f"训练已在第 {epoch - 1} 个 epoch 后暂停（epoch {epoch} 中途）")
             optimizer.zero_grad()
+            if len(y_batch) == 0:
+                parallel.step(optimizer, 0)
+                continue
             out = model(X_batch.to(device))
             pred = out if task == "classification" else out.squeeze(-1)
             loss = nn.functional.cross_entropy(out, y_batch.to(device)) if task == "classification" \
                 else nn.functional.mse_loss(pred, y_batch.to(device))
             loss.backward()
-            optimizer.step()
+            if parallel is None:
+                optimizer.step()
+            else:
+                parallel.step(optimizer, len(y_batch))
             running += loss.item() * len(y_batch)
             seen += len(y_batch)
+        if parallel is not None:
+            running, seen = parallel.totals([running, seen])
         train_loss = running / max(seen, 1)
         if y_scale:  # 反归一化到目标原始量纲，保持 train/val 曲线单位一致
             train_loss *= y_scale[1] ** 2
 
-        val_result, _, _ = _evaluate(model, val_loader, task, device, y_scale=y_scale)
+        val_result = None
+        if parallel is None or parallel.primary:
+            val_result, _, _ = _evaluate(model, val_loader, task, device, y_scale=y_scale)
+        if parallel is not None:
+            val_result = parallel.json_from_primary(val_result)
         record: dict[str, Any] = {"epoch": epoch, "train_loss": round(train_loss, 6),
                                   "val_loss": round(val_result["val_loss"], 6)}
         if task == "classification":
@@ -1062,7 +1093,8 @@ def run_training(
         else:
             record["val_mse"] = round(val_result["val_mse"], 6)
             record["val_r2"] = round(val_result["val_r2"], 6)
-        _append_jsonl(metrics_path, record)
+        if parallel is None or parallel.primary:
+            _append_jsonl(metrics_path, record)
 
         if task == "classification":
             db_log_fn(
@@ -1080,8 +1112,9 @@ def run_training(
         # 以验证集指标保留最佳权重（分类看 acc；回归看最小 val_loss）
         if best_record is None or score > best_score:
             best_score, best_epoch, best_record = score, epoch, dict(record)
-            _save_checkpoint(job_dir / "best.pt", model, arch, preprocessor, task, "best", record)
-        if epoch % 5 == 0 or epoch == epochs:
+            if parallel is None or parallel.primary:
+                _save_checkpoint(job_dir / "best.pt", model, arch, preprocessor, task, "best", record)
+        if (epoch % 5 == 0 or epoch == epochs) and (parallel is None or parallel.primary):
             _save_checkpoint(job_dir / "last.pt", model, arch, preprocessor, task, "last", record)
 
         # 周期性保存完整训练上下文（断点续训依据），并同步 metrics/日志到状态平面
@@ -1089,8 +1122,13 @@ def run_training(
             _persist_state(epoch)
         if on_epoch_end is not None:
             on_epoch_end(record)
+        if parallel is not None and parallel.control(cancel_event, pause_event, allow_pause=True):
+            _persist_state(epoch)
+            raise JobPaused(f"联合训练已在完整 epoch {epoch} 后暂停")
 
     # ---- 最终报告（用最佳权重）----
+    if parallel is not None and not parallel.primary:
+        return {}
     best_path = job_dir / "best.pt"
     if not best_path.exists():
         raise ValueError(
@@ -1120,6 +1158,9 @@ def run_training(
     }
     if sequence_meta:
         summary.update(sequence_meta)
+    if parallel is not None:
+        summary["parallel"] = {"workers": parallel.world_size, "backend": parallel.backend,
+                               "batch_sizes": parallel.sizes, "global_batch_size": sum(parallel.sizes)}
     if task == "classification":
         report = classification_report(
             y_true, y_pred,

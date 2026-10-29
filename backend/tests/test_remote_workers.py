@@ -2721,7 +2721,8 @@ def test_remote_bootstrap_script_config_overwrites_env_without_touching_containe
 
 
 def _run_bootstrap_action(
-    tmp_path: Path, action: str, env_text: str, stub_script: str, mode: str = "cpu"
+    tmp_path: Path, action: str, env_text: str, stub_script: str, mode: str = "cpu",
+    distributed_host: str = "",
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     """在隔离 HOME 与 docker 替身下运行 remote_worker.sh 生命周期动作。"""
     bin_dir = tmp_path / "bin"
@@ -2743,6 +2744,7 @@ def _run_bootstrap_action(
         "MTP_ACTION": action,
         "MTP_MACHINE_ID": "remote-config",
         "MTP_MODE": mode,
+        "MTP_DISTRIBUTED_HOST": distributed_host,
         "MTP_CPU_SLOTS": "4",
         "MTP_WORKER_IMAGE": "registry.example.net/ml/worker:unit",
         "MTP_REDIS_URL": "rediss://redis.example.net:6380/0",
@@ -2857,6 +2859,46 @@ def test_remote_bootstrap_script_restart_unchanged_config_forces_restart(tmp_pat
     assert "restart --time 45 mtp-worker-remote-config" in commands
     assert "stop --time" not in commands
     assert "run --detach" not in commands
+
+
+@pytest.mark.parametrize("action", ["start", "restart"])
+@pytest.mark.parametrize("network", ["bridge", "host"])
+def test_distributed_host_requires_host_network_before_start(tmp_path, action, network):
+    """互联地址只能配合可直连的容器网络，拒绝在普通重启中静默沿用 bridge。"""
+    stub = _RUNNING_STUB.replace(
+        "if [[ \"$1\" == inspect && \"$2\" == --format ]]; then\n",
+        "if [[ \"$1\" == inspect && \"$2\" == --format ]]; then\n"
+        f"  if [[ \"$3\" == *'.HostConfig.NetworkMode'* ]]; then printf '{network}\\n'; exit 0; fi\n",
+    )
+    result, docker_log, env_file = _run_bootstrap_action(
+        tmp_path, action, _CURRENT_WORKER_ENV, stub, distributed_host="10.0.0.12"
+    )
+    if network == "host":
+        assert result.returncode == 0, result.stderr
+        assert "WORKER_DISTRIBUTED_HOST=10.0.0.12\n" in env_file.read_text(encoding="utf-8")
+        assert action in docker_log.read_text(encoding="utf-8")
+    else:
+        assert result.returncode != 0
+        assert "先点击“部署代码”" in result.stderr
+        assert env_file.read_text(encoding="utf-8") == _CURRENT_WORKER_ENV
+        assert not docker_log.exists()
+
+
+@pytest.mark.parametrize("host", ["", "10.0.0.12"])
+def test_optional_distributed_host_configuration_can_be_cleared(tmp_path, host):
+    """配置地址时保存有效值，清空时删除旧值，兼容既有单节点配置文本。"""
+    original = _CURRENT_WORKER_ENV + "WORKER_DISTRIBUTED_HOST=10.0.0.99\n"
+    result, docker_log, env_file = _run_bootstrap_action(
+        tmp_path, "config", original, _RUNNING_STUB, distributed_host=host
+    )
+    assert result.returncode == 0, result.stderr
+    saved = env_file.read_text(encoding="utf-8")
+    assert "10.0.0.99" not in saved
+    if host:
+        assert f"WORKER_DISTRIBUTED_HOST={host}\n" in saved
+    else:
+        assert saved == _CURRENT_WORKER_ENV
+    assert not docker_log.exists()
 
 
 def test_remote_bootstrap_script_start_applies_config_change_to_stopped_container(tmp_path: Path):

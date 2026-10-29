@@ -48,6 +48,7 @@ router = APIRouter(prefix="/api", tags=["jobs"])
 
 @router.post("/train")
 def start_training(req: TrainRequest) -> dict:
+    """校验数据与计算资源后创建单节点或异构联合训练任务。"""
     llm_task = req.task.startswith("llm_")
     meta = _load_meta_or_404(req.dataset_id, materialize=True) if req.dataset_source == "local" else None
     target = "" if req.task == "clustering" or llm_task else (req.target or "")
@@ -85,10 +86,23 @@ def start_training(req: TrainRequest) -> dict:
         ):
             params.pop(name, None)
     requested_gpu = bool(params.pop("require_gpu"))
+    parallel_workers = params.pop("parallel_workers")
+    parallel_timeout = params.pop("parallel_timeout")
     resource_hint = {
-        "require_gpu": llm_task or requested_gpu,
+        "require_gpu": (llm_task and not parallel_workers) or requested_gpu,
         "min_vram_mb": int(params.pop("min_vram_mb") or 0),
     }
+    if parallel_workers:
+        from app.parallel_worker import select_members
+        try:
+            members = select_members(manager.lease, parallel_workers, require_idle=False)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if resource_hint["require_gpu"] and any(member["device"] == "cpu" for member in members):
+            raise HTTPException(400, "已选择 CPU 节点，请关闭仅 GPU 资源限制")
+        if resource_hint["min_vram_mb"] and any(member["device"] == "cpu" or member["vram_mb"] < resource_hint["min_vram_mb"] for member in members):
+            raise HTTPException(400, "所选联合训练节点不满足最低显存限制")
+        resource_hint.update({"parallel_workers": parallel_workers, "parallel_timeout": parallel_timeout})
 
     job = manager.submit(
         {
@@ -225,6 +239,9 @@ def resume_job(job_id: str) -> dict:
 def retry_job(job_id: str, request: RetryJobRequest) -> dict:
     """失败任务重新排队；指定槽位时先验证在线、启用及资源要求。"""
     _check_id(job_id, "任务")
+    existing = manager.get(job_id)
+    if request.worker_id and existing and ((existing.get("spec") or {}).get("resource_hint") or {}).get("parallel_workers"):
+        raise HTTPException(400, "联合训练按原成员整组重试，不能改为单个计算槽")
     if request.worker_id:
         worker = next(
             (
@@ -626,6 +643,8 @@ def update_remote_server(
     if any(updates.get(key) is None for key in ("host", "port", "mode", "cpu_slots") if key in updates):
         raise HTTPException(422, "SSH 主机、端口、计算类型和 CPU 槽不能设为空")
     candidate = dict(server)
+    if "distributed_host" in updates:
+        candidate["distributed_host"] = updates.pop("distributed_host") or ""
     for key in ("host", "port", "mode", "cpu_slots"):
         if key in updates:
             candidate[key] = updates.pop(key)

@@ -8,6 +8,7 @@
 - 📜 实时训练日志，任务可排队、暂停（保存断点）、恢复（跨卡/跨机接续）、取消、删除
 - 🖥 计算资源管理：平台通过 SSH 远程执行单文件部署脚本、自动检测 CPU/GPU、手动选择计算槽加入资源池，并可远程启动/停止/重启 worker
 - 🏆 支持分类、回归、KMeans 聚类、单序列预测、LLM 从零预训练、全参数 SFT、DPO 与 PPO/RLHF
+- 🔗 多节点联合训练同一个模型：支持不同 NVIDIA CUDA 显卡、纯 CPU 和 CPU/GPU 混合，按节点设置批大小
 - 🔮 表格模型在线单条预测；LLM 可输入 prompt 生成文本，模型包可下载
 - ♻️ 环境性故障（CUDA/OOM/网络瞬断）自动从断点续训（`JOB_MAX_AUTO_RETRY` 次内），单卡故障不影响整体任务完成
 - 🔧 预留 GPU 接入：镜像内置 CUDA 12 构建 torch，宿主机装好驱动即自动启用 GPU
@@ -175,6 +176,37 @@ REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:
 python -m app.worker --slot A-gpu0   # 单卡子进程（CUDA_VISIBLE_DEVICES 由 supervisor 注入）
 python -m app.worker --probe-gpu     # 一次性卡健康探测（退出码 0=健康）
 ```
+
+### 5. 多台机器联合训练一个模型
+
+在「添加/编辑服务器」中填写各机器的「联合训练互联地址」，例如训练内网 IP `10.0.0.12`。部署最新版 worker、启动并将所需计算槽加入资源池后，在训练参数中选择「多节点联合训练一个模型」，选取 **2～32 个不同计算槽**，分别设置本地批大小。服务器可以使用不同型号的 NVIDIA 显卡，也可以全部使用 CPU 或混合 CPU/GPU；每个计算槽必须能容纳完整模型，PPO 还需要参考模型、奖励模型和 value head。KMeans 继续使用单节点。
+
+各节点必须使用 **Python 3.12、相同版本的项目代码和 PyTorch**；PyTorch 的 CPU/CUDA 构建后缀可以不同。显卡需受当前 PyTorch/CUDA 构建及宿主驱动支持；AMD ROCm、Apple MPS 暂未适配。各节点使用同一 Redis 和 S3 状态存储，互联地址必须能被所有节点访问；`localhost`、Docker 内部服务名不能用作跨机器地址。使用 Linux host 网络部署受管理 worker：旧 bridge 容器添加互联地址后，必须先「部署代码」重建容器，再启动，普通重启不能切换网络模式。
+
+首次选择的计算槽为主节点。全 GPU 且支持 NCCL 时使用 NCCL，其余组合使用 Gloo；数据按固定 seed 分片，不补齐或丢弃尾批。每步按实际样本数加权合并梯度，LLM 预训练/SFT 按有效目标 token 数加权，主节点统一执行优化器更新并广播参数。最终只发布一份模型：表格/时间序列为 `best.pt`，LLM 为 `best_model.zip`。这要求节点从同一模型和数据开始同步训练，不能直接合并任意独立训练产生的权重。
+
+全局批大小为各节点批大小之和；算力弱的节点建议从较小批大小开始。联合模式以各节点批大小为准，普通 `batch_size` 仍用于验证集分批。通信和最慢节点会影响每步耗时，CPU 加入 GPU 组不保证加速。表格节点批大小范围为 1～4096，LLM 为 1～64。`parallel_timeout` 默认为 300 秒，可设 10～3600 秒；需覆盖单步计算、模型准备、验证或上传断点的最长等待。
+
+暂停在完整 epoch 边界保存主节点模型和优化器断点；取消、成员退出或通信超时会结束本轮组执行并释放计算槽。可重试故障按原成员整组重试，缺失成员上线前保持排队；手动重试也不能改成单节点。相同成员、批大小、数据和 seed 的 CPU 执行支持可复现续训；不同设备和 GPU 算法不承诺逐位一致。训练和预测沿用同一预处理参数，表格预测的缺失/非法数值按训练中位数填充，类别缺失按训练众数填充。
+
+API 示例（计算槽 ID 从 `/api/workers` 获取；CPU 或混合组不设置仅 GPU 限制）：
+
+```json
+{
+  "dataset_id": "数据集ID",
+  "target": "target",
+  "task": "classification",
+  "epochs": 30,
+  "parallel_workers": [
+    {"worker_id": "node-a-gpu0", "batch_size": 64},
+    {"worker_id": "node-b-cpu0", "batch_size": 4}
+  ],
+  "parallel_timeout": 300,
+  "require_gpu": false
+}
+```
+
+裸机启动可设置 `WORKER_DISTRIBUTED_HOST=本机训练内网IP`，并按需设置 `WORKER_DISTRIBUTED_PORT`（默认基数 29500，GPU 槽加槽号，CPU 槽加 256 再加槽号）。同机多个 supervisor 需分配不冲突的端口段。Gloo/NCCL 还会建立动态数据连接，仅开放 rendezvous 端口不足以完成训练；部署在互信、双向可达的内网，勿向公网暴露训练通信。多网卡或主机名解析到回环地址时，在 worker 环境显式设置 `GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME` 为训练网卡，例如 `eth0`；所有节点需选择实际可互通的网卡。
 
 ## GPU 环境接入（后续补充）
 

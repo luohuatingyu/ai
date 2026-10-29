@@ -951,6 +951,7 @@ _ENVIRONMENT_KEYS = (
     "MTP_MACHINE_ID",
     "MTP_MODE",
     "MTP_CPU_SLOTS",
+    "MTP_DISTRIBUTED_HOST",
     "MTP_WORKER_IMAGE",
     "MTP_REDIS_URL",
     "MTP_REDIS_PASSWORD",
@@ -1361,6 +1362,7 @@ def remote_effective_config(server: Dict[str, object]) -> Dict[str, object]:
         "port": int(server.get("port", 22)),
         "mode": str(server.get("mode", "cpu")),
         "cpu_slots": int(server.get("cpu_slots", 2)),
+        "distributed_host": str(server.get("distributed_host", "")),
         "deployed": remote_server_is_deployed(server),
         "status": str(server.get("status", "")),
         "worker_image": deployment["worker_image"],
@@ -1800,6 +1802,9 @@ def validate_server_record(server: Dict[str, object]) -> None:
         raise RemoteWorkerError("服务器标识格式无效")
     if not _HOST_RE.fullmatch(host):
         raise RemoteWorkerError("SSH 主机地址格式无效")
+    distributed_host = str(server.get("distributed_host") or "")
+    if distributed_host and not _HOST_RE.fullmatch(distributed_host):
+        raise RemoteWorkerError("联合训练互联地址格式无效")
     if not _USERNAME_RE.fullmatch(username):
         raise RemoteWorkerError("SSH 用户名格式无效")
     if not 1 <= port <= 65535:
@@ -1855,6 +1860,7 @@ def render_remote_script(
         "MTP_MACHINE_ID": str(server["machine_id"]),
         "MTP_MODE": mode,
         "MTP_CPU_SLOTS": str(cpu_slots),
+        "MTP_DISTRIBUTED_HOST": str(server.get("distributed_host", "")),
         "MTP_WORKER_IMAGE": deployment["worker_image"],
         "MTP_REDIS_URL": deployment["redis_url"],
         "MTP_REDIS_PASSWORD": deployment["redis_password"],

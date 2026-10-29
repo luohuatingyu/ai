@@ -43,6 +43,7 @@ from app.storage import (
     resolve_dataset_for_worker,
 )
 from app.trainer import JobCancelled, JobPaused, load_trainer_state, run_training
+from app.parallel_worker import make_group, run_rank_process, select_members, slot_key
 
 
 def detect_capabilities(
@@ -79,6 +80,16 @@ def detect_capabilities(
     except Exception:
         torch_version, cuda_version = "未知", None
     hostname = socket.gethostname()
+    parallel = {"protocol": 1, "host": os.environ.get("WORKER_DISTRIBUTED_HOST", "").strip(),
+                "gloo": False, "nccl": False, "vendor": "nvidia"}
+    slot_name = slot or "cpu0"
+    slot_number = int("".join(character for character in slot_name if character.isdigit()) or "0")
+    parallel["port"] = int(os.environ.get("WORKER_DISTRIBUTED_PORT", "29500")) + slot_number + (256 if slot_name.startswith("cpu") else 0)
+    try:
+        parallel.update({"gloo": _torch.distributed.is_gloo_available(), "nccl": _torch.distributed.is_nccl_available(),
+                         "vendor": "amd" if _torch.version.hip else "nvidia"})
+    except Exception:
+        pass
     return {
         "worker_id": worker_id or f"worker-{hostname}-{uuid.uuid4().hex[:6]}",
         "machine_id": machine_id or config.WORKER_MACHINE_ID or hostname,
@@ -91,6 +102,7 @@ def detect_capabilities(
         "cuda_version": cuda_version,
         "python_version": platform.python_version(),
         "started_at": time.time(),
+        "parallel": parallel,
     }
 
 
@@ -150,6 +162,7 @@ _RETRYABLE_PATTERNS = (
     "connection reset", "connection refused", "timed out", "timeout",
     "temporarily unavailable", "broken pipe", "no space left",
     "storage", "rpc error", "econnreset",
+    "联合训练通信", "联合训练进程连接中断", "gloo", "connection closed",
 )
 
 # 业务性错误类型（不可重试）：重试也无法改变结果，直接判 FAILED
@@ -305,6 +318,7 @@ class JobController:
         self._signals_ready = threading.Event()
         self._epoch = 0
         self._state = "starting"
+        self.resources: list[tuple[str, str]] = []
 
     def set_progress(self, epoch: int, state: str = "training") -> None:
         """训练循环回调：更新当前进度（心跳里上报给 /api/workers 展示）。"""
@@ -340,6 +354,10 @@ class JobController:
         if not owned:
             self._mark_lease_lost()
             raise JobLeaseLost("worker 任务租约已失效，停止写入并等待 watchdog 接续调度")
+        for key, token in list(self.resources):
+            if not self._lease_store.renew(key, token, self._ttl):
+                self._mark_lease_lost()
+                raise JobLeaseLost("联合训练计算槽租约已失效，停止本轮执行")
         self._last_renewed_at = time.monotonic()
 
     def stop(self) -> None:
@@ -360,6 +378,10 @@ class JobController:
                     self._mark_lease_lost()
                     return
                 self._last_renewed_at = time.monotonic()
+                for key, token in list(self.resources):
+                    if not self._lease_store.renew(key, token, self._ttl):
+                        self._mark_lease_lost()
+                        return
                 signals = self._lease_store.get_signals(self._job_id) if self._signals_ready.is_set() else set()
                 if "cancel" in signals:
                     self.cancel_event.set()
@@ -375,6 +397,38 @@ class JobController:
                 if time.monotonic() - self._last_renewed_at >= self._ttl:
                     self._mark_lease_lost()
                     return
+
+
+class GroupMemberController(JobController):
+    """参与节点只维护自身心跳，不得续租主节点或发布任务状态。"""
+
+    def __init__(self, lease, group: dict, worker_id: str, assignment: str) -> None:
+        """保存执行轮次和槽位 token，使旧成员不能加入新一轮训练。"""
+        super().__init__(lease, group["job_id"], group["token"], worker_id,
+                         config.WORKER_HEARTBEAT_INTERVAL, config.WORKER_LEASE_TTL)
+        self._assignment = assignment
+
+    def ensure_owned(self) -> None:
+        """验证主节点仍拥有任务以及本槽仍属于同一执行轮次。"""
+        if self.lease_lost.is_set() or self._lease_store.peek_holder(self._job_id) != self._token or self._lease_store.peek_holder(slot_key(self._worker_id)) != self._assignment:
+            self._mark_lease_lost()
+            raise JobLeaseLost("联合训练主节点或成员租约已失效")
+
+    def _loop(self) -> None:
+        """独立维护成员存活与控制信号，覆盖数据下载和模型加载阶段。"""
+        while not self._stop_event.wait(self._interval):
+            try:
+                self.ensure_owned()
+                signals = self._lease_store.get_signals(self._job_id)
+                if "cancel" in signals:
+                    self.cancel_event.set()
+                if "pause" in signals:
+                    self.pause_event.set()
+                self._lease_store.heartbeat_worker(self._worker_id,
+                    {"current_job": self._job_id, "state": "training", "epoch": self._epoch}, self._hb_ttl)
+            except Exception:
+                self._mark_lease_lost()
+                return
 
 
 class TrainingWorker:
@@ -401,6 +455,7 @@ class TrainingWorker:
         self._controller: Optional[JobController] = None
         self._last_skip: Tuple[Optional[str], float] = (None, 0.0)
         self._degraded = False  # 卡软探测失败标记：不再领取新任务，恢复后自动摘除
+        self._finished_group: Optional[str] = None
         self._gpu_probe_enabled = (
             config.WORKER_GPU_PROBE if gpu_probe_enabled is None else gpu_probe_enabled
         )
@@ -484,6 +539,19 @@ class TrainingWorker:
             # 掉卡或人工停用期间保持心跳，但不领取新任务。
             self._shutdown.wait(self._idle_poll)
             return
+        assignment = self.lease_store.peek_holder(slot_key(self.worker_id))
+        if assignment:
+            try:
+                group = json.loads(assignment)
+            except (ValueError, TypeError):
+                group = {}
+            if group.get("parallel") and group["members"][0]["worker_id"] != self.worker_id:
+                if group["group_id"] != self._finished_group:
+                    self._join_parallel_group(group, assignment)
+                    self._finished_group = group["group_id"]
+                else:
+                    self._shutdown.wait(self._idle_poll)
+                return
         try:
             job_id = self.queue.pop(timeout=self._idle_poll)
         except Exception as exc:  # noqa: BLE001
@@ -505,6 +573,44 @@ class TrainingWorker:
     # ------------------------------------------------------------------
     # 内部：领取与执行
     # ------------------------------------------------------------------
+
+    def _join_parallel_group(self, group: dict, assignment: str) -> None:
+        """跟随主节点清单运行独立 rank，绝不写入共享模型或任务终态。"""
+        controller = GroupMemberController(self.lease_store, group, self.worker_id, assignment)
+        self._controller = controller
+        scratch = config.WORKER_SCRATCH_DIR / f"member-{group['group_id']}-{self.worker_id}" / group["job_id"]
+        try:
+            controller.start()
+            started = time.monotonic()
+            while not self.store.exists(group["manifest_key"]):
+                controller.ensure_owned()
+                if time.monotonic() - started > group["timeout"]:
+                    raise RuntimeError("联合训练准备清单等待 timeout")
+                time.sleep(0.1)
+            request = self.store.read_json(group["manifest_key"])
+            controller.ensure_owned()
+            rank = next(index for index, member in enumerate(group["members"]) if member["worker_id"] == self.worker_id)
+            scratch.mkdir(parents=True, exist_ok=True)
+            dataset_path = None
+            if request["params"].get("dataset_source", "local") != "hub":
+                dataset_path = resolve_dataset_for_worker(request["dataset_id"], scratch)
+            resume_path = None
+            if request.get("resume_key"):
+                resume_path = self.store.read_file(request["resume_key"], scratch / "resume-ckpt.pt")
+            run_rank_process({**request, "job_dir": str(scratch),
+                "dataset_path": str(dataset_path) if dataset_path else None,
+                "resume_path": str(resume_path) if resume_path else None,
+                "group": {**group, "rank": rank, "device": group["members"][rank]["device"]}},
+                controller, lambda message: self._log(f"[{group['job_id']}] {message}"))
+        except (JobPaused, JobCancelled, JobLeaseLost):
+            pass
+        except Exception as exc:
+            self._log(f"[{group['job_id']}] 联合训练成员退出：{exc}")
+        finally:
+            controller.stop()
+            self._controller = None
+            self._finished_group = group["group_id"]
+            shutil.rmtree(scratch.parent, ignore_errors=True)
 
     def _execute_job(self, job_id: str) -> None:
         """领取一个任务：校验 -> 抢租约 -> 执行（含全部异常兜底）。"""
@@ -530,6 +636,11 @@ class TrainingWorker:
             return
         spec = record.get("spec") or {}
         hint = spec.get("resource_hint") or {}
+        selected = hint.get("parallel_workers") or []
+        if selected and selected[0]["worker_id"] != self.worker_id:
+            self.queue.push(job_id)
+            self._shutdown.wait(self._idle_poll)
+            return
         gpu = self.caps.get("gpu") or {}
         min_vram = int(hint.get("min_vram_mb") or 0)
         # 资源提示匹配（到卡级）：require_gpu 要求是 GPU 卡；min_vram_mb 要求显存下限。
@@ -573,17 +684,46 @@ class TrainingWorker:
             record = jobstore.read_job(self.store, job_id)
             if record is None or record.get("status") != jobstore.QUEUED:
                 return
-            self._run_claimed(job_id, record, record.get("spec") or {}, controller)
+            group = None
+            if selected:
+                try:
+                    members = select_members(self.lease_store, selected, require_idle=False)
+                except RuntimeError as exc:
+                    self._log(f"[{job_id}] {exc}")
+                    self.queue.push(job_id)
+                    self._shutdown.wait(self._idle_poll)
+                    return
+                if hint.get("require_gpu") and any(member["device"] == "cpu" for member in members):
+                    raise ValueError("联合训练成员不满足仅 GPU 限制")
+                if min_vram and any(member["device"] == "cpu" or member["vram_mb"] < min_vram for member in members):
+                    raise ValueError("联合训练成员不满足最低显存限制")
+                group = make_group(job_id, token, members, int(hint.get("parallel_timeout", 300)), int((spec.get("params") or {}).get("seed", 42)))
+            resource_token = json.dumps(group, sort_keys=True) if group else token
+            identifiers = [item["worker_id"] for item in group["members"]] if group else [self.worker_id]
+            # 有序预留并在失败时整体释放；成员只在 manifest 发布后才启动 rank。
+            for identifier in sorted(identifiers):
+                key = slot_key(identifier)
+                if not self.lease_store.acquire(key, resource_token, config.WORKER_LEASE_TTL):
+                    self.queue.push(job_id)
+                    return
+                controller.resources.append((key, resource_token))
+            self._run_claimed(job_id, record, record.get("spec") or {}, controller, group=group)
         except JobLeaseLost as exc:
             self._log(f"[{job_id}] {exc}")
+        except ValueError as exc:
+            controller.ensure_owned()
+            jobstore.update_job(_LeaseGuardedStore(self.store, controller.ensure_owned), job_id,
+                                status=jobstore.FAILED, error=str(exc), finished_at=time.time())
         except Exception:
             self._log(f"[{job_id}] worker 执行异常:\n{traceback.format_exc()}")
         finally:
             controller.stop()
             self._controller = None
+            for key, resource_token in controller.resources:
+                self.lease_store.release(key, resource_token)
             self.lease_store.release(job_id, token)
 
-    def _run_claimed(self, job_id: str, record: dict, spec: dict, controller: JobController) -> None:
+    def _run_claimed(self, job_id: str, record: dict, spec: dict, controller: JobController, group=None) -> None:
         """执行已持有租约的任务：拉状态 -> 训练 -> 同步产物 -> 状态收尾。"""
         store = _LeaseGuardedStore(self.store, controller.ensure_owned)
         attempt_id = uuid.uuid4().hex
@@ -617,6 +757,10 @@ class TrainingWorker:
                 "status": "running",
                 "started_at": time.time(),
             }
+            if group:
+                current_attempt["members"] = group["members"]
+                current_attempt["backend"] = group["backend"]
+                current_attempt["group_id"] = group["group_id"]
             jobstore.update_job(
                 store,
                 job_id,
@@ -663,12 +807,14 @@ class TrainingWorker:
 
             # ---- 恢复训练上下文：优先最新 checkpoint，损坏则回退更早版本 ----
             resume_state = None
+            resume_key = None
             resumed_epoch = 0
             for epoch, key in _list_checkpoints(store, job_id):
                 try:
                     local_ckpt = store.read_file(key, scratch / "resume-ckpt.pt")
                     resume_state = load_trainer_state(local_ckpt)
                     resumed_epoch = epoch
+                    resume_key = key
                     break
                 except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
                     joblog(f"checkpoint e{epoch} 加载失败，回退更早版本: {exc}")
@@ -710,7 +856,7 @@ class TrainingWorker:
             def on_checkpoint(epoch_done: int) -> None:
                 """先同步指标与最佳模型再发布断点，保证接手者不会缺失已存档的进度。"""
                 reconcile_log_revision()
-                for name in ("metrics.jsonl", "log.txt", "best.pt", "last.pt", "preprocessor.json"):
+                for name in ("metrics.jsonl", "log.txt", "best.pt", "last.pt", "preprocessor.json", "best_model.zip"):
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
@@ -726,19 +872,31 @@ class TrainingWorker:
             # 本段执行的起始 epoch（续训场景 = 最近 checkpoint 之后）
 
             try:
-                summary = run_training(
-                    dataset_path=dataset_path,
-                    target=str(spec["target"]),
-                    task=str(spec["task"]),
-                    params=training_params,
-                    cancel_event=controller.cancel_event,
-                    log_fn=scratch_log,
-                    job_dir=scratch,
-                    pause_event=controller.pause_event,
-                    resume_state=resume_state,
-                    on_epoch_end=on_epoch_end,
-                    on_checkpoint=on_checkpoint,
-                )
+                if group:
+                    request = {"target": str(spec["target"]), "task": str(spec["task"]),
+                               "params": training_params, "dataset_id": str(spec["dataset_id"]),
+                               "resume_key": resume_key}
+                    store.write_json(group["manifest_key"], request)
+                    joblog(f"联合训练启动：{len(group['members'])} 个计算槽，通信 {group['backend']}；全局批大小 {sum(item['batch_size'] for item in group['members'])}")
+                    summary = run_rank_process({**request, "job_dir": str(scratch),
+                        "dataset_path": str(dataset_path) if dataset_path else None,
+                        "resume_path": str(scratch / "resume-ckpt.pt") if resume_state else None,
+                        "group": {**group, "rank": 0, "device": group["members"][0]["device"]}},
+                        controller, scratch_log, on_epoch_end, on_checkpoint)
+                else:
+                    summary = run_training(
+                        dataset_path=dataset_path,
+                        target=str(spec["target"]),
+                        task=str(spec["task"]),
+                        params=training_params,
+                        cancel_event=controller.cancel_event,
+                        log_fn=scratch_log,
+                        job_dir=scratch,
+                        pause_event=controller.pause_event,
+                        resume_state=resume_state,
+                        on_epoch_end=on_epoch_end,
+                        on_checkpoint=on_checkpoint,
+                    )
             except JobPaused as exc:
                 controller.ensure_owned()
                 # 优雅暂停：训练器已在暂停点存档并上传（on_checkpoint），
@@ -812,6 +970,8 @@ class TrainingWorker:
                     self._flush_final(scratch, job_id, store=store)
             finally:
                 shutil.rmtree(attempt_dir, ignore_errors=True)
+                if group and not controller.lease_lost.is_set():
+                    store.delete(group["manifest_key"])
 
     def _set_failed(self, job_id: str, error: str, scratch: Optional[Path] = None,
                     store: Optional[ArtifactStore] = None) -> None:
@@ -1001,8 +1161,7 @@ class WorkerSupervisor:
         """启动一个卡槽子进程：CUDA_VISIBLE_DEVICES 隔离到单卡（必须在 CUDA 初始化前设置）。"""
         env = dict(os.environ)
         env.pop("_", None)  # 防止个别环境变量干扰 torch 启动偏好
-        if gpu_index is not None:
-            env["CUDA_VISIBLE_DEVICES"] = gpu_index
+        env["CUDA_VISIBLE_DEVICES"] = gpu_index if gpu_index is not None else ""
         env["WORKER_SLOT"] = slot
         env["PYTHONUNBUFFERED"] = "1"
         child = subprocess.Popen(

@@ -230,6 +230,9 @@ class JobManager:
 
     def retry(self, job_id: str, worker_id: Optional[str] = None) -> dict:
         """重试失败任务；可将下一次执行固定到一个 worker 或交回自动调度。"""
+        record = self.get(job_id)
+        if worker_id and record and ((record.get("spec") or {}).get("resource_hint") or {}).get("parallel_workers"):
+            raise ValueError("联合训练必须按原成员整组重试")
         token = f"manual-retry:{uuid.uuid4().hex}"
         if not self.lease.acquire(
             job_id, token, max(float(config.WORKER_LEASE_TTL), 10.0)

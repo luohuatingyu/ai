@@ -402,7 +402,7 @@
             <div class="field" id="ppoUpdatesField" hidden><label>PPO 更新次数</label><input id="p_ppo_updates" type="number" value="4" min="1" max="16"></div>
             <div class="field" id="llmLearningRateField" hidden><label>微调学习率</label><input id="p_llm_lr" type="number" value="0.00002" step="0.00001" min="0.000001" max="1"></div>
           </div>
-          <div class="hint">Hub 模型和数据集均按公共仓库加载，禁用自定义远程代码。LLM 任务要求单张 GPU，模型与序列长度需适配该卡显存。</div>
+          <div class="hint">Hub 模型和数据集均按公共仓库加载，禁用自定义远程代码。单节点 LLM 使用 GPU；联合训练可选择 GPU、CPU 或混合节点，每个节点都需容纳完整模型。</div>
         </div>
         <div class="field"><label id="epochLabel">轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"></div>
         <div class="field" id="batchSizeField"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"></div>
@@ -421,6 +421,16 @@
           <label>最低显存（MiB，可选）</label>
           <input id="p_min_vram" type="number" value="0" min="0" step="1024">
         </div>
+      </div>
+      <div class="field" id="parallelModeField">
+        <label for="p_parallel">训练方式</label>
+        <select id="p_parallel"><option value="single">单节点训练</option><option value="parallel">多节点联合训练一个模型</option></select>
+      </div>
+      <div id="parallelPanel" class="stack" hidden>
+        <div class="hint">选择 2～32 个计算槽。各节点处理不同数据并共同更新同一模型；低算力节点可设置较小批大小。CPU/GPU 混合不保证比纯 GPU 更快。</div>
+        <div id="parallelWorkers" class="stack" aria-label="参与联合训练的计算槽"></div>
+        <div id="parallelSummary" class="hint" aria-live="polite"></div>
+        <div class="field"><label for="p_parallel_timeout">节点通信超时（秒）</label><input id="p_parallel_timeout" type="number" min="10" max="3600" value="300"></div>
       </div>
       <button id="btnStart" class="primary" disabled>🚀 开始训练</button>
       <div class="hint" id="taskHint">分类适用于离散标签，回归适用于连续数值目标。</div>
@@ -560,6 +570,11 @@
       <details id="remoteServerAdvanced" class="server-form-section server-advanced-settings">
         <summary><span>高级配置<small>Redis / S3 与软件源，通常无需修改</small></span></summary>
         <div class="server-section-grid">
+      <div class="field wide">
+        <label for="remoteDistributedHost">联合训练互联地址（可选）</label>
+        <input id="remoteDistributedHost" name="distributed_host" maxlength="253" pattern="[A-Za-z0-9.:-]*" placeholder="例如 10.0.0.12；留空仅支持单节点任务">
+        <div class="hint">填写本机在可信局域网/VPN 中可被其他节点访问的地址。启用或关闭后需点击“部署”重建容器以切换 host 网络；各节点需允许双向通信。</div>
+      </div>
       <div class="field wide">
         <label for="remoteRedisUrl">远程 Redis URL（可选覆盖）</label>
         <input id="remoteRedisUrl" name="remote_redis_url" type="password" maxlength="4096" autocomplete="new-password" placeholder="留空时使用平台 .env 的 Redis">
@@ -710,6 +725,7 @@ const fmtLoss = (v) => (v === null || v === undefined) ? "-" : Number(v).toFixed
 // 将一次执行记录转换成稳定可读的机器、槽位和设备标签。
 function resourceText(attempt) {
   if (!attempt) return "";
+  if (Array.isArray(attempt.members)) return attempt.members.map(member => `${member.machine_id || member.worker_id} / ${member.worker_id} · ${member.gpu_name || "CPU"} · batch ${member.batch_size}`).join("；");
   const machine = attempt.machine_id || attempt.worker_id || "未知机器";
   const slot = attempt.slot ? ` / ${attempt.slot}` : "";
   const worker = attempt.worker_id && attempt.worker_id !== machine ? ` · ${attempt.worker_id}` : "";
@@ -736,8 +752,8 @@ function renderResourceAllocation(job) {
       const hint = job.spec.resource_hint || {};
       rows.push({
         title: "等待分配",
-        resource: "自动匹配空闲资源",
-        meta: hint.require_gpu ? "仅 GPU 槽位" : hint.min_vram_mb ? `GPU 显存 ≥ ${hint.min_vram_mb} MiB` : "CPU / GPU 均可",
+        resource: hint.parallel_workers?.length ? hint.parallel_workers.map(member => member.worker_id).join("、") : "自动匹配空闲资源",
+        meta: hint.parallel_workers?.length ? "等待所选节点全部空闲后共同启动" : hint.require_gpu ? "仅 GPU 槽位" : hint.min_vram_mb ? `GPU 显存 ≥ ${hint.min_vram_mb} MiB` : "CPU / GPU 均可",
         status: "排队中",
       });
     }
@@ -991,8 +1007,44 @@ function updateStart() {
   const ready = datasetReady && hasBaseModel && hasRewardModel && (isLLM || (task === "clustering"
     || (hasTarget && (task !== "time_series_forecasting" || hasTimeColumn))));
 
-  $("btnStart").disabled = !ready;
+  const selections = [...parallelSelections.entries()];
+  const parallelReady = $("p_parallel").value !== "parallel" || (selections.length >= 2 && selections.length <= 32 && selections.every(([id, batch]) =>
+    Number.isInteger(batch) && batch >= 1 && batch <= (isLLM ? 64 : 4096)
+    && state.workerSlots.some(worker => worker.worker_id === id && worker.active && worker.enabled && worker.parallel?.host && worker.parallel?.gloo && worker.parallel?.protocol === 1)));
+  $("btnStart").disabled = !ready || !parallelReady;
 }
+
+const parallelSelections = new Map();
+
+// 展示可选计算槽并保留用户已输入的批大小；轮询不抢占正在编辑的输入框。
+function renderParallelWorkers() {
+  $("parallelSummary").textContent = `已选 ${parallelSelections.size} 个计算槽 · 全局批大小 ${[...parallelSelections.values()].reduce((sum, value) => sum + (Number(value) || 0), 0)}。首个选中节点负责保存模型；故障后按原成员整组恢复。`;
+  if ($("parallelWorkers").contains(document.activeElement)) return;
+  const workers = state.workerSlots || [];
+  $("parallelWorkers").innerHTML = workers.map(worker => {
+    const available = worker.active && worker.enabled && worker.parallel?.host && worker.parallel?.gloo && worker.parallel?.protocol === 1;
+    const selected = parallelSelections.has(worker.worker_id);
+    const size = parallelSelections.get(worker.worker_id) ?? (taskSelect.value.startsWith("llm_") ? 1 : 32);
+    return `<div class="card" style="padding:12px;display:grid;grid-template-columns:minmax(0,1fr) 82px;gap:12px;align-items:center;">
+      <label style="display:flex;gap:8px;align-items:center;overflow-wrap:anywhere;"><input style="width:auto" type="checkbox" data-parallel-worker="${esc(worker.worker_id)}" ${selected ? "checked" : ""} ${available || selected ? "" : "disabled"}>
+      <span>${esc(worker.machine_id || worker.worker_id)} / ${esc(worker.slot || "")}<br><small>${esc(worker.gpu?.available ? worker.gpu.name : "CPU")}${available ? "" : " · 需上线、启用并配置互联地址"}</small></span></label>
+      <label>本地批大小<input type="number" data-parallel-batch="${esc(worker.worker_id)}" min="1" max="${taskSelect.value.startsWith("llm_") ? 64 : 4096}" value="${size}" ${selected ? "" : "disabled"}></label></div>`;
+  }).join("") || '<div class="empty">尚无计算槽，请先添加服务器并配置互联地址。</div>';
+}
+
+// 选择和批大小变化只影响新任务，不更改现有计算槽的接单状态。
+$("parallelWorkers").addEventListener("change", event => {
+  const id = event.target.dataset.parallelWorker || event.target.dataset.parallelBatch;
+  if (!id) return;
+  if (event.target.dataset.parallelWorker) {
+    if (event.target.checked) parallelSelections.set(id, taskSelect.value.startsWith("llm_") ? 1 : 32);
+    else parallelSelections.delete(id);
+    event.target.blur();
+  } else parallelSelections.set(id, Number(event.target.value));
+  renderParallelWorkers();
+  updateStart();
+});
+$("p_parallel").addEventListener("change", () => { updateTaskFields(); renderParallelWorkers(); });
 
 function updateTaskFields() {
   const task = taskSelect.value;
@@ -1002,6 +1054,10 @@ function updateTaskFields() {
   const isPretraining = task === "llm_pretraining";
   const isDpo = task === "llm_dpo";
   const isPpo = task === "llm_ppo";
+  if (isClustering) $("p_parallel").value = "single";
+  const isParallel = $("p_parallel").value === "parallel";
+  $("parallelModeField").hidden = isClustering;
+  $("parallelPanel").hidden = !isParallel;
   $("targetField").hidden = isClustering || isLLM;
   $("timeColumnField").hidden = !isForecasting;
   $("nClustersField").hidden = !isClustering;
@@ -1022,14 +1078,16 @@ function updateTaskFields() {
   $("vocabSizeField").hidden = !isPretraining;
   ["modelHiddenSizeField", "modelLayersField", "modelHeadsField"].forEach((id) => { $(id).hidden = !isPretraining; });
   $("ppoUpdatesField").hidden = !isPpo;
-  ["batchSizeField", "testSplitField"].forEach((id) => { $(id).hidden = isClustering; });
+  $("batchSizeField").hidden = isClustering || isParallel;
+  $("testSplitField").hidden = isClustering;
   $("learningRateField").hidden = isClustering || (isLLM && !isPretraining);
   $("llmLearningRateField").hidden = !isLLM || isPretraining;
   ["hiddenLayersField", "hiddenSizeField"].forEach((id) => { $(id).hidden = isClustering || isLLM; });
-  $("resourceHintField").hidden = isClustering || isLLM;
+  $("resourceHintField").hidden = isClustering || isLLM || isParallel;
   $("p_require_gpu").disabled = isLLM;
   $("p_require_gpu").checked = isLLM || $("p_require_gpu").checked;
   $("minVramField").hidden = isLLM ? false : (isClustering || !$("p_require_gpu").checked);
+  if (isParallel) $("minVramField").hidden = true;
   $("btnPredict").textContent = isLLM ? "生成文本" : "预测";
   if (isClustering) {
     $("p_require_gpu").checked = false;
@@ -1046,9 +1104,10 @@ function updateTaskFields() {
           : isDpo
             ? "基于 prompt、chosen、rejected 偏好对执行 DPO，全参数更新基座模型。"
             : isPpo
-              ? "基于奖励模型执行 PPO 式 RLHF；需要标量奖励模型和单张 GPU。"
+              ? "基于奖励模型执行 PPO 式 RLHF；需要输出标量分数的奖励模型。"
               : "对 Hugging Face CausalLM 执行全参数监督微调（SFT）。"
         : "分类适用于离散标签，回归适用于连续数值目标。";
+  renderParallelWorkers();
   updateStart();
 }
 
@@ -1128,6 +1187,13 @@ $("btnStart").onclick = async () => {
       require_gpu: true,
       min_vram_mb: Math.max(Number($("p_min_vram").value) || 0, 0),
     });
+  }
+  // 联合模式在任务参数填充后统一覆盖资源限制，避免 LLM 默认值排除 CPU 成员。
+  if ($("p_parallel").value === "parallel") {
+    payload.parallel_workers = [...parallelSelections].map(([worker_id, batch_size]) => ({ worker_id, batch_size }));
+    payload.parallel_timeout = Number($("p_parallel_timeout").value);
+    payload.require_gpu = false;
+    payload.min_vram_mb = 0;
   }
   $("btnStart").disabled = true;
   try {
@@ -1688,6 +1754,8 @@ async function refreshWorkers() {
     const grid = $("workerGrid");
     const workers = d.workers || [];
     state.workerSlots = workers;
+    renderParallelWorkers();
+    updateStart();
     renderRetryControls(state.detailRecord);
     const remoteResult = await loadRemoteServers();
     const groups = new Map();
@@ -2099,6 +2167,7 @@ async function openEditRemoteServer(machineId) {
   $("remotePort").value = server.port || 22;
   document.querySelector(`input[name="mode"][value="${server.mode === "cpu" ? "cpu" : "gpu"}"]`).checked = true;
   $("remoteCpuSlots").value = server.cpu_slots ?? 2;
+  $("remoteDistributedHost").value = server.distributed_host || "";
   $("remoteCpuSlotsField").hidden = server.mode !== "cpu";
   $("remoteRedisUrl").value = "";
   $("remoteRedisUrl").placeholder = server.has_remote_redis_url_override
