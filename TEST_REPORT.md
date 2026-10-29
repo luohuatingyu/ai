@@ -1,3 +1,100 @@
+## 本次变更测试结果：在线服务器配置生效修复（2026-10-29）
+
+- **Commit Hash**：`99c8defd9a452f85e328b9b1e4b3bd20f84b7b25`（Keep remote config progress messages consistent）。
+- **实现提交**：`ca78f44`（Fix remote worker configuration application）；`112cd9c`（Clarify remote config activation and extend regression tests）；`99c8def`。
+- **分支**：`emdash/hot-boxes-clean-y9u6p`；测试日期：2026-10-29。
+- **重测依据**：`git diff d808115 HEAD -- backend/app/` 显示三个远程 worker 文件有业务变更，因此运行相关及完整套件。后续业务代码、配置加载、SSH 脚本、启动入口或心跳判断变动均须重测。
+
+**行为及影响范围**：保持 README 的保存后等待重启约定。在线卡片可重启；保存、下发进度和完成提示明确重启时机。Bash 配置写入错误不再被忽略，无变化正常成功；入口启动前清除受管理旧变量，缺少配置时退出 78。启动/重启检查旧容器入口、只读配置目录挂载和 GPU 授权，不兼容时提示先部署代码重建。Python 执行器在 SSH 前采样启动代次，排除旧代次心跳。未修改依赖、平台 `.env`、Compose 仓库文件或数据库结构。
+
+**最终测试结果**：
+
+| 范围 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 完整 pytest 套件 | 320 | 314 | 0 | 0 | 6 |
+| 远程脚本/执行器、API、配置仓储专项 | 171 | 171 | 0 | 0 | 0 |
+| 最后一次前端提示调整后的 API 回归 | 59 | 59 | 0 | 0 | 0 |
+| 实际页面卡片渲染（Node stdin） | 4 | 4 | 0 | 0 | 0 |
+
+- Python **3.12.15**，完整套件 49.07 秒；已执行用例通过率 100%，含环境跳过计为 98.13%。远程模块 108/108，API 59/59，配置仓储 4/4；完整套件另覆盖数据层、训练/预测、固定 seed、任务管理、协调层、worker/Supervisor 和启动脚本回归。
+- 完整套件在 `112cd9c` 内容上通过；其后仅调整前端状态文字和对应断言，API 全量 59 项再次通过。业务代码未再变动。
+- 6 个既有环境门控跳过：3 个真实 Redis 协调用例、1 个 Redis Supervisor 多进程用例、2 个真实 S3 用例；未配置 `MTP_TEST_REDIS` / `MTP_TEST_S3`。未删除或弱化有效测试。
+- 两条既有警告：SQLAlchemy `declarative_base()` 弃用、Pandas `xlrd` 引擎弃用。
+
+**实际测试命令**（项目根目录；仓库只读挂载，测试数据和协调存储隔离）：
+
+```bash
+# 相关套件：171 passed
+docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 \
+  sha256:b8b22036d0d888f513973a6c7618f535fc1631467b6da05b85b285c655dea2b2 \
+  python -m pytest tests/test_remote_workers.py tests/test_api.py tests/test_remote_config_repository.py \
+  -q -p no:cacheprovider --basetemp=/tmp/mtp-config-regression
+
+# 完整套件：314 passed, 6 skipped
+docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 \
+  sha256:b8b22036d0d888f513973a6c7618f535fc1631467b6da05b85b285c655dea2b2 \
+  python -m pytest tests/ -v -p no:cacheprovider --basetemp=/tmp/mtp-config-full
+
+# 最后前端改动后：59 passed
+docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest \
+  python -m pytest tests/test_api.py -q -p no:cacheprovider --basetemp=/tmp/mtp-config-ui
+
+bash -n backend/app/remote_worker.sh backend/app/worker-entrypoint.sh
+git diff --check
+```
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 层级、前置条件和用例 | 输入与业务结果 | 场景 |
+|---|---|---|---|
+| 在线可重启，提示区分保存/写入/应用 | API 静态契约 `test_remote_server_card_filters_lifecycle_actions_by_presence`，Node 执行实际页面 `workerServerCard` | 已部署在线显示停止+重启；离线显示启动+重启；未部署不显示生命周期按钮；忙时重启禁用；任务排队时只提示正在下发 | 正常、边界、回归 |
+| 写入失败不能报告成功 | Shell `test_remote_bootstrap_script_reports_config_write_failure`；生命周期无变化及变更用例 | 无权限 HOME 真实触发写入失败，非零退出且不输出更新成功；配置一致时仍可启动/重启；修改配置写入正确值 | 异常、权限、兼容 |
+| 不继承已删除配置，缺文件拒绝启动 | 入口集成 `test_worker_entrypoint_clears_removed_values_and_rejects_missing_file`、`test_worker_entrypoint_loads_env_file_and_execs_worker` | 继承旧密码/槽数后加载新文件，删除键不再残留；缺文件返回 78；空值、空格、等号和特殊字符按字面量处理 | 正常、边界、安全 |
+| 旧容器及模式不匹配有明确诊断 | Shell 参数化 `test_remote_bootstrap_script_rejects_legacy_container_on_restart`、`test_remote_bootstrap_script_rejects_gpu_mode_change_on_restart` | 分别缺入口/挂载、CPU→GPU、GPU→CPU 均拒绝重启并提示部署；GPU 同模式正常重启且 CPU 槽为 0 | 兼容、分支、回归 |
+| 检查失败不改配置或重启 | Shell 参数化 `test_remote_bootstrap_script_inspect_failure_stops_restart` | Cmd/Mounts/DeviceRequests 任一 Docker 查询失败，原 env 保留，不执行 restart | 外部依赖失败、关键副作用 |
+| 旧心跳不冒充新启动 | 单元参数化 `test_worker_heartbeat_probe_ignores_preexisting_worker_generation`、采样及读取失败用例 | 同 ID 相同/更早/缺失/非法启动时间拒绝；较新代次或新槽接纳；其它机器记录排除；协调存储失败返回空基线 | 正常、边界、异常、兼容 |
+| 历史功能及敏感数据保护不回归 | 完整套件，SSH 配置/API 现有安全用例 | 输入注入拒绝、凭据加密/不回显、部署回滚、训练/预测及双数据布局行为继续通过 | 安全、兼容、回归 |
+
+**构建、启动及运行验证**：
+
+1. 已按要求执行默认 `docker compose up --build -d`。前次被用户中断；续跑约 5 分钟仍停留在阿里云镜像下载 454 MB torch wheel，无新的完成输出。停止本次挂起构建（退出 130）；**默认联网依赖重建未完成，不记为通过**。
+2. 校验已有 Python 3.12 镜像的 `/app/requirements.txt` 与仓库 SHA256 相同（`7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`），且本次没有依赖变更。先通过 stdin Dockerfile 复用已安装依赖、复制最新应用代码构建；最终用以下临时 stdin 构建覆盖执行完整 Compose 重建启动。覆盖只影响本次构建方法，不改仓库配置、服务环境或数据卷：
+
+```bash
+docker compose -f docker-compose.yml -f - up --build -d <<'YAML'
+services:
+  trainer:
+    build:
+      dockerfile_inline: &cached_backend |
+        FROM emdash-hot-boxes-clean-y9u6p-trainer:latest
+        WORKDIR /app
+        COPY app ./app
+        COPY static ./static
+        COPY sample_data ./sample_data
+        COPY Dockerfile ./Dockerfile
+        COPY init_db.sh start.sh ./
+        RUN chmod +x init_db.sh start.sh
+        CMD ["./start.sh"]
+  worker:
+    build:
+      dockerfile_inline: *cached_backend
+YAML
+```
+
+3. 上述离线依赖复用构建 **成功**，trainer、worker、frontend 重建运行，SeaweedFS 运行且健康，frontend 健康；`curl -fsS --max-time 10 http://127.0.0.1:8000/api/health` 返回 `{"ok":true}`。Node stdin 将容器代码/实际 HTTP 页面与本地文件逐字节比较，三个远程 worker 文件、请求模型、路由及页面一致。运行时检查 `_remote_build_args`、`docker_registry` 请求字段及启动代次采样均存在，原先运行后端落后导致仓库源字段被忽略的问题已在本机环境消除。
+4. 本地等价 API 启动验证使用一次性 Python 3.12 容器：`docker run --rm -d --name mtp-config-smoke --network none --env USE_DATABASE=false --env REDIS_URL= --env STORAGE_BACKEND=local --env DATA_DIR=/tmp/mtp-config-smoke --env EMBEDDED_WORKERS=0 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`；容器内 urllib 断言 `/api/health` 为真，通过后 `docker stop mtp-config-smoke` 清理。不使用宿主机 Python 3.9 替代；该验证与容器均为 3.12.15。
+5. `node` stdin 解析全部内联 JavaScript 通过；实际页面函数四种状态渲染验证通过；真实 Docker 执行挂载 Go 模板语法通过。
+
+**过程问题及处理**：首次相关套件只挂载 backend 到 `/app`，读取项目根 Compose 文件的测试报 FileNotFoundError（154 通过、1 失败）；改为完整仓库挂载后 155 项全部通过。首轮完整套件 302 通过、6 跳过；增加上述分支测试后为最终 314 通过、6 跳过。一次运行时代码核对误用了不存在的类名 `RemoteServerUpdate`，更正为 `RemoteServerUpdateRequest` 后通过，未改业务逻辑。
+
+**已知限制与后续验证**：未连接真实 SSH 目标机执行保存→重启→确认槽数/地址链路，未实测 NVIDIA GPU 授权切换或旧远程容器升级；这些不能由 Shell Docker 替身测试代替。旧 worker 无 `started_at` 或操作前协调存储读取失败时兼容回退到普通心跳确认，不能保证新代次；零 CPU 槽或部署后保持停止时仍会等待心跳超时，不能据此判断配置失败。源设置只在镜像构建时生效，修改平台 `.env` 需重建平台容器。默认 Dockerfile 从头下载依赖的路径仍需网络稳定后重验。当前完整测试包括工作区已有 Dockerfile 重试及其断言调整，两处既有改动未纳入本次提交。
+
+**清理及提交范围**：验证脚本通过 stdin 运行；pytest 临时数据位于一次性容器 `/tmp/mtp-config-regression`、`/tmp/mtp-config-full`、`/tmp/mtp-config-ui`（前轮 `/tmp/mtp-remote-config-tests`），均随 `--rm` 删除；冒烟容器已停止删除。无新调试文件、数据、密钥或模型权重提交。工作区原有 `backend/Dockerfile` 和 `backend/tests/test_remote_workers.py` 的 pip 断言修改保留。
+
 ## 本次变更测试结果：worker 自动补同步历史数据集（2026-10-29）
 
 **Git基准点**：`d808115`（Auto-migrate local datasets for workers）
