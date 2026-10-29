@@ -1,3 +1,94 @@
+## 本次变更测试结果：Hugging Face Hub 数据集维护（2026-10-29）
+
+### Git 基准点与实现范围
+
+- **Commit Hash**：`1ad502d1de08b4a5ccdf3a5f04480baf7bc13bcd`。
+- **提交信息**：Add on-demand Hugging Face dataset imports。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围**：DatasetManager、数据集 API/请求模型、训练入口的数据准备、存储解析、维护页与训练页、正式 Hub 测试。无新增依赖、数据库迁移或仓库配置修改。
+- **技术环境**：Python **3.12.15**、FastAPI/Pydantic、Pandas、datasets 4.8.5、huggingface_hub 0.36.2、PyTorch CPU、原生 HTML/CSS/JavaScript。
+- **行为**：维护页可立即下载或仅保存远程引用；保存引用只查询元信息并固定 commit SHA。首次明确预览、统计、画像、处理或训练时下载，缓存复用；列表和训练页自动加载不触发拉取。失败保留引用和脱敏错误供重试。文件锁串行化同一数据集的下载/删除；临时 CSV 通过限制检查、同步 S3 后原子发布。
+- **兼容范围**：旧扁平布局与 metadata/raw/processed 布局、本地上传、LLM 既有入口、本地及 S3 Worker。
+- **测试隔离**：共享工作区同时存在其他任务修改，未纳入本次提交。最终另行导出本次拟提交树 `297696ca1b0d8e36f707526b898e2bc220beeb28` 验证；导出后并行合入 `8346b5f` 服务器弹窗修改，最终基准与该测试树的 **backend/app/ 完全一致**，仅另含该并行前端/API 测试变更。工作区整套测试另有记录，不能把工作区结果当成纯净提交结果。
+
+### 测试结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 初版 Hub 专项 | 39 | 39 | 0 | 0 | 0 |
+| 首次相关回归 | 146 | 137 | 7 | 0 | 2 |
+| 修正隔离并补充并发删除后的相关回归 | 147 | 145 | 0 | 0 | 2 |
+| 共享工作区完整 pytest | 466 | 442 | 0 | 0 | 24 |
+| 拟提交内容独立完整 pytest | 432 | 410 | 0 | 0 | 22 |
+
+最终独立完整测试 49.57 秒，已执行用例通过率 **100%**（含跳过为 94.91%）；新增 Hub 用例 **40/40**，没有删除、跳过或弱化有效测试。两条既有弃用警告来自 SQLAlchemy declarative_base 和 Pandas xlrd。
+
+首次相关回归的 7 项失败均为训练等待超时：新增测试 fixture 停止了共用 JobManager，后续 API 测试无法执行任务。已改为模块独立的 JobManager、EmbeddedJobQueue、EmbeddedLeaseStore，只停止自身管理器；相关套件及完整套件均通过。并发删除用例改为下载未完成时真实发起删除，验证等待锁、最终无 CSV 和无法重新使用已删除 ID。
+
+### 验收标准—可执行测试映射
+
+正式用例均在 `backend/tests/test_hub_datasets.py`；外部 Hub 网络使用 Mock，流式迭代器、CSV 转换、缓存、API、训练和预测运行真实逻辑。
+
+| 验收标准 | 层级 / 前置条件及输入 | 测试用例 | 预期结果 / 场景 |
+|---|---|---|---|
+| 保存远程引用不下载且固定版本 | API；公开仓库，remote/v1/plain/test | test_remote_reference_pins_revision_without_downloading | 元信息固定 SHA，列表可见，无 CSV、无下载调用；正常 |
+| 两种模式首次使用并复用缓存 | API；local/remote 两种模式 | test_import_and_first_preview_cache_data | 120 行及列值正确，仅下载一次；正常/兼容 |
+| 每个数据消费者支持引用 | API/存储；stats/profile/process/worker | test_first_use_downloads_for_each_data_consumer | 得到实际数据并转为 ready；正常/回归 |
+| 非法输入不能访问 Hub | API；12 组空值、超长、URL、路径、非法 split/mode/tags | test_invalid_sources_do_not_reach_hub | 422，无网络请求或元数据；边界/安全 |
+| 受限仓库和外部错误不泄漏信息 | API；401/403/404/500、gated | test_hub_metadata_failures_are_clear_and_redacted、test_gated_dataset_is_rejected | 明确 4xx/503，不回显秘密/路径；权限/异常 |
+| 下载失败保留引用，可重试 | API；TimeoutError/ValueError 后恢复 | test_download_failure_retains_reference_and_retry_works | error 状态、无残缺 CSV；同 ID 重试 ready；异常/恢复 |
+| 大小限制不能静默截断 | API；行/列/字节等于上限与超过上限 | test_download_limits_are_exact_without_truncation | 边界成功，超限 400 且无 CSV；边界 |
+| 支持嵌套文本、拒绝空和媒体 | API；empty/media/nested_media/text | test_supported_text_and_unsupported_data | 文本 JSON 结构保留，其他完整失败；正常/边界/异常 |
+| 下载与删除正确协调 | 管理器；并发请求及下载中删除 | test_concurrent_downloads_share_one_cache、test_delete_waits_for_inflight_download | 单次下载、删除等待、不会复活；并发/状态冲突 |
+| S3 故障可恢复且 Worker 可读 | API/存储；模拟远端失败后恢复 | test_object_store_sync_failure_rolls_back_and_remote_worker_reads_cache | 失败无本地 CSV，重试后远端副本与 Worker 读取一致；异常/兼容 |
+| 远程引用可直接训练且可复现 | API/真实 CPU；固定 seed 两次分类训练 | test_hub_reference_trains_reproducibly_and_predicts | completed、accuracy、日志、best.pt，重复指标一致；正常/回归 |
+| 预测沿用训练预处理 | API/真实模型；正常、缺失、非法字段，各重复预测 | 同上 | 预测成功且结果稳定；边界/兼容 |
+| 旧布局与历史训练继续有效 | 完整既有 API/Storage/Trainer 套件 | test_process_dataset_supports_legacy_flat_layout 等 | 两布局、分类/回归/聚类/时序、指标及产物回归通过 |
+| 页面自动加载不下载 | Node vm 执行实际 loadPreview 函数；Stub DOM/API | 下述前端行为检查 | 自动加载 0 次请求；显式预览下载并更新状态；异常显示文字 |
+
+### 实际执行命令
+
+以下均从项目根目录执行；测试容器只读挂载源码、使用独立临时数据，不连接生产协调服务。
+
+```bash
+# 初版专项：39 passed
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_hub_datasets.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-hub-targeted
+# 首轮相关回归使用相同参数，basetemp=/tmp/mtp-hub-related：7 failed，137 passed，2 skipped
+# fixture 修正后：145 passed，2 skipped
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_hub_datasets.py tests/test_api.py tests/test_storage.py tests/test_llm_trainer.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-hub-related-fixed
+# 工作区整套：442 passed，24 skipped，118.46 秒
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-hub-full
+# 本次拟提交树已导出至下述临时目录：410 passed，22 skipped
+docker run --rm --pull=never --network none --mount type=bind,src=/tmp/mtp-hub-work.OhXGPM/verified-source,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v --tb=short -r s -p no:cacheprovider --basetemp=/tmp/mtp-hub-isolated
+git diff --check
+```
+
+前端另以 Node 26.9.0 的 `vm.Script` 编译两个 HTML 内联脚本，均通过；`vm.runInContext` 执行实际 `loadPreview` 和 `apiJson`，断言：自动进入远程引用不调用 API；点击下载预览后显示实际行并变为 ready；网络失败显示明确错误；Pydantic 422 数组错误显示 msg 而非 [object Object]。均使用 `node <<'JS'` 内联脚本，未生成或提交临时测试代码。Safari 实际展示了 Hub 表单与默认“保存远程引用”，提交公开仓库成功；由于浏览器同时被其他操作切换，未完成独立的完整视觉/窄屏验收，不将其记为通过。
+
+### 真实 Hub、S3 与部署验证
+
+1. 使用一次性 Python 3.12 容器真实访问 `lhoestq/demo1`：`register_hub_dataset('lhoestq/demo1', 'main', None, 'train', 'remote')` 返回固定 SHA `87ecf163bedca9d80598b528940a9c4f99e14c11`，CSV 数量 0；`ensure_local(id)` 与 `get_dataset_preview(id)` 返回 5 行、6 列。首次内联 smoke 脚本存在多余括号的 SyntaxError，修正后实际网络调用通过。
+2. Safari 在部署页保存测试引用 `ds-20261029-111333-ae0e30`。通过 `curl --silent --fail http://localhost:8000/api/datasets` 及容器内 urllib 验证保存后仍为 remote，raw CSV 不存在。
+3. `docker exec -i -e PYTHONDONTWRITEBYTECODE=1 mtp-trainer python -` 内联脚本对该 ID 调用 `POST /api/datasets/{id}/materialize`，断言 ready、5 行、真实 S3 对象存在；`GET /api/datasets/{id}` 预览 5 行。
+4. `docker exec -i -e PYTHONDONTWRITEBYTECODE=1 mtp-worker python -` 使用 `TemporaryDirectory` 和 `resolve_dataset_for_worker(id, Path(work))`，Pandas 断言 5 行且包含 review 列，验证独立 Worker 的真实 S3 读取。
+5. 同样在 trainer 中真实调用 `POST /api/datasets/hub`，输入 `{"repo_id":"lhoestq/demo1","storage_mode":"local"}`，断言 ready、5 行及 S3 副本。随后通过 DELETE 清理两个本次创建的 ID，断言对应本地 CSV 和 S3 对象均不存在，并清理对应锁文件。
+6. 已执行要求的 `docker compose up --build -d`。默认依赖下载出现 `[SSL] record layer failure`，454 MB 的 torch wheel 首轮仅下载约 8.9 MB 后失败，第二轮仍极慢，因此中止该轮。没有把默认从零构建标记成功。
+7. 通过现有 Dockerfile 的 BASE_IMAGE 构建参数复用已安装依赖的本地 Python 3.12 镜像，临时 Compose 覆盖文件仅位于 `/tmp/mtp-hub-work.OhXGPM/compose-cache.yml`，不修改仓库配置。已执行两次 `COMPOSE_FILE="$PWD/docker-compose.yml:/tmp/mtp-hub-work.OhXGPM/compose-cache.yml" docker compose up --build -d`，均成功重建并启动 trainer、worker、frontend；第二次包含参数错误反馈修正。首次创建缓存标签的实际命令为 `docker tag emdash-hot-boxes-clean-y9u6p-trainer:latest mtp-hub-trainer-base:validation` 和 `docker tag mtp-worker:local mtp-hub-worker-base:validation`；覆盖文件分别向两服务传入对应 BASE_IMAGE。
+8. `docker compose ps --format json` 确认服务 running、frontend/seaweedfs healthy；`curl --silent --fail http://localhost:8000/api/health` 返回 `{"ok":true}`。容器内 DatasetManager、数据集路由、storage 三文件 SHA-256 与工作区一致。
+
+### 未执行项、限制与后续建议
+
+- 最终套件 22 项环境跳过：15 项真实 Redis 协调/注册测试、4 项真实 Redis Worker 测试、1 项 Supervisor 多进程测试、2 项独立 S3 测试；未配置隔离的 MTP_TEST_REDIS / MTP_TEST_S3。工作区套件另有 2 项其他任务的 CUDA 多节点测试因无 GPU 跳过。真实 Hub→S3→独立 Worker smoke 已通过，但不替代这些独立故障测试。建议在隔离 Redis/S3 和具备 GPU 的环境补跑相应套件。
+- 仅支持无需授权的公开表格/文本数据集，不接受 token；不运行远程代码，不支持图像/音频。沿用 500 MB、200 万行、100 列限制。子集/split 和数据格式在实际下载时验证，保存引用时不提前下载验证。
+- 下载为同步请求，耗时受 Hub 网络和数据规模影响；CSV 完成后用 Pandas 计算元信息，内存占用可能高于文件大小。未进行最大规模/长时间下载压力测试。
+- 默认基础镜像从零安装依赖仍未验证成功，建议网络恢复后重跑无覆盖的 `docker compose up --build -d`。本次成功的是复用本地依赖的容器重建，没有使用低版本 Python 替代。
+- 浏览器完整视觉/移动端验收未完成；表单结构、交互函数和实际保存动作已验证。平台现有数据集 API 无账户鉴权，本次未新建权限模型；安全测试覆盖受限 Hub 拒绝、输入校验、禁用凭证/远程代码与错误脱敏。
+- 临时快照/索引/导出源码/构建覆盖文件位于已告知的 `/tmp/mtp-hub-work.OhXGPM`，交付前清理；测试容器自动删除，测试数据及 S3 副本已清理。正式测试保留在仓库。
+- 重测触发条件：Hub 元数据模型、拉取/发布/回滚、存储解析、训练入口、前端按需触发逻辑或相关依赖变更时重跑对应测试及完整套件。
+- 回滚：回退本次功能提交并重建容器；无需数据库回滚。已下载的 CSV 沿用既有结构，未下载引用需要恢复此功能后才能使用。
+
+---
+
 ## 本次变更测试结果：本地计算资源注册自动恢复（2026-10-29）
 
 ### Git 基准点、根因与范围
