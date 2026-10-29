@@ -3137,39 +3137,43 @@ docker compose logs --tail=15 worker
 - 修改远程操作状态机、`remote_worker.sh` 容器错误文本、服务器状态持久化或部署按钮行为时，需重跑远程 worker 专项、API 套件和完整后端套件。
 - 回滚可撤销提交 `d9f542d` 并重新构建平台；无数据迁移。
 
-## 本次变更测试结果：异构设备兼容性补充（2026-10-30）
+## 本次变更测试结果：训练资源选择与异构设备兼容（2026-10-30）
 
 ### Git 基准点与范围
 
-- **Commit Hash**：`d252c8a`（Expand heterogeneous device coverage）。
+- **Commit Hash**：`d92d1c0`（Improve training workbench interactions）；核心实现提交为 `9601e84`，异构设备补充提交为 `d252c8a`。
 - **测试日期 / 分支**：2026-10-30 / `emdash/hot-boxes-clean-y9u6p`。
-- **范围**：补充 AMD ROCm、Intel XPU、Apple MPS、NVIDIA CUDA 与 CPU 的设备协议、混合后端 Gloo 选择、Supervisor 设备可见性隔离，以及远程 ROCm/XPU 构建和 MPS Docker 拒绝测试。无新增运行时依赖、数据库迁移或数据格式变更。
+- **范围**：训练表单可自动分配或指定在线计算槽，并筛选 CUDA、ROCm、XPU、MPS、CPU 后端；API 在创建任务前校验槽位状态和任务要求，worker 仅由指定槽领取并在租约后复核；失败重试与暂停恢复保留选择。异构联合训练按成员能力选择 NCCL/Gloo，Supervisor 按槽位隔离设备可见性。训练台增加配置错误定位、任务搜索/状态筛选、详情请求竞态保护和日志跟随控制。无新增运行时依赖、数据库迁移或训练数据格式变更。
 
 ### 验收标准—测试用例映射
 
-| 验收标准 | 可执行用例 | 结果与场景 |
+| 验收标准 | 可执行用例 | 预期与场景 |
 |---|---|---|
-| CUDA、ROCm、XPU、MPS、CPU 能力被正确识别并选择 | `test_member_selection_supports_each_device_backend`、`test_device_info_reports_simulated_cross_platform_backends` | 设备后端、厂商、PyTorch device 字符串和通信能力保持一致；正常、兼容、边界 |
-| 异构组不误用 NCCL | `test_mixed_accelerators_use_gloo`、`test_incompatible_members_are_rejected` | ROCm/XPU/MPS/CPU 混合组使用 Gloo；未知后端和不支持架构明确拒绝；异常、安全 |
-| 每个槽位只看到自己的加速器 | `test_cpu_slot_hides_inherited_gpu_visibility`、`test_supervisor_sets_backend_specific_device_visibility` | CUDA、HIP/ROCR、oneAPI 变量按槽位设置，CPU 槽清空继承变量；资源隔离、回归 |
-| 远程节点构建适配目标后端 | `test_remote_build_selects_non_cuda_gpu_backend`、`test_remote_build_rejects_mps_docker_deployment` | ROCm/XPU 注入对应构建参数；MPS 要求 macOS 原生 worker；配置异常、兼容 |
-| 训练和既有 API/数据链路回归 | `pytest tests/`、前端并行训练与资源套件 | 指标、产物、断点、预测、旧数据布局和资源选择保持通过；回归 |
+| 用户可自动调度或指定在线、启用且兼容的计算槽；无效选择不能创建任务 | API：`test_start_training_api_validates_selected_resource` 及同组资源参数化用例；前端：`frontend/training-resources.test.cjs` | CPU/GPU 槽展示容量和状态；离线、停用、失效及任务不兼容的槽阻止提交；忙碌槽明确排队；恶意标签安全转义。正常、边界、异常、安全 |
+| 指定任务只由目标槽执行，租约竞争或策略变化后重新核验 | Worker：`test_selected_training_resource_executes_on_target_only`、`test_selected_training_resource_kept_on_auto_retry`、`test_selected_training_resource_rechecked_after_lease` | 非目标 worker 不领取；目标槽完成分类/回归并生成指标、`best.pt`、预处理产物和日志；自动重试保留目标，禁用/改选/degraded 竞争不启动训练。正常、并发、回归 |
+| 手动重试和暂停恢复保留或明确更新分配策略 | JobManager/API：`test_manual_retry_requeues_failed_job_with_selected_assignment` 与重试 API 用例；Worker 失败/恢复用例 | 指定槽、自动重派、联合训练整组重试规则保持一致；暂停恢复继续等待原指定槽。状态冲突、兼容、回归 |
+| 任务资源提示和可用设备后端约束得到执行 | `test_device_info_reports_simulated_cross_platform_backends`、`test_member_selection_supports_each_device_backend`、`test_incompatible_members_are_rejected` | CUDA、ROCm、XPU、MPS、CPU 的厂商、设备字符串及能力映射正确；未知后端、无效索引和不支持架构被拒绝。正常、边界、异常 |
+| 异构联合训练通信与设备隔离正确 | `test_mixed_accelerators_use_gloo`、`test_cpu_slot_hides_inherited_gpu_visibility`、`test_supervisor_sets_backend_specific_device_visibility` | 仅全 NVIDIA CUDA 使用 NCCL，混合设备使用 Gloo；HIP/ROCR、CUDA、oneAPI 可见性按槽位隔离，CPU 清理继承变量。兼容、安全、回归 |
+| 远程 worker 构建匹配后端并拒绝不支持的容器目标 | `test_remote_build_selects_non_cuda_gpu_backend`、`test_remote_build_rejects_mps_docker_deployment` | ROCm/XPU 使用对应构建参数，MPS 明确要求 macOS 原生 worker。配置边界、兼容 |
+| 训练台交互清晰且避免旧响应覆盖新选择 | `frontend/training-resources.test.cjs`、`frontend/workbench-interactions.test.cjs` | 表单校验和定位、资源失效提示、任务搜索筛选、日志跟随/回到最新、标签键盘操作及异步竞态均有断言。正常、异常、并发、可访问性 |
+| 训练、预测、产物和既有数据布局保持兼容 | 完整 `backend/tests/` | 分类/回归训练产物、指标、预测、checkpoint、旧/新数据布局和远程管理回归通过。兼容、回归 |
 
 ### 测试执行结果
 
-| 命令（Python 3.12.15 trainer 容器内、`backend/` 工作目录；省略 Docker 启动与挂载参数） | 结果 |
+| 阶段与实际命令 | 结果 |
 |---|---|
-| `python -m pytest tests/test_device.py tests/test_parallel.py` | **68 passed，2 skipped**；跳过真实 NVIDIA GPU/NCCL |
-| `python -m pytest tests/test_device.py tests/test_parallel.py tests/test_remote_workers.py -k 'device_info or member_selection_supports or mixed_accelerators or incompatible_members or cpu_slot or supervisor_sets or remote_build_selects_non_cuda or remote_build_rejects_mps'` | **28 passed，202 deselected** |
-| `docker run ... python -m pytest tests/ -q -rs --tb=short` | **571 passed，24 skipped，0 failed**；Python 3.12.15 |
-| `node --test frontend/parallel-training.test.cjs frontend/training-resources.test.cjs` | **25 passed，0 failed** |
-| `node --test frontend/dataset-display.test.cjs frontend/dataset-preview.test.cjs frontend/server-modal.test.cjs` | **55 passed，0 failed** |
-| 临时等价 Compose（现有 Python 3.12.15 依赖镜像，仅复制当前源码） | trainer/frontend 构建、启动和健康检查通过；`/api/health` 返回 `{"ok":true}`，前端 `/healthz` 返回 `ok` |
-| `docker compose up --build -d` | **未通过**：PyTorch 2.15.0 wheel 下载约 9.1/483.7 MiB 时 SHA256 与 requirements 锁定值不一致，已停止重试；不能标记标准 Compose 构建通过 |
+| Python 3.12.15 相关回归：`docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer python -m pytest tests/test_device.py tests/test_worker.py tests/test_parallel.py tests/test_api.py -q -p no:cacheprovider --basetemp=/tmp/selectable-resources-related --tb=short` | **203 passed，6 skipped，0 failed**；覆盖 API、worker、设备和联合训练 |
+| Python 3.12.15 完整回归：`docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/selectable-resources-full --tb=short -rs` | **571 passed，24 skipped，0 failed**；2 条既有弃用警告 |
+| 前端完整套件：`node --test frontend/*.test.cjs` | **100 passed，0 failed**；包括资源选择与工作台交互 |
+| `git diff --check` | 通过；无空白错误 |
+| 标准容器重建：`docker compose up --build -d` | 首次等待依赖安装时手动停止；第二次复用已缓存 wheel 后 **通过**，trainer、worker、frontend 均构建并启动 |
+| HTTP 与资源冒烟：`curl --fail --silent http://127.0.0.1:8000/api/health`、`curl --fail --silent http://127.0.0.1:8000/api/workers` | 通过；health 返回 `{"ok":true}`，workers 返回在线 CPU 槽及设备后端字段；工作台包含资源选择控件 |
 
 ### 已知限制
 
 - 当前环境没有 NVIDIA、AMD、Intel 或 Apple GPU，真实 CUDA/ROCm/XPU/MPS 算子和 NCCL 仅做协议模拟测试；应在对应硬件和驱动环境补跑。
 - Apple MPS 只能在 macOS 原生 worker 使用；Linux Docker 不透传 MPS，Windows GPU 使用 WSL2 对应运行时。
-- 标准 Compose 受外部 PyTorch wheel 下载源内容哈希不一致阻塞；网络稳定后需重新执行 `docker compose up --build -d`。
+- 当前环境没有 NVIDIA、AMD、Intel 或 Apple GPU，真实 CUDA/ROCm/XPU/MPS 算子和 NCCL 仅由协议模拟覆盖；应在对应硬件和驱动环境补跑。
+- 24 项完整套件跳过项依赖真实 Redis、S3、Supervisor 多进程环境或双 NVIDIA GPU/NCCL；均未配置，不视作通过。
+- 标准 Compose 首次安装依赖耗时较长；缓存 wheel 后第二次完整构建成功。
 - 临时等价验证文件和容器不纳入仓库；未执行 `git push`。
