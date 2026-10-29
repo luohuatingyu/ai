@@ -1067,11 +1067,23 @@ function renderParallelWorkers() {
   const workers = state.workerSlots || [];
   $("parallelWorkers").innerHTML = workers.map(worker => {
     const available = worker.active && worker.enabled && worker.parallel?.host && worker.parallel?.gloo && worker.parallel?.protocol === 1;
+    const unavailableReason = !worker.active
+      ? "离线或已失效"
+      : !worker.enabled
+        ? "未启用"
+        : !worker.parallel?.host
+          ? "缺少可达的联合训练互联地址"
+          : !worker.parallel?.gloo || worker.parallel?.protocol !== 1
+            ? "不支持联合训练通信"
+            : "";
     const selected = parallelSelections.has(worker.worker_id);
     const size = parallelSelections.get(worker.worker_id) ?? (taskSelect.value.startsWith("llm_") ? 1 : 32);
+    const action = unavailableReason === "缺少可达的联合训练互联地址"
+      ? ` · <a href="/server-manager.html" target="_blank" rel="noopener">去服务器管理配置</a>`
+      : "";
     return `<div class="card" style="padding:12px;display:grid;grid-template-columns:minmax(0,1fr) 82px;gap:12px;align-items:center;">
       <label style="display:flex;gap:8px;align-items:center;overflow-wrap:anywhere;"><input style="width:auto" type="checkbox" data-parallel-worker="${esc(worker.worker_id)}" ${selected ? "checked" : ""} ${available || selected ? "" : "disabled"}>
-      <span>${esc(worker.machine_id || worker.worker_id)} / ${esc(worker.slot || "")}<br><small>${esc(worker.gpu?.available ? worker.gpu.name : "CPU")}${available ? "" : " · 需上线、启用并配置互联地址"}</small></span></label>
+      <span>${esc(worker.machine_id || worker.worker_id)} / ${esc(worker.slot || "")}<br><small>${esc(worker.gpu?.available ? worker.gpu.name : "CPU")}${available ? "" : ` · ${esc(unavailableReason)}${action}`}</small></span></label>
       <label>本地批大小<input type="number" data-parallel-batch="${esc(worker.worker_id)}" min="1" max="${taskSelect.value.startsWith("llm_") ? 64 : 4096}" value="${size}" ${selected ? "" : "disabled"}></label></div>`;
   }).join("") || '<div class="empty">尚无计算槽，请先添加服务器并配置互联地址。</div>';
 }

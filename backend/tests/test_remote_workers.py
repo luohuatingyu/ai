@@ -874,6 +874,7 @@ def test_compose_separates_local_worker_image_from_remote_default():
         compose = (repository_root / filename).read_text(encoding="utf-8")
         assert f"WORKER_REMOTE_IMAGE: ${{WORKER_IMAGE:-{local_default}}}" in compose
         assert f"WORKER_IMAGE: ${{WORKER_IMAGE:-{local_default}}}" in compose
+        assert "WORKER_DISTRIBUTED_HOST: ${WORKER_DISTRIBUTED_HOST:-worker}" in compose
     remote_compose = (repository_root / "docker-compose.remote.yml").read_text(encoding="utf-8")
     assert "/var/run/docker.sock:/var/run/docker.sock" in remote_compose
     assert "USE_DATABASE: ${USE_DATABASE:-true}" in remote_compose

@@ -52,6 +52,17 @@ def test_detect_capabilities_reports_cpu_and_stable_server_identity(monkeypatch)
     assert caps["cpu"]["memory_mb"] is None or caps["cpu"]["memory_mb"] >= 1
 
 
+def test_detect_capabilities_reports_configured_parallel_host(monkeypatch):
+    """联合训练能力上报保留 Compose 服务名或管理员配置的可达地址。"""
+    monkeypatch.setenv("WORKER_DISTRIBUTED_HOST", "worker")
+
+    caps = detect_capabilities("worker-cpu0", slot="cpu0")
+
+    assert caps["parallel"]["host"] == "worker"
+    assert caps["parallel"]["protocol"] == 1
+    assert caps["parallel"]["gloo"] is True
+
+
 # ---------------------------------------------------------------------------
 # 正常执行（AC6）
 # ---------------------------------------------------------------------------

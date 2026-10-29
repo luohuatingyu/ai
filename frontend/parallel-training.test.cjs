@@ -30,8 +30,9 @@ function fixture(task = 'classification', mode = 'parallel') {
   const workers = ['gpu', 'cpu'].map((worker_id) => ({ worker_id, machine_id: worker_id,
     active: true, enabled: true, parallel: { host: '10.0.0.1', protocol: 1, gloo: true } }));
   const requests = [];
+  const state = { datasetId: 'dataset', workerSlots: workers };
   const context = vm.createContext({ document: { activeElement: null },
-    $: (id) => nodes.get(id), state: { datasetId: 'dataset', workerSlots: workers },
+    $: (id) => nodes.get(id), state,
     esc: (value) => String(value).replaceAll('<', '&lt;'), toast() {}, selectJob() {},
     apiJson: async (url, options) => { requests.push({ url, payload: JSON.parse(options.body) }); return { job_id: 'joint' }; },
   });
@@ -40,7 +41,7 @@ function fixture(task = 'classification', mode = 'parallel') {
   vm.runInContext(start + '\n' + submit, context);
   const selections = vm.runInContext('parallelSelections', context);
   selections.set('gpu', 3); selections.set('cpu', 1);
-  return { context, nodes, requests, workers, selections };
+  return { context, nodes, requests, workers, selections, state };
 }
 
 for (const task of ['classification', 'regression', 'llm_pretraining', 'llm_sft', 'llm_dpo', 'llm_ppo']) {
@@ -87,6 +88,38 @@ test('节点掉线、停用、未配置通信能力或批大小非法时禁止�
   f.workers[1].parallel.host = '10.0.0.1';
   f.workers[1].parallel.gloo = false; f.context.updateStart();
   assert.equal(f.nodes.get('btnStart').disabled, true);
+});
+
+test('本机 Compose 计算槽可参与联合训练，缺失远端地址时给出配置入口', () => {
+  const f = fixture();
+  f.state.workerSlots = [
+    { worker_id: 'local-cpu0', machine_id: 'local', slot: 'cpu0', active: true, enabled: true,
+      parallel: { host: 'worker', protocol: 1, gloo: true } },
+    { worker_id: 'local-cpu1', machine_id: 'local', slot: 'cpu1', active: true, enabled: true,
+      parallel: { host: 'worker', protocol: 1, gloo: true } },
+    { worker_id: 'remote-cpu0', machine_id: 'remote', slot: 'cpu0', active: true, enabled: true,
+      parallel: { host: '', protocol: 1, gloo: true } },
+  ];
+
+  f.context.renderParallelWorkers();
+  const markup = f.nodes.get('parallelWorkers').innerHTML;
+  assert.match(markup, /data-parallel-worker="local-cpu0"[^>]*>/);
+  assert.match(markup, /data-parallel-worker="local-cpu1"[^>]*>/);
+  assert.match(markup, /data-parallel-worker="remote-cpu0"[^>]*disabled/);
+  assert.match(markup, /href="\/server-manager\.html"/);
+  assert.match(markup, /缺少可达的联合训练互联地址/);
+
+  f.selections.clear();
+  f.selections.set('local-cpu0', 2);
+  f.selections.set('local-cpu1', 1);
+  f.context.updateStart();
+  assert.equal(f.nodes.get('btnStart').disabled, false);
+  return f.nodes.get('btnStart').onclick().then(() => {
+    assert.deepEqual(f.requests[0].payload.parallel_workers, [
+      { worker_id: 'local-cpu0', batch_size: 2 },
+      { worker_id: 'local-cpu1', batch_size: 1 },
+    ]);
+  });
 });
 
 test('LLM 限制批大小为 64；编辑中仍更新总批大小且不重建输入框', () => {

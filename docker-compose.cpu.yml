@@ -139,6 +139,8 @@ services:
       USE_DATABASE: ${USE_DATABASE:-false}
       WORKER_MACHINE_ID: ${WORKER_MACHINE_ID:-}
       WORKER_MANAGED: ${WORKER_MANAGED:-false}
+      # 同一 Compose 网络内的 CPU 槽使用服务名互联；跨机器部署请显式配置训练网地址并使用受管 worker。
+      WORKER_DISTRIBUTED_HOST: ${WORKER_DISTRIBUTED_HOST:-worker}
     depends_on:
       redis:
         condition: service_healthy

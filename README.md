@@ -111,6 +111,8 @@ bash scripts/start-platform.sh   # 默认 CPU；设置 PLATFORM_MODE=gpu 选择 
 
 打开 http://localhost:8000：页面由 frontend 容器托管，API 经同源代理转发。
 
+Compose 启动的本机 worker 默认使用 `worker` 服务名作为联合训练互联地址，因此同一容器内的多个 CPU/GPU 槽可以直接在训练页选择。若要让本机 Compose worker 与其它服务器联合训练，必须在 `.env` 中设置该主机可被所有节点访问的训练网地址，并按实际网络方式部署；远端受管 worker 仍需在服务器管理页填写各自的联合训练互联地址后重新部署。
+
 ### 2. 追加计算服务器（CPU / GPU 均可）
 
 外接服务器由平台直接通过 SSH 管理。目标服务器不需要检出或接收本项目源码，也不需要访问镜像仓库；首次部署时平台把精简构建上下文经 SSH 发送到目标机，由目标机 Docker 构建 worker 镜像。开始前准备：
