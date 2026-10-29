@@ -72,7 +72,83 @@ git diff --check
 
 **清理与提交**：pytest 临时目录 `/tmp/mtp-lease-*` 随一次性容器清理；隔离 Redis 容器已停止并自动删除；临时构建目录 `/tmp/mtp-lease-build-eb81386/` 和基底镜像标签已删除；现场下载/预测验证新生成的 `data/worker-scratch/serve/job-20261029-083952-b64fb1/` 缓存已删除。没有提交模型、数据、日志或其他运行时产物；业务代码与本测试报告分开提交，不执行 git push。已有 Dockerfile/远程测试改动保留。
 
-## 远程部署卡住与旧 worker 启动失败诊断（2026-10-29，尚未修复）
+## SSH 大输入传输修复与远端恢复验证（2026-10-29）
+
+- **Commit Hash**：`9013f1c8b0db669523ffba2c81ad0f46e25d97c4`（Fix stalled SSH input streaming during remote deployment）。
+- **分支**：`emdash/hot-boxes-clean-y9u6p`；Python 3.12.15；用户已确认下文修复、测试及重新部署方案。
+- **范围**：`backend/app/remote_workers.py` 和 `backend/tests/test_remote_workers.py`；没有新增依赖或修改仓库配置。工作区原有 Dockerfile 重试及相关测试断言改动保留，参与工作区测试但未纳入本次代码提交。
+- **结论**：SSH 传输卡死已修复，完整自动测试通过，真机已收到完整构建包。已复用远端现有镜像下发新配置和代码并重建容器；远程资源心跳尚未验收，不能标记端到端恢复完成。
+
+**关键实现**：Python 标准库独立发送线程独占 stdin，通过非阻塞 `os.write` 和 `select` 持续发送完整输入，结束时关闭管道；主线程继续 `communicate` 读取实时 stdout/stderr。超时、取消和 OS 写入错误会回收子进程及发送线程；远端提前退出的 BrokenPipe 保留原退出码与 stderr；日志回调异常仍按既有约定隔离。文本按流编码发送，二进制 tar 不做转换。方法及核心分支均含中文说明。
+
+**测试结果**：
+
+| 执行范围 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 修复前定向复现 | 11 | 6 | 5 | 0 | 0 |
+| 修复后远程专项 | 119 | 119 | 0 | 0 | 0 |
+| 最终完整 pytest | 351 | 344 | 0 | 0 | 7 |
+| 隔离 Python 3.12 API 冒烟 | 1 | 1 | 0 | 0 | 0 |
+
+完整套件 69.03 秒，已执行用例通过率 100%，含跳过为 98.01%。7 项环境跳过为真实 Redis 协调/租约/Supervisor 和真实 S3 用例，未配置 `MTP_TEST_REDIS` / `MTP_TEST_S3`；保留既有门控，未删除或弱化有效测试。两条既有警告：SQLAlchemy declarative_base、Pandas xlrd 弃用。
+
+修复前两个大输入用例稳定超时，两个超时/取消清理用例发现 stdin 未关闭；另一个初版回调用例错误地期待日志异常向上传播，与既有 `_emit_progress` 隔离日志故障的约定不符，修正为验证回调被执行、异常被隔离、随后超时正常回收。原二进制 Mock 用例改为真实进程校验含 NUL、非 UTF-8 字节和 CRLF 的完整往返，断言强度提高。最终增加 OS 写入错误验证。专项通过后仅补充发送线程退出与异常收集顺序，最终完整套件覆盖了该最终版本。
+
+**实际测试命令**（项目根目录；只读挂载、隔离网络/数据）：
+
+```bash
+# 修复前：5 failed, 6 passed, 107 deselected
+docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py \
+  -q -p no:cacheprovider --basetemp=/tmp/mtp-ssh-red \
+  -k 'remote_input or preserves_binary_build_context'
+# 修复后专项：119 passed
+docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py \
+  -q -p no:cacheprovider --basetemp=/tmp/mtp-ssh-green --tb=short
+# 最终完整套件：344 passed, 7 skipped
+docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ \
+  -v -p no:cacheprovider --basetemp=/tmp/mtp-ssh-full --tb=short
+git diff --check
+```
+
+**验收标准—最终可执行用例映射**：
+
+| 标准 | 层级、前置条件及输入 | 预期结果与实际结果 | 场景 |
+|---|---|---|---|
+| 跨轮询完整传输并收到 EOF | 真实子进程 `test_remote_input_survives_poll_timeout`；接收端延迟 0.6 秒，0/1024/716800 重复单元，文本/二进制六组 | 字节数及 SHA256 一致、stdin 关闭、退出 0；6/6 通过 | 空值、边界、大输入、兼容 |
+| 二进制无损传输 | `test_run_remote_subprocess_preserves_binary_build_context`，NUL/0xff/CRLF | 收到原始字节、退出 0、stderr 空；通过 | tar 格式兼容 |
+| 实时日志不重复 | 上述六组接收前输出 ready/waiting；既有 CR/部分行用例 | 子进程未退出时收到回调，完整输出无重复；通过 | 正常、回归 |
+| 卡住时可取消与超时清理 | `test_remote_input_cleanup_when_receiver_stalls`，2 MiB 输入、接收端不读，timeout/cancel/callback 三组 | 有界结束、管道关闭、无发送线程/子进程遗留；3/3 通过 | 超时、中断、日志故障 |
+| 提前退出和写入失败可诊断 | `test_remote_input_early_receiver_exit_preserves_error`、`test_remote_input_write_error_is_reported_and_cleaned_up` | 保留错误退出码/消息或返回脱敏发送错误，回收资源；通过 | 依赖失败、安全 |
+| 既有构建/部署行为兼容 | 远程专项与完整套件 | Buildx 兼容回退、脱敏、凭证、配置、训练/预测/数据回归通过 | 兼容、安全、回归 |
+| 真机服务正常运行 | 真实 Linux Docker，配置+代码同步及重建 | 容器已创建并运行，但 30 秒心跳未通过，随后远端服务响应超时；尚未验收 | 外部环境、部署 |
+
+**平台重建与等价验证**：
+
+1. 执行 `docker compose up --build -d`；阿里云 pip 镜像下载 454 MB torch 包连续约 3 分钟无新增进展，主动中断构建，退出 130。未记为默认联网重建通过。
+2. 运行镜像、工作区以及远端旧镜像的 `requirements.txt` SHA256 均为 `7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`。无依赖变更，采用下文既有“离线依赖复用”临时 stdin Compose 覆盖：`docker compose -f docker-compose.yml -f - up --build -d`，Dockerfile inline 从现有 trainer 镜像复制最新 app/static/sample_data/Dockerfile/启动脚本。实际重建成功，trainer/worker 重建运行，frontend/SeaweedFS 健康。仓库 Compose、环境和卷配置未改。
+3. trainer `/api/health` 返回 `{"ok":true}`；运行 `remote_workers.py` 与工作区 SHA256 相同：`914dda0510cfabffde08f15022281e46f1330fc56dff18f46d0de2b03268c29e`。
+4. 本地等价验证仍使用 Python 3.12.15：`docker run --rm -d --name mtp-ssh-smoke --network none --env USE_DATABASE=false --env REDIS_URL= --env STORAGE_BACKEND=local --env DATA_DIR=/tmp/mtp-ssh-smoke --env EMBEDDED_WORKERS=0 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m uvicorn app.main:app --host 0.0.0.0 --port 8000`；容器内 urllib 查询 `/api/health` 成功，随后 `docker stop mtp-ssh-smoke` 清理。该冒烟不能替代完整套件或联网构建。
+
+**真实远端恢复过程**（UTC）：
+
+- 检查原操作已因其它平台重启变为 failed；远端没有残留 `docker build`，无需杀构建进程。平台没有活跃训练任务，Linux 没有有效资源槽。旧容器镜像为 `sha256:784a8a1627901c0cf688b4155b956824b38c27e1972a9ab68e56551ae6929d1b`，保留镜像供回退；旧容器仍有无效 SeaweedFS 配置，重启次数已达 5470。
+- 经 POST `/api/remote-servers/Linux/install` 发起 `b5961e5f123849b7b94aa52433df26e7`。09:38:33 日志出现 `Sending build context to Docker daemon 747.5kB`、`Step 1/17` 和 `Step 2/17`，确认真实 SSH 构建包传输已完成。09:39:04 基础镜像拉取失败：访问 Docker Hub `registry-1.docker.io` 的 HTTPS 请求 i/o timeout。缺少 Buildx 已正常回退传统构建器，没有再卡在 stdin。
+- 复用依赖清单相同的既有远端镜像。因平台 `deployed=false` 与真实旧容器存在不一致，直接调用已有 `execute_remote_operation` 执行 config/deploy 恢复路径，仍保留协调存储操作日志、状态持久化和心跳检查；没有修改路由或手写伪造成功状态。
+- config 操作 `d72dab363a994e4b98de4d2db11d6fc5` 于 09:41:09 完成，写入 `~/.config/mtp-worker/Linux.env`；安全摘要为 CPU 槽 1、OSS S3 endpoint、bucket xyzc、HTTPS true、Redis 和 S3 凭证已配置。
+- deploy 操作 `f4a8ee96a44b434499dea5f5fcc693a1` 同步最新代码并复用旧镜像重建；09:41:44 新容器 `52c25a5b176318b297bc3f63af28408655ee2a4f05f47422f46f4029c60c05f7` 快照 `state=running restart_count=0 exit_code=0`，脚本正常返回。30 秒未收到心跳，记录 `heartbeat_ok=false`，服务器状态 error，deployed 标记已更新；不能把操作 completed 理解为 worker 在线。
+- 随后只读 SSH 检查在 35 秒超时；平台 `/api/workers` 因 Redis 响应异常返回 500、`/api/remote-servers` 读取超时。SSH/MySQL/Redis TCP 可连接，但容器内协议响应均出现 5 秒超时；宿主侧 SSH 等待 banner 30 秒超时，Redis 曾有一次 2.6 秒响应。尚无足够证据区分网络异常与主机资源压力，未推断根因，也未执行主机重启或修改数据库/Redis配置。已请用户从云控制台确认主机资源和状态。
+
+**已知限制、重测条件与后续**：当前代码测试通过，平台和远端容器重建已执行；远端 worker 持续运行、OSS/Redis 可访问、新代次心跳尚未完成验收。从头联网构建受镜像/依赖下载阻碍。远端恢复响应后，应读取新容器命令/挂载和日志，确认环境已加载、重启次数稳定、CPU 槽 1 上线；需要时使用已部署服务器的 start/restart 流程恢复。若发现新的代码或配置问题，按范围重新确认方案。SSH 发送、取消、超时、构建或启动逻辑再变更时必须重新运行专项和完整测试。不能将本节标记为远程恢复完成。
+
+**清理与提交**：测试数据仅位于一次性容器 `/tmp/mtp-ssh-red`、`/tmp/mtp-ssh-green`、`/tmp/mtp-ssh-full`，已随 `--rm` 删除；冒烟容器已删除。所有诊断脚本经 stdin，SSH 私钥仅在 memfd 内存中，已关闭；两次卡在只读数据库获取的诊断 Python 进程已终止。未留下调试文件、未提交数据/秘密/运行时结果；代码提交 `9013f1c`，本报告单独提交。既有 Dockerfile 和一处测试断言差异属于原工作区改动，保留不纳入提交。
+
+## 远程部署卡住与旧 worker 启动失败诊断（2026-10-29，修复前记录）
 
 **检查版本**：`eb813869fbc31fb21aae306579b4567b173b17de`；分支 `emdash/hot-boxes-clean-y9u6p`。本节是只读诊断及缺陷复现，不更新下文完整测试验收基准，不代表当前工作区通过完整测试。本次仅修改本报告；既有 Dockerfile、远程测试及其它任务的变更不纳入本次提交。
 
