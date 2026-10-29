@@ -12,15 +12,21 @@ set -euo pipefail
 
 env_file="${1:?缺少 worker 环境文件路径}"
 
-if [[ -f "$env_file" ]]; then
-  set -a
-  while IFS= read -r line; do
-    case "$line" in
-      ''|'#'*) continue ;;
-      *=*) export "${line%%=*}"="${line#*=}" ;;
-    esac
-  done < "$env_file"
-  set +a
+# 受管理变量必须先清空，避免配置文件删除某个变量后继续沿用容器创建时的旧值。
+unset REDIS_URL REDIS_PASSWORD STORAGE_BACKEND S3_ENDPOINT S3_ACCESS_KEY \
+  S3_SECRET_KEY S3_BUCKET S3_SECURE WORKER_MACHINE_ID WORKER_MANAGED \
+  WORKER_CPU_SLOTS USE_DATABASE DATA_DIR
+
+if [[ ! -r "$env_file" ]]; then
+  printf 'worker 配置文件不存在或不可读：%s\n' "$env_file" >&2
+  exit 78
 fi
+
+while IFS= read -r line; do
+  case "$line" in
+    ''|'#'*) continue ;;
+    *=*) export "${line%%=*}"="${line#*=}" ;;
+  esac
+done < "$env_file"
 
 exec python -m app.worker

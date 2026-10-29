@@ -15,8 +15,7 @@ CONFIG_DIR="${HOME}/.config/mtp-worker"
 ENV_FILE="${CONFIG_DIR}/${MTP_MACHINE_ID}.env"
 APP_DIR="${CONFIG_DIR}/${MTP_MACHINE_ID}/app"
 
-# 重写目标机 worker 环境文件。返回 0 表示配置有变化（已覆盖），
-# 返回 1 表示与现网配置一致（不写入），供调用方跳过无谓操作。
+# 重写目标机 worker 环境文件。配置有变化时覆盖文件；配置一致时跳过写入。
 # 外部文件是唯一事实源：本函数只落盘，绝不操作运行中的容器。
 write_worker_env() {
   local staging_env cpu_slots_value
@@ -51,10 +50,41 @@ write_worker_env() {
   # 配置与现网一致时不做覆盖，避免无谓写盘。
   if [[ -f "$ENV_FILE" ]] && cmp -s "$staging_env" "$ENV_FILE"; then
     rm -f "$staging_env"
-    return 1
+    return 0
   fi
   mv -f "$staging_env" "$ENV_FILE"
   return 0
+}
+
+# 检查现有容器是否由当前外部配置方案创建；Docker start/restart 不会重新读取
+# --env-file、挂载或 GPU DeviceRequests，因此旧容器必须先执行部署代码重建。
+validate_worker_container_compatibility() {
+  local command mounts device_requests
+  command="$(docker inspect --format '{{json .Config.Cmd}}' "$CONTAINER")" || {
+    printf '无法读取 worker 容器启动命令，请先执行部署代码重建容器。\n' >&2
+    return 1
+  }
+  mounts="$(docker inspect --format '{{range .Mounts}}{{.Source}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}' "$CONTAINER")" || {
+    printf '无法读取 worker 容器挂载配置，请先执行部署代码重建容器。\n' >&2
+    return 1
+  }
+  if [[ "$command" != *worker-entrypoint.sh* ]] ||
+    [[ "$mounts" != *"${CONFIG_DIR}|/app/config|false"* ]]; then
+    printf '当前 worker 容器不支持外部配置文件，请先点击“部署代码”重建容器。\n' >&2
+    return 1
+  fi
+  device_requests="$(docker inspect --format '{{json .HostConfig.DeviceRequests}}' "$CONTAINER")" || {
+    printf '无法读取 worker 容器 GPU 配置，请先执行部署代码重建容器。\n' >&2
+    return 1
+  }
+  if [[ "$MODE" == gpu && "$device_requests" != *gpu* ]]; then
+    printf '当前 worker 容器未启用 GPU，计算类型已改为 GPU；请先点击“部署代码”重建容器。\n' >&2
+    return 1
+  fi
+  if [[ "$MODE" == cpu && "$device_requests" == *gpu* ]]; then
+    printf '当前 worker 容器仍启用 GPU，计算类型已改为 CPU；请先点击“部署代码”重建容器。\n' >&2
+    return 1
+  fi
 }
 
 # 输出目标机刚写入的安全配置摘要；秘密只显示是否已配置。
@@ -89,7 +119,7 @@ show_worker_config() {
   printf 'WORKER_MACHINE_ID=%s\n' "$MTP_MACHINE_ID"
   printf 'WORKER_CPU_SLOTS=%s\n' "$cpu_slots_value"
   printf 'REDIS_TARGET=%s\n' "$(redis_target "$MTP_REDIS_URL")"
-  printf 'REDIS_PASSWORD=%s\n' "$(secret_state "$MTP_REDIS_PASSWORD")"
+  printf 'REDIS_PASSWORD=%s\n' "$(secret_state "${MTP_REDIS_PASSWORD:-}")"
   printf 'S3_ENDPOINT=%s\n' "$MTP_S3_ENDPOINT"
   printf 'S3_BUCKET=%s\n' "$MTP_S3_BUCKET"
   printf 'S3_SECURE=%s\n' "$MTP_S3_SECURE"
@@ -187,8 +217,8 @@ install_worker() {
   if [[ -n "${APP_STAGING_DIR:-}" ]]; then
     activate_worker_app
   fi
-  # 安装必须无条件写配置（返回 1 仅表示与现网一致，不影响后续启动）。
-  write_worker_env || true
+  # 安装必须无条件写配置；配置一致时函数会跳过无谓覆盖。
+  write_worker_env
   run_worker_container "$MTP_WORKER_IMAGE"
   printf 'worker 已安装并启动：%s\n' "$CONTAINER"
   show_worker_startup
@@ -272,7 +302,7 @@ deploy_worker() {
 # 更新配置：只覆盖目标机 worker 环境文件，不重建、不重启运行中的容器。
 # 新配置在容器下次启动/重启时由入口脚本读取外部 .env 自动生效。
 update_worker_config() {
-  write_worker_env || true
+  write_worker_env
   printf 'worker 配置已更新，将在下次启动/重启时生效：%s\n' "$CONTAINER"
   show_worker_config
 }
@@ -288,7 +318,8 @@ manage_worker() {
   case "$ACTION" in
     start|restart)
       # 先把平台最新配置落到外部 .env（安全网），容器启动时自动读取生效。
-      write_worker_env || true
+      validate_worker_container_compatibility
+      write_worker_env
       if [[ "$ACTION" == "restart" ]]; then
         docker restart --time 45 "$CONTAINER"
       else

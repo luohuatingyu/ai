@@ -415,7 +415,8 @@ def test_remote_operation_logs_can_be_cleared_without_changing_state(client):
 
 def test_remote_operation_log_clear_returns_404_for_missing_operation(client):
     """不存在的远程操作不得创建记录或返回清除成功。"""
-    response = client.delete(f"/api/remote-operations/{'b' * 32}/logs")
+    # 使用与其它操作用例不同的 ID，避免跨模块共享协调存储时误命中已取消操作。
+    response = client.delete(f"/api/remote-operations/{'9' * 32}/logs")
 
     assert response.status_code == 404
 
@@ -1418,7 +1419,7 @@ def test_training_page_resource_retry_and_chart_style_contract():
     assert "grid-column: 1 / -1" in css
     assert ".training-page #llmFields > .formgrid" in css
     assert "repeat(auto-fit, minmax(min(100%, 210px), 1fr))" in css
-    assert 'href="/app.css?v=20261025-2"' in html
+    assert 'href="/app.css?v=20261029-1"' in html
 
 
 def test_remote_server_feedback_toasts_render_above_add_modal():
@@ -1524,7 +1525,7 @@ def test_remote_server_rejects_invalid_repository_sources():
 
 
 def test_remote_server_card_filters_lifecycle_actions_by_presence():
-    """在线卡片隐藏启动和重启，离线卡片隐藏停止；未部署时不显示生命周期操作。"""
+    """在线卡片提供停止/重启，离线卡片提供启动/重启；未部署时不显示生命周期操作。"""
     backend_dir = Path(__file__).resolve().parents[1]
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
@@ -1539,9 +1540,9 @@ def test_remote_server_card_filters_lifecycle_actions_by_presence():
     lifecycle_controls = card_renderer.split("const lifecycleControls", 1)[1].split(
         "const serverControls", 1
     )[0]
-    assert "? `<button data-remote-machine-id=\"${esc(machineId)}\" data-remote-action=\"stop\"" in lifecycle_controls
-    assert ': `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="start"' in lifecycle_controls
+    assert '? `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop"' in lifecycle_controls
     assert 'data-remote-action="restart"' in lifecycle_controls
+    assert ': `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="start"' in lifecycle_controls
 
 
 def test_remote_server_cards_expose_interrupt_action_for_active_operations():

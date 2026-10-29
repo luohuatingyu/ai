@@ -334,6 +334,41 @@ def test_worker_heartbeat_probe_reports_present_and_missing_slots(monkeypatch):
     assert any("未收到资源心跳" in message for _phase, message in emitted)
 
 
+def test_worker_heartbeat_probe_ignores_preexisting_worker_generation(monkeypatch):
+    """只有启动时间晚于操作前基线的 worker 才能确认本次重启已生效。"""
+    operation_id = "a" * 32
+    manager.lease.clear_remote_operation_cancel(operation_id)
+    monkeypatch.setattr(remote_workers, "_WORKER_STARTUP_HEARTBEAT_TIMEOUT", 0.0)
+    worker = {
+        "worker_id": "remote-a-cpu0",
+        "machine_id": "remote-a",
+        "active": True,
+        "started_at": 10.0,
+    }
+    monkeypatch.setattr(manager.lease, "list_workers", lambda: [worker])
+    assert remote_workers._wait_for_remote_worker_heartbeat(
+        operation_id,
+        "remote-a",
+        lambda *_args: None,
+        baseline={"remote-a-cpu0": {"started_at": 10.0, "last_seen": 11.0}},
+    ) is False
+
+
+def test_remote_worker_generation_snapshot_reads_start_time(monkeypatch):
+    """心跳基线按机器过滤并保存 worker 启动时间。"""
+    monkeypatch.setattr(
+        manager.lease,
+        "list_workers",
+        lambda: [
+            {"worker_id": "w1", "machine_id": "m1", "started_at": 10, "last_seen": 11},
+            {"worker_id": "w2", "machine_id": "m2", "started_at": 20, "last_seen": 21},
+        ],
+    )
+    assert remote_workers._remote_worker_generation_snapshot("m1") == {
+        "w1": {"started_at": 10.0, "last_seen": 11.0}
+    }
+
+
 def test_run_remote_install_records_stages_and_worker_heartbeat(tmp_path, monkeypatch):
     """远程安装日志记录目标架构、目标机构建、worker 启动和首次资源心跳。"""
     _remote_config(tmp_path, monkeypatch)
@@ -2382,7 +2417,7 @@ def test_remote_bootstrap_script_config_overwrites_env_without_touching_containe
 
 
 def _run_bootstrap_action(
-    tmp_path: Path, action: str, env_text: str, stub_script: str
+    tmp_path: Path, action: str, env_text: str, stub_script: str, mode: str = "cpu"
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     """在隔离 HOME 与 docker 替身下运行 remote_worker.sh 生命周期动作。"""
     bin_dir = tmp_path / "bin"
@@ -2403,7 +2438,7 @@ def _run_bootstrap_action(
         "DOCKER_LOG": str(docker_log),
         "MTP_ACTION": action,
         "MTP_MACHINE_ID": "remote-config",
-        "MTP_MODE": "cpu",
+        "MTP_MODE": mode,
         "MTP_CPU_SLOTS": "4",
         "MTP_WORKER_IMAGE": "registry.example.net/ml/worker:unit",
         "MTP_REDIS_URL": "rediss://redis.example.net:6380/0",
@@ -2440,7 +2475,7 @@ _RUNNING_STUB = (
     "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-config\" ]]; then exit 0; fi\n"
     "if [[ \"$1\" == inspect && \"$2\" == \"mtp-worker-remote-config-previous\" ]]; then exit 1; fi\n"
     "if [[ \"$1\" == inspect && \"$2\" == --format ]]; then\n"
-    "  if [[ \"$3\" == \"{{.Image}}\" ]]; then printf 'sha256:existing-image\\n'; elif [[ \"$3\" == \"{{.State.Status}}\" ]]; then printf 'running\\n'; else printf 'state=running restart_count=0 exit_code=0 error=\\n'; fi\n"
+    "  if [[ \"$3\" == \"{{.Image}}\" ]]; then printf 'sha256:existing-image\\n'; elif [[ \"$3\" == \"{{.State.Status}}\" ]]; then printf 'running\\n'; elif [[ \"$3\" == *'.Config.Cmd'* ]]; then printf '[\\\"bash\\\",\\\"/app/app/worker-entrypoint.sh\\\"]\\n'; elif [[ \"$3\" == *'.Mounts'* ]]; then printf '%s\\n' \"$HOME/.config/mtp-worker|/app/config|false\"; elif [[ \"$3\" == *'.HostConfig.DeviceRequests'* ]]; then printf '[]\\n'; else printf 'state=running restart_count=0 exit_code=0 error=\\n'; fi\n"
     "  exit 0\n"
     "fi\n"
     "if [[ \"$1\" == logs ]]; then printf 'worker startup diagnostic\\n'; exit 0; fi\n"
@@ -2780,3 +2815,105 @@ def test_worker_entrypoint_loads_env_file_and_execs_worker(tmp_path: Path):
     assert "WORKER_CPU_SLOTS=2" in captured
     assert "SPACED_VALUE=has spaces here" in captured
     assert "EMPTY_VALUE=" in captured
+
+
+def test_worker_entrypoint_clears_removed_values_and_rejects_missing_file(tmp_path: Path):
+    """入口脚本清除已从配置删除的旧变量，并拒绝静默使用缺失配置启动。"""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    captured_env = tmp_path / "captured.env"
+    python_stub = bin_dir / "python"
+    python_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "env | sort > \"$CAPTURED_ENV\"\n",
+        encoding="utf-8",
+    )
+    python_stub.chmod(0o755)
+    env_file = tmp_path / "worker.env"
+    env_file.write_text("REDIS_URL=redis://new.example:6379/0\n", encoding="utf-8")
+    entrypoint = Path(remote_workers.__file__).with_name("worker-entrypoint.sh")
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+        "CAPTURED_ENV": str(captured_env),
+        "REDIS_PASSWORD": "old-password",
+        "WORKER_CPU_SLOTS": "99",
+    })
+    result = subprocess.run(
+        ["bash", str(entrypoint), str(env_file)], text=True, capture_output=True, env=env
+    )
+    assert result.returncode == 0, result.stderr
+    captured = captured_env.read_text(encoding="utf-8")
+    assert "REDIS_PASSWORD=" not in captured
+    assert "WORKER_CPU_SLOTS=" not in captured
+
+    result = subprocess.run(
+        ["bash", str(entrypoint), str(tmp_path / "missing.env")],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert result.returncode == 78
+    assert "不存在或不可读" in result.stderr
+
+
+def test_remote_bootstrap_script_reports_config_write_failure(tmp_path: Path):
+    """配置文件无法写入时脚本失败且不报告成功。"""
+    home = tmp_path / "home"
+    home.mkdir()
+    home.chmod(0o500)
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(home),
+        "MTP_ACTION": "config",
+        "MTP_MACHINE_ID": "permission-failure",
+        "MTP_MODE": "cpu",
+        "MTP_CPU_SLOTS": "2",
+        "MTP_REDIS_URL": "redis://redis.example:6379/0",
+        "MTP_S3_ENDPOINT": "storage.example:9000",
+        "MTP_S3_ACCESS_KEY": "access",
+        "MTP_S3_SECRET_KEY": "secret",
+        "MTP_S3_BUCKET": "bucket",
+        "MTP_S3_SECURE": "false",
+    })
+    script = Path(remote_workers.__file__).with_name("remote_worker.sh")
+    try:
+        result = subprocess.run(
+            ["bash", str(script)], text=True, capture_output=True, env=env,
+            user=65534, group=65534,
+        )
+    finally:
+        home.chmod(0o700)
+    assert result.returncode != 0
+    assert "worker 配置已更新" not in result.stdout
+
+
+def test_remote_bootstrap_script_rejects_legacy_container_on_restart(tmp_path: Path):
+    """旧容器没有入口脚本或外部配置挂载时，重启提示先部署代码。"""
+    legacy_stub = _RUNNING_STUB.replace(
+        "printf '[\\\"bash\\\",\\\"/app/app/worker-entrypoint.sh\\\"]\\n'",
+        "printf '[\\\"python\\\",\\\"-m\\\",\\\"app.worker\\\"]\\n'",
+    ).replace(
+        "printf '%s\\n' \"$HOME/.config/mtp-worker|/app/config|false\";",
+        "printf '%s\\n' \"$HOME/.config/mtp-worker/data|/app/data|false\";",
+    )
+    result, docker_log, _env_file = _run_bootstrap_action(
+        tmp_path, "restart", _CURRENT_WORKER_ENV, legacy_stub
+    )
+    assert result.returncode != 0
+    assert "先点击“部署代码”" in result.stderr
+    assert not docker_log.exists()
+
+
+def test_remote_bootstrap_script_rejects_gpu_mode_change_on_restart(tmp_path: Path):
+    """CPU 容器切换 GPU 只更新配置不足以授权设备，需先重建容器。"""
+    result, docker_log, _env_file = _run_bootstrap_action(
+        tmp_path,
+        "restart",
+        _CURRENT_WORKER_ENV,
+        _RUNNING_STUB,
+        mode="gpu",
+    )
+    assert result.returncode != 0
+    assert "未启用 GPU" in result.stderr
+    assert not docker_log.exists()

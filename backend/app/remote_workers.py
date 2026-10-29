@@ -1493,12 +1493,41 @@ def _stream_worker_image_to_remote(
             writer.join(timeout=5)
 
 
+def _remote_worker_generation_snapshot(machine_id: str) -> Dict[str, Dict[str, float | None]]:
+    """记录操作前的 worker 启动代次，避免把旧心跳误判为本次启动成功。"""
+    try:
+        workers = manager.lease.list_workers()
+    except Exception:
+        return {}
+    snapshot: Dict[str, Dict[str, float | None]] = {}
+    for item in workers:
+        if str(item.get("machine_id", "")) != machine_id:
+            continue
+        worker_id = str(item.get("worker_id", ""))
+        if not worker_id:
+            continue
+        try:
+            started_at = float(item["started_at"]) if item.get("started_at") is not None else None
+        except (TypeError, ValueError):
+            started_at = None
+        try:
+            last_seen = float(item["last_seen"]) if item.get("last_seen") is not None else None
+        except (TypeError, ValueError):
+            last_seen = None
+        # 旧 worker 记录可能没有启动代次；不把这种记录放入基线，避免阻断
+        # 兼容旧 worker 的首次部署心跳确认。
+        if started_at is not None:
+            snapshot[worker_id] = {"started_at": started_at, "last_seen": last_seen}
+    return snapshot
+
+
 def _wait_for_remote_worker_heartbeat(
     operation_id: str,
     machine_id: str,
     progress_callback: Callable[[str, str], None],
+    baseline: Dict[str, Dict[str, float | None]] | None = None,
 ) -> bool:
-    """短暂等待远程 worker 注册，返回是否收到资源心跳供操作结果诊断。"""
+    """等待新 worker 代次注册，避免把操作前的旧心跳误判为成功。"""
     timeout_seconds = int(_WORKER_STARTUP_HEARTBEAT_TIMEOUT)
     _emit_progress(
         progress_callback,
@@ -1522,6 +1551,30 @@ def _wait_for_remote_worker_heartbeat(
             item for item in workers
             if str(item.get("machine_id", "")) == machine_id and item.get("active")
         ]
+        if baseline:
+            fresh_matches = []
+            for item in matches:
+                worker_id = str(item.get("worker_id", ""))
+                previous = baseline.get(worker_id)
+                if previous is None:
+                    fresh_matches.append(item)
+                    continue
+                try:
+                    current_started_at = (
+                        float(item["started_at"])
+                        if item.get("started_at") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    current_started_at = None
+                previous_started_at = previous.get("started_at")
+                if (
+                    current_started_at is not None
+                    and previous_started_at is not None
+                    and current_started_at > previous_started_at
+                ):
+                    fresh_matches.append(item)
+            matches = fresh_matches
         if matches:
             worker_ids = ", ".join(str(item.get("worker_id", "未知槽位")) for item in matches)
             _emit_progress(
@@ -1805,6 +1858,14 @@ def run_remote_action(
     ssh_path = shutil.which("ssh")
     if not ssh_path:
         raise RemoteWorkerError("平台后端容器未安装 OpenSSH 客户端")
+    heartbeat_baseline = None
+    if operation_id and action in {
+        "install", "deploy", "update", "start", "restart"
+    }:
+        # 必须在 SSH 操作前采样；否则重启已完成后再采样会把新代次当成旧基线。
+        heartbeat_baseline = _remote_worker_generation_snapshot(
+            str(server.get("machine_id", ""))
+        )
     try:
         Path(config.WORKER_SSH_KNOWN_HOSTS_PATH).parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1977,11 +2038,14 @@ def run_remote_action(
     if operation_id and action in {
         "install", "deploy", "update", "start", "restart"
     }:
-        heartbeat_ok = _wait_for_remote_worker_heartbeat(
-            operation_id,
-            str(server.get("machine_id", "")),
-            progress_callback or report,
-        )
+        machine_id = str(server.get("machine_id", ""))
+        wait_args = (operation_id, machine_id, progress_callback or report)
+        if heartbeat_baseline:
+            heartbeat_ok = _wait_for_remote_worker_heartbeat(
+                *wait_args, baseline=heartbeat_baseline
+            )
+        else:
+            heartbeat_ok = _wait_for_remote_worker_heartbeat(*wait_args)
     output["heartbeat_ok"] = heartbeat_ok
     return output
 

@@ -1568,7 +1568,8 @@ function workerServerCard(machineId, slots, remoteServer = null) {
   const phaseElapsed = operation && operation.phase_started_at
     ? Math.max(0, Math.floor(Date.now() / 1000 - Number(operation.phase_started_at))) : null;
   const lifecycleControls = !deployed ? "" : online
-    ? `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop" ${operationBusy ? "disabled" : ""}>停止</button>`
+    ? `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop" ${operationBusy ? "disabled" : ""}>停止</button>
+      <button data-remote-machine-id="${esc(machineId)}" data-remote-action="restart" ${operationBusy ? "disabled" : ""}>重启</button>`
     : `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="start" ${operationBusy ? "disabled" : ""}>启动</button>
       <button data-remote-machine-id="${esc(machineId)}" data-remote-action="restart" ${operationBusy ? "disabled" : ""}>重启</button>`;
   const serverControls = remoteServer ? `<div class="server-controls" aria-label="远程 worker 控制">
@@ -1938,7 +1939,7 @@ async function submitRemoteServer(event) {
       headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     toast(editingMachineId
-      ? result.operation_id ? "配置已保存，正在更新并应用服务器配置" : "配置已保存；服务器部署后才会写入远程配置"
+      ? result.operation_id ? "配置已保存并写入远端；请点击“重启”后生效" : "配置已保存；服务器部署后才会写入远程配置"
       : "服务器配置已登记；请在服务器卡片上点击“部署”", "ok");
     closeAddServerModal();
     await refreshWorkers();
