@@ -21,6 +21,7 @@ from app.storage import (
     parse_checkpoint_epoch,
     prune_checkpoints,
     resolve_dataset_csv_local,
+    resolve_dataset_for_worker,
     sync_dataset_to_store,
 )
 
@@ -129,6 +130,103 @@ def test_dataset_sync_propagates_remote_failure(monkeypatch, tmp_path):
 
     with pytest.raises(ArtifactStoreUnavailableError, match="暂时不可用"):
         sync_dataset_to_store("ds-remote-failure", csv)
+
+
+def test_worker_resolve_auto_migrates_local_legacy_dataset(monkeypatch, tmp_path):
+    """对象缺失但节点有本地副本时，worker 自动补同步并下载数据集。"""
+    class RecoveringRemoteStore:
+        def __init__(self):
+            """初始化一个记录上传对象的内存状态平面替身。"""
+            self.objects = {}
+
+        def exists(self, key):
+            """返回对象是否已经上传。"""
+            return key in self.objects
+
+        def write_file(self, key, local_path):
+            """记录本地文件上传内容。"""
+            self.objects[key] = local_path.read_bytes()
+
+        def read_file(self, key, local_path):
+            """把已上传对象下载到 worker scratch。"""
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(self.objects[key])
+            return local_path
+
+    ds_id = "ds-local-recovery"
+    local_csv = config.DATASETS_DIR / "processed" / f"{ds_id}.csv"
+    local_csv.parent.mkdir(parents=True, exist_ok=True)
+    local_csv.write_text("feature,target\n1,0\n", encoding="utf-8")
+    remote = RecoveringRemoteStore()
+    monkeypatch.setattr("app.storage.get_store", lambda: remote)
+
+    pulled = resolve_dataset_for_worker(ds_id, tmp_path)
+
+    assert pulled.read_text(encoding="utf-8") == "feature,target\n1,0\n"
+    assert remote.objects[f"datasets/{ds_id}.csv"] == local_csv.read_bytes()
+
+
+def test_worker_resolve_uses_existing_remote_dataset(monkeypatch, tmp_path):
+    """对象存储已有数据集时直接下载，不重复读取或上传本地副本。"""
+    ds_id = "ds-remote-existing"
+    key = f"datasets/{ds_id}.csv"
+
+    class ExistingRemoteStore:
+        def exists(self, object_key):
+            """只报告预置对象存在。"""
+            return object_key == key
+
+        def write_file(self, object_key, local_path):
+            """已有远端对象不应触发上传。"""
+            raise AssertionError(f"不应上传已有对象: {object_key}")
+
+        def read_file(self, object_key, local_path):
+            """写出预置对象内容。"""
+            assert object_key == key
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_text("feature,target\n2,1\n", encoding="utf-8")
+            return local_path
+
+    monkeypatch.setattr("app.storage.get_store", lambda: ExistingRemoteStore())
+
+    pulled = resolve_dataset_for_worker(ds_id, tmp_path)
+
+    assert pulled.read_text(encoding="utf-8") == "feature,target\n2,1\n"
+
+
+def test_worker_resolve_keeps_migration_error_when_dataset_is_missing(
+    monkeypatch, tmp_path
+):
+    """对象存储和本地目录均无数据集时，继续给出迁移提示。"""
+    class MissingRemoteStore:
+        def exists(self, key):
+            """报告对象缺失。"""
+            return False
+
+    monkeypatch.setattr("app.storage.get_store", lambda: MissingRemoteStore())
+
+    with pytest.raises(FileNotFoundError, match="请先运行迁移脚本"):
+        resolve_dataset_for_worker("ds-missing-recovery", tmp_path)
+
+
+def test_worker_resolve_propagates_auto_migration_failure(monkeypatch, tmp_path):
+    """自动补同步遇到对象存储故障时，必须保留基础设施异常。"""
+    class FailingRemoteStore:
+        def exists(self, key):
+            """报告对象缺失以触发自动补同步。"""
+            return False
+
+        def write_file(self, key, local_path):
+            """模拟状态平面上传故障。"""
+            raise ArtifactStoreUnavailableError("对象存储暂时不可用")
+
+    ds_id = "ds-failed-recovery"
+    local_csv = config.DATASETS_DIR / f"{ds_id}.csv"
+    local_csv.write_text("feature,target\n1,0\n", encoding="utf-8")
+    monkeypatch.setattr("app.storage.get_store", lambda: FailingRemoteStore())
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="暂时不可用"):
+        resolve_dataset_for_worker(ds_id, tmp_path)
 
 
 # ---------------------------------------------------------------------------

@@ -422,13 +422,23 @@ def resolve_dataset_csv_local(ds_id: str) -> Path:
 
 
 def resolve_dataset_for_worker(ds_id: str, scratch_dir: Path) -> Path:
-    """worker 视角解析数据集：本地布局直接用，对象存储则下载到 scratch。"""
+    """worker 视角解析数据集：本地布局直接用，对象存储则下载到 scratch。
+
+    对象存储中缺少历史数据时，若当前节点仍保留本地副本，先自动补同步，
+    这样升级到 S3 状态平面后无需为每个任务手工执行迁移脚本。远程节点没有
+    本地副本时仍保留明确的迁移提示。
+    """
     store = get_store()
     if isinstance(store, LocalArtifactStore):
         return resolve_dataset_csv_local(ds_id)
     key = f"datasets/{ds_id}.csv"
     if not store.exists(key):
-        raise FileNotFoundError(
-            f"数据集 {ds_id} 未同步到对象存储（请先运行迁移脚本 scripts/migrate_to_object_storage.py）"
-        )
+        # 旧数据可能只存在当前节点的挂载目录，首次使用时自动补到状态平面。
+        local_csv = resolve_dataset_csv_local(ds_id)
+        if local_csv.is_file():
+            sync_dataset_to_store(ds_id, local_csv)
+        else:
+            raise FileNotFoundError(
+                f"数据集 {ds_id} 未同步到对象存储（请先运行迁移脚本 scripts/migrate_to_object_storage.py）"
+            )
     return store.read_file(key, Path(scratch_dir) / f"{ds_id}.csv")
