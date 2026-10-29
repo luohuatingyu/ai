@@ -305,7 +305,7 @@
   <div class="brand">🏋️ 可视化模型训练平台<span class="sub">Docker · Python 3.12 · PyTorch GPU</span></div>
   <nav class="app-nav" aria-label="主导航">
     <a href="/" aria-current="page">训练工作台</a>
-    <a href="/dataset-manager.html">数据集管理</a>
+    <a id="btnUpload" href="/dataset-manager.html">数据集管理</a>
   </nav>
   <div id="deviceBadge" class="badge"><span class="dot"></span><span id="deviceText">检测训练设备中…</span></div>
 </header>
@@ -316,12 +316,12 @@
     <h2>① 数据集</h2>
     <div id="datasetLocalPanel">
       <div class="row">
-        <select id="datasetSelect"></select>
-        <button id="btnUpload">上传数据</button>
+        <select id="datasetSelect" aria-label="数据集" style="min-width:0;"></select>
+        <button id="btnPreview" type="button" disabled aria-controls="previewWrap previewMeta" aria-expanded="false" style="flex-shrink:0;white-space:nowrap;">预览数据</button>
       </div>
-      <input type="file" id="fileInput" accept=".csv,.json,.jsonl,.ndjson" hidden>
-      <div id="previewWrap"><div class="empty">选择或上传数据集后在此预览</div></div>
-      <div id="previewMeta" class="hint" style="margin-top:6px;"></div>
+      <div id="datasetEmptyHint" class="hint" hidden>暂无数据集，请前往“数据集管理”上传或导入。</div>
+      <div id="previewWrap" role="region" aria-label="数据预览" aria-live="polite" aria-busy="false" tabindex="0" style="overflow-x:auto;" hidden></div>
+      <div id="previewMeta" class="hint" style="margin-top:6px;" hidden></div>
     </div>
 
     <h2>② 训练配置</h2>
@@ -695,7 +695,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 const state = {
-  datasets: [], datasetId: null, preview: null,
+  datasets: [], datasetId: null, preview: null, previewOpen: false, previewError: false, previewRequest: 0,
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   charts: { loss: null, metric: null }, metricKind: null,
   workerSlots: [], detailRecord: null, retrySubmitting: false,
@@ -896,40 +896,76 @@ async function loadSystem() {
 }
 
 /* ---------- 数据集 ---------- */
-/** 按数据集列表渲染选择框；列表为空时清理预览并禁用选择。 */
+/** 收起并清空预览，使已发出的旧请求失效；列选项独立保留。 */
+function resetDatasetPreview() {
+  state.previewRequest++;
+  state.previewOpen = false;
+  state.previewError = false;
+  state.preview = null;
+  const wrap = $("previewWrap"), button = $("btnPreview");
+  wrap.hidden = true;
+  wrap.innerHTML = "";
+  wrap.setAttribute("aria-busy", "false");
+  $("previewMeta").hidden = true;
+  $("previewMeta").textContent = "";
+  button.disabled = !state.datasetId;
+  button.textContent = "预览数据";
+  button.setAttribute("aria-expanded", "false");
+  const selected = state.datasets.find((dataset) => dataset.id === state.datasetId);
+  button.title = selected?.source === "huggingface" && selected.cache_status !== "ready"
+    ? "首次预览将下载并缓存 Hub 数据集" : "查看所选数据集的前 5 行";
+  $("datasetEmptyHint").hidden = Boolean(state.datasetId);
+}
+
+/** 从列表元信息填充训练列，预览返回时保留仍有效的用户选择。 */
+function updateDatasetColumns(dataset, preserve = false) {
+  const columns = dataset?.columns || [];
+  const targetSel = $("targetSelect"), timeSel = $("timeColumnSelect");
+  const target = targetSel.value, time = timeSel.value;
+  targetSel.innerHTML = "";
+  timeSel.innerHTML = "";
+  for (const column of columns) {
+    for (const select of [targetSel, timeSel]) {
+      const option = document.createElement("option");
+      option.value = column;
+      option.textContent = column;
+      select.appendChild(option);
+    }
+  }
+  targetSel.value = preserve && columns.includes(target) ? target : columns[columns.length - 1] || "";
+  timeSel.value = preserve && columns.includes(time) && time !== targetSel.value
+    ? time : columns.find((column) => column !== targetSel.value) || "";
+  targetSel.onchange = updateStart;
+  timeSel.onchange = updateStart;
+}
+
+/** 列表只初始化选择与列信息，不请求数据行；空列表禁用预览入口。 */
 function renderDatasetSelect() {
   const sel = $("datasetSelect");
   sel.innerHTML = "";
   if (!state.datasets.length) {
     state.datasetId = null;
-    state.preview = null;
     sel.disabled = true;
-    sel.innerHTML = `<option value="">（暂无数据集，请上传 CSV）</option>`;
-    $("targetSelect").innerHTML = "";
-    $("timeColumnSelect").innerHTML = "";
-    $("previewWrap").innerHTML = `<div class="empty">暂无数据集，请上传 CSV 后预览</div>`;
-    $("previewMeta").hidden = true;
-    $("previewMeta").textContent = "";
+    sel.innerHTML = `<option value="">（暂无数据集）</option>`;
+    resetDatasetPreview();
+    updateDatasetColumns(null);
     updateStart();
     return;
   }
   sel.disabled = false;
-  for (const d of state.datasets) {
-    const opt = document.createElement("option");
-    opt.value = d.id;
-    opt.textContent = d.source === "huggingface" && d.cache_status !== "ready"
-      ? `${d.name}（Hub 远程引用）` : `${d.name}（${d.rows} 行 × ${d.columns.length} 列）`;
-    sel.appendChild(opt);
+  for (const dataset of state.datasets) {
+    const option = document.createElement("option");
+    option.value = dataset.id;
+    option.textContent = dataset.source === "huggingface" && dataset.cache_status !== "ready"
+      ? `${dataset.name}（Hub 远程引用）` : `${dataset.name}（${dataset.rows} 行 × ${dataset.columns.length} 列）`;
+    sel.appendChild(option);
   }
-  if (state.datasetId && state.datasets.some((d) => d.id === state.datasetId)) {
-    sel.value = state.datasetId;
-  } else {
-    state.datasetId = state.datasets[0].id;
-  }
+  if (!state.datasets.some((dataset) => dataset.id === state.datasetId)) state.datasetId = state.datasets[0].id;
+  sel.value = state.datasetId;
   sel.dispatchEvent(new Event("change"));
 }
 
-/** 读取数据集列表接口的 datasets 字段，并保留上传后的当前选择。 */
+/** 读取数据集列表，保留仍存在的当前选择。 */
 async function loadDatasets(keepId) {
   const response = await apiJson("/api/datasets");
   state.datasets = Array.isArray(response.datasets) ? response.datasets : [];
@@ -937,61 +973,46 @@ async function loadDatasets(keepId) {
   renderDatasetSelect();
 }
 
-/** 远程引用仅在用户明确预览时下载，自动加载列表只展示来源状态。 */
-async function loadPreview(materialize = false) {
-  const wrap = $("previewWrap"), metaBox = $("previewMeta");
-  const targetSel = $("targetSelect");
-  const timeColumnSel = $("timeColumnSelect");
-  targetSel.innerHTML = "";
-  timeColumnSel.innerHTML = "";
-  $("previewMeta").hidden = true;
-  metaBox.textContent = "";
-  if (!state.datasetId) { wrap.innerHTML = `<div class="empty">选择或上传数据集后在此预览</div>`; state.preview = null; updateStart(); return; }
-  const selectedId = state.datasetId;
-  const selected = state.datasets.find((dataset) => dataset.id === selectedId);
-  if (!materialize && selected?.source === "huggingface" && selected.cache_status !== "ready") {
-    state.preview = null;
-    wrap.innerHTML = `<div class="empty">Hub 远程引用：首次预览或训练时下载并缓存。<br><button type="button" id="downloadPreviewBtn">下载并预览</button></div>`;
-    $("downloadPreviewBtn").onclick = () => loadPreview(true);
-    updateStart();
-    return;
-  }
+/** 仅在明确点击预览时读取数据；请求序号避免切换或收起后的旧响应回写。 */
+async function loadPreview() {
+  if (!state.datasetId) return;
+  const selectedId = state.datasetId, request = ++state.previewRequest;
+  const wrap = $("previewWrap"), metaBox = $("previewMeta"), button = $("btnPreview");
+  state.previewOpen = true;
+  state.previewError = false;
   state.preview = null;
+  wrap.hidden = false;
+  wrap.setAttribute("aria-busy", "true");
   wrap.innerHTML = `<div class="empty">正在准备数据，请稍候…</div>`;
-  updateStart();
+  metaBox.hidden = true;
+  metaBox.textContent = "";
+  button.textContent = "收起预览";
+  button.setAttribute("aria-expanded", "true");
   try {
-    const d = await apiJson(`/api/datasets/${state.datasetId}`);
-    if (state.datasetId !== selectedId) return;
-    state.datasets = state.datasets.map((dataset) => dataset.id === selectedId ? d : dataset);
-    state.preview = d;
-    // 目标列下拉（默认最后一列）
-    for (const c of d.columns) {
-      const opt = document.createElement("option");
-      opt.value = c; opt.textContent = c;
-      targetSel.appendChild(opt);
-      const timeOpt = document.createElement("option");
-      timeOpt.value = c; timeOpt.textContent = c;
-      timeColumnSel.appendChild(timeOpt);
+    const data = await apiJson(`/api/datasets/${encodeURIComponent(selectedId)}`);
+    if (state.datasetId !== selectedId || state.previewRequest !== request || !state.previewOpen) return;
+    state.datasets = state.datasets.map((dataset) => dataset.id === selectedId ? data : dataset);
+    state.preview = data;
+    updateDatasetColumns(data, true);
+    // 列名和单元格均转义，缺失值显示为空，最多展示前五行。
+    let html = `<table class="preview-table"><thead><tr>${data.columns.map((column) => `<th scope="col">${esc(column)}</th>`).join("")}</tr></thead><tbody>`;
+    for (const row of (data.preview || []).slice(0, 5)) {
+      html += `<tr>${data.columns.map((column) => `<td>${esc(row[column] ?? "")}</td>`).join("")}</tr>`;
     }
-    targetSel.value = d.columns[d.columns.length - 1];
-    timeColumnSel.value = d.columns.find((column) => column !== targetSel.value) || "";
-    targetSel.onchange = updateStart;
-    timeColumnSel.onchange = updateStart;
-    // 预览表
-    let html = `<table class="preview-table"><tr>${d.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>`;
-    for (const row of (d.preview || []).slice(0, 5)) {
-      html += `<tr>${d.columns.map((c) => `<td>${esc(row[c] ?? "")}</td>`).join("")}</tr>`;
-    }
-    html += "</table>";
-    wrap.innerHTML = html;
+    wrap.innerHTML = html + "</tbody></table>";
     metaBox.hidden = false;
-    metaBox.textContent = `${d.rows} 行 · ${d.columns.length} 列 · 仅展示前 5 行`;
-  } catch (e) {
-    if (state.datasetId !== selectedId) return;
-    wrap.innerHTML = `<div class="empty">预览失败：${esc(e.message)}</div>`;
-    state.preview = null;
+    metaBox.textContent = `${data.rows} 行 · ${data.columns.length} 列 · 仅展示前 5 行`;
+  } catch (error) {
+    if (state.datasetId !== selectedId || state.previewRequest !== request || !state.previewOpen) return;
+    state.previewError = true;
+    wrap.innerHTML = `<div class="empty">预览失败：${esc(error.message)}，请点击“重试预览”。</div>`;
+    button.textContent = "重试预览";
+  } finally {
+    if (state.datasetId === selectedId && state.previewRequest === request && state.previewOpen) {
+      wrap.setAttribute("aria-busy", "false");
+      updateStart();
+    }
   }
-  updateStart();
 }
 
 function updateStart() {
@@ -1112,22 +1133,17 @@ function updateTaskFields() {
 }
 
 /* 上传 */
-$("btnUpload").onclick = () => $("fileInput").click();
-$("fileInput").onchange = async () => {
-  const f = $("fileInput").files[0];
-  if (!f) return;
-  const fd = new FormData();
-  fd.append("file", f);
-  toast("正在上传 " + f.name + " …");
-  try {
-    const meta = await apiJson("/api/datasets", { method: "POST", body: fd });
-    toast("数据集已上传: " + meta.name, "ok");
-    $("fileInput").value = "";
-    await loadDatasets(meta.id);
-  } catch (e) { toast("上传失败: " + e.message, "err"); }
+// 上传统一由数据集管理页提供；此处只绑定按需预览与数据集切换。
+$("btnPreview").onclick = () => {
+  if (state.previewOpen && !state.previewError) resetDatasetPreview();
+  else return loadPreview();
 };
-
-$("datasetSelect").onchange = (e) => { state.datasetId = e.target.value; loadPreview(); };
+$("datasetSelect").onchange = (event) => {
+  state.datasetId = event.target.value || null;
+  resetDatasetPreview();
+  updateDatasetColumns(state.datasets.find((dataset) => dataset.id === state.datasetId));
+  updateStart();
+};
 
 /* ---------- 训练任务 ---------- */
 const taskSelect = $("taskSelect");
