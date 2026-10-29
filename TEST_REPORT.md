@@ -1,3 +1,77 @@
+## 远程服务器配置不生效专项检查（2026-10-29，缺陷待修复）
+
+**检查版本**：`82e9cc5bbdd33eee498ac5f4d25c2bf315dda051`（Pass apt/pip mirror build args to local compose build）。
+**分支**：`emdash/hot-boxes-clean-y9u6p`。
+**检查范围**：README 的远程服务器配置约定、页面提交和按钮渲染、配置仓储、SSH 脚本、worker 入口、心跳验收，以及本机运行的 trainer 与工作区版本一致性。本次仅检查并记录结果，未修改业务代码、运行配置或远程服务器，也未重启运行服务。
+**基准说明**：下文既有完整测试验收基准 `83472ed` 保留。本节不是新版本验收通过记录，不能用本次定向检查替代完整回归。
+
+### 实际运行环境检查
+
+- 当前 trainer 为 Python 3.12.15。对比 `docker compose config --format json` 与运行容器的环境，REDIS_URL、REDIS_PASSWORD、WORKER_REMOTE_REDIS_URL、WORKER_REMOTE_REDIS_PASSWORD、S3_ENDPOINT、WORKER_REMOTE_S3_ENDPOINT、S3_BUCKET、S3_SECURE、WORKER_REMOTE_IMAGE、USE_DATABASE 均一致；只输出比较结果，没有输出密钥值。
+- 当前 trainer 中 `remote_worker.sh`、`worker-entrypoint.sh` 与工作区一致，但 `remote_workers.py` 不一致。进一步读取运行容器源码，确认没有 `_remote_build_args`，请求模型没有 `docker_registry` 字段，更新路由也没有仓库源字段处理。**如果更新的是 Docker/pip/apt 源，当前运行后端尚不支持这些字段，Pydantic 默认忽略额外输入，页面提交不能使其生效。** 需要让运行服务使用已实现这些字段的代码；本次没有执行重建。
+- 对本机 `http://127.0.0.1:8000` 读取服务器和资源状态：仅登记一台 `Linux`，CPU 槽配置为 1，`deployed=false`、`status=error`，最近操作为 `install/failed`，该机器没有活跃计算槽。不能据此认定用户所指的在线服务器就是本机这条记录；也不能在日志错误字段为空时推断安装失败原因。
+
+### 已发现的问题和证据
+
+| 编号 | 问题与触发条件 | 证据、实际影响 | 验证方式 |
+|---|---|---|---|
+| C1 | 在线服务器无法直接重启应用配置 | `backend/static/index.html:1570` 的在线分支只渲染停止按钮。执行原始 `workerServerCard` 函数，在线动作是 `deploy,stop`，离线才是 `deploy,start,restart`。配置操作只写文件，在线 worker 仍使用旧配置；保存提示却写“正在更新并应用服务器配置” | Node 执行实际卡片渲染函数，覆盖在线/离线分支 |
+| C2 | 旧版本容器重启后仍用旧配置 | 提交 `83472ed` 才引入外部配置目录挂载和入口命令。当前 `remote_worker.sh:283` 的 start/restart 仅写文件并调用 Docker start/restart，不检测或迁移旧容器的 Cmd/Mounts；这些创建参数不会因 restart 改变。旧容器仍直接执行 `python -m app.worker`，读取创建时固定的环境 | 当前源码与 `git show 83472ed` 对照；未在真实旧 SSH 容器验证 |
+| C3 | 文件写入失败仍报告配置更新成功 | `write_worker_env` 由 `write_worker_env || true` 调用，函数内部命令不受预期的 errexit 保护，且最后无条件 return 0。以无权限用户运行原始 config 脚本，stderr 出现 Permission denied，但退出码仍为 0、stdout 仍报告“worker 配置已更新” | Python 3.12 隔离容器以 UID/GID 65534 运行原始 Bash 脚本，真实触发文件权限失败 |
+| C4 | 删除密码或缺失配置文件时仍使用旧环境 | 写配置时空 REDIS_PASSWORD 被省略，入口只 export 文件中存在的键，不清理容器固化的旧变量。继承模拟旧密码、加载不含密码的新文件后仍有旧密码。文件缺失时入口也会直接启动 worker，保留全部旧环境 | 执行原始 worker-entrypoint.sh；仅用 python 可执行替身捕获启动环境。密码删除、文件缺失两例均复现 |
+| C5 | 旧心跳被当作本次重启成功 | `_wait_for_remote_worker_heartbeat` 只检查 machine_id 和 active，不检查启动代次。向真实 EmbeddedLeaseStore 登记一个旧 worker，未启动新 worker，函数即返回 True；因此“操作完成/在线”不能证明新配置已加载 | 调用原始等待函数及内存协调存储，未模拟核心判断逻辑 |
+| C6 | CPU/GPU 切换仅更新环境和重启不足以生效 | `--gpus all` 仅在创建容器时设置；start/restart 不重新配置 DeviceRequests。CPU 改 GPU 时文件中的 CPU 槽会变成 0，但旧容器仍没有 GPU 授权；反向切换也不会移除原 GPU 访问 | API 允许修改 mode、脚本创建与重启分支代码审查；真实 GPU 未验证 |
+
+**需区分的预期行为**：README 明确规定“更新配置”不立即重启运行中的 worker，因此仅保存后暂时看不到运行变化本身符合约定；“生效配置”接口显示的是平台解析的待下发值，不是从运行中的 worker 读取的结果。平台项目 `.env` 由 Compose 注入，Python config 在进程导入时读取，编辑该文件不会自动刷新已有 trainer 容器。已部署服务器的 Docker/pip/apt 源只在首次镜像构建路径使用，“部署代码”复用既有镜像，不重新安装依赖。
+
+### 实际执行的测试和结果
+
+隔离镜像：`sha256:b8b22036d0d888f513973a6c7618f535fc1631467b6da05b85b285c655dea2b2`，Python 3.12.15。仓库只读挂载，网络关闭，测试数据在一次性容器内，与运行平台的数据和协调存储隔离。
+
+```bash
+docker run --rm --network none \
+  --mount type=bind,src=/Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p,dst=/workspace,readonly \
+  --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 \
+  sha256:b8b22036d0d888f513973a6c7618f535fc1631467b6da05b85b285c655dea2b2 \
+  python -m pytest tests/test_remote_workers.py tests/test_api.py tests/test_remote_config_repository.py \
+  -q -p no:cacheprovider --basetemp=/tmp/mtp-config-audit-tests
+```
+
+- 总计 **153 项：151 通过（98.69%）、2 失败、0 错误、0 跳过**；有 1 条 SQLAlchemy 既有弃用警告。
+- `test_remote_operation_log_clear_returns_404_for_missing_operation`：期望 404，实际 200。与远程 worker 测试组合执行时，固定操作 ID `b * 32` 留在共享 manager 中。相同镜像和隔离参数下，单独执行 `python -m pytest tests/test_api.py::test_remote_operation_log_clear_returns_404_for_missing_operation -q -p no:cacheprovider --basetemp=/tmp/mtp-config-audit-isolation`，**1 通过**。这是本次发现的测试隔离问题，未修改测试或业务逻辑。
+- `test_training_page_resource_retry_and_chart_style_contract`：断言 CSS URL `20261025-2`，工作区现有改动使用 `20261029-1`。属于当前工作区样式改动与既有测试契约不一致，未擅自回退或修改相关文件。
+- Node stdin 验证：执行页面原有卡片渲染函数，确认 C1 的在线/离线动作差异。
+- Python 3.12 stdin 诊断：清除密码仍保留旧值、缺失文件仍启动、写入权限失败仍返回成功、旧心跳仍判定健康，共 **4 个缺陷场景成功复现**。这是观察到错误行为，不表示相应功能验收通过。
+- `git diff --check`、两个远程 shell 文件的 `bash -n` 检查通过。
+- 初次误用宿主机 `python3`（3.9.6）的检查：`tests/test_api.py -k 'remote_server_card_filters_lifecycle_actions_by_presence or remote_server_form_exposes_network_overrides_and_effective_config_action' -q` 为 2 通过；`tests/test_remote_workers.py -k 'config_overwrites_remote_config_without_code_archive or start_applies_config_change or restart_applies_config_change or config_keeps_stopped' -q` 因缺少 cryptography 收集报错。这次环境不符合 Python 3.12 要求，不作为验收依据，随后已改用上述 3.12 隔离测试。
+
+**未执行内容与限制**：未执行完整训练/预测测试套件、真实 SSH 目标机生命周期操作、真实 GPU 切换、真实旧容器升级和 Docker Compose 重建。本次没有代码实现，不应把检查结果描述为修复完成。现有测试大量断言 Docker 命令字符串，未证明进程最终读到的新配置；C1 的错误按钮行为还被现有测试明确固化。
+
+**临时文件清理**：新增诊断脚本通过 stdin 执行；诊断环境文件和可执行替身位于一次性容器 `/tmp/mtp-config-audit-*`，由 TemporaryDirectory 清理；pytest 临时目录随 `docker run --rm` 的容器删除，未提交运行时产物。
+
+### 建议修复方案与验收映射（尚未实施，待人工确认）
+
+1. `backend/static/index.html`：在线时提供重启入口；统一“配置已写入、待重启”的提示，明确配置摘要为平台期望值。
+2. `backend/app/remote_worker.sh`、`backend/app/worker-entrypoint.sh`：区分写入成功/无变化/失败；写入失败立即终止，保留原配置；明确写出空密码并清除受管理旧变量；配置文件缺失或不可读时拒绝静默使用旧环境。保留“保存不打断任务”的约定。
+3. 同一 shell 脚本：启动/重启前识别旧入口、缺少配置挂载或计算模式变化，返回明确“需部署代码重建容器”的错误。通过已有部署流程升级，避免静默承诺 restart 能改变容器创建参数；本方案不自动重建旧目标机。
+4. `backend/app/remote_workers.py`：记录操作前的 worker 启动信息，等待新启动代次注册，避免仅凭残留心跳判成功；对已停止容器保持停止的部署、CPU 槽为 0 等场景分别处理。复用现有 started_at 信息比较前后变化，避免依赖跨机器时钟一致。
+5. 在现有 `backend/tests/test_remote_workers.py`、`backend/tests/test_api.py` 中先建立失败回归用例，再实现修复；修复相关测试的固定 ID 污染，保留日志不存在应返回 404 的业务断言。README 更新操作时序、旧容器兼容和 CPU/GPU 变更要求，TEST_REPORT.md 单独提交结果。
+6. 验证后执行 `docker compose up --build -d`，确认运行服务使用新代码，包括已有的仓库源配置能力。重建涉及当前工作区既有 Dockerfile/样式改动，执行前确认工作区状态并保留他人改动；不改变 `.env`、Compose 配置、数据库结构或依赖。
+
+| 验收标准 | 测试层级与前置条件 | 输入 → 预期 | 场景 |
+|---|---|---|---|
+| 在线可重启，保存不宣称立即生效 | 页面函数/现有 API 测试；已部署服务器 | 在线、离线、未部署、操作进行中 → 正确按钮、禁用状态和提示 | 正常、边界、回归 |
+| 配置写入失败不可成功返回 | Shell 集成；旧配置已存在 | 无变化、权限错误、替换失败 → 无变化成功；真实失败非零且原配置保留，不启动容器 | 正常、异常 |
+| 配置是受管理变量的启动来源 | 入口脚本集成；继承旧环境 | 改值、清空密码、缺失文件、特殊字符 → 新值/空值生效；缺文件拒绝启动；不执行输入中的命令 | 边界、安全、兼容 |
+| 旧容器和模式变化可诊断 | Shell 集成；Docker 外部依赖替身或隔离测试容器 | 旧 Cmd/缺挂载/CPU↔GPU → 明确要求部署；新式同模式容器正常重启 | 兼容、分支、回归 |
+| 新启动不能用旧心跳验收 | 远程管理函数与真实内存协调层 | 仅旧注册、出现新启动代次、超时、停止状态部署、零 CPU 槽 → 不误报成功并区分不应等待心跳的动作 | 正常、异常、边界 |
+| 运行版本支持仓库源字段 | 构建后 API 检查与仓库源单元测试 | Docker/pip/apt 源 → 字段保存/回显、首次构建参数正确；已部署复用镜像的限制清晰 | 正常、兼容 |
+| 既有接口行为不退化 | 相关套件后运行 `cd backend && python -m pytest tests/ -v`（Python 3.12） | 远程操作、数据、训练、预测 → 保持既有有效业务断言；环境跳过和失败逐项记录 | 完整回归 |
+
+**风险与回滚**：点击重启会短暂中断目标 worker，沿用 45 秒优雅停止和训练断点机制；旧容器和模式变更增加明确拒绝，需按提示部署。保存配置不自动停机。以独立英文提交实施，回滚相应提交并统一容器重建；若已经对目标机部署新入口，需同时恢复目标机相应代码版本，不能只回滚平台页面。无需新增依赖、配置修改或数据库迁移。
+
+**重测触发/下一步**：以上缺陷修复、远程 shell/入口/状态判断改动、部署版本更换，或用户补充不同的实际操作路径后，按映射复跑相关用例；业务代码变更必须完整回归、容器重建并单独更新测试报告。当前不把有缺陷及测试失败的状态标记为开发完成。
+
 ## 本次变更测试结果：远程 worker 配置改为外部文件事实源（2026-10-29）
 
 **Git基准点**：`83472ed`（Apply worker config via external env file sourced at container startup）
