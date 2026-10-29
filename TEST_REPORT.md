@@ -84,6 +84,105 @@ git status --short
 - 回滚可撤销 `500826a` 并重新构建平台/Worker；无数据迁移。临时快照、脚本和补丁位于上述临时目录，交付前清除；一次性测试容器及数据自动删除，临时依赖镜像标签删除，运行服务保留。本任务代码和报告分开提交，未执行 git push，其他会话的未提交修改保留。
 
 
+## 本次变更测试结果：数据集卡片标题挤压修复（2026-10-29）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`630aa3c87c18689505bff1b410bf2200aa9b0549`。
+- **提交信息**：Fix dataset card title layout。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围与技术**：原生 HTML/CSS；仅修改 `backend/static/app.css` 的数据集页标题和操作区规则，以及 `backend/static/dataset-manager.html` 的 CSS 缓存版本。没有修改后端、依赖、配置、数据或第三方代码。
+- **根因与行为**：桌面窄卡片中标题与不收缩的四按钮区域共用一行，标题宽度可被挤到接近 0。修复后标题占满卡片内容宽度，按钮另起一行、左对齐并自动折行；长名称完整换行。缓存版本从 `20261029-hub-1` 更新为 `20261029-dataset-layout-1`。
+- **验收边界**：独立回归副本由 `git archive a7bee30` 加本次两个文件构成。完整 pytest 的业务基准为 `a7bee30`，本节不将其后其他任务的联合训练、内存优化等后端提交宣称为已完整回归。本次提交中的两个前端文件与该验收副本一致。并行工作期间其他任务继续修改这两个文件，包括卡片结构、导航和新的缓存版本；这些修改被保留，没有夹带到本次提交。
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---:|---|
+| Chromium 布局与交互，修复前 | 27 | 19 | 8 | 0 | 0 | 预期失败；桌面标题宽度接近 0，窄屏标题未独占可用宽度 |
+| 同一组 Chromium 用例，修复后 | 27 | 27 | 0 | 0 | 0 | 四视口、普通/边界数据、按钮命中、详情/处理/搜索通过 |
+| 训练页 CSS 作用域回归 | 4 | 4 | 0 | 0 | 0 | 每个视口逐项比较 339 个节点的位置、尺寸和关键计算样式，无变化 |
+| 独立版本前端完整 Node 套件 | 18 | 18 | 0 | 0 | 0 | 已提交版本的全部前端正式测试 |
+| 独立版本后端完整 pytest | 434 | 412 | 0 | 0 | 22 | Python 3.12.15，65.21 秒；已执行用例通过率 100%，总通过比例 94.93% |
+| 共享工作区前端套件复核 | 47 | 38 | 9 | 0 | 0 | 混入其他任务正在编写的训练工作台测试，不能作为本次独立验收结果 |
+| 部署后现场卡片布局 | 4 | 4 | 0 | 0 | 0 | 1600/1024/390/320px，现场 3 张卡片均未挤压标题或溢出 |
+| 部署及本地等价服务 HTTP 核对 | 2 组 | 2 组 | 0 | 0 | 0 | 每组检查健康接口及 HTML/CSS；核对范围见下文 |
+
+后端 22 项既有跳过涉及未配置 `MTP_TEST_REDIS`、`MTP_TEST_S3` 的真实 Redis/S3/Supervisor 验证，不计为通过。保留 SQLAlchemy `declarative_base` 和 Pandas `xlrd` 两条既有弃用警告。没有删除、跳过或弱化既有测试。
+
+**共享工作区失败分析**：首次运行全量 Node 套件时，训练工作台交互测试正在由其他任务补充，出现未实现函数/行为相关失败；再次采样为 47 项中 38 通过、9 失败。失败均位于当时未跟踪的 `frontend/workbench-interactions.test.cjs`，涉及搜索/状态筛选、任务卡片复用、旧详情成功与失败响应、同任务详情乱序、日志跟随、并发日志去重、预测模板旧响应和键盘标签切换。它们不属于本次 CSS/缓存修复，未擅自修改；相关任务应在开发完成后重新验收。已提交基准的全部 18 项 Node 测试通过。本节不宣称共享工作区整体测试通过。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级与前置条件 | 输入、预期结果与副作用 | 场景 |
+|---|---|---|---|
+| 标题不被按钮挤压 | Chromium；真实页面代码，仅数据 API 在网络边界隔离 | 远程 `lhoestq/demo1` 四按钮、普通 CSV 三按钮；标题宽度等于内容宽度、操作在标题下方、短仓库名单行、名称文本完整 | 正常、截图缺陷回归 |
+| 长名称和空值可读 | Chromium；同一布局断言参数化执行 | 超长英文仓库名、超长中文名称、空名称、0 行/空字段、已缓存 Hub、含 HTML 字符名称；完整文本或“未命名数据集”可见，按钮数量正确，无卡片横向溢出 | 边界、默认行为兼容 |
+| 响应式和按钮可操作 | Chromium；上述两组数据各跑四种视口 | 1600、1024、390、320px；页面无横向溢出，所有按钮边界位于卡片内，浏览器 trial click 命中成功 | 桌面/手机、正常/边界 |
+| 详情、处理和筛选保持可用 | Chromium；API fixture 隔离现场数据 | 点击本地详情显示正确名称并请求对应 ID；处理打开操作面板；搜索只保留匹配卡片，无匹配显示空状态 | 交互、空集合、回归 |
+| 训练工作台不受样式影响 | Chromium；固定同一已提交 HTML，禁用页面脚本以隔离其他逻辑 | 修复前后 CSS 在四视口下对所有 339 个 DOM 节点比较位置、尺寸和关键计算样式，结果相同 | 样式作用域、兼容回归 |
+| 更新应用到运行服务 | Compose 与 HTTP/Chromium | 健康接口返回 `ok: true`；线上 CSS 包含本次规则、HTML 使用非旧缓存版本；四视口现场卡片通过几何断言 | 部署、运行回归 |
+
+浏览器测试使用系统已有 Playwright/Chromium，不新增依赖。API mock 只隔离网络，页面渲染、CSS、搜索和事件分派均运行真实代码；不对现场数据执行删除、下载、训练或处理写操作。
+
+### 实际执行命令
+
+```bash
+# 项目根目录；临时副本与脚本在验证结束后清理
+git archive a7bee30 | tar -x -C /tmp/mtp-dataset-layout.ysficK/isolated
+cp backend/static/app.css backend/static/dataset-manager.html /tmp/mtp-dataset-layout.ysficK/isolated/backend/static/
+PHASE=before node /tmp/mtp-dataset-layout.ysficK/check-layout.cjs
+PHASE=after node /tmp/mtp-dataset-layout.ysficK/check-layout.cjs
+node /tmp/mtp-dataset-layout.ysficK/check-workbench.cjs
+node --test frontend/*.test.cjs
+node --test /tmp/mtp-dataset-layout.ysficK/isolated/frontend/*.test.cjs
+docker run --rm --pull=never --network none --mount type=bind,src=/tmp/mtp-dataset-layout.ysficK/isolated,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 f72a45f60ca7 python -m pytest tests/ -v -p no:cacheprovider --basetemp=/tmp/mtp-dataset-layout-tests --tb=short
+docker compose up --build -d
+node /tmp/mtp-dataset-layout.ysficK/check-live.cjs
+curl -fsS http://127.0.0.1:18087/api/health
+git diff --check
+```
+
+先执行 before，再改动两个文件并覆盖副本、执行 after。共享工作区第二次 Node 采样通过 Node `spawnSync('node', ['--test', ...files])` 调用同一完整前端套件，仅筛选显示汇总和失败用例名，不改变执行或断言。
+
+### 构建、等价验证与限制
+
+1. 默认 `docker compose up --build -d` 的阿里云 PyPI 镜像下载失败：454MB PyTorch 包在约 307 秒后只得到 6.6MB，随后 SHA256 不匹配。停止重复下载，命令退出 130；**默认 Dockerfile 联网构建未通过**。
+2. 使用已有 Python 3.12.15 依赖镜像复用依赖，容器内外 `requirements.txt` SHA256 均为 `7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`。初次引用的测试镜像在并行工作中已被移除，临时覆盖构建随即取消；重新核对并固定当时的运行镜像 `e2f8321e2aba` 为 `mtp-dataset-layout-base:validation` 后成功重建。没有修改仓库 Compose、Dockerfile 或依赖清单。
+3. 成功构建并启动 trainer、worker、frontend 的实际命令如下，退出 0；这是复用已有依赖的 Compose 构建，不代表默认联网安装成功：
+
+```bash
+docker tag e2f8321e2aba mtp-dataset-layout-base:validation
+cat <<'YAML' | docker compose -f docker-compose.yml -f - up --build -d
+services:
+  trainer:
+    build: &dataset_layout_build
+      context: ./backend
+      dockerfile_inline: |
+        FROM mtp-dataset-layout-base:validation
+        COPY app /app/app
+        COPY static /app/static
+        COPY sample_data /app/sample_data
+        COPY Dockerfile worker.Dockerfile requirements-worker.txt /app/
+        COPY init_db.sh start.sh /app/
+        RUN chmod +x /app/init_db.sh /app/start.sh
+  worker:
+    build: *dataset_layout_build
+YAML
+```
+
+4. 另执行本地源码等价启动验证。宿主机没有可调用的 `python3.12`，为遵守 Python 3.12 要求，在一次性容器内只读挂载独立源码，运行相同 `uvicorn` 入口、`USE_DATABASE=false`，临时数据置于容器 `/tmp`；没有用 Python 3.9 代替，也没有用此验证替代 Compose 构建：
+
+```bash
+docker run --rm --name mtp-dataset-layout-smoke --pull=never -p 127.0.0.1:18087:8000 --mount type=bind,src=/tmp/mtp-dataset-layout.ysficK/isolated,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env DATA_DIR=/tmp/mtp-dataset-layout-data --env USE_DATABASE=false --env STORAGE_BACKEND=local --env REDIS_URL= --env EMBEDDED_WORKERS=0 mtp-dataset-layout-base:validation python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+5. 独立源码服务健康检查通过；`/static/dataset-manager.html`、`/static/app.css` 与验收副本逐字一致。首次误用前端根路径返回 404，改用后端实际 `/static/` 挂载后通过。现场 8000 服务整文件相等检查曾因其他任务同时调整导航和页面结构失败，随后按本次变更边界逐项核对 CSS 规则及缓存版本，并通过四种视口的实际卡片布局验证；没有宣称现场整页与独立版本相同。现场数据为三张本地卡片，远程四按钮场景由独立浏览器 fixture 覆盖。
+6. 已检查修复前后桌面截图、部署后桌面与 320px 卡片截图。没有执行 Safari/Firefox、手机实机、真实 Hub 下载或删除；本次不修改这些业务路径。真实 Redis/S3/Supervisor 环境验证、后续其他任务变更的完整验收及默认联网构建仍需各自补验。默认构建建议网络恢复后重新执行原命令。
+7. **重测触发与回滚**：调整卡片结构、标题/按钮布局、响应式规则或缓存方式时，重跑上述浏览器场景及前端测试；业务代码变化按项目规则完整回归。可撤销 `630aa3c` 回滚本次两文件变更并重新构建；后续其他任务继续修改相同区域时应先检查冲突，无数据迁移。
+
+**提交与清理**：本次两个文件通过独立暂存索引仅提交已验收差异，没有回退或提交同文件中其他任务的修改；报告另行提交。临时目录 `/tmp/mtp-dataset-layout.ysficK` 中的脚本、截图、独立副本及暂存索引在交付前删除。一次性测试容器自动销毁，等价验证容器已停止并移除，临时依赖镜像标签已删除。未提交运行时产物、未执行 git push；其他任务的未提交/未跟踪文件保留。
+
 ## 本次变更测试结果：异构多节点联合训练（2026-10-29）
 
 ### Git 基准点与实现范围
