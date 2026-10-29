@@ -18,6 +18,8 @@ import pandas as pd
 import torch
 from torch import nn
 
+from app.device import backend_from_device, seed_device, select_device
+
 LogFn = Callable[[str], None]
 _REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?$")
 
@@ -563,8 +565,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
     job_dir.mkdir(parents=True, exist_ok=True)
     seed = int(params.get("seed", 42))
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    seed_device(seed, parallel.device if parallel is not None else None)
     rows = _load_rows(dataset_path, params, task, log_fn)
     cache = _cache_dir()
 
@@ -608,7 +609,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
             value_head = nn.Linear(hidden_size, 1)
 
     train_examples, val_examples = _split_examples(examples, seed)
-    device = parallel.device if parallel is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = parallel.device if parallel is not None else select_device(log_fn=log_fn)
     model.to(device)
     if reference is not None:
         reference.to(device)
@@ -788,6 +789,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
     summary = {
         "task": task,
         "device": str(device),
+        "device_backend": backend_from_device(device),
         "epochs_total": epoch,
         "epochs_done": epoch,
         "resumed_from": start_epoch,

@@ -206,3 +206,39 @@ def test_api_view_shape(store, q, ls, make_dataset, make_job):
                 "manual_retry_count"):
         assert key in view, f"api_view 缺少 {key}"
     assert view["metrics"] == []
+
+
+@pytest.mark.parametrize("replacement", [None, "new-cpu"])
+def test_selected_resource_manual_retry_replaces_or_clears_policy(store, q, ls, make_dataset, replacement):
+    """指定槽训练失败后，显式重选和切回自动都会替换原策略。"""
+    mgr = JobManager(store=store, queue=q, lease=ls, start_workers=False, start_watchdog=False)
+    record = mgr.submit({"dataset_id": make_dataset(n=40), "task": "classification", "target": "target",
+                         "resource_hint": {"worker_id": "old-cpu", "require_gpu": False, "min_vram_mb": 0}})
+    jobstore.update_job(store, record["id"], status="failed", error="worker unavailable")
+    updated = mgr.retry(record["id"], worker_id=replacement)
+    assert updated["spec"]["resource_hint"].get("worker_id") == replacement
+    assert updated["retry_worker_id"] == replacement
+    assert updated["status"] == "queued"
+    assert updated["spec"]["resource_hint"]["require_gpu"] is False
+    assert updated["manual_retry_count"] == 1
+    mgr.stop()
+
+
+@pytest.mark.parametrize("action", ["resume", "watchdog"])
+def test_selected_resource_survives_resume_and_redispatch(store, q, ls, make_dataset, action):
+    """暂停恢复和心跳失联重派均保留原计算槽，日志明确说明等待目标。"""
+    mgr = JobManager(store=store, queue=q, lease=ls, start_workers=False, start_watchdog=False)
+    record = mgr.submit({"dataset_id": make_dataset(n=40), "task": "classification", "target": "target",
+                         "resource_hint": {"worker_id": "fixed-cpu"}})
+    if action == "resume":
+        mgr.pause(record["id"])
+        mgr.resume(record["id"])
+    else:
+        jobstore.update_job(store, record["id"], status="running", worker_id="fixed-cpu")
+        mgr._watchdog_once()
+    updated = mgr.get(record["id"])
+    assert updated["status"] == "queued"
+    assert updated["spec"]["resource_hint"]["worker_id"] == "fixed-cpu"
+    assert "指定计算槽 fixed-cpu" in jobstore.read_job_log(store, record["id"])
+    assert record["id"] in q.snapshot()
+    mgr.stop()

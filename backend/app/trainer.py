@@ -35,6 +35,13 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
 import app.config as config
+from app.device import (
+    backend_from_device,
+    device_rng_state,
+    restore_device_rng_state,
+    seed_device,
+    select_device,
+)
 
 LogFn = Callable[[str], None]
 
@@ -102,10 +109,11 @@ def _rng_snapshot() -> dict:
         },
         "python": {"version": int(py_state[0]), "state": list(py_state[1]), "gauss": py_state[2]},
     }
-    # CUDA 随机数状态一并无损保存（GPU 上 Dropout 等算子使用设备侧 RNG）；
-    # 恢复时设备数不同则跳过（跨卡续训本就不承诺逐位一致）
-    if torch.cuda.is_available():
-        snapshot["cuda"] = torch.cuda.get_rng_state_all()
+    # 保存设备侧 RNG；跨设备续训时状态不匹配会被安全跳过。
+    device = select_device()
+    states = device_rng_state(device)
+    if states is not None:
+        snapshot[backend_from_device(device)] = states
     return snapshot
 
 
@@ -124,13 +132,14 @@ def _rng_restore(snapshot: dict, log_fn: LogFn | None = None) -> None:
     except (KeyError, TypeError, ValueError) as exc:
         if log_fn:
             log_fn(f"随机数状态恢复失败（不影响续训，仅 shuffle 序列变化）: {exc}")
-    cuda_states = snapshot.get("cuda")
-    if cuda_states and torch.cuda.is_available() and torch.cuda.device_count() >= len(cuda_states):
-        try:
-            torch.cuda.set_rng_state_all([s.cpu() for s in cuda_states])
-        except (RuntimeError, ValueError) as exc:
-            if log_fn:
-                log_fn(f"CUDA 随机数状态恢复跳过: {exc}")
+    # checkpoint 可能由另一种 GPU 生成，按当前设备后端尽力恢复。
+    try:
+        current_device = select_device()
+        backend = backend_from_device(current_device)
+        restore_device_rng_state(current_device, snapshot.get(backend), log_fn)
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"设备随机数状态恢复跳过: {exc}")
 
 
 def _version_tuple(version: str) -> tuple:
@@ -169,21 +178,8 @@ class _KMeansCenters(nn.Module):
 
 
 def _pick_device(log_fn: LogFn) -> torch.device:
-    # 首先尝试初始化GPU
-    try:
-        if torch.cuda.is_available():
-            # 尝试获取GPU设备名称，如果失败则抛出异常
-            name = torch.cuda.get_device_name(0)
-            # 尝试创建一个张量来测试GPU是否真正可用
-            test_tensor = torch.tensor([1.0], device='cuda')
-            log_fn(f"成功启动 GPU: {name} (CUDA {torch.version.cuda})")
-            return torch.device("cuda")
-        else:
-            raise RuntimeError("CUDA 不可用")
-    except Exception as e:
-        # GPU初始化失败，回退到CPU
-        log_fn(f"GPU 初始化失败: {str(e)}，回退到 CPU 训练（速度较慢，可检查 GPU 驱动和 CUDA 版本）")
-        return torch.device("cpu")
+    """选择 NVIDIA/ROCm/XPU/MPS/CPU，并保留自动回退 CPU 的旧行为。"""
+    return select_device(log_fn=log_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +520,10 @@ def _run_kmeans_training(
         raise ValueError("KMeans 最大迭代次数必须在 1 到 500 之间")
     if clusters < 2 or clusters > 64:
         raise ValueError("聚类数必须在 2 到 64 之间")
+    # KMeans 当前固定在 CPU 执行；先确定设备再保存设备侧随机种子。
+    device = torch.device("cpu")
     torch.manual_seed(seed)
+    seed_device(seed, device)
     np.random.seed(seed)
     df = pd.read_csv(dataset_path)
     if len(df) < 2:
@@ -594,7 +593,6 @@ def _run_kmeans_training(
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     if resume_state is not None:
         optimizer.load_state_dict(resume_state["optimizer"])
-    device = torch.device("cpu")
     db_log_fn(
         f"KMeans 聚类: 样本 {len(values)} 条，特征 {n_features} 个，簇数 {clusters}，"
         f"最大迭代 {max_iter} 次（CPU）"
@@ -733,6 +731,7 @@ def _run_kmeans_training(
         "device": "cpu",
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
+        "device_backend": backend_from_device(device),
         "epochs_total": iterations_done,
         "epochs_done": iterations_done,
         "resumed_from": start_epoch,
@@ -1161,6 +1160,7 @@ def run_training(
         "device": str(device),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
+        "device_backend": backend_from_device(device),
         "epochs_total": epochs,
         "epochs_done": epochs,
         "resumed_from": start_epoch,          # 本次运行起始 epoch（0 表示全新训练）

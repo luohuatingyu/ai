@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from app.device import set_device
+
 
 class ParallelContext:
     """每个独立训练进程持有一个通信组，CPU/GPU 混合统一使用 CPU 通信张量。"""
@@ -26,8 +28,8 @@ class ParallelContext:
         self.parameters = []
         self.buffers = []
         self.progress = None
-        if self.device.type == "cuda":
-            torch.cuda.set_device(self.device)
+        if self.device.type in {"cuda", "xpu"}:
+            set_device(self.device)
         host = spec["host"]
         if ":" in host:
             host = f"[{host}]"

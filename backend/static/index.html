@@ -319,6 +319,8 @@
   .toast.ok { border-left-color: var(--ok); }
   @keyframes toastIn { from { opacity: 0; transform: translateX(12px); }
                        to { opacity: 1; transform: none; } }
+  /* 资源选择按训练方式切换，避免布局类覆盖原生 hidden 行为。 */
+  #trainingResourceField[hidden], #parallelPanel[hidden] { display:none; }
 </style>
 <link rel="stylesheet" href="/app.css?v=20261029-management-tabs-1">
 </head>
@@ -455,6 +457,13 @@
         <div id="parallelSummary" class="hint" aria-live="polite"></div>
         <div class="field"><label for="p_parallel_timeout">节点通信超时（秒）</label><input id="p_parallel_timeout" type="number" min="10" max="3600" value="300"></div>
       </div>
+      <div class="field" id="trainingResourceField">
+        <label for="trainingResourceSelect">计算资源</label>
+        <select id="trainingResourceSelect" aria-describedby="trainingResourceHint">
+          <option value="">自动分配 · 所有符合要求的资源</option>
+        </select>
+        <div id="trainingResourceHint" class="hint" style="margin-top:6px;" aria-live="polite">正在读取计算资源；自动分配可排队等待资源上线。</div>
+      </div>
       <button id="btnStart" class="primary" disabled>🚀 开始训练</button>
       <div class="hint" id="taskHint">分类适用于离散标签，回归适用于连续数值目标。</div>
     </form>
@@ -566,7 +575,7 @@ const state = {
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   previewPage: 1, previewPageCount: 1, previewTotalRows: 0, previewReturnFocus: null,
   charts: { loss: null, metric: null }, metricKind: null,
-  workerSlots: [], detailRecord: null, retrySubmitting: false,
+  workerSlots: [], workerResourcesLoaded: false, workerResourcesError: false, trainSubmitting: false, detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
   remoteLogOperationId: null, remoteLogPollTimer: null,
   editingRemoteMachineId: null,
@@ -597,8 +606,8 @@ function resourceText(attempt) {
   const machine = attempt.machine_id || attempt.worker_id || "未知机器";
   const slot = attempt.slot ? ` / ${attempt.slot}` : "";
   const worker = attempt.worker_id && attempt.worker_id !== machine ? ` · ${attempt.worker_id}` : "";
-  const device = attempt.device === "cuda"
-    ? `GPU${attempt.gpu_name ? ` · ${attempt.gpu_name}` : ""}${attempt.vram_mb ? ` ${(Number(attempt.vram_mb) / 1024).toFixed(1)} GB` : ""}`
+  const device = attempt.device_backend && attempt.device_backend !== "cpu"
+    ? `${String(attempt.device_backend).toUpperCase()}${attempt.gpu_name ? ` · ${attempt.gpu_name}` : ""}${attempt.vram_mb ? ` ${(Number(attempt.vram_mb) / 1024).toFixed(1)} GB` : ""}`
     : attempt.device === "cpu" ? "CPU" : "设备未知";
   return `${machine}${slot}${worker} · ${device}`;
 }
@@ -608,7 +617,10 @@ function renderResourceAllocation(job) {
   const box = $("resourceAllocation");
   const segments = Array.isArray(job.segments) ? job.segments : [];
   const rows = [];
-  if (job.status === "queued") {
+  if (job.status === "queued" && job.spec.resource_hint?.worker_id) {
+    rows.push({ title: "指定资源", resource: job.spec.resource_hint.worker_id,
+      meta: "等待指定槽位领取；离线时等待恢复", status: "排队中" });
+  } else if (job.status === "queued") {
     if (job.retry_worker_id) {
       rows.push({
         title: "重试目标",
@@ -673,6 +685,7 @@ function renderResourceAllocation(job) {
 // 用最近一次实际执行位置补充任务列表信息，排队任务显示其分配策略。
 function jobResourceLabel(job) {
   if (job.current_attempt) return `资源 · ${resourceText(job.current_attempt)}`;
+  if (job.status === "queued" && job.spec.resource_hint?.worker_id) return `指定资源 · ${job.spec.resource_hint.worker_id}`;
   if (job.status === "queued" && job.retry_worker_id) return `重试目标 · ${job.retry_worker_id}`;
   const segments = Array.isArray(job.segments) ? job.segments : [];
   if (segments.length) return `最近资源 · ${resourceText(segments[segments.length - 1])}`;
@@ -704,7 +717,7 @@ function renderRetryControls(job) {
   for (const worker of eligible) {
     const gpu = worker.gpu || {};
     const device = gpu.available
-      ? `GPU · ${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB` : ""}`
+      ? `${String(gpu.backend || worker.device_backend || "GPU").toUpperCase()} · ${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB` : ""}`
       : `CPU · ${worker.cpu && worker.cpu.cores ? `${worker.cpu.cores} 线程` : "资源"}`;
     const stateText = worker.state === "running" ? "训练中，排队等待" : "在线";
     const label = `${worker.machine_id || worker.worker_id} / ${worker.slot || "计算槽"} · ${device} · ${stateText}`;
@@ -940,6 +953,73 @@ async function loadPreviewPage(page = 1) {
   }
 }
 
+// 返回不可选原因；忙碌槽允许排队，任务类型和显存限制实时参与筛选。
+function trainingResourceUnavailable(worker) {
+  if (!worker || !worker.active) return "离线或已失效";
+  if (!worker.enabled || worker.state === "disabled") return "未启用";
+  if (["degraded", "offline", "stopping"].includes(worker.state)) return "暂不可用";
+  const task = $("taskSelect").value;
+  const gpu = worker.gpu || {};
+  if (task === "clustering" && gpu.available) return "聚类需选择 CPU";
+  const required = task.startsWith("llm_") || (task !== "clustering" && $("p_require_gpu").checked);
+  const minimum = required ? Math.max(Number($("p_min_vram").value) || 0, 0) : 0;
+  if (required && !gpu.available) return "任务需要 GPU";
+  if (minimum > Number(gpu.vram_mb || 0)) return "显存不足";
+  return "";
+}
+
+// 保留失效的已选项并禁止提交，避免轮询将用户选择静默切回自动分配。
+function trainingResourceReady() {
+  const selected = $("trainingResourceSelect").value;
+  if ($("p_parallel")?.value === "parallel" || !selected) return true;
+  return state.workerResourcesLoaded && !state.workerResourcesError
+    && !trainingResourceUnavailable(state.workerSlots.find(worker => worker.worker_id === selected));
+}
+
+// 根据资源池渲染选项；仅展示公开的机器、卡槽、型号和状态。
+function renderTrainingResources() {
+  const field = $("trainingResourceField");
+  const select = $("trainingResourceSelect");
+  field.hidden = $("p_parallel")?.value === "parallel";
+  select.disabled = field.hidden || state.trainSubmitting;
+  const selected = select.value;
+  const options = ['<option value="">自动分配 · 所有符合要求的资源</option>'];
+  let available = 0;
+  for (const worker of state.workerSlots) {
+    const reason = trainingResourceUnavailable(worker);
+    if (!reason) available++;
+    const gpu = worker.gpu || {};
+    const device = gpu.available
+      ? `${String(gpu.backend || worker.device_backend || "GPU").toUpperCase()} · ${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB` : ""}`
+      : `CPU${worker.cpu?.cores ? ` · ${worker.cpu.cores} 线程` : ""}`;
+    const status = reason || (worker.current_job || worker.state === "running" ? "忙碌，排队等待" : "可用");
+    const label = `${worker.machine_id || worker.worker_id} / ${worker.slot || "计算槽"} (${worker.worker_id}) · ${device} · ${status}`;
+    options.push(`<option value="${esc(worker.worker_id)}" ${reason ? "disabled" : ""}>${esc(label)}</option>`);
+  }
+  if (selected && !state.workerSlots.some(worker => worker.worker_id === selected)) {
+    options.push(`<option value="${esc(selected)}" disabled>${esc(selected)} · 离线或已失效</option>`);
+  }
+  // 浏览器展开下拉框时避免无变化的 DOM 替换，同时保持状态校验生效。
+  const markup = options.join("");
+  if (select.dataset.options !== markup) {
+    select.innerHTML = markup;
+    select.dataset.options = markup;
+  }
+  select.value = selected;
+  const hint = $("trainingResourceHint");
+  if (state.workerResourcesError) {
+    hint.textContent = "资源状态读取失败，请刷新计算资源；自动分配仍可排队等待。";
+  } else if (selected && !trainingResourceReady()) {
+    hint.textContent = "所选资源当前不满足要求，请重新选择或切回自动分配。";
+  } else if (selected) {
+    hint.textContent = "任务仅在所选计算槽执行；忙碌或暂时离线时排队等待，失败后可重新分配。";
+  } else {
+    hint.textContent = available
+      ? `当前有 ${available} 个符合要求的计算槽，系统将自动分配；也可指定资源。`
+      : "当前没有符合要求的计算槽；自动分配会排队等待资源上线。";
+  }
+}
+
 // 汇总配置状态与提交锁
 function updateStart() {
   const task = taskSelect.value;
@@ -958,7 +1038,7 @@ function updateStart() {
   const parallelReady = $("p_parallel").value !== "parallel" || (selections.length >= 2 && selections.length <= 32 && selections.every(([id, batch]) =>
     Number.isInteger(batch) && batch >= 1 && batch <= (isLLM ? 64 : 4096)
     && state.workerSlots.some(worker => worker.worker_id === id && worker.active && worker.enabled && worker.parallel?.host && worker.parallel?.gloo && worker.parallel?.protocol === 1)));
-  $("btnStart").disabled = !ready || !parallelReady;
+  $("btnStart").disabled = state.trainSubmitting || !trainingResourceReady() || !ready || !parallelReady;
 }
 
 const parallelSelections = new Map();
@@ -1055,6 +1135,7 @@ function updateTaskFields() {
               : "对 Hugging Face CausalLM 执行全参数监督微调（SFT）。"
         : "分类适用于离散标签，回归适用于连续数值目标。";
   renderParallelWorkers();
+  renderTrainingResources();
   updateStart();
 }
 
@@ -1090,9 +1171,20 @@ $("p_dataset_source").addEventListener("change", updateTaskFields);
 [
   "p_hub_dataset", "p_base_model", "p_reward_model", "p_completion_column",
 ].forEach((id) => $(id).addEventListener("input", () => { updateTaskFields(); updateStart(); }));
-$("p_require_gpu").onchange = () => { $("minVramField").hidden = !$("p_require_gpu").checked; };
+$("p_require_gpu").onchange = () => {
+  $("minVramField").hidden = !$("p_require_gpu").checked;
+  renderTrainingResources(); updateStart();
+};
+$("p_min_vram").addEventListener("input", () => { renderTrainingResources(); updateStart(); });
+$("trainingResourceSelect").addEventListener("change", () => { renderTrainingResources(); updateStart(); });
 
 $("btnStart").onclick = async () => {
+  if (state.trainSubmitting) return;
+  if (!trainingResourceReady()) {
+    renderTrainingResources(); updateStart();
+    toast("所选计算资源已不可用，请重新选择", "err");
+    return;
+  }
   const task = taskSelect.value;
   const isLLM = task.startsWith("llm_");
   const datasetSource = isLLM ? $("p_dataset_source").value : "local";
@@ -1149,7 +1241,11 @@ $("btnStart").onclick = async () => {
     payload.require_gpu = false;
     payload.min_vram_mb = 0;
   }
-  $("btnStart").disabled = true;
+  if ($("p_parallel")?.value !== "parallel" && $("trainingResourceSelect").value) {
+    payload.worker_id = $("trainingResourceSelect").value;
+  }
+  state.trainSubmitting = true;
+  renderTrainingResources(); updateStart();
   try {
     const { job_id } = await apiJson("/api/train", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
@@ -1157,7 +1253,7 @@ $("btnStart").onclick = async () => {
     toast("训练任务已创建: " + job_id, "ok");
     selectJob(job_id, true);
   } catch (e) { toast("创建任务失败: " + e.message, "err"); }
-  updateStart();
+  finally { state.trainSubmitting = false; renderTrainingResources(); updateStart(); }
 };
 
 const statusText = { queued: "排队中", running: "训练中", completed: "已完成", failed: "失败", cancelled: "已取消", paused: "已暂停" };
@@ -1565,7 +1661,7 @@ function workerSlotCard(w) {
   const cpu = w.cpu || {};
   const isGpu = Boolean(gpu.available);
   const device = isGpu
-    ? `${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB 显存` : ""}`
+    ? `${String(gpu.backend || w.device_backend || "GPU").toUpperCase()} · ${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB 显存` : ""}`
     : `CPU${cpu.cores ? ` · ${cpu.cores} 线程` : ""}${cpu.memory_mb ? ` · ${formatMemory(cpu.memory_mb)}` : ""}`;
   const active = Boolean(w.active);
   const enabled = Boolean(w.enabled);
@@ -1694,6 +1790,9 @@ async function refreshWorkers() {
     const grid = $("workerGrid");
     const workers = d.workers || [];
     state.workerSlots = workers;
+    state.workerResourcesLoaded = true;
+    state.workerResourcesError = false;
+    renderTrainingResources();
     renderParallelWorkers();
     updateStart();
     renderRetryControls(state.detailRecord);
@@ -1730,6 +1829,8 @@ async function refreshWorkers() {
       : "当前没有已启用的 GPU 槽；要求 GPU 的任务会排队等待。可先添加服务器并启用 GPU 槽。";
     $("queueDepth").textContent = `队列 ${d.queue_depth ?? 0}`;
   } catch {
+    state.workerResourcesError = true;
+    renderTrainingResources(); updateStart();
     $("gpuResourceHint").textContent = "GPU 资源状态暂不可用，请检查连接后刷新。";
   } finally {
     state.refreshingWorkers = false;

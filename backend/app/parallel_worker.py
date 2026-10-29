@@ -34,13 +34,38 @@ def select_members(lease, requested: list[dict], require_idle: bool = True) -> l
         if capability.get("protocol") != 1 or not capability.get("host") or not capability.get("gloo"):
             raise ValueError(f"节点 {worker_id} 尚未配置联合训练通信地址或 Gloo 支持")
         gpu = worker.get("gpu") or {}
-        if gpu.get("available") and capability.get("vendor") != "nvidia":
-            raise ValueError("当前联合训练支持 NVIDIA CUDA 与 CPU，其他显卡后端尚未适配")
+        vendor = str(gpu.get("vendor") or "").lower()
+        if vendor in {"", "cpu"}:
+            vendor = str(capability.get("vendor") or "").lower()
+        backend_value = gpu.get("backend") or capability.get("backend")
+        backend = str(backend_value or ("cuda" if gpu.get("available") else "cpu")).lower()
+        # 兼容旧 worker 注册信息：旧版本只上报 gpu.available，默认按 CUDA 解析。
+        if gpu.get("available") and backend_value == "cpu" and vendor not in {"", "cpu", "nvidia"}:
+            raise ValueError("当前节点不是 NVIDIA CUDA 后端；请使用 NVIDIA GPU 或重新登记后端能力")
+        if gpu.get("available") and backend == "cpu":
+            backend = {"nvidia": "cuda"}.get(vendor, "cuda")
+        if gpu.get("available") and vendor == "amd" and backend == "cuda":
+            raise ValueError("当前节点不是 NVIDIA CUDA 后端；请使用 NVIDIA GPU 或重新登记后端能力")
+        if backend not in {"cuda", "rocm", "xpu", "mps", "cpu"}:
+            raise ValueError(f"节点 {worker_id} 的计算后端 {backend} 不受支持")
         if gpu.get("available") and capability.get("capability_supported") is False:
             raise ValueError(f"节点 {worker_id} 的显卡架构不受当前 PyTorch 构建支持")
+        if gpu.get("available") and not capability.get("gloo"):
+            raise ValueError(f"节点 {worker_id} 不支持 Gloo，无法进行异构联合训练")
+        device = str(gpu.get("device") or capability.get("device") or "")
+        if backend in {"cuda", "rocm"} and (not device or device == "cpu"):
+            device = "cuda:0"
+        elif backend == "xpu" and (not device or device == "cpu"):
+            device = "xpu:0"
+        elif backend == "mps" and (not device or device == "cpu"):
+            device = "mps"
+        elif not device:
+            device = "cpu"
         members.append({
             **selection, "machine_id": worker.get("machine_id"),
-            "device": "cuda:0" if gpu.get("available") else "cpu",
+            "device": device if gpu.get("available") else "cpu",
+            "device_backend": backend,
+            "vendor": vendor or backend,
             "gpu_name": gpu.get("name"), "torch_version": worker.get("torch_version"),
             "vram_mb": int(gpu.get("vram_mb") or 0),
             "host": capability["host"], "port": int(capability["port"]),
@@ -57,7 +82,11 @@ def make_group(job_id: str, token: str, members: list[dict], timeout: int, seed:
     return {
         "parallel": 1, "job_id": job_id, "token": token, "group_id": group_id,
         "members": members, "host": members[0]["host"], "port": members[0]["port"],
-        "backend": "nccl" if all(item["device"].startswith("cuda") and item["nccl"] for item in members) else "gloo",
+        "backend": "nccl" if all(
+            item.get("device_backend", "cuda" if str(item.get("device", "")).startswith("cuda") else "cpu") == "cuda"
+            and str(item.get("device", "")).startswith("cuda") and item["nccl"]
+            for item in members
+        ) else "gloo",
         "timeout": timeout, "seed": seed,
         "manifest_key": f"jobs/{job_id}/attempts/{group_id}/request.json",
     }

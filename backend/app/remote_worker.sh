@@ -9,6 +9,7 @@ fi
 
 ACTION="${MTP_ACTION:-}"
 MODE="${MTP_MODE:-}"
+BACKEND="${MTP_DEVICE_BACKEND:-auto}"
 CPU_SLOTS="${MTP_CPU_SLOTS:-2}"
 CONTAINER="mtp-worker-${MTP_MACHINE_ID}"
 CONFIG_DIR="${HOME}/.config/mtp-worker"
@@ -41,6 +42,10 @@ write_worker_env() {
     printf 'S3_BUCKET=%s\n' "$MTP_S3_BUCKET"
     printf 'S3_SECURE=%s\n' "$MTP_S3_SECURE"
     printf 'WORKER_MACHINE_ID=%s\n' "$MTP_MACHINE_ID"
+    # auto 与历史配置等价，省略该键可避免无意义地改写旧环境文件。
+    if [[ "$BACKEND" != auto ]]; then
+      printf 'WORKER_DEVICE=%s\n' "$BACKEND"
+    fi
     printf 'WORKER_MANAGED=true\n'
     printf 'WORKER_CPU_SLOTS=%s\n' "$cpu_slots_value"
     if [[ -n "${MTP_DISTRIBUTED_HOST:-}" ]]; then
@@ -68,6 +73,12 @@ validate_worker_container_compatibility() {
   image_mode="$(docker inspect --format '{{index .Config.Labels "org.mtp.worker.mode"}}' "$CONTAINER")" || return 1
   if [[ "$MODE" == gpu && "$image_mode" == cpu ]]; then
     printf 'CPU 版 worker 镜像不支持 GPU，请先重新构建 GPU 版镜像并替换容器。\n' >&2
+    return 1
+  fi
+  local image_backend
+  image_backend="$(docker inspect --format '{{index .Config.Labels "org.mtp.worker.backend"}}' "$CONTAINER")" || return 1
+  if [[ "$BACKEND" != auto && -n "$image_backend" && "$BACKEND" != "$image_backend" ]]; then
+    printf '当前 worker 镜像后端为 %s，与配置的 %s 不一致，请先重新构建镜像。\n' "$image_backend" "$BACKEND" >&2
     return 1
   fi
   command="$(docker inspect --format '{{json .Config.Cmd}}' "$CONTAINER")" || {
@@ -188,6 +199,12 @@ validate_worker_image() {
     printf 'CPU 版 worker 镜像不支持 GPU，请先重新构建 GPU 版镜像并替换容器。\n' >&2
     return 1
   fi
+  local image_backend
+  image_backend="$(docker image inspect --format '{{index .Config.Labels "org.mtp.worker.backend"}}' "$image")" || return 1
+  if [[ "$BACKEND" != auto && -n "$image_backend" && "$BACKEND" != "$image_backend" ]]; then
+    printf 'worker 镜像后端为 %s，与配置的 %s 不一致，请先重新构建镜像。\n' "$image_backend" "$BACKEND" >&2
+    return 1
+  fi
 }
 
 # 用指定的现有镜像和当前部署配置创建 worker 容器；start=0 时仅创建不启动，
@@ -210,7 +227,11 @@ run_worker_container() {
     args+=(--volume "$APP_DIR:/app/app:ro")
   fi
   if [[ "$MODE" == gpu ]]; then
-    args+=(--gpus all)
+    case "$BACKEND" in
+      rocm) args+=(--device /dev/kfd --device /dev/dri --group-add video) ;;
+      xpu) args+=(--device /dev/dri) ;;
+      *) args+=(--gpus all) ;;
+    esac
   fi
   # 显式配置节点互联地址后使用 Linux host 网络，允许 Gloo/NCCL 节点间直连。
   # 仅打开 rendezvous 端口不足以支持后续动态通信端口，节点应位于可信互通网络。

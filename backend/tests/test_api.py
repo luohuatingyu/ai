@@ -1698,6 +1698,89 @@ def test_remote_server_card_exposes_live_operation_logs():
     assert "navigator.clipboard.writeText" in html
 
 
+@pytest.fixture()
+def selection_api(client, store, monkeypatch, tmp_path):
+    """资源选择使用独立队列和管理器，不改变其他 API 测试的 worker 生命周期。"""
+    from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore
+    from app.jobs import JobManager
+    from app.storage import LocalArtifactStore
+    from app.routers import jobs as routes
+
+    store = LocalArtifactStore(tmp_path / "selection-state")
+    lease = EmbeddedLeaseStore()
+    manager = JobManager(store=store, queue=EmbeddedJobQueue(), lease=lease,
+                         start_workers=False, start_watchdog=False)
+    monkeypatch.setattr(routes, "manager", manager)
+    for name, gpu, state, enabled in [
+        ("cpu", False, "idle", True), ("busy", False, "running", True),
+        ("gpu", True, "idle", True), ("disabled", False, "idle", False),
+        ("degraded", True, "degraded", True), ("offline", False, "idle", True),
+    ]:
+        lease.register_worker(name, {"worker_id": name, "state": state, "managed": True,
+            "gpu": {"available": gpu, "vram_mb": 8192 if gpu else 0},
+            "current_job": "another-job" if state == "running" else None},
+            ttl=-1 if name == "offline" else 60)
+        lease.set_worker_enabled(name, enabled)
+    yield client, manager, lease
+    manager.stop()
+
+
+@pytest.mark.parametrize("worker_id", [None, "cpu", "busy", "gpu"])
+def test_training_resource_selection_persists_hint(selection_api, make_dataset, worker_id):
+    """自动、CPU、GPU 和忙碌资源均可提交，选择只进入调度参数。"""
+    client, manager, _ = selection_api
+    response = client.post("/api/train", json=_train_payload(make_dataset(n=40), worker_id=worker_id))
+    assert response.status_code == 200, response.text
+    record = manager.get(response.json()["job_id"])
+    assert record["spec"]["resource_hint"].get("worker_id") == worker_id
+    assert "worker_id" not in record["spec"]["params"]
+    assert record["status"] == "queued"
+    assert manager.queue.snapshot() == [record["id"]]
+    assert client.get(f"/api/jobs/{record['id']}").json()["resource_hint"] == record["spec"]["resource_hint"]
+
+
+@pytest.mark.parametrize("worker_id,extra,status", [
+    ("unknown", {}, 409), ("offline", {}, 409), ("disabled", {}, 409), ("degraded", {}, 409),
+    ("cpu", {"require_gpu": True}, 409), ("cpu", {"min_vram_mb": 1}, 409),
+    ("gpu", {"min_vram_mb": 8193}, 409),
+    ("gpu", {"task": "clustering", "target": None}, 409),
+    ("cpu", {"task": "llm_pretraining"}, 409),
+    ("", {}, 422), ("x" * 161, {}, 422), ("../../;echo secret", {}, 422),
+    ("cpu", {"parallel_workers": [{"worker_id": "cpu"}, {"worker_id": "gpu"}]}, 422),
+])
+def test_training_resource_selection_rejects_invalid_without_job(selection_api, worker_id, extra, status):
+    """资源错误先于数据拉取被拒绝，非法输入不创建任务或队列项。"""
+    client, manager, _ = selection_api
+    response = client.post("/api/train", json=_train_payload("unmaterialized-dataset", worker_id=worker_id, **extra))
+    assert response.status_code == status, response.text
+    assert manager.list() == []
+    assert manager.queue.snapshot() == []
+
+
+@pytest.mark.parametrize("minimum", [0, 8192])
+def test_training_resource_selection_gpu_vram_boundary(selection_api, make_dataset, minimum):
+    """显存下限为零或恰好等于卡容量时允许选择 GPU。"""
+    client, manager, _ = selection_api
+    response = client.post("/api/train", json=_train_payload(make_dataset(n=40), worker_id="gpu", min_vram_mb=minimum))
+    assert response.status_code == 200, response.text
+    assert manager.get(response.json()["job_id"])["spec"]["resource_hint"]["min_vram_mb"] == minimum
+
+
+def test_training_resource_selection_dependency_failure_is_redacted(selection_api, monkeypatch):
+    """协调服务读取失败返回可重试错误，不暴露连接凭证或创建任务。"""
+    client, manager, lease = selection_api
+
+    def unavailable():
+        """模拟外部协调服务不可用，保留 API 校验与错误处理真实执行。"""
+        raise ConnectionError("redis://secret-password@private-host")
+
+    monkeypatch.setattr(lease, "list_workers", unavailable)
+    response = client.post("/api/train", json=_train_payload("unmaterialized", worker_id="cpu"))
+    assert response.status_code == 503
+    assert "secret-password" not in response.text
+    assert manager.list() == [] and manager.queue.size() == 0
+
+
 def test_management_tabs_have_independent_pages_and_forms():
     """服务器和凭证分别维护，导航可直接访问，训练台仅展示资源状态。"""
     static_dir = Path(__file__).resolve().parents[1] / "static"

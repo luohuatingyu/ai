@@ -552,7 +552,7 @@ def _worker_runtime_files(app_root: Path) -> List[Path]:
         raise RemoteWorkerError("worker 源码目录不能是符号链接")
     names = [
         "__init__.py", "config.py", "coordination.py", "storage.py", "jobstore.py",
-        "trainer.py", "llm_trainer.py", "worker.py", "worker-entrypoint.sh",
+        "device.py", "trainer.py", "llm_trainer.py", "worker.py", "worker-entrypoint.sh",
     ]
     # 联合训练模块在支持该功能的版本中随 worker 一起部署，兼容未启用该功能的版本。
     names.extend(name for name in ("parallel.py", "parallel_worker.py")
@@ -572,9 +572,10 @@ def _worker_build_context(
     import tarfile
 
     roots = context_roots or [
+        # 优先使用当前模块所属源码，避免容器中旧的 /app 副本漏掉新运行文件。
+        Path(__file__).resolve().parents[1],
         config.APP_ROOT.parent,
         Path("/app"),
-        Path(__file__).resolve().parents[1],
     ]
     context_root = None
     for candidate in dict.fromkeys(Path(root).resolve() for root in roots):
@@ -660,11 +661,22 @@ def _worker_code_archive() -> bytes:
 
 
 def _remote_build_args(server: Dict[str, object]) -> str:
-    """按目标硬件选择 CPU/CUDA 依赖，继续支持基础镜像和 pip 加速源。"""
+    """按目标硬件选择 CPU/CUDA/ROCm/XPU 依赖，继续支持基础镜像和 pip 加速源。"""
     mode = str(server.get("mode", "cpu"))
     if mode not in {"cpu", "gpu"}:
         raise RemoteWorkerError("资源类型必须是 cpu 或 gpu")
+    backend = str(server.get("device_backend", "auto") or "auto").lower()
+    if backend not in {"auto", "cuda", "rocm", "xpu", "mps", "cpu"}:
+        raise RemoteWorkerError("计算后端必须是 auto、cuda、rocm、xpu、mps 或 cpu")
+    if mode == "cpu" and backend not in {"auto", "cpu"}:
+        raise RemoteWorkerError("CPU 资源类型不能选择 GPU 后端")
+    if mode == "gpu" and backend == "cpu":
+        raise RemoteWorkerError("GPU 资源类型不能选择 CPU 后端")
+    if backend == "mps":
+        raise RemoteWorkerError("Apple MPS 需要 macOS 原生 worker，不能通过 Linux Docker 部署")
     args: List[str] = [f"--build-arg WORKER_MODE={mode}"]
+    if backend != "auto":
+        args.append(f"--build-arg WORKER_BACKEND={backend}")
     docker_registry = str(server.get("docker_registry") or "").strip()
     if docker_registry:
         base_image = f"{docker_registry}/library/python:3.12-slim"
@@ -950,6 +962,7 @@ _ENVIRONMENT_KEYS = (
     "MTP_ACTION",
     "MTP_MACHINE_ID",
     "MTP_MODE",
+    "MTP_DEVICE_BACKEND",
     "MTP_CPU_SLOTS",
     "MTP_DISTRIBUTED_HOST",
     "MTP_WORKER_IMAGE",
@@ -1361,6 +1374,7 @@ def remote_effective_config(server: Dict[str, object]) -> Dict[str, object]:
         "host": str(server.get("host", "")),
         "port": int(server.get("port", 22)),
         "mode": str(server.get("mode", "cpu")),
+        "device_backend": str(server.get("device_backend", "auto")),
         "cpu_slots": int(server.get("cpu_slots", 2)),
         "distributed_host": str(server.get("distributed_host", "")),
         "deployed": remote_server_is_deployed(server),
@@ -1809,6 +1823,14 @@ def validate_server_record(server: Dict[str, object]) -> None:
         raise RemoteWorkerError("SSH 用户名格式无效")
     if not 1 <= port <= 65535:
         raise RemoteWorkerError("SSH 端口必须在 1 到 65535 之间")
+    backend = str(server.get("device_backend", "auto") or "auto").lower()
+    if backend not in {"auto", "cuda", "rocm", "xpu", "mps", "cpu"}:
+        raise RemoteWorkerError("计算后端配置无效")
+    mode = str(server.get("mode", "cpu"))
+    if mode == "cpu" and backend not in {"auto", "cpu"}:
+        raise RemoteWorkerError("CPU 资源类型不能选择 GPU 后端")
+    if mode == "gpu" and backend == "cpu":
+        raise RemoteWorkerError("GPU 资源类型不能选择 CPU 后端")
 
 
 # start/restart 会把最新配置下发到目标机并重建容器应用（见 remote_worker.sh），
@@ -1865,6 +1887,9 @@ def render_remote_script(
     mode = str(server.get("mode", "cpu"))
     if mode not in {"cpu", "gpu"}:
         raise RemoteWorkerError("计算类型必须是 cpu 或 gpu")
+    device_backend = str(server.get("device_backend", "auto") or "auto").lower()
+    if device_backend == "mps":
+        raise RemoteWorkerError("Apple MPS 需要 macOS 原生 worker；Linux Docker 远程部署不支持 MPS")
     try:
         cpu_slots = int(server.get("cpu_slots", 2))
     except (TypeError, ValueError) as exc:
@@ -1877,6 +1902,7 @@ def render_remote_script(
         "MTP_ACTION": action,
         "MTP_MACHINE_ID": str(server["machine_id"]),
         "MTP_MODE": mode,
+        "MTP_DEVICE_BACKEND": device_backend,
         "MTP_CPU_SLOTS": str(cpu_slots),
         "MTP_DISTRIBUTED_HOST": str(server.get("distributed_host", "")),
         "MTP_WORKER_IMAGE": deployment["worker_image"],

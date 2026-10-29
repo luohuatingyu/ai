@@ -679,3 +679,102 @@ def test_controller_caps_heartbeat_interval_and_clears_old_signals(ls):
         assert not controller.pause_event.is_set()
     finally:
         controller.stop()
+
+
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_selected_training_resource_executes_on_target_only(store, make_dataset, make_job, q, ls, spawn_worker, task):
+    """真实训练只由指定槽执行，验证指标、产物、日志与执行轨迹。"""
+    ds = make_dataset(kind=task, n=120)
+    job = make_job(ds, epochs=2, task=task)
+    record = jobstore.read_job(store, job)
+    record["spec"]["resource_hint"]["worker_id"] = "selected-cpu"
+    jobstore.write_job(store, record)
+    q.push(job)
+    other = spawn_worker(capabilities=_caps("other-cpu"))
+    assert wait_until(lambda: other.worker._last_skip[0] == job, 5)
+    assert job_status(store, job) == "queued"
+    target = spawn_worker(capabilities=_caps("selected-cpu"))
+    assert wait_until(lambda: job_status(store, job) == "completed"
+                      and bool((jobstore.read_job(store, job) or {}).get("segments"))
+                      and ls.peek_holder(job) is None, 40)
+    final = jobstore.read_job(store, job)
+    assert final["worker_id"] == "selected-cpu"
+    assert all(segment["worker_id"] == "selected-cpu" for segment in final["segments"])
+    assert final["spec"]["resource_hint"]["worker_id"] == "selected-cpu"
+    metrics = jobstore.read_metrics(store, job)
+    assert len(metrics) == 2
+    assert ("val_accuracy" if task == "classification" else "val_r2") in metrics[-1]
+    if task == "regression":
+        assert "val_rmse" in final["summary"]["final"]
+    assert store.exists(job_key(job, "best.pt"))
+    assert store.exists(job_key(job, "preprocessor.json"))
+    assert "selected-cpu" in jobstore.read_job_log(store, job)
+    other.stop()
+    target.stop()
+
+
+def test_selected_training_resource_kept_on_auto_retry(store, make_dataset, make_job, q, ls):
+    """环境错误自动重试不解除初始的资源选择。"""
+    from app.worker import TrainingWorker
+
+    job = make_job(make_dataset(n=40), epochs=2)
+    record = jobstore.read_job(store, job)
+    record["spec"]["resource_hint"]["worker_id"] = "selected-cpu"
+    jobstore.write_job(store, record)
+    worker = TrainingWorker(store=store, queue=q, lease_store=ls, capabilities=_caps("selected-cpu"), gpu_probe_enabled=False)
+    worker._handle_run_failure(job, RuntimeError("CUDA out of memory"))
+    final = jobstore.read_job(store, job)
+    assert final["status"] == "queued" and final["retry_count"] == 1
+    assert final["spec"]["resource_hint"]["worker_id"] == "selected-cpu"
+    assert job in q.snapshot()
+
+
+@pytest.mark.parametrize("change", ["disable", "reassign", "degraded"])
+def test_selected_training_resource_rechecked_after_lease(store, make_dataset, make_job, q, ls, monkeypatch, change):
+    """模拟取得租约期间改选或停用，不能让旧槽越过校验开始训练。"""
+    from app.worker import TrainingWorker
+
+    job = make_job(make_dataset(n=40), epochs=2)
+    record = jobstore.read_job(store, job)
+    record["spec"]["resource_hint"]["worker_id"] = "selected-cpu"
+    jobstore.write_job(store, record)
+    worker = TrainingWorker(store=store, queue=q, lease_store=ls, capabilities=_caps("selected-cpu"), gpu_probe_enabled=False)
+    acquire = ls.acquire
+
+    def acquire_then_change(*args, **kwargs):
+        """在真实租约成功后注入并发状态变更，不替代核心领取逻辑。"""
+        result = acquire(*args, **kwargs)
+        if change == "disable":
+            ls.set_worker_enabled("selected-cpu", False)
+        elif change == "degraded":
+            worker._degraded = True
+        else:
+            changed = jobstore.read_job(store, job)
+            changed["spec"]["resource_hint"]["worker_id"] = "another-cpu"
+            jobstore.write_job(store, changed)
+        return result
+
+    monkeypatch.setattr(ls, "acquire", acquire_then_change)
+    worker._execute_job(job)
+    assert job_status(store, job) == "queued"
+    assert not store.exists(job_key(job, "best.pt"))
+    assert ls.peek_holder(job) is None
+    assert job in q.snapshot()
+
+
+def test_selected_cpu_clustering_rejects_replaced_gpu_slot(store, make_dataset, make_job, q, ls):
+    """资源登记后硬件能力变化时，CPU 聚类仍不得在 GPU 槽上执行。"""
+    from app.worker import TrainingWorker
+
+    job = make_job(make_dataset(kind="clustering", n=40), task="clustering")
+    record = jobstore.read_job(store, job)
+    record["spec"]["resource_hint"]["worker_id"] = "selected-slot"
+    jobstore.write_job(store, record)
+    worker = TrainingWorker(store=store, queue=q, lease_store=ls,
+                            capabilities=_caps("selected-slot", gpu=True, vram=8192),
+                            idle_poll=0.01, gpu_probe_enabled=False)
+    worker._execute_job(job)
+    assert job_status(store, job) == "queued"
+    assert ls.peek_holder(job) is None
+    assert not store.exists(job_key(job, "best.pt"))
+    assert job in q.snapshot()

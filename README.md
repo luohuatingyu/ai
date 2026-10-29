@@ -8,10 +8,10 @@
 - 📜 实时训练日志，任务可排队、暂停（保存断点）、恢复（跨卡/跨机接续）、取消、删除
 - 🖥 计算资源管理：平台通过 SSH 远程执行单文件部署脚本、自动检测 CPU/GPU、手动选择计算槽加入资源池，并可远程启动/停止/重启 worker
 - 🏆 支持分类、回归、KMeans 聚类、单序列预测、LLM 从零预训练、全参数 SFT、DPO 与 PPO/RLHF
-- 🔗 多节点联合训练同一个模型：支持不同 NVIDIA CUDA 显卡、纯 CPU 和 CPU/GPU 混合，按节点设置批大小
+- 🔗 多节点联合训练同一个模型：支持 NVIDIA CUDA、AMD ROCm、Intel XPU、Apple MPS、纯 CPU 和 CPU/GPU 混合，按节点设置批大小
 - 🔮 表格模型在线单条预测；LLM 可输入 prompt 生成文本，模型包可下载
 - ♻️ 环境性故障（CUDA/OOM/网络瞬断）自动从断点续训（`JOB_MAX_AUTO_RETRY` 次内），单卡故障不影响整体任务完成
-- 🔧 预留 GPU 接入：镜像内置 CUDA 12 构建 torch，宿主机装好驱动即自动启用 GPU
+- 🔧 统一设备适配：自动识别 CUDA、ROCm、XPU、MPS 和 CPU；模型 checkpoint 可在不同设备与操作系统间续训
 - 💾 支持MySQL数据库存储（可选镜像），使用已有MySQL服务器
 
 无需任何登录/权限逻辑，开放访问。
@@ -177,13 +177,25 @@ python -m app.worker --slot A-gpu0   # 单卡子进程（CUDA_VISIBLE_DEVICES �
 python -m app.worker --probe-gpu     # 一次性卡健康探测（退出码 0=健康）
 ```
 
+Apple Silicon worker 需要在 macOS 主机直接运行，不能使用 Linux Docker 透传 MPS。先在仓库根目录创建 Python 3.12 虚拟环境并安装 `backend/requirements-worker.txt`（Apple 的 PyTorch 构建应包含 MPS），再执行：
+
+```bash
+python3.12 -m venv .venv-worker
+. .venv-worker/bin/activate
+pip install -r backend/requirements-worker.txt
+REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:9000 \
+  bash scripts/worker-native.sh
+```
+
+`worker-native.sh` 会自动切换到 `backend/` 目录，默认使用 `WORKER_DEVICE=mps`；无 Apple GPU 时可显式设置 `WORKER_DEVICE=cpu`。macOS 原生 worker 与 Linux/Windows WSL2 worker 共用 Redis、S3 和项目代码版本，互联地址仍需填写该主机可被其他节点访问的地址。
+
 ### 5. 多台机器联合训练一个模型
 
 在「添加/编辑服务器」中填写各机器的「联合训练互联地址」，例如训练内网 IP `10.0.0.12`。部署最新版 worker、启动并将所需计算槽加入资源池后，在训练参数中选择「多节点联合训练一个模型」，选取 **2～32 个不同计算槽**，分别设置本地批大小。服务器可以使用不同型号的 NVIDIA 显卡，也可以全部使用 CPU 或混合 CPU/GPU；每个计算槽必须能容纳完整模型，PPO 还需要参考模型、奖励模型和 value head。KMeans 继续使用单节点。
 
-各节点必须使用 **Python 3.12、相同版本的项目代码和 PyTorch**；PyTorch 的 CPU/CUDA 构建后缀可以不同。显卡需受当前 PyTorch/CUDA 构建及宿主驱动支持；AMD ROCm、Apple MPS 暂未适配。各节点使用同一 Redis 和 S3 状态存储，互联地址必须能被所有节点访问；`localhost`、Docker 内部服务名不能用作跨机器地址。使用 Linux host 网络部署受管理 worker：旧 bridge 容器添加互联地址后，必须先「部署代码」重建容器，再启动，普通重启不能切换网络模式。
+各节点必须使用 **Python 3.12、相同版本的项目代码和 PyTorch**；CPU/CUDA/ROCm/XPU 构建后缀可以不同，但同一联合组的 PyTorch 主版本必须一致。AMD 节点使用 ROCm PyTorch 构建，Intel 节点使用带 XPU 支持的 PyTorch/oneAPI 环境，Apple GPU 使用 macOS 原生 worker（`scripts/worker-native.sh`），Linux Docker 不能透传 MPS；Windows 采用 WSL2 + 对应 Linux GPU 运行时。各节点使用同一 Redis 和 S3 状态存储，互联地址必须能被所有节点访问；`localhost`、Docker 内部服务名不能用作跨机器地址。使用 Linux host 网络部署受管理 worker：旧 bridge 容器添加互联地址后，必须先「部署代码」重建容器，再启动，普通重启不能切换网络模式。
 
-首次选择的计算槽为主节点。全 GPU 且支持 NCCL 时使用 NCCL，其余组合使用 Gloo；数据按固定 seed 分片，不补齐或丢弃尾批。每步按实际样本数加权合并梯度，LLM 预训练/SFT 按有效目标 token 数加权，主节点统一执行优化器更新并广播参数。最终只发布一份模型：表格/时间序列为 `best.pt`，LLM 为 `best_model.zip`。这要求节点从同一模型和数据开始同步训练，不能直接合并任意独立训练产生的权重。
+首次选择的计算槽为主节点。全 NVIDIA CUDA 且支持 NCCL 时使用 NCCL，其余组合（ROCm、XPU、MPS、CPU 或混合）使用 Gloo，通信张量放在 CPU；数据按固定 seed 分片，不补齐或丢弃尾批。每步按实际样本数加权合并梯度，LLM 预训练/SFT 按有效目标 token 数加权，主节点统一执行优化器更新并广播参数。最终只发布一份模型：表格/时间序列为 `best.pt`，LLM 为 `best_model.zip`。这要求节点从同一模型和数据开始同步训练，不能直接合并任意独立训练产生的权重。
 
 全局批大小为各节点批大小之和；算力弱的节点建议从较小批大小开始。联合模式以各节点批大小为准，普通 `batch_size` 仍用于验证集分批。通信和最慢节点会影响每步耗时，CPU 加入 GPU 组不保证加速。表格节点批大小范围为 1～4096，LLM 为 1～64。`parallel_timeout` 默认为 300 秒，可设 10～3600 秒；需覆盖单步计算、模型准备、验证或上传断点的最长等待。
 

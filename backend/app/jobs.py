@@ -214,7 +214,7 @@ class JobManager:
         return updated
 
     def resume(self, job_id: str) -> dict:
-        """恢复暂停的任务：回到队列，任意可用卡/机器从 checkpoint 接续。"""
+        """恢复暂停任务，保留指定槽或自动调度策略并从断点接续。"""
         record = self.get(job_id)
         if record is None:
             raise KeyError(job_id)
@@ -224,7 +224,11 @@ class JobManager:
         self.queue.push(job_id)
         jobstore.append_job_log(
             self.store, job_id,
-            "任务恢复：重新排队，任意可用卡/机器将从最近 checkpoint 接续训练",
+            "任务恢复：重新排队，" + (
+                f"等待指定计算槽 {record['spec']['resource_hint']['worker_id']} 从最近 checkpoint 接续训练"
+                if ((record.get("spec") or {}).get("resource_hint") or {}).get("worker_id")
+                else "任意可用卡/机器将从最近 checkpoint 接续训练"
+            ),
         )
         return updated
 
@@ -245,6 +249,15 @@ class JobManager:
             if record.get("status") != FAILED:
                 raise ValueError("仅失败任务可重新排队")
 
+            # 定向训练的手动重试显式更新策略；旧任务仍保持单次重试选槽语义。
+            spec = dict(record.get("spec") or {})
+            hint = dict(spec.get("resource_hint") or {})
+            if hint.get("worker_id"):
+                if worker_id:
+                    hint["worker_id"] = worker_id
+                else:
+                    hint.pop("worker_id", None)
+                spec["resource_hint"] = hint
             previous_error = record.get("error") or record.get("last_error")
             assignment_mode = "worker" if worker_id else "auto"
             updated = jobstore.update_job(
@@ -260,6 +273,7 @@ class JobManager:
                 retry_worker_id=worker_id,
                 retry_assignment_mode=assignment_mode,
                 retry_requested_at=time.time(),
+                spec=spec,
             )
             jobstore.append_job_log(
                 self.store,
@@ -401,7 +415,11 @@ class JobManager:
                 jobstore.append_job_log(
                     self.store, job_id,
                     "watchdog: 执行槽心跳丢失（租约已过期），任务重新排队"
-                    "——进度由 checkpoint 保留，任意可用卡可接手",
+                    "——进度由 checkpoint 保留，" + (
+                        f"等待指定计算槽 {record['spec']['resource_hint']['worker_id']} 恢复"
+                        if ((record.get("spec") or {}).get("resource_hint") or {}).get("worker_id")
+                        else "任意可用卡可接手"
+                    ),
                 )
                 self.queue.push(job_id)
             elif status == QUEUED and inflight is not None and job_id not in inflight:

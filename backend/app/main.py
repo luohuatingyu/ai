@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import app.config as config
+from app.device import available_backends, device_info
 from app.routers import datasets, jobs
 from app.state import manager  # noqa: F401  (对外保留引用，兼容测试/调用方)
 
@@ -36,14 +37,20 @@ def health() -> dict:
 
 @app.get("/api/system")
 def system() -> dict:
-    cuda = torch.cuda.is_available()
+    info = device_info()
+    cuda = bool(info["backend"] in {"cuda", "rocm"})
     return {
-        "device": "cuda" if cuda else "cpu",
-        "device_name": torch.cuda.get_device_name(0) if cuda else "未检测到 GPU",
+        "device": info["device"],
+        "device_name": info["name"] or "未检测到 GPU",
         "cuda_available": cuda,
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
-        "gpu_count": torch.cuda.device_count(),
+        "gpu_count": int(info["count"] if info["backend"] != "cpu" else 0),
+        "backend": info["backend"],
+        "vendor": info["vendor"],
+        "memory_mb": info["memory_mb"],
+        "healthy": info["healthy"],
+        "available_backends": available_backends(),
     }
 
 

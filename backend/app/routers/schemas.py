@@ -52,10 +52,20 @@ class TrainRequest(BaseModel):
     test_split: float = Field(0.2, ge=0.05, le=0.5)
     seed: int = 42
     # 资源提示（任务分发匹配到卡级）：要求在 GPU 卡上训练 / 显存下限
+    worker_id: str | None = Field(default=None, min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.-]+$")
     require_gpu: bool = False
     min_vram_mb: int = Field(0, ge=0, le=1024 * 1024)
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] = "auto"
     parallel_workers: list[ParallelMember] = Field(default_factory=list, max_length=32)
     parallel_timeout: int = Field(default=300, ge=10, le=3600)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_resource_selection(cls, data: Any) -> Any:
+        """单槽定向与多节点联合选择互斥，避免调度策略相互覆盖。"""
+        if isinstance(data, dict) and data.get("worker_id") and data.get("parallel_workers"):
+            raise ValueError("指定单个计算槽与多节点联合训练不能同时选择")
+        return data
 
     @model_validator(mode="after")
     def validate_task_fields(self) -> "TrainRequest":
@@ -100,6 +110,10 @@ class TrainRequest(BaseModel):
                 raise ValueError("时间列不能与目标列相同")
         if self.task == "clustering" and self.require_gpu:
             raise ValueError("KMeans 聚类当前仅支持 CPU 计算")
+        if self.device_backend == "cpu" and self.require_gpu:
+            raise ValueError("CPU 后端不能同时设置 require_gpu=true")
+        if self.task == "clustering" and self.device_backend not in {"auto", "cpu"}:
+            raise ValueError("KMeans 聚类当前仅支持 CPU 后端")
         return self
 
 
@@ -175,6 +189,7 @@ class RemoteServerRequest(BaseModel):
     )
     port: int = Field(default=22, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] = "gpu"
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] = "auto"
     cpu_slots: int = Field(default=2, ge=0, le=256)
     distributed_host: str = Field(default="", max_length=253, pattern=r"^[A-Za-z0-9.:-]*$")
     remote_redis_url: str | None = Field(default=None, max_length=4096)
@@ -212,6 +227,7 @@ class RemoteServerUpdateRequest(BaseModel):
     ssh_credential_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     port: int | None = Field(default=None, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] | None = None
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] | None = None
     cpu_slots: int | None = Field(default=None, ge=0, le=256)
     distributed_host: str | None = Field(default=None, max_length=253, pattern=r"^[A-Za-z0-9.:-]*$")
     remote_redis_url: str | None = Field(default=None, max_length=4096)

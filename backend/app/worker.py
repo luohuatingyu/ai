@@ -44,6 +44,7 @@ from app.storage import (
 )
 from app.trainer import JobCancelled, JobPaused, load_trainer_state, run_training
 from app.parallel_worker import make_group, run_rank_process, select_members, slot_key
+from app.device import device_info, probe_device
 
 
 def detect_capabilities(
@@ -60,17 +61,15 @@ def detect_capabilities(
     machine_id / slot：一卡一进程模式下，Supervisor 传入机器与卡槽标识，
     使 /api/workers 可按「机器 -> 卡」两级聚合展示。
     """
-    gpu = {"available": False, "name": None, "count": 0, "vram_mb": 0}
+    gpu = {"available": False, "name": None, "count": 0, "vram_mb": 0,
+           "backend": "cpu", "vendor": "cpu", "device": "cpu", "healthy": True}
     try:
-        import torch
-
-        if torch.cuda.is_available():
-            gpu = {
-                "available": True,
-                "name": torch.cuda.get_device_name(0),
-                "count": int(torch.cuda.device_count()),
-                "vram_mb": int(torch.cuda.get_device_properties(0).total_memory // 2**20),
-            }
+        info = device_info()
+        if info["backend"] != "cpu":
+            gpu = {"available": True, "name": info["name"], "count": info["count"],
+                   "vram_mb": info["memory_mb"], "backend": info["backend"],
+                   "vendor": info["vendor"], "device": info["device"],
+                   "healthy": info["healthy"]}
     except Exception:
         pass
     try:
@@ -81,13 +80,13 @@ def detect_capabilities(
         torch_version, cuda_version = "未知", None
     hostname = socket.gethostname()
     parallel = {"protocol": 1, "host": os.environ.get("WORKER_DISTRIBUTED_HOST", "").strip(),
-                "gloo": False, "nccl": False, "vendor": "nvidia"}
+                "gloo": False, "nccl": False, "vendor": gpu["vendor"],
+                "backend": gpu["backend"], "device": gpu["device"]}
     slot_name = slot or "cpu0"
     slot_number = int("".join(character for character in slot_name if character.isdigit()) or "0")
     parallel["port"] = int(os.environ.get("WORKER_DISTRIBUTED_PORT", "29500")) + slot_number + (256 if slot_name.startswith("cpu") else 0)
     try:
-        parallel.update({"gloo": _torch.distributed.is_gloo_available(), "nccl": _torch.distributed.is_nccl_available(),
-                         "vendor": "amd" if _torch.version.hip else "nvidia"})
+        parallel.update({"gloo": _torch.distributed.is_gloo_available(), "nccl": _torch.distributed.is_nccl_available()})
     except Exception:
         pass
     return {
@@ -98,6 +97,9 @@ def detect_capabilities(
         "managed": config.WORKER_MANAGED,
         "cpu": {"cores": _detect_cpu_cores(), "memory_mb": _detect_memory_mb()},
         "gpu": gpu,
+        "device": gpu["device"],
+        "device_backend": gpu["backend"],
+        "vendor": gpu["vendor"],
         "torch_version": torch_version,
         "cuda_version": cuda_version,
         "python_version": platform.python_version(),
@@ -146,12 +148,8 @@ def probe_visible_gpu() -> bool:
     任何异常均视为不健康，绝不抛出——探测本身必须先于一切可靠。
     """
     try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return False
-        x = torch.tensor([2.0], device="cuda")
-        return float((x * 2).item()) == 4.0
+        info = device_info()
+        return info["backend"] != "cpu" and probe_device(info["device"])
     except Exception:
         return False
 
@@ -494,9 +492,10 @@ class TrainingWorker:
         hb_ttl = max(config.WORKER_LEASE_TTL * 2.0, config.WORKER_HEARTBEAT_INTERVAL * 3.0)
         self.lease_store.register_worker(self.worker_id, self.caps, hb_ttl)
         gpu = self.caps.get("gpu") or {}
+        device_label = f"{gpu.get('backend', 'gpu')}({gpu.get('name')})" if gpu.get("available") else "cpu"
         self._log(
             f"worker {self.worker_id} 启动: 机器={self.caps.get('machine_id')} 槽位={self.caps.get('slot')} "
-            f"设备={'cuda(' + str(gpu.get('name')) + ')' if gpu.get('available') else 'cpu'}"
+            f"设备={device_label}"
             f" / torch={self.caps.get('torch_version')} / 存储={config.STORAGE_BACKEND}"
         )
         try:
@@ -622,13 +621,15 @@ class TrainingWorker:
             # 已被取消/暂停的排队任务：直接丢弃（不再回队列）
             self._log(f"[{job_id}] 状态为 {record.get('status')}，跳过")
             return
-        requested_worker = record.get("retry_worker_id")
+        spec = record.get("spec") or {}
+        hint = spec.get("resource_hint") or {}
+        requested_worker = hint.get("worker_id") or record.get("retry_worker_id")
         if requested_worker and requested_worker != self.worker_id:
             self.queue.push(job_id)
             last_id, last_ts = self._last_skip
             if last_id != job_id or time.time() - last_ts > 30.0:
                 self._log(
-                    f"[{job_id}] 重试指定计算槽 {requested_worker}，"
+                    f"[{job_id}] 任务指定计算槽 {requested_worker}，"
                     f"本槽 {self.worker_id} 不匹配，已放回队列"
                 )
                 self._last_skip = (job_id, time.time())
@@ -642,7 +643,21 @@ class TrainingWorker:
             self._shutdown.wait(self._idle_poll)
             return
         gpu = self.caps.get("gpu") or {}
+        requested_backend = str(hint.get("device_backend") or "auto")
+        actual_backend = str(gpu.get("backend") or self.caps.get("device_backend") or ("cuda" if gpu.get("available") else "cpu"))
+        if requested_backend != "auto" and requested_backend != actual_backend:
+            self.queue.push(job_id)
+            last_id, last_ts = self._last_skip
+            if last_id != job_id or time.time() - last_ts > 30.0:
+                self._log(f"[{job_id}] 资源提示需要 {requested_backend} 后端，本槽为 {actual_backend}，已放回队列")
+                self._last_skip = (job_id, time.time())
+            time.sleep(min(2.0, self._idle_poll))
+            return
         min_vram = int(hint.get("min_vram_mb") or 0)
+        if hint.get("worker_id") and spec.get("task") == "clustering" and gpu.get("available"):
+            self.queue.push(job_id)
+            self._shutdown.wait(self._idle_poll)
+            return
         # 资源提示匹配（到卡级）：require_gpu 要求是 GPU 卡；min_vram_mb 要求显存下限。
         # 不匹配则放回队列等待合适的卡（提示日志防刷屏），不影响队列中其它任务。
         if (hint.get("require_gpu") or min_vram > 0) and not gpu.get("available"):
@@ -684,6 +699,14 @@ class TrainingWorker:
             record = jobstore.read_job(self.store, job_id)
             if record is None or record.get("status") != jobstore.QUEUED:
                 return
+            # 租约获取期间可能发生重试改选或停用；执行前再次核对最新策略。
+            latest_hint = (record.get("spec") or {}).get("resource_hint") or {}
+            latest_worker = latest_hint.get("worker_id") or record.get("retry_worker_id")
+            if (latest_worker and latest_worker != self.worker_id) or self._degraded or not self.lease_store.is_worker_enabled(
+                self.worker_id, default=not bool(self.caps.get("managed"))
+            ):
+                self.queue.push(job_id)
+                return
             group = None
             if selected:
                 try:
@@ -695,6 +718,10 @@ class TrainingWorker:
                     return
                 if hint.get("require_gpu") and any(member["device"] == "cpu" for member in members):
                     raise ValueError("联合训练成员不满足仅 GPU 限制")
+                if requested_backend != "auto" and any(
+                    str(member.get("device_backend", "cpu")) != requested_backend for member in members
+                ):
+                    raise ValueError(f"联合训练成员必须全部使用 {requested_backend} 后端")
                 if min_vram and any(member["device"] == "cpu" or member["vram_mb"] < min_vram for member in members):
                     raise ValueError("联合训练成员不满足最低显存限制")
                 group = make_group(job_id, token, members, int(hint.get("parallel_timeout", 300)), int((spec.get("params") or {}).get("seed", 42)))
@@ -750,7 +777,9 @@ class TrainingWorker:
                 "worker_id": self.worker_id,
                 "machine_id": self.caps.get("machine_id"),
                 "slot": self.caps.get("slot"),
-                "device": "cuda" if gpu.get("available") else "cpu",
+                "device": gpu.get("device", "cpu") if gpu.get("available") else "cpu",
+                "device_backend": gpu.get("backend", "cpu"),
+                "vendor": gpu.get("vendor", "cpu"),
                 "gpu_name": gpu.get("name") if gpu.get("available") else None,
                 "vram_mb": int(gpu.get("vram_mb") or 0) if gpu.get("available") else None,
                 "from_epoch": 1,
@@ -1031,6 +1060,7 @@ class TrainingWorker:
                 pass
 
         retry_count = 0
+        record = {}
         try:
             record = jobstore.read_job(store, job_id) or {}
             retry_count = int(record.get("retry_count") or 0)
@@ -1041,7 +1071,9 @@ class TrainingWorker:
             new_count = retry_count + 1
             local_log(
                 f"环境性错误，自动重试 {new_count}/{config.JOB_MAX_AUTO_RETRY}"
-                f"（断点已保留，任意可用卡可接续）: {exc}",
+                + ("（断点已保留，等待指定计算槽恢复）"
+                   if ((record.get("spec") or {}).get("resource_hint") or {}).get("worker_id")
+                   else "（断点已保留，任意可用卡可接续）") + f": {exc}",
             )
             try:
                 jobstore.finish_current_attempt(
@@ -1149,19 +1181,50 @@ class WorkerSupervisor:
         self._shutdown = threading.Event()
         self._children: Dict[str, "subprocess.Popen"] = {}  # slot -> 子进程
         self._slots: List[Tuple[str, Optional[str]]] = []   # (slot 短名, GPU 索引或 None)
+        self._slot_backends: Dict[str, str] = {}
         gpu_count = _gpu_count()
-        for i in range(gpu_count):
+        try:
+            import torch
+            backend = str(os.environ.get("WORKER_DEVICE", "auto")).lower()
+            if backend == "auto":
+                backend = str(device_info().get("backend", "cpu"))
+                # 旧版测试/调用方可能只替换 GPU 数量；保持显式可见 GPU 的 CUDA 兼容行为。
+                if backend == "cpu" and gpu_count > 0:
+                    backend = "cuda"
+            if backend in {"cuda", "rocm"}:
+                accelerator_count = gpu_count
+            elif backend == "xpu":
+                accelerator_count = int(torch.xpu.device_count()) if hasattr(torch, "xpu") else 0
+            elif backend == "mps":
+                accelerator_count = 1
+            else:
+                accelerator_count = 0
+        except Exception:
+            backend, accelerator_count = "cpu", 0
+        for i in range(accelerator_count):
             self._slots.append((f"gpu{i}", str(i)))
+            self._slot_backends[f"gpu{i}"] = backend
         n_cpu = config.WORKER_CPU_SLOTS if cpu_slots is None else cpu_slots
-        for j in range(max(int(n_cpu), 1) if gpu_count == 0 else int(n_cpu)):
+        for j in range(max(int(n_cpu), 1) if accelerator_count == 0 else int(n_cpu)):
             self._slots.append((f"cpu{j}", None))
+            self._slot_backends[f"cpu{j}"] = "cpu"
 
     # ------------------------------------------------------------------
     def _spawn(self, slot: str, gpu_index: Optional[str]) -> "subprocess.Popen":
-        """启动一个卡槽子进程：CUDA_VISIBLE_DEVICES 隔离到单卡（必须在 CUDA 初始化前设置）。"""
+        """启动一个卡槽子进程，并按后端隔离 CUDA/ROCm 或 XPU 设备。"""
         env = dict(os.environ)
         env.pop("_", None)  # 防止个别环境变量干扰 torch 启动偏好
-        env["CUDA_VISIBLE_DEVICES"] = gpu_index if gpu_index is not None else ""
+        backend = self._slot_backends.get(slot, "cpu")
+        if gpu_index is not None and backend == "cpu":
+            # 兼容旧测试/旧 supervisor：显式 GPU 索引默认沿用 CUDA。
+            backend = "cuda"
+        env["WORKER_DEVICE"] = backend
+        env["CUDA_VISIBLE_DEVICES"] = gpu_index if backend in {"cuda", "rocm"} and gpu_index is not None else ""
+        env["HIP_VISIBLE_DEVICES"] = gpu_index if backend == "rocm" and gpu_index is not None else ""
+        env["ROCR_VISIBLE_DEVICES"] = gpu_index if backend == "rocm" and gpu_index is not None else ""
+        env["ONEAPI_DEVICE_SELECTOR"] = (
+            f"level_zero:{gpu_index}" if backend == "xpu" and gpu_index is not None else ""
+        )
         env["WORKER_SLOT"] = slot
         env["PYTHONUNBUFFERED"] = "1"
         child = subprocess.Popen(
@@ -1171,12 +1234,18 @@ class WorkerSupervisor:
         self._log(f"supervisor: 启动卡槽 {slot} 子进程 pid={child.pid}")
         return child
 
-    def _probe_gpu(self, gpu_index: Optional[str]) -> bool:
+    def _probe_gpu(self, gpu_index: Optional[str], backend: str = "cuda") -> bool:
         """探测指定卡是否恢复：一次性 --probe-gpu 子进程（退出码 0 = 健康）。"""
         if gpu_index is None:
             return True
         env = dict(os.environ)
-        env["CUDA_VISIBLE_DEVICES"] = gpu_index
+        env["WORKER_DEVICE"] = backend
+        env["CUDA_VISIBLE_DEVICES"] = gpu_index if backend in {"cuda", "rocm"} else ""
+        env["HIP_VISIBLE_DEVICES"] = gpu_index if backend == "rocm" else ""
+        env["ROCR_VISIBLE_DEVICES"] = gpu_index if backend == "rocm" else ""
+        env["ONEAPI_DEVICE_SELECTOR"] = (
+            f"level_zero:{gpu_index}" if backend == "xpu" else ""
+        )
         try:
             probe = subprocess.run(
                 [sys.executable, "-m", "app.worker", "--probe-gpu"],
@@ -1192,7 +1261,7 @@ class WorkerSupervisor:
         for slot, gpu_index in self._slots:
             if slot in self._children and self._children[slot] is not None:
                 continue
-            if gpu_index is not None and not self._probe_gpu(gpu_index):
+            if gpu_index is not None and not self._probe_gpu(gpu_index, self._slot_backends.get(slot, "cuda")):
                 # 掉卡时先不启动子进程：等下轮探测恢复再启动（recovering）
                 self._log(f"supervisor: 卡 {slot}（GPU {gpu_index}）探测失败，暂不启动（recovering）")
                 continue
@@ -1267,11 +1336,10 @@ class WorkerSupervisor:
 
 
 def _gpu_count() -> int:
-    """本机可见 GPU 数（Supervisor 决定拉起几个卡槽用）；失败按 0 处理。"""
+    """本机可见加速器数（Supervisor 决定拉起几个卡槽）；失败按 0 处理。"""
     try:
-        import torch
-
-        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+        info = device_info()
+        return int(info["count"]) if info["backend"] != "cpu" else 0
     except Exception:
         return 0
 
