@@ -3093,3 +3093,46 @@ docker compose logs --tail=15 worker
 - 默认 Compose 全量重建仍受 PyTorch 镜像传输和哈希不一致阻塞；依赖镜像稳定后应重新执行标准构建并运行完整 pytest。
 - 本次最新弹窗版本未完成 Safari 中点击按钮后的人工交互验收，Node 测试和静态服务检查已覆盖相同交互逻辑；应在稳定的训练工作台标签页补做打开弹窗、翻页和关闭的浏览器验收。
 - 完整后端回归中的失败与本次分页逻辑无关，需在完整项目根目录挂载并隔离其他并行变更后重新分类验证。
+
+## 本次变更测试结果：远程服务器状态与实际 worker 容器校准（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`d9f542d60a5cab25287cae4b732593426d2a26f8`。
+- **提交信息**：Reconcile remote worker deployment state。
+- **测试日期 / 分支**：2026-10-30 / `emdash/hot-boxes-clean-y9u6p`。
+- **变更范围**：远程 worker 操作执行器和远程 worker 回归测试。部署代码遇到“远端 worker 容器/配置缺失”时自动转为完整安装；生命周期操作确认缺失时将 MySQL 服务器记录校准为 `deployed=false`、`status=not_deployed`，页面下次刷新显示“部署”。无新增依赖、数据库迁移或配置修改。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 测试层级、前置条件与输入 | 预期结果与场景 |
+|---|---|---|
+| 部署代码与远端实际一致 | `test_execute_remote_operation_recovers_deploy_when_worker_container_is_missing`；模拟已部署记录、远端部署返回“未找到容器” | 自动按 `deploy → install` 重试，完整安装成功后操作完成、服务器在线、日志记录自动校准；正常、异常、回归 |
+| 完整恢复失败不继续显示已部署 | `test_execute_remote_operation_keeps_missing_state_when_recovery_fails`；部署和自动安装均返回配置缺失 | 操作失败但持久化为 `deployed=false`、`not_deployed`；异常、状态冲突 |
+| 启动/重启等生命周期操作校准缺失容器 | `test_execute_remote_operation_marks_missing_worker_as_undeployed`；重启返回“未找到 worker 容器” | 操作失败，保留原始错误，服务器记录可直接进入下一次部署；异常、兼容 |
+| 已有容器的既有语义保持不变 | `test_execute_remote_operation_persists_success_and_failure`、心跳成功/超时用例及完整远程 worker/API 套件 | 正常部署、失败、心跳缺失和成功心跳结果保持原行为；正常、边界、回归 |
+
+### 测试执行结果
+
+| 阶段 / 实际命令 | 通过 | 失败 | 错误 / 跳过 | 结论 |
+|---|---:|---:|---:|---|
+| Python 3.12 专项：`docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q -k 'execute_remote_operation_recovers_deploy_when_worker_container_is_missing or execute_remote_operation_marks_missing_worker_as_undeployed or execute_remote_operation_keeps_missing_state_when_recovery_fails or execute_remote_operation_persists_success_and_failure or execute_remote_operation_records_missing_worker_heartbeat or execute_remote_operation_records_healthy_worker_heartbeat'` | 6 | 0 | 0 / 148 未选 | 通过 |
+| Python 3.12 远程/API 回归：`... python -m pytest tests/test_remote_workers.py tests/test_api.py -q --tb=short` | 239 | 0 | 0 / 0 | 通过 |
+| Python 3.12 完整套件：`... python -m pytest tests/ -q --tb=short` | 565 | 0 | 2 / 24 | 已执行用例 100% 通过 |
+| `git diff --check`（业务代码与正式测试） | 通过 | — | — | 无空白错误 |
+| `docker compose up --build -d` | — | 1 | 构建中止 | trainer/worker 安装 PyTorch 2.15.0 时镜像下载仅收到约 7.9/483.7 MB，SHA256 与 requirements 锁定值不一致；已停止重试，不能标记完整 Compose 构建通过 |
+
+### 关键模块与环境验证
+
+- 远程 worker 模块：专项 6/6，包含自动恢复、恢复失败、状态校准、既有成功/失败和心跳分支。
+- API 与远程操作：239/239 通过。
+- 完整后端套件：565 通过、24 跳过、0 失败、0 错误；跳过项为既有真实 Redis/S3/GPU/NCCL 等环境依赖。
+- 替代验证使用现有 trainer 镜像中的 **Python 3.12.15**，挂载当前源码执行；未使用宿主 Python 3.9 结果替代容器验证。
+- 完整 Compose 构建未通过的原因是外部 PyTorch 镜像传输内容哈希不匹配，与本次远程状态代码无关；前端镜像在同一次构建中已完成，但不能代表整套服务构建成功。
+
+### 已知问题、重测与回滚
+
+- 稳定依赖源可用后，应重新执行 `docker compose up --build -d`，确认 trainer、worker、frontend 全部从当前源码重建并启动。
+- 若远端容器被手动删除，第一次点击“部署代码”会触发完整镜像构建，耗时可能明显高于复用现有镜像的普通代码部署。
+- 修改远程操作状态机、`remote_worker.sh` 容器错误文本、服务器状态持久化或部署按钮行为时，需重跑远程 worker 专项、API 套件和完整后端套件。
+- 回滚可撤销提交 `d9f542d` 并重新构建平台；无数据迁移。
