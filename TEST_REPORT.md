@@ -3056,3 +3056,40 @@ docker compose logs --tail=15 worker
 **已知问题与限制**：完整 Compose 重建需要修复或更换当前 PyPI 镜像中的 torch 包哈希后重新执行；前端镜像本身已成功构建并启动。
 
 **下次测试建议**：在可用的 Python 3.12 依赖镜像环境中重新执行 `docker compose up --build -d`，随后运行完整 `cd backend && python -m pytest tests/ -v` 回归套件。
+
+## 本次变更测试结果：弹窗分页展示数据集预览（2026-10-29）
+
+### Git 基准点与范围
+
+- **Git 基准点**：`80bf639`（Add paginated dataset preview modal）；本报告随后单独提交。
+- **分支**：`emdash/hot-boxes-clean-y9u6p`。
+- **变更范围**：训练工作台的数据集预览改为按需打开弹窗；弹窗按每页 10 行请求并展示表格，支持上一页、下一页、关闭、遮罩关闭和 Escape 关闭。数据集详情 API 新增 `rows` / `offset` 分页参数并返回页码元数据；旧的不带参数调用继续返回前 5 行。
+- **涉及文件**：`backend/static/index.html`、`backend/app/dataset_manager.py`、`backend/app/routers/datasets.py`、`frontend/dataset-preview.test.cjs`、`backend/tests/test_dataset_preview_pagination.py`。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 测试层级、用例与输入 | 预期与覆盖场景 |
+|---|---|---|
+| 预览数据只在弹窗中展示，训练页主布局不内联表格 | Node：`预览入口打开弹窗，主页面不再内联表格`；列表加载用例 | 默认不请求详情；点击后打开 `role=dialog` 弹窗并加载第一页；正常、兼容、回归 |
+| 数据按页展示，每页 10 行且可前后翻页 | Node：`点击打开弹窗并加载第一页`、`下一页和上一页按偏移请求`；Python：`test_preview_returns_requested_page_and_metadata` | 请求 `rows=10` 与对应 `offset`，页码和按钮状态正确，最后一页不足 10 行；正常、边界 |
+| 非法分页参数、越界、请求失败和恶意文本可安全处理 | Python：`test_preview_rejects_invalid_page_parameters`、`test_preview_out_of_range_returns_empty_page`；Node：失败重试、特殊字符转义、旧响应隔离 | 非法参数返回 400，越界返回空页，失败可重试，HTML 特殊字符不执行；异常、安全、并发 |
+| 旧 API 调用和训练列配置保持兼容 | Python：`test_preview_default_call_remains_first_page`；Node：`预览分页不重置训练列选择`；前端完整套件 | 不带分页参数仍返回 5 行，翻页不重置列选择，切换数据集从第一页开始；兼容、回归 |
+
+### 测试执行结果
+
+| 阶段 | 结果 | 说明 |
+|---|---|---|
+| `node --test frontend/dataset-preview.test.cjs` | **8 通过，0 失败** | 弹窗、分页、关闭、异步竞态、错误重试和安全转义 |
+| `node --test frontend/*.test.cjs` | **100 通过，0 失败** | 当前共享工作区前端回归套件 |
+| Python 3.12：`pytest tests/test_dataset_preview_pagination.py -q` | **6 通过，0 失败** | 1 条既有 SQLAlchemy 弃用警告 |
+| 内联 JavaScript `vm.Script` 解析 | **通过** | 当前候选页面脚本可解析 |
+| 前端容器：`docker compose up -d --no-build --no-deps frontend` | **通过** | 容器健康；`curl http://127.0.0.1:8000/healthz` 返回 `ok`；页面包含 `previewModal`、`previewPrev`、`previewNext` |
+| `git diff --check` | **通过** | 无空白错误 |
+| `docker compose up --build -d` | **未完成** | trainer/worker 构建下载 PyTorch 483.7 MB 时出现 SSL record layer failure，重试后下载内容 SHA256 与 requirements 锁定值不一致；已停止长时间重试。前端镜像已完成构建并单独启动 |
+| 后端完整回归（Python 3.12 镜像） | **507 通过、33 失败、24 跳过** | 失败集中在只挂载 `backend/` 时缺少 `/scripts`、`/docker-compose.yml`，以及并行任务涉及的 worker、NCCL、KMeans/远程环境；不能作为完整回归通过结论 |
+
+### 已知问题与下次验证建议
+
+- 默认 Compose 全量重建仍受 PyTorch 镜像传输和哈希不一致阻塞；依赖镜像稳定后应重新执行标准构建并运行完整 pytest。
+- 本次最新弹窗版本未完成 Safari 中点击按钮后的人工交互验收，Node 测试和静态服务检查已覆盖相同交互逻辑；应在稳定的训练工作台标签页补做打开弹窗、翻页和关闭的浏览器验收。
+- 完整后端回归中的失败与本次分页逻辑无关，需在完整项目根目录挂载并隔离其他并行变更后重新分类验证。
