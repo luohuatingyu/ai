@@ -558,6 +558,19 @@
         <label for="remoteS3Endpoint">S3 地址（可选覆盖）</label>
         <input id="remoteS3Endpoint" name="remote_s3_endpoint" maxlength="512" placeholder="留空时使用平台 .env 的 S3_ENDPOINT">
       </div>
+      <div class="field wide">
+        <label for="remoteDockerRegistry">Docker 镜像加速（可选）</label>
+        <input id="remoteDockerRegistry" name="docker_registry" maxlength="253" placeholder="例如 docker.m.daocloud.io，加速基础镜像拉取">
+        <div class="hint">仅用于目标机构建 worker 镜像时拉取基础镜像；留空直连 Docker Hub。</div>
+      </div>
+      <div class="field wide">
+        <label for="remotePipIndexUrl">pip 源（可选）</label>
+        <input id="remotePipIndexUrl" name="pip_index_url" maxlength="2048" placeholder="例如 https://mirrors.aliyun.com/pypi/simple/（默认清华源）">
+      </div>
+      <div class="field wide">
+        <label for="remoteAptMirror">apt 源（可选）</label>
+        <input id="remoteAptMirror" name="apt_mirror" maxlength="253" placeholder="例如 mirrors.aliyun.com（默认 deb.debian.org）">
+      </div>
       <div class="field wide hint" id="remoteConfigApplyHint">登记配置后，可在服务器卡片上单独部署。</div>
       <div class="field wide hint">SSH 凭证在页面统一配置；主机密钥首次连接时自动信任并持久化。</div>
       <div class="server-form-actions">
@@ -1873,6 +1886,9 @@ async function openEditRemoteServer(machineId) {
   $("clearRemoteRedisOverride").checked = false;
   $("remoteRedisUrl").disabled = false;
   $("remoteS3Endpoint").value = server.remote_s3_endpoint_override || "";
+  $("remoteDockerRegistry").value = server.docker_registry || "";
+  $("remotePipIndexUrl").value = server.pip_index_url || "";
+  $("remoteAptMirror").value = server.apt_mirror || "";
   $("addServerTitle").textContent = `编辑服务器 ${machineId}`;
   $("btnSubmitRemoteServer").textContent = server.deployed ? "更新配置" : "保存配置";
   $("remoteConfigApplyHint").textContent = server.deployed
@@ -1906,6 +1922,9 @@ async function submitRemoteServer(event) {
   payload.cpu_slots = Number(payload.cpu_slots || 0);
   payload.remote_redis_url = String(payload.remote_redis_url || "").trim();
   payload.remote_s3_endpoint = payload.remote_s3_endpoint.trim() || null;
+  payload.docker_registry = String(payload.docker_registry || "").trim() || null;
+  payload.pip_index_url = String(payload.pip_index_url || "").trim() || null;
+  payload.apt_mirror = String(payload.apt_mirror || "").trim() || null;
   payload.clear_remote_redis_url_override = $("clearRemoteRedisOverride").checked;
   const editingMachineId = state.editingRemoteMachineId;
   if (editingMachineId) delete payload.machine_id;

@@ -917,6 +917,55 @@ def test_remote_worker_build_sends_minimal_context_and_quotes_docker_args(monkey
     assert not any(name.startswith(("data/", "tests/")) for name in names)
 
 
+def test_remote_build_args_empty_when_no_mirror_configured():
+    """未配置加速源时不追加任何 --build-arg。"""
+    assert remote_workers._remote_build_args(_server()) == ""
+
+
+def test_remote_worker_build_injects_repository_mirror_build_args(monkeypatch):
+    """服务器配置镜像/pip/apt 加速源时，docker build 命令携带对应 --build-arg。"""
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout=b"Build complete\n", stderr=b"")
+
+    monkeypatch.setattr(remote_workers, "_run_remote_subprocess", fake_run)
+    server = _server(
+        docker_registry="docker.m.daocloud.io",
+        pip_index_url="https://mirrors.aliyun.com/pypi/simple/",
+        apt_mirror="mirrors.aliyun.com",
+    )
+    remote_workers._build_worker_image_on_remote(
+        "worker:latest",
+        "linux/x86_64",
+        ["/usr/bin/ssh", "worker@compute.example.net", "bash -s"],
+        None,
+        {"password": "", "passphrase": ""},
+        server,
+        timeout=3600,
+    )
+
+    command = calls[0][0][-1]
+    assert "--build-arg BASE_IMAGE=docker.m.daocloud.io/library/python:3.12-slim" in command
+    assert "--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/" in command
+    assert "--build-arg APT_MIRROR=mirrors.aliyun.com" in command
+
+
+def test_worker_build_context_dockerfile_accepts_build_args():
+    """构建上下文 Dockerfile 使用可覆盖的 BASE_IMAGE 与 APT_MIRROR 参数。"""
+    import io
+    import tarfile
+
+    backend_dir = Path(remote_workers.__file__).resolve().parents[1]
+    context = remote_workers._worker_build_context([backend_dir])
+    with tarfile.open(fileobj=io.BytesIO(context), mode="r:") as archive:
+        dockerfile = archive.extractfile("Dockerfile").read().decode("utf-8")
+    assert "FROM ${BASE_IMAGE}" in dockerfile
+    assert "ARG BASE_IMAGE=python:3.12-slim" in dockerfile
+    assert "ARG APT_MIRROR=" in dockerfile
+
+
 def test_remote_worker_build_falls_back_when_buildx_is_missing(monkeypatch):
     """Buildx 缺失时改用目标机原生架构和传统构建器重试。"""
     import io

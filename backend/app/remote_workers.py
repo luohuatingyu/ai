@@ -607,6 +607,22 @@ def _worker_code_archive() -> bytes:
     return archive_buffer.getvalue()
 
 
+def _remote_build_args(server: Dict[str, object]) -> str:
+    """按服务器配置构造 docker build 的 --build-arg（Docker/pip/apt 加速源）。"""
+    args: List[str] = []
+    docker_registry = str(server.get("docker_registry") or "").strip()
+    if docker_registry:
+        base_image = f"{docker_registry}/library/python:3.12-slim"
+        args.append(f"--build-arg BASE_IMAGE={shlex.quote(base_image)}")
+    pip_index = str(server.get("pip_index_url") or "").strip()
+    if pip_index:
+        args.append(f"--build-arg PIP_INDEX_URL={shlex.quote(pip_index)}")
+    apt_mirror = str(server.get("apt_mirror") or "").strip()
+    if apt_mirror:
+        args.append(f"--build-arg APT_MIRROR={shlex.quote(apt_mirror)}")
+    return " ".join(args)
+
+
 def _build_worker_image_on_remote(
     image: str,
     platform: str,
@@ -659,9 +675,11 @@ def _build_worker_image_on_remote(
             stdout, stderr, credentials, server
         )
 
+    build_args = _remote_build_args(server)
+    build_arg_clause = f" {build_args}" if build_args else ""
     remote_build_command = (
-        "DOCKER_BUILDKIT=1 docker build --progress=plain --platform {} --tag {} -"
-    ).format(shlex.quote(canonical_platform), shlex.quote(image))
+        "DOCKER_BUILDKIT=1 docker build --progress=plain --platform {} --tag {}{} -"
+    ).format(shlex.quote(canonical_platform), shlex.quote(image), build_arg_clause)
     _emit_progress(
         progress_callback,
         "构建目标架构镜像",
@@ -682,8 +700,8 @@ def _build_worker_image_on_remote(
             )
             legacy_context = _worker_build_context(legacy_builder=True)
             # 目标平台刚从此 Docker daemon 读取；传统构建器按 daemon 本机架构构建。
-            legacy_command = "DOCKER_BUILDKIT=0 docker build --tag {} -".format(
-                shlex.quote(image)
+            legacy_command = "DOCKER_BUILDKIT=0 docker build --tag {}{} -".format(
+                shlex.quote(image), build_arg_clause
             )
             result, _stdout, _stderr, output = run_build(
                 legacy_command, legacy_context

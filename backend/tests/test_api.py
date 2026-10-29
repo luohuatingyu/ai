@@ -534,6 +534,9 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
         "cpu_slots": 0,
         "remote_redis_url": "rediss://worker:synthetic-redis-password@redis.example.net:6380/4",
         "remote_s3_endpoint": "remote-storage.example.net:9000",
+        "docker_registry": "docker.m.daocloud.io",
+        "pip_index_url": "https://mirrors.aliyun.com/pypi/simple/",
+        "apt_mirror": "mirrors.aliyun.com",
     }
     added = client.post("/api/remote-servers", json=payload)
     assert added.status_code == 201
@@ -551,6 +554,9 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     assert server["username_override"] == "worker"
     assert server["ssh_credential_id"] == credential_id
     assert server["remote_s3_endpoint_override"] == payload["remote_s3_endpoint"]
+    assert server["docker_registry"] == "docker.m.daocloud.io"
+    assert server["pip_index_url"] == "https://mirrors.aliyun.com/pypi/simple/"
+    assert server["apt_mirror"] == "mirrors.aliyun.com"
     assert "worker_image_override" not in server
     assert server["has_remote_redis_url_override"] is True
     assert server["deployed"] is False
@@ -614,6 +620,8 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
         f"/api/remote-servers/{machine_id}",
         json={
             "remote_s3_endpoint": "storage-v3.example.net:9000",
+            "docker_registry": "docker.m.daocloud.io",
+            "apt_mirror": "",
         },
     )
     assert updated.status_code == 202, updated.text
@@ -623,7 +631,11 @@ def test_remote_server_api_separates_registration_deployment_and_config_update(c
     assert update_operation["status"] == "completed"
     assert update_operation["action"] == "config"
     assert calls[-1] == (machine_id, "config", "worker")
-    assert remote_config_repository.get_remote_server(machine_id)["remote_s3_endpoint_override"] == "storage-v3.example.net:9000"
+    edited_record = remote_config_repository.get_remote_server(machine_id)
+    assert edited_record["remote_s3_endpoint_override"] == "storage-v3.example.net:9000"
+    assert edited_record["docker_registry"] == "docker.m.daocloud.io"
+    assert edited_record["apt_mirror"] is None
+    assert edited_record["pip_index_url"] == "https://mirrors.aliyun.com/pypi/simple/"
 
     for action in ("install", "deploy", "start", "stop", "restart"):
         result = client.post(f"/api/remote-servers/{machine_id}/{action}")
@@ -1467,6 +1479,9 @@ def test_remote_server_form_exposes_network_overrides_and_effective_config_actio
         "remoteEffectiveConfigModal",
         'id="remoteRedisUrl"',
         'id="remoteS3Endpoint"',
+        'id="remoteDockerRegistry"',
+        'id="remotePipIndexUrl"',
+        'id="remoteAptMirror"',
         'id="clearRemoteRedisOverride"',
         "data-edit-remote-machine-id",
         'data-remote-action="deploy"',
@@ -1480,6 +1495,32 @@ def test_remote_server_form_exposes_network_overrides_and_effective_config_actio
         assert marker in html
     assert 'id="remoteWorkerImage"' not in html
     assert 'name="worker_image"' not in html
+
+
+def test_remote_server_rejects_invalid_repository_sources():
+    """镜像加速/pip/apt 源格式非法时拒绝，合法时接受。"""
+    from pydantic import ValidationError
+
+    from app.routers.schemas import RemoteServerRequest
+
+    with pytest.raises(ValidationError):
+        RemoteServerRequest(machine_id="m1", host="h.example.net", ssh_credential_id="c1", docker_registry="https://bad.example")
+    with pytest.raises(ValidationError):
+        RemoteServerRequest(machine_id="m1", host="h.example.net", ssh_credential_id="c1", pip_index_url="not-a-url")
+    with pytest.raises(ValidationError):
+        RemoteServerRequest(machine_id="m1", host="h.example.net", ssh_credential_id="c1", apt_mirror="mirrors.aliyun.com/debian")
+
+    ok = RemoteServerRequest(
+        machine_id="m1",
+        host="h.example.net",
+        ssh_credential_id="c1",
+        docker_registry="docker.m.daocloud.io",
+        pip_index_url="https://mirrors.aliyun.com/pypi/simple/",
+        apt_mirror="mirrors.aliyun.com",
+    )
+    assert ok.docker_registry == "docker.m.daocloud.io"
+    assert ok.pip_index_url == "https://mirrors.aliyun.com/pypi/simple/"
+    assert ok.apt_mirror == "mirrors.aliyun.com"
 
 
 def test_remote_server_card_filters_lifecycle_actions_by_presence():

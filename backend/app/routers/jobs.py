@@ -634,6 +634,11 @@ def update_remote_server(
         if not updates["ssh_credential_id"]:
             raise HTTPException(422, "必须选择 SSH 凭证")
         candidate["ssh_credential_id"] = updates.pop("ssh_credential_id")
+    # 远程构建仓库源（镜像加速 / pip 源 / apt 源）：空值表示清除，回退平台默认。
+    for key in ("docker_registry", "pip_index_url", "apt_mirror"):
+        if key in updates:
+            raw = updates.pop(key)
+            candidate[key] = (str(raw).strip() or None) if raw is not None else None
 
     try:
         candidate = apply_remote_server_overrides(candidate, updates)

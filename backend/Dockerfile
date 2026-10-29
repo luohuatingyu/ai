@@ -2,11 +2,15 @@
 # 基础镜像: Python 3.12 (Debian slim)
 # GPU 运行时: 宿主机 NVIDIA 驱动 + nvidia-container-toolkit 挂载进容器，
 #             torch 的 Linux wheel 内置 CUDA 12 运行时，镜像内无需安装 CUDA Toolkit。
-FROM python:3.12-slim
+# 基础镜像与远程仓库源均可通过 build-arg 覆盖（远程目标机构建时注入国内加速源）：
+#   BASE_IMAGE    Docker Hub 基础镜像（镜像加速：<registry>/library/python:3.12-slim）
+#   PIP_INDEX_URL pip 源（默认清华）
+#   APT_MIRROR    Debian apt 源 host（默认留空走官方 deb.debian.org）
+ARG BASE_IMAGE=python:3.12-slim
+FROM ${BASE_IMAGE}
 
-# 默认走清华 PyPI 镜像（大体积 torch/nvidia wheel 下载更稳）；
-# 海外环境可用 build-arg 覆盖，例如 --build-arg PIP_INDEX_URL=https://pypi.org/simple
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG APT_MIRROR=""
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=180 \
@@ -15,7 +19,10 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # API 通过 OpenSSH 客户端远程执行已打包的 worker 引导脚本。
-RUN apt-get update \
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      sed -i "s#http://deb.debian.org#http://${APT_MIRROR}#g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/*
 

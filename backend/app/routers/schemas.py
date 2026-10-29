@@ -137,6 +137,10 @@ class RemoteServerRequest(BaseModel):
     cpu_slots: int = Field(default=2, ge=0, le=256)
     remote_redis_url: str | None = Field(default=None, max_length=4096)
     remote_s3_endpoint: str | None = Field(default=None, max_length=512)
+    # 远程构建仓库源（可选，目标机构建 worker 镜像时注入加速源）
+    docker_registry: str | None = Field(default=None, max_length=253)
+    pip_index_url: str | None = Field(default=None, max_length=2048)
+    apt_mirror: str | None = Field(default=None, max_length=253)
 
     @model_validator(mode="after")
     def validate_deployment_overrides(self) -> "RemoteServerRequest":
@@ -147,6 +151,14 @@ class RemoteServerRequest(BaseModel):
             raise ValueError("Redis 地址不能包含空白或控制字符")
         if self.remote_s3_endpoint and any(char.isspace() or ord(char) < 32 for char in self.remote_s3_endpoint):
             raise ValueError("S3 地址不能包含空白字符")
+        if self.docker_registry and not re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", self.docker_registry):
+            raise ValueError("镜像加速源必须是主机[:端口]格式，例如 docker.m.daocloud.io")
+        if self.pip_index_url and not self.pip_index_url.startswith(("http://", "https://")):
+            raise ValueError("pip 源必须以 http:// 或 https:// 开头")
+        if self.pip_index_url and any(char.isspace() or ord(char) < 32 for char in self.pip_index_url):
+            raise ValueError("pip 源不能包含空白或控制字符")
+        if self.apt_mirror and not re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", self.apt_mirror):
+            raise ValueError("apt 源必须是主机[:端口]格式，例如 mirrors.aliyun.com")
         return self
 
 
@@ -162,6 +174,10 @@ class RemoteServerUpdateRequest(BaseModel):
     remote_redis_url: str | None = Field(default=None, max_length=4096)
     remote_s3_endpoint: str | None = Field(default=None, max_length=512)
     clear_remote_redis_url_override: bool = False
+    # 远程构建仓库源（可选，目标机构建 worker 镜像时注入加速源）
+    docker_registry: str | None = Field(default=None, max_length=253)
+    pip_index_url: str | None = Field(default=None, max_length=2048)
+    apt_mirror: str | None = Field(default=None, max_length=253)
 
     @model_validator(mode="after")
     def validate_deployment_overrides(self) -> "RemoteServerUpdateRequest":
@@ -172,6 +188,14 @@ class RemoteServerUpdateRequest(BaseModel):
             raise ValueError("Redis 地址不能包含空白或控制字符")
         if self.remote_s3_endpoint and any(char.isspace() or ord(char) < 32 for char in self.remote_s3_endpoint):
             raise ValueError("S3 地址不能包含空白字符")
+        if self.docker_registry and not re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", self.docker_registry):
+            raise ValueError("镜像加速源必须是主机[:端口]格式，例如 docker.m.daocloud.io")
+        if self.pip_index_url and not self.pip_index_url.startswith(("http://", "https://")):
+            raise ValueError("pip 源必须以 http:// 或 https:// 开头")
+        if self.pip_index_url and any(char.isspace() or ord(char) < 32 for char in self.pip_index_url):
+            raise ValueError("pip 源不能包含空白或控制字符")
+        if self.apt_mirror and not re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", self.apt_mirror):
+            raise ValueError("apt 源必须是主机[:端口]格式，例如 mirrors.aliyun.com")
         return self
 
 
