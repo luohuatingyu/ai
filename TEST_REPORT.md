@@ -3117,8 +3117,8 @@ docker compose logs --tail=15 worker
 | 阶段 / 实际命令 | 通过 | 失败 | 错误 / 跳过 | 结论 |
 |---|---:|---:|---:|---|
 | Python 3.12 专项：`docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q -k 'execute_remote_operation_recovers_deploy_when_worker_container_is_missing or execute_remote_operation_marks_missing_worker_as_undeployed or execute_remote_operation_keeps_missing_state_when_recovery_fails or execute_remote_operation_persists_success_and_failure or execute_remote_operation_records_missing_worker_heartbeat or execute_remote_operation_records_healthy_worker_heartbeat'` | 6 | 0 | 0 / 148 未选 | 通过 |
-| Python 3.12 远程/API 回归：`... python -m pytest tests/test_remote_workers.py tests/test_api.py -q --tb=short` | 239 | 0 | 0 / 0 | 通过 |
-| Python 3.12 完整套件：`... python -m pytest tests/ -q --tb=short` | 565 | 0 | 2 / 24 | 已执行用例 100% 通过 |
+| Python 3.12 远程/API 回归：`docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py tests/test_api.py -q --tb=short` | 239 | 0 | 0 / 0 | 通过 |
+| Python 3.12 完整套件：`docker run --rm --network none --mount type=bind,src="$PWD",dst=/workspace --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q --tb=short` | 565 | 0 | 2 / 24 | 已执行用例 100% 通过 |
 | `git diff --check`（业务代码与正式测试） | 通过 | — | — | 无空白错误 |
 | `docker compose up --build -d` | — | 1 | 构建中止 | trainer/worker 安装 PyTorch 2.15.0 时镜像下载仅收到约 7.9/483.7 MB，SHA256 与 requirements 锁定值不一致；已停止重试，不能标记完整 Compose 构建通过 |
 
