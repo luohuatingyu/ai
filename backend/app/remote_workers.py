@@ -1917,13 +1917,13 @@ def run_remote_action(
             _emit_progress(
                 progress_callback,
                 "同步 worker 代码",
-                "同步最新 worker Python 代码、重写配置并重建远端容器。",
+                "同步最新 worker Python 代码并重建远端容器，不上传新配置。",
             )
         elif action == "config":
             _emit_progress(
                 progress_callback,
                 "覆盖 worker 配置",
-                "覆盖目标机 worker 配置并重建容器应用，不上传代码。",
+                "覆盖目标机 worker 配置，下次启动/重启时生效，不上传代码。",
             )
         _emit_progress(progress_callback, "执行远程部署脚本", f"开始执行远端 {action} 脚本。")
         progress_options = (
@@ -1953,10 +1953,11 @@ def run_remote_action(
         detail = (output["stderr"] or output["stdout"] or "远程脚本返回错误").strip()
         raise RemoteWorkerError(detail[-2000:])
     _emit_progress(progress_callback, "执行远程部署脚本", "远端脚本已成功返回。")
-    # 重建/重启容器后等待资源心跳，确认 worker 真的注册成功（stop 无需等待）。
+    # 重建/重启容器后等待资源心跳，确认 worker 真的注册成功（stop/config 无需等待；
+    # config 只写文件、不重启容器，worker 仍按旧配置心跳，等待无意义）。
     heartbeat_ok: bool | None = None
     if operation_id and action in {
-        "install", "deploy", "update", "config", "start", "restart"
+        "install", "deploy", "update", "start", "restart"
     }:
         heartbeat_ok = _wait_for_remote_worker_heartbeat(
             operation_id,

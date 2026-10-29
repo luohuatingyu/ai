@@ -1473,8 +1473,8 @@ def test_remote_server_form_exposes_network_overrides_and_effective_config_actio
         'deployed ? "部署代码" : "部署"',
         "更新配置",
         "部署代码",
-        "同步最新 worker 代码与配置并重建容器",
-        "保存后覆盖远端配置并重建 worker 容器应用",
+        "同步最新 worker 代码并重建容器",
+        "保存后覆盖远端配置文件，下次启动/重启时生效",
         "openEditRemoteServer",
     ):
         assert marker in html

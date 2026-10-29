@@ -1562,7 +1562,7 @@ function workerServerCard(machineId, slots, remoteServer = null) {
       <button class="server-log-button" data-remote-server-logs="${esc(machineId)}">日志</button>
       <button data-remote-effective-config="${esc(machineId)}">生效配置</button>
       <button data-edit-remote-machine-id="${esc(machineId)}" ${operationBusy ? "disabled" : ""}>更新配置</button>
-      <button title="${deployed ? "同步最新 worker 代码与配置并重建容器" : "首次部署 worker 镜像、配置和代码"}" data-remote-machine-id="${esc(machineId)}" data-remote-action="deploy" ${operationBusy ? "disabled" : ""}>${deployed ? "部署代码" : "部署"}</button>
+      <button title="${deployed ? "同步最新 worker 代码并重建容器" : "首次部署 worker 镜像、配置和代码"}" data-remote-machine-id="${esc(machineId)}" data-remote-action="deploy" ${operationBusy ? "disabled" : ""}>${deployed ? "部署代码" : "部署"}</button>
       ${lifecycleControls}
       ${operationBusy ? `<button data-cancel-remote-operation="${esc(operation.operation_id)}" ${cancelRequested ? "disabled" : ""}>${cancelRequested ? "正在中断…" : "中断操作"}</button>` : ""}
     </div>` : "";
@@ -1876,7 +1876,7 @@ async function openEditRemoteServer(machineId) {
   $("addServerTitle").textContent = `编辑服务器 ${machineId}`;
   $("btnSubmitRemoteServer").textContent = server.deployed ? "更新配置" : "保存配置";
   $("remoteConfigApplyHint").textContent = server.deployed
-    ? "保存后覆盖远端配置并重建 worker 容器应用（运行中的 worker 会短暂重启）。"
+    ? "保存后覆盖远端配置文件，下次启动/重启时生效（不影响当前运行中的 worker）。"
     : "服务器尚未部署；保存后可在服务器卡片上点击“部署”。";
   modal.hidden = false;
   modal.classList.add("open");
