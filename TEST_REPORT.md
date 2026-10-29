@@ -1,3 +1,88 @@
+## 本次变更测试结果：异构多节点联合训练（2026-10-29）
+
+### Git 基准点与实现范围
+
+- **Commit Hash**：`f5ba35f916635f9b8c0e370916984e949ab591e8`。
+- **提交信息**：Add heterogeneous synchronous multi-node training。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围**：新增 `parallel.py` / `parallel_worker.py`，接入表格/时间序列/LLM 训练器、Worker 槽预留及租约、任务 API 与请求校验、远程互联地址与 host 网络部署、训练页面、README 和正式测试。未新增依赖、迁移数据库或修改仓库 Compose 配置；工作区预先存在的 Dockerfile 下载重试修改不属于本提交。
+- **技术环境**：Docker Desktop / Linux ARM64，Python **3.12.15**，PyTorch **2.14.1+cu130**（实际以 CPU 执行）、Gloo、Redis 7、SeaweedFS S3、FastAPI/Pydantic、原生 HTML/JavaScript。未使用宿主机旧版 Python 执行业务验证。
+- **实现行为**：2～32 个计算槽按不同本地批大小处理数据，按样本数或有效目标 token 数加权汇总梯度，主节点更新并广播唯一模型；全 CUDA/NCCL 组使用 NCCL，CPU/混合组使用 Gloo。支持分类、回归、时间序列、LLM 预训练/SFT/DPO/PPO；KMeans 保持单节点。暂停保存完整 epoch，取消/故障终止本轮，原成员整组恢复；表格产物 `best.pt`，LLM 产物 `best_model.zip`。
+- **验证隔离**：测试期间其他会话又修改了训练器和前端。最终从 `a7bee30` 导出独立快照，再覆盖本任务已经部署的精确源码和正式测试。提交前逐文件比较暂存 blob 与快照，16 个提交文件全部一致；共享工作区的其他修改保留，未混入本提交。快照与临时 Compose 文件位于 `/private/tmp/mtp-parallel-validation-PURH0f/`，完成后清除。
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---:|---|
+| 新增进展回归，修复前 | 3 | 0 | 3 | 0 | 0 | 复现参与 rank 的进展计数为 0，长 epoch 会被父进程误判无进展 |
+| 新增页面回归，修复前 | 9 | 3 | 6 | 0 | 0 | 4 个 LLM 分支覆盖了 CPU 资源设置；缺少 Gloo 校验；编辑时汇总不刷新 |
+| 首轮联合/远程相关套件 | 177 | 175 | 0 | 0 | 2 | 初始实现验证，75.31 秒 |
+| 扩展联合/远程相关套件 | 198 | 196 | 0 | 0 | 2 | 修复及边界测试通过，87.30 秒；随后补充 LLM 续训用例 |
+| 分类与 LLM 暂停续训 | 2 | 2 | 0 | 0 | 0 | 与不中断训练逐参数、逐指标一致，24.17 秒 |
+| 最终独立快照完整 pytest | **488** | **464** | **0** | **0** | **24** | **140.45 秒**；已执行用例通过率 100%，含跳过的总通过比例 95.08% |
+| Redis/S3 环境补测 | 33 | 33 | 0 | 0 | 0 | 真实隔离服务，2.97 秒；覆盖上述 19 个 Redis、2 个 S3 跳过项，另含已有同类回归 |
+| 独立快照前端测试 | 27 | 27 | 0 | 0 | 0 | 联合训练 9 项、既有服务器弹窗 18 项 |
+| 跨容器联合训练 | 1 | 1 | 0 | 0 | 0 | 两个独立 worker、真实 Redis/S3、eth0 上 Gloo 通信、完整 API 业务断言 |
+| Python 3.12 本地等价 API | 1 | 1 | 0 | 0 | 0 | 隔离 Uvicorn、禁用数据库/Redis、临时本地存储，健康接口断言通过 |
+
+最终完整套件中的联合训练模块为 **46 通过 / 2 个真实 GPU 用例跳过**，远程管理为 **151 通过**；其余数据层、训练器、调度/API 和既有功能的可执行测试均通过。共享工作区完整套件也得到 464 通过、24 跳过（160.03 秒），最终验收以上述独立快照为准。保留 SQLAlchemy `declarative_base()` 与 Pandas `xlrd` 两条既有弃用警告；没有删除、跳过或弱化已有有效测试。
+
+### 验收标准与可执行用例映射
+
+以下联合训练用例位于 `backend/tests/test_parallel.py`；使用真实 PyTorch 计算与通信，只有外部进程启动/网络加载边界按需隔离。
+
+| 验收标准 | 测试层级、前置条件与输入 | 可执行用例 | 预期结果 / 场景 |
+|---|---|---|---|
+| AC1 一组只更新一个模型，批大小可不同 | CPU 多进程；7 条样本，批大小 (2,1)/(1,5)/(3,3,3) | `test_weighted_gradients_equal_global_batch_with_empty_tail` | 各 rank 每一步权重均等于串行全局批计算；尾批不补齐、不丢失；全部 rank 上报进展。正常/边界 |
+| AC2 CPU/GPU 兼容与能力选择 | 注册 CPU、不同 GPU 名称及软件版本；实际 CPU 进程 | `test_member_validation_and_backend_selection`、`test_incompatible_members_are_rejected`、`test_cpu_slot_hides_inherited_gpu_visibility` | 选择 NCCL/Gloo 正确；版本/厂商/能力不兼容及禁用/离线节点拒绝；CPU 槽隐藏 CUDA。兼容/异常/资源权限 |
+| AC2 真实异构硬件 | 需要至少一张或两张 NVIDIA GPU | `test_real_cuda_cpu_mixed_training`、`test_real_nccl_training` | 检查真实混合通信及 NCCL 参数一致性；本机无 GPU，**未执行** |
+| AC3 所有批准的梯度训练任务 | 微型本地模型和数据，双 CPU rank，包含空尾批 | `test_training_artifacts_metrics_and_predictions`、`test_parallel_llm_finetuning_and_empty_tail` | 分类/回归/时间序列/预训练/SFT/DPO/PPO 指标有限且产物可用；PPO value head、全局优势统计参与更新。正常/边界 |
+| AC4 API 全链路与旧数据兼容 | flat/structured 两种数据布局 × 分类/回归 | `test_workers_complete_one_joint_job` | POST 训练→轮询→日志→accuracy/R²/RMSE→唯一 best.pt；预测稳定，缺失/非法数值与显式训练中位数填充的结果一致。端到端/兼容/回归 |
+| AC5 暂停、恢复、复现 | 固定 seed、成员、批大小；分类及 LLM 在 epoch 1 暂停 | `test_pause_resume_matches_uninterrupted_and_repeatable` | 恢复到 epoch 3 后参数和指标与完整运行一致；恢复起点和 checkpoint 正确。控制/可复现 |
+| AC6 异常与有界退出 | 数据不一致、rank 退出/取消/NaN、成员缺席超时 | `test_different_data_is_rejected_by_all_ranks`、`test_rank_failure_stops_the_group_without_publishing_model`、`test_missing_rank_times_out_and_cleans_subprocess_files` | 明确失败或整组取消，无错误模型，子进程及通信文件清理。异常/超时 |
+| AC7 槽位互斥与状态隔离 | 某槽被占用；主节点 token 被替换；失败组请求单槽重试 | `test_group_reservation_rolls_back_if_member_is_busy`、`test_member_does_not_renew_or_overwrite_replaced_leader`、`test_group_retry_cannot_be_assigned_to_single_worker` | 部分预留回滚，旧成员不能续租/覆盖新主节点，重试保持原组。冲突/资源权限 |
+| AC8 参数边界及单节点兼容 | 重复/非法 ID、1/33 节点、0/超大批大小、超时边界、KMeans、LLM GPU 限制 | `test_invalid_parallel_requests_are_rejected`、`test_parallel_schema_limits_and_unsupported_tasks`、`test_parallel_schema_accepts_upper_bound`、两项 `test_api_*` | 明确拒绝非法请求，32 节点上界合法；单节点 LLM 仍默认要求 GPU，联合 LLM 可用 CPU。边界/恶意输入/兼容 |
+| AC9 远程配置与已有部署兼容 | Bash 引导脚本；start/restart × bridge/host；地址设置/清空 | `test_remote_workers.py::test_distributed_host_requires_host_network_before_start`、`test_optional_distributed_host_configuration_can_be_cleared` | bridge 配置联合地址时提示先部署；host 可运行；清空恢复旧配置文本。配置/兼容 |
+| AC10 页面操作与参数提交 | 实际页面函数；DOM/网络边界替身 | `frontend/parallel-training.test.cjs` | 节点批大小、资源限制、LLM CPU 载荷、掉线/停用/Gloo 缺失校验、聚类回退和编辑汇总正确。前端/回归 |
+
+平台现有产品未提供登录/角色系统，本次未新增身份认证流程；安全验证覆盖恶意成员 ID、禁用资源、租约越权、旧执行轮次隔离、JSON 通信与已有 API/SSH 回归，不将未存在的登录权限体系记为已验证。
+
+### 实际执行命令与环境
+
+所有 pytest 均通过 Docker 中 Python 3.12 执行，公共运行参数为 `--rm --pull=never`、只读绑定项目到 `/workspace`、工作目录 `/workspace/backend`、`PYTHONDONTWRITEBYTECODE=1`、`OMP_NUM_THREADS=1`、`MKL_NUM_THREADS=1`。本地套件使用 `--network none`；测试产物仅写容器临时目录。关键完整命令：
+
+```bash
+docker run --rm --pull=never --network none --mount type=bind,src=/Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_parallel.py tests/test_remote_workers.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-parallel-targeted-final
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-parallel-validation-PURH0f/snapshot,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v -rs --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-parallel-isolated
+docker run --rm --pull=never --network mtp-parallel-check --mount type=bind,src=/Users/xyzc/emdash/worktrees/ai-d973ef21/emdash-hot-boxes-clean-y9u6p,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env MTP_TEST_REDIS=redis://mtp-parallel-check-redis:6379/0 --env MTP_TEST_S3=mtp-parallel-check-s3:8333 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_coordination.py tests/test_storage.py tests/test_worker.py -q -k 'redis or heartbeat_recovers or s3' --tb=short -rs -p no:cacheprovider --basetemp=/tmp/mtp-parallel-services
+node --test frontend/parallel-training.test.cjs
+node --test frontend/*.test.cjs
+node --test /private/tmp/mtp-parallel-validation-PURH0f/snapshot/frontend/parallel-training.test.cjs /private/tmp/mtp-parallel-validation-PURH0f/snapshot/frontend/server-modal.test.cjs
+docker compose up --build -d
+docker compose -f docker-compose.yml -f /private/tmp/mtp-parallel-validation-PURH0f/compose.yml up --build -d
+docker compose ps
+curl -fsS http://127.0.0.1:8000/api/health
+curl -fsS http://127.0.0.1:8000/healthz
+git diff --cached --check
+git status --short
+```
+
+早期回归和补充续训分别以相同 Docker 包装执行 `python -m pytest tests/test_parallel.py -q -k weighted --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-parallel-progress-regression`、`python -m pytest tests/test_parallel.py -q -k pause_resume --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-parallel-resume`。完整页面内联脚本也通过 Node `vm.Script` 语法解析；该项未代替业务测试或浏览器视觉验证。
+
+**跨容器业务验证**：创建独立网络 `mtp-parallel-check`，启动临时 Redis (`redis:7-alpine`) 和 SeaweedFS (`chrislusf/seaweedfs:latest server -s3 -filer -dir=/tmp -ip=0.0.0.0`)；两个 worker 容器用生产入口 `python -m app.worker --slot cpu0 --idle-poll 0.1`，分别注册 `node-a-cpu0`、`node-b-cpu0`，设置各自容器 DNS 为互联地址、`GLOO_SOCKET_IFNAME=eth0`，连接隔离 Redis 和 S3 bucket `parallel-check`。第三个一次性容器通过 `python -u -` 执行内联 TestClient 验证：上传 80 行分类数据，以 batch 5+2 训练 3 epochs；断言唯一 segment 含两成员、全局批 7、3 条指标、accuracy 有效、S3 best.pt 存在、日志含联合启动、两次预测一致且槽租约全部释放。结果打印 PASS。未操作用户已有远程服务器或线上训练数据；脚本未保存到仓库。
+
+### 容器验证、限制与后续建议
+
+- **默认从零构建未完成**：规定命令 `docker compose up --build -d` 已执行，在从当前 pip 源下载 454.0 MB PyTorch 包的阶段等待数分钟仍未完成，主动取消，退出码 **130**。未将其标记为构建通过，也没有跳过包校验或修改项目依赖。
+- **等价依赖基底的统一 Compose 重建通过**：复用镜像 `sha256:ad102bbe9afd8b1005897712d96332b702f5f7e547832d4b046335610ad98153` 的已安装依赖，以临时 Dockerfile 复制最新 app/static/sample_data 与构建资源，临时 Compose 覆盖 trainer/worker 的 Dockerfile 路径。基底和项目 `requirements.txt` SHA256 均为 `7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`。全部 Compose 服务成功重建启动，`/api/health` 返回 `{"ok":true}`，`/healthz` 返回 `ok`。关键训练文件和页面 SHA256 与本任务快照一致，运行镜像为 `sha256:f72a45f60ca7f88976cc1a9740eaefbbf63eb118cdbe645dc3e17ee0c72850ee`。没有提交临时覆盖配置。
+- **本地等价启动通过**：在一次性 Python 3.12 容器中挂载项目，以 `USE_DATABASE=false STORAGE_BACKEND=local REDIS_URL= DATA_DIR=/tmp/parallel-local-api python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000` 启动，容器内 `urllib.request` 验证健康结果。与目标 Python 3.12 无版本差异。
+- **剩余未验证项**：2 项真实 NVIDIA CPU/GPU 混合和多 GPU NCCL 测试未执行；已有 Supervisor kill/restart E2E 在完整套件因未配置 Redis 跳过，补测未选择该项，当前镜像也缺少其依赖的 `pgrep`。在真实 GPU/Linux 环境补跑对应测试，并为 Supervisor 验证提供 procps。真实跨物理主机、跨网段网络、x86_64 与性能加速比未测；跨容器验证不能替代这些硬件验证。
+- **浏览器验证限制**：Computer Use 的 in-app browser 不可用，浏览器列表为空，未进行真实浏览器渲染/交互验收；前端函数业务测试和整体脚本解析均通过。建议有浏览器环境后检查不同屏宽下的节点选择、批大小编辑和远程地址填写。
+- **使用限制**：每节点需容纳完整模型；混合 CPU/GPU 不保证加速；NVIDIA CUDA 与 CPU 以外后端暂未适配。成员需相同 PyTorch 版本（CPU/CUDA 后缀可不同），可信双向可达网络及必要动态通信端口；节点/数据/批大小不变的 CPU 续训已验证逐位一致，跨设备不保证逐位一致。默认依赖从零构建仍需在稳定网络补验。
+- **重测触发**：修改梯度汇总、数据分片、预处理、LLM 目标函数、任务/槽租约、断点、训练 API、远程部署或相关业务配置，重新执行相关套件、完整回归、跨容器验证及可用硬件测试；用户明确要求时同样重测。
+- **回滚**：先停止或暂停联合任务，再撤销本业务提交并统一重建服务；旧版本不能继续接收联合训练配置。不涉及数据库迁移。报告单独提交，未执行 git push。
+- **清理**：本任务临时 worker/API/Redis/S3 容器、隔离网络、验证镜像标签已移除；容器测试数据和权重随容器删除。临时快照/Compose 目录交付前清除；仅保留正式测试用例，运行产物未纳入 Git。共享工作区其他会话的未提交修改保留。
+
 ## 本次变更测试结果：Hugging Face Hub 数据集维护（2026-10-29）
 
 ### Git 基准点与实现范围
