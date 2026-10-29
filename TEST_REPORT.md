@@ -89,6 +89,97 @@ git diff --check
 
 ---
 
+## 本次变更测试结果：添加服务器弹窗交互优化（2026-10-29）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`8346b5fa3cd5f89259a860f38b00e4cfdf0a9fa4`。
+- **提交信息**：Improve server dialog interaction and validation。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围**：`backend/static/index.html`、`backend/static/app.css`、`backend/tests/test_api.py`、`frontend/server-modal.test.cjs`。原生 HTML/CSS/JavaScript，Node 内置 test/vm，pytest；没有新增依赖、修改后端接口、配置或数据结构。
+- **行为**：连接信息与计算资源分组；高级项折叠；标题和操作栏固定、内容独立滚动；凭证就近管理、空状态引导及保存后自动选中；校验定位、失败保留输入、防重复提交；遮罩不关闭、未保存提醒、Tab 焦点循环、关闭清空秘密。添加与编辑共用交互，登记后仍需单独部署。
+- **隔离说明**：共享工作区存在其他任务的联合训练、Hub 数据集、镜像及 Worker 改动。本次完整验收以 `5a969d5d3a50cfaac6796e4dfb0116cbc405fa4f` 归档加本次 4 个文件为准；与本次提交之间仅有其他测试报告提交，业务及测试内容一致。只提交弹窗相关差异，没有提交或回退其他任务的代码；联合训练互联地址字段保留在共享工作区，但不纳入本次独立提交或测试前提。其后其他功能提交不由本节结果背书。
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---:|---|
+| 新增静态回归，实施前 | 2 | 0 | 2 | 0 | 0 | 预期失败，缺少分组布局和关闭保护 |
+| 首轮相关 API/页面测试 | 21 | 20 | 1 | 0 | 0 | 原测试按无参函数签名截取源码，加入 preferredId 参数后截取失败；更新定位字符串并保留原断言 |
+| 相关 API/页面测试修正后 | 21 | 21 | 0 | 0 | 0 | 另有 44 项被 -k 筛选，不计入执行数 |
+| Node 交互回归，工作区及隔离版本 | 18 | 18 | 0 | 0 | 0 | 每轮均 18/18；执行真实页面函数，DOM/网络边界隔离 |
+| 共享工作区完整 pytest | 453 | 426 | 3 | 0 | 24 | 混有其他任务未提交功能，190.13 秒；详见失败分析 |
+| 本次独立提交内容完整 pytest | 394 | 372 | 0 | 0 | 22 | Python 3.12.15，51.76 秒；已执行用例通过率 100%，总通过比例 94.42% |
+
+保留 2 条已有弃用警告：SQLAlchemy declarative_base、Pandas xlrd。22 项跳过涉及未配置 MTP_TEST_REDIS、MTP_TEST_S3 的真实 Redis/S3 与 Supervisor 场景，不计为通过。内联 JavaScript 语法检查、`git diff --check` 和本次提交差异检查通过。
+
+**共享工作区失败分析**：
+
+- `test_hub_reference_trains_reproducibly_and_predicts`：其他任务新增的 Hub 训练用例在 30 秒内未进入终态。未擅自放宽等待阈值或修改该功能。
+- `test_remote_bootstrap_script_start_unchanged_config_keeps_pure_operation`、`test_remote_bootstrap_script_restart_unchanged_config_forces_restart`：其他任务未提交的联合训练逻辑新增 WORKER_DISTRIBUTED_HOST 行，与当前已提交测试期望不一致。
+- 隔离完整套件保留所有基准内正式测试，两项远端测试均通过；Hub 用例尚不属于当时已提交基准。本次弹窗不修改这些后端路径，未通过删改有效测试规避失败；共享工作区整体仍需由相关功能完成后重新验收。
+
+**实际执行命令**（项目根目录；一次性容器、只读挂载、无外部网络，测试产物随容器销毁）：
+
+```bash
+node --test frontend/server-modal.test.cjs
+node --test /tmp/mtp-server-modal.I3q8Iw/isolated/frontend/server-modal.test.cjs
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_api.py -q -p no:cacheprovider --basetemp=/tmp/mtp-modal-red -k 'remote_server_dialog' --tb=short
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-modal-deps:local python -m pytest tests/test_api.py -q -p no:cacheprovider --basetemp=/tmp/mtp-modal-targeted-final -k 'remote_server or remote_ssh' --tb=short
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-modal-deps:local python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-modal-full --tb=short
+docker run --rm --pull=never --network none --mount type=bind,src=/tmp/mtp-server-modal.I3q8Iw/isolated,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 mtp-modal-deps:local python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-modal-isolated --tb=short
+curl -fsS http://localhost:8000/api/health
+git diff --check
+```
+
+隔离副本由 Node 调用 `git archive 5a969d5d3a50cfaac6796e4dfb0116cbc405fa4f`，通过 tar 解包后覆盖本次文件；没有改动共享工作区来运行隔离测试。初轮相关测试使用同类 Docker 命令。Node vm.Script 检查页面内联脚本语法。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与用例 | 输入 → 预期结果及副作用 | 场景 |
+|---|---|---|---|
+| 分组与固定操作栏、折叠高级项 | pytest 静态契约；test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_area；桌面 Safari | 读取 HTML/CSS → 高级项默认关闭，submit 关联正确表单，内容滚动区与 footer 分离；桌面实际呈现无重叠 | 正常、布局回归 |
+| 无效字段可见且可修正 | Node 参数化字段校验、折叠区域校验 | 空标识、非法主机、端口 0/65536/2.5；边界 1/65535 → 阻止提交并聚焦；折叠项报告无效时自动展开；输入修正后可提交 | 空值、非法输入、数值边界 |
+| CPU/GPU 状态同步 | Node 高级字段和计算槽测试；Safari CPU 切换 | GPU 隐藏禁用 CPU 校验；CPU -1/257 拒绝、0/256 允许；编辑 CPU 0 正确回填 | 边界、添加/编辑兼容 |
+| 凭证流程不中断填写 | Node 空目录、默认选择、保存成功/失败测试 | 空目录引导创建；默认回填不误报未保存；新增成功自动选中、清空秘密、恢复按钮，服务器输入保留；失败可重试 | 正常、空集合、依赖失败、回归 |
+| 防重复提交及旧响应覆盖 | Node 延迟 Promise 测试 | 重复保存只发一次请求，body 和表单 inert；保存时不能关闭；旧会话加载响应不得改变新会话选择；失败解锁并保留输入 | 并发、时序、异常 |
+| 安全关闭与键盘导航 | Node 未保存保护和键盘测试；pytest test_remote_server_dialog_protects_input_and_keyboard_navigation | 取消关闭保留内容，确认丢弃清空秘密并恢复触发焦点；Tab/Shift+Tab 循环；Esc 经过关闭保护；遮罩事件不关闭 | 安全、误触、键盘回归 |
+| 添加/编辑接口兼容 | Node POST/PATCH 载荷测试；21 项已有 API/SSH 相关测试 | POST 携带 machine_id，PATCH 不修改标识；数值转换、可选用户名、S3 覆盖和清除 Redis 保持含义；成功保存后关闭 | 正常、接口兼容、已有认证/脱敏回归 |
+
+未修改训练/预测/数据路径；对应既有已提交测试通过完整套件回归。未新增认证或授权逻辑，沿用后端已有权限校验。
+
+### 构建、页面验证与限制
+
+1. 已执行 `docker compose up --build -d`，默认 PyPI 镜像的 PyTorch 大包下载不完整并出现哈希不匹配；本次构建进程随后停止，退出 130，不记为默认从零构建成功。
+2. 运行依赖镜像与 requirements.txt 的 SHA256 同为 `7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`。固定原镜像为临时标签 `mtp-modal-deps:local`，使用 stdin 临时 Compose 覆盖复用 Python 3.12 依赖并复制最新源码、静态资源、启动文件。未修改仓库配置或依赖文件。首次临时覆盖使用 dockerfile:null 被 Compose 校验拒绝，移除该项后重建成功。
+3. 实际成功命令如下；trainer、worker、frontend 完成 Compose 构建启动，健康接口返回 HTTP 200 / {"ok":true}。这是依赖复用的容器重建，不能解释为默认 Dockerfile 全量联网构建通过。
+
+```bash
+cat <<'YAML' | docker compose -f docker-compose.yml -f - up --build -d
+services:
+  trainer:
+    build: &modal_build
+      context: ./backend
+      dockerfile_inline: |
+        FROM mtp-modal-deps:local
+        COPY app /app/app
+        COPY static /app/static
+        COPY sample_data /app/sample_data
+        COPY Dockerfile worker.Dockerfile requirements-worker.txt /app/
+        COPY init_db.sh start.sh /app/
+        RUN chmod +x /app/init_db.sh /app/start.sh
+  worker:
+    build: *modal_build
+YAML
+```
+
+4. 使用 Node fetch 只读比较线上 HTML 的弹窗、会话逻辑和事件绑定片段与工作区内容，均一致；共享工作区其他任务同时变更 HTML，因此整页哈希曾不同，未将它误判为弹窗版本不一致。CSS 从 HTTP 成功读取；初次误查 /health 返回 404，正确健康路径为 /api/health。
+5. Safari 桌面实际检查了分组、首字段焦点、固定标题/底栏、CPU 槽位显示、凭证目录加载及凭证管理展开。曾在环境重建期间显示凭证读取失败，之后成功读取 1 条既有凭证；未新建或修改现场凭证/服务器。截图仅在工具中查看，没有保存文件。
+6. **未执行/限制**：窄屏实机和完整浏览器端到端提交尚未验证；桌面被其他操作持续切换，工具多次返回用户已改变应用状态。Node fixture 不替代真实浏览器布局/原生验证气泡。建议用 390×844 与 1280×720 复查高级项展开、滚动、Tab/Esc、遮罩、失败重试和固定按钮；在隔离服务补充真实提交流程。真实 Redis/S3/Supervisor 的 22 项环境测试未执行；默认依赖联网构建待网络恢复后复验。
+7. **重测触发**：继续修改弹窗结构/状态/校验或相关 API 时，运行 Node 交互测试和相关 pytest；后端业务变更需完整回归并更新其基准。回滚本次功能可撤销 `8346b5f` 后重新构建，不涉及数据迁移。
+
+**清理与提交**：本任务临时目录 `/tmp/mtp-server-modal.I3q8Iw`（含原始备份、隔离副本、暂存索引）在交付前删除，临时依赖标签移除；本任务创建的 Safari 验证标签已关闭。正式测试保留，运行数据、秘密和调试脚本不提交。代码与本报告独立提交，未执行 git push；共享工作区其他任务的改动保留。
+
 ## 本次变更测试结果：本地计算资源注册自动恢复（2026-10-29）
 
 ### Git 基准点、根因与范围
