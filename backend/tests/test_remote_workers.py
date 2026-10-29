@@ -1087,6 +1087,20 @@ def test_remote_build_selects_worker_runtime(mode):
     assert f"--build-arg WORKER_MODE={mode}" in remote_workers._remote_build_args(_server(mode=mode))
 
 
+@pytest.mark.parametrize("backend", ["rocm", "xpu"])
+def test_remote_build_selects_non_cuda_gpu_backend(backend):
+    """AMD 与 Intel Worker 镜像使用各自的 PyTorch 构建参数。"""
+    args = remote_workers._remote_build_args(_server(mode="gpu", device_backend=backend))
+    assert "--build-arg WORKER_MODE=gpu" in args
+    assert f"--build-arg WORKER_BACKEND={backend}" in args
+
+
+def test_remote_build_rejects_mps_docker_deployment():
+    """MPS 只能由 macOS 原生 Worker 使用，远程 Linux Docker 部署需明确拒绝。"""
+    with pytest.raises(remote_workers.RemoteWorkerError, match="macOS 原生 worker"):
+        remote_workers._remote_build_args(_server(mode="gpu", device_backend="mps"))
+
+
 @pytest.mark.parametrize("mode", ["", "auto", "cpu;touch /tmp/unsafe"])
 def test_remote_build_rejects_invalid_runtime(mode):
     """非法模式在启动远程构建前失败，不能回退成庞大的默认 GPU 镜像。"""

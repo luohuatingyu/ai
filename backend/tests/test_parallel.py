@@ -336,6 +336,64 @@ def test_member_validation_and_backend_selection(ls):
         select_members(ls, requests)
 
 
+@pytest.mark.parametrize(
+    ("backend", "vendor", "device", "expected_group_backend"),
+    [("cuda", "nvidia", "cuda:0", "nccl"),
+     ("rocm", "amd", "cuda:0", "gloo"),
+     ("xpu", "intel", "xpu:0", "gloo"),
+     ("mps", "apple", "mps", "gloo"),
+     ("cpu", "cpu", "cpu", "gloo")],
+)
+def test_member_selection_supports_each_device_backend(
+    ls, backend, vendor, device, expected_group_backend
+):
+    """设备能力通过注册协议保留；仅全 NVIDIA CUDA 成员使用 NCCL。"""
+    requested = [{"worker_id": "selected-node", "batch_size": 2}]
+    caps = _caps("selected-node", _port())
+    caps["gpu"].update({
+        "available": backend != "cpu", "backend": backend, "vendor": vendor,
+        "device": device, "name": f"{vendor}-test-device", "vram_mb": 4096,
+    })
+    caps["parallel"].update({
+        "backend": backend, "vendor": vendor, "device": device, "nccl": True,
+    })
+    ls.register_worker("selected-node", caps, 30)
+
+    members = select_members(ls, requested)
+    group = make_group("job-device", "token-device", members, 30, 42)
+
+    assert members[0]["device_backend"] == backend
+    assert members[0]["vendor"] == vendor
+    assert members[0]["device"] == device
+    assert group["backend"] == expected_group_backend
+
+
+def test_mixed_accelerators_use_gloo(ls):
+    """AMD/Intel/Apple/CPU 混合計算组统一走 Gloo，不伪装为 CUDA/NCCL。"""
+    requests = []
+    for index, (backend, vendor, device) in enumerate([
+        ("rocm", "amd", "cuda:0"), ("xpu", "intel", "xpu:0"),
+        ("mps", "apple", "mps"), ("cpu", "cpu", "cpu"),
+    ]):
+        worker_id = f"mixed-{index}"
+        caps = _caps(worker_id, _port())
+        caps["gpu"].update({
+            "available": backend != "cpu", "backend": backend, "vendor": vendor,
+            "device": device, "name": f"{vendor}-test-device", "vram_mb": 4096,
+        })
+        caps["parallel"].update({
+            "backend": backend, "vendor": vendor, "device": device, "nccl": True,
+        })
+        ls.register_worker(worker_id, caps, 30)
+        requests.append({"worker_id": worker_id, "batch_size": index + 1})
+
+    members = select_members(ls, requests)
+    group = make_group("job-mixed", "token-mixed", members, 30, 42)
+
+    assert [member["device_backend"] for member in members] == ["rocm", "xpu", "mps", "cpu"]
+    assert group["backend"] == "gloo"
+
+
 def _llm_rank(rank, group, task, dataset, params, directory):
     """使用本地微型基座隔离 Hub 下载，真实执行多进程 SFT/DPO/PPO 训练。"""
     from app import llm_trainer
@@ -469,19 +527,20 @@ def test_parallel_schema_accepts_upper_bound():
 
 @pytest.mark.parametrize("condition,match", [
     ("offline", "上线"), ("disabled", "启用"), ("address", "地址"),
-    ("gloo", "Gloo"), ("vendor", "NVIDIA"), ("architecture", "架构"),
+    ("gloo", "Gloo"), ("backend", "不受支持"), ("architecture", "架构"),
 ])
 def test_incompatible_members_are_rejected(ls, condition, match):
-    """资源安全：不能绕过停用开关，也不能把不支持的设备静默当成可训练 GPU。"""
+    """资源安全：不能绕过停用开关或静默接受未适配后端与架构。"""
     caps = _caps("node", _port())
     if condition == "address":
         caps["parallel"]["host"] = ""
     if condition == "gloo":
         caps["parallel"]["gloo"] = False
-    if condition in {"vendor", "architecture"}:
+    if condition in {"backend", "architecture"}:
         caps["gpu"]["available"] = True
-        caps["parallel"].update({"vendor": "amd" if condition == "vendor" else "nvidia",
-                                 "capability_supported": condition != "architecture"})
+        if condition == "backend":
+            caps["gpu"].update({"backend": "vulkan", "vendor": "unknown", "device": "vulkan:0"})
+        caps["parallel"].update({"vendor": "nvidia", "capability_supported": condition != "architecture"})
     if condition != "offline":
         ls.register_worker("node", caps, 30)
     if condition == "disabled":
@@ -537,3 +596,42 @@ def test_cpu_slot_hides_inherited_gpu_visibility(monkeypatch):
     supervisor._spawn("cpu0", None)
     supervisor._spawn("gpu1", "1")
     assert [environment["CUDA_VISIBLE_DEVICES"] for environment in launched] == ["", "1"]
+    assert launched[0]["WORKER_DEVICE"] == "cpu"
+    assert launched[0]["HIP_VISIBLE_DEVICES"] == ""
+    assert launched[0]["ROCR_VISIBLE_DEVICES"] == ""
+    assert launched[0]["ONEAPI_DEVICE_SELECTOR"] == ""
+
+
+@pytest.mark.parametrize(
+    ("backend", "index", "expected"),
+    [("rocm", "1", ("1", "1", "1", "")),
+     ("xpu", "1", ("", "", "", "level_zero:1")),
+     ("mps", "0", ("", "", "", ""))],
+)
+def test_supervisor_sets_backend_specific_device_visibility(monkeypatch, backend, index, expected):
+    """子进程后端选择与每槽设备可见性变量保持一致。"""
+    from types import SimpleNamespace
+    from app.worker import WorkerSupervisor
+
+    count = 1 if backend == "mps" else 2
+    monkeypatch.setenv("WORKER_DEVICE", backend)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0,1")
+    monkeypatch.setattr("app.worker.device_info", lambda preferred=None: {"backend": backend, "count": count})
+    monkeypatch.setattr("app.worker._gpu_count", lambda: count)
+    if backend == "xpu":
+        monkeypatch.setattr("torch.xpu.device_count", lambda: count)
+    launched = []
+    monkeypatch.setattr("app.worker.subprocess.Popen", lambda args, env: launched.append(env) or SimpleNamespace(pid=1))
+
+    supervisor = WorkerSupervisor(None, None, None, log=lambda message: None, cpu_slots=0)
+    slot = "gpu0" if backend == "mps" else "gpu1"
+    supervisor._spawn(slot, index)
+
+    assert launched[0]["WORKER_DEVICE"] == backend
+    assert tuple(launched[0][name] for name in (
+        "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
+        "ONEAPI_DEVICE_SELECTOR",
+    )) == expected
