@@ -1919,3 +1919,32 @@ docker compose logs --tail=15 worker
 | 运行中清除不恢复旧快照 | worker `log_revision` 同步逻辑 | 并发、回归 |
 
 **Git基准点**：`0dc831c`（Add task log clearing）。
+## 本次变更测试结果：统一前端 UI 样式（2026-10-29）
+
+**Git基准点**：`bdaa3d9`（Refresh frontend visual design system）  
+**分支**：`emdash/hot-boxes-clean-y9u6p`  
+**变更范围**：统一训练工作台与数据集管理页的浅色设计令牌、导航、卡片、表单、按钮、状态反馈、弹窗和响应式布局；仅修改 `backend/static/` 前端静态资源，不涉及业务 API、数据模型或训练逻辑。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 覆盖场景 |
+|---|---|---|---|
+| 两个页面使用统一的视觉层级和控件状态 | 静态资源检查；通过前端容器读取两个页面及共享 CSS | 页面均引用 `app.css?v=20261029-1`，CSS 设计令牌和页面选择器存在 | 正常、兼容 |
+| 训练工作台和数据集管理页在桌面布局下无样式语法错误 | CSS 静态检查 | 花括号数量 431/431；`git diff --check` 通过 | 回归 |
+| 窄屏布局有明确的折叠和堆叠行为 | CSS 规则检查 | 存在 1080px、720px、560px 响应式规则，覆盖导航、表单、按钮组、卡片和弹窗 | 边界、兼容 |
+| 前端静态服务可以提供新资源 | 容器/API 冒烟 | `curl http://127.0.0.1:8000/healthz` 返回 `ok`；两个页面返回新 CSS 版本号 | 正常、回归 |
+
+**测试执行结果**：
+
+- 前端镜像：`docker compose build frontend` **通过**。
+- 前端服务：`docker compose up -d --no-build frontend` **通过**，容器启动。
+- 静态资源冒烟：healthz 返回 `ok`；训练页与数据集页均返回 `app.css?v=20261029-1`。
+- CSS 静态检查：花括号平衡、`git diff --check` **通过**。
+- 完整 `docker compose up --build -d`：**未通过**。失败发生在后端依赖安装阶段，阿里云镜像返回的 `torch-2.14.1` 文件哈希与 requirements 锁定值不一致（Expected `0b13ac...`, Got `061ff5...`）；未执行完整 pytest，不能将本次变更标记为完整容器回归通过。
+
+**关键模块测试**：前端静态服务与资源版本检查通过；后端业务测试未执行（本次仅前端样式变更，且完整 Compose 构建被依赖镜像哈希错误阻断）。
+
+**已知问题与限制**：完整 Compose 重建需要修复或更换当前 PyPI 镜像中的 torch 包哈希后重新执行；前端镜像本身已成功构建并启动。
+
+**下次测试建议**：在可用的 Python 3.12 依赖镜像环境中重新执行 `docker compose up --build -d`，随后运行完整 `cd backend && python -m pytest tests/ -v` 回归套件。
+
