@@ -1816,6 +1816,24 @@ def validate_server_record(server: Dict[str, object]) -> None:
 _PURE_LIFECYCLE_ACTIONS = ("stop", "status")
 
 
+def _remote_worker_state_missing(message: object) -> bool:
+    """识别远端 worker 容器或外部配置已被清理的确定性错误。"""
+    text = str(message or "")
+    return any(
+        marker in text
+        for marker in (
+            "目标服务器上未找到 worker 容器",
+            "目标服务器未找到 worker 配置文件",
+        )
+    )
+
+
+def _mark_remote_worker_undeployed(server: Dict[str, object]) -> None:
+    """将持久化状态校准为远端不存在 worker，避免继续显示可重建旧容器。"""
+    server["deployed"] = False
+    server["status"] = "not_deployed"
+
+
 def _deployment_settings_for_action(
     server: Dict[str, object], action: str
 ) -> Dict[str, str]:
@@ -2179,7 +2197,32 @@ def execute_remote_operation(
             )
             server.update({"status": "running", "operation_id": operation_id})
             _persist_remote_server_status(operation_id, server, "准备远程操作")
-            result = run_remote_action(server, action, operation_id)
+            missing_worker_detected = False
+            recovered_with_install = False
+            try:
+                result = run_remote_action(server, action, operation_id)
+            except RemoteWorkerError as exc:
+                missing_worker_detected = _remote_worker_state_missing(exc)
+                if action not in {"deploy", "update"} or not missing_worker_detected:
+                    if missing_worker_detected:
+                        _mark_remote_worker_undeployed(server)
+                    raise
+                # 部署代码原本只复用现有镜像重建容器；容器被手动清理后，
+                # 自动退回完整安装，重新构建镜像并创建容器，修复持久化标记与远端事实脱钩。
+                _append_remote_operation_log(
+                    operation_id,
+                    "校准远程状态",
+                    "检测到远端 worker 容器或配置缺失，自动改为完整部署。"
+                    f"原始错误：{exc}",
+                    server=server,
+                )
+                try:
+                    result = run_remote_action(server, "install", operation_id)
+                    recovered_with_install = True
+                except RemoteWorkerError as recovery_exc:
+                    # 首次错误已经确认远端没有可复用容器；恢复失败后让页面显示“部署”。
+                    _mark_remote_worker_undeployed(server)
+                    raise recovery_exc
             # 远端脚本的最终 stdout/stderr 也写入操作日志；日志窗口优先展示 log，避免配置摘要只停留在 output 字段而不可见。
             for stream_name, phase in (("stdout", "远端脚本输出"), ("stderr", "远端脚本错误")):
                 stream_output = str(result.get(stream_name, "") or "").strip()
@@ -2201,7 +2244,7 @@ def execute_remote_operation(
             }
             if action in {"config", "deploy", "update"}:
                 previous_status = str(operation.get("previous_server_status", ""))
-                server["status"] = previous_status if previous_status in {
+                server["status"] = "online" if recovered_with_install else previous_status if previous_status in {
                     "online", "stopped", "error", "not_deployed"
                 } else "online"
             else:
@@ -2240,7 +2283,10 @@ def execute_remote_operation(
                 "phase": "操作失败",
             }
             terminal_log = ("操作失败", str(exc))
-            server["status"] = "error"
+            if _remote_worker_state_missing(exc):
+                _mark_remote_worker_undeployed(server)
+            elif server.get("status") != "not_deployed":
+                server["status"] = "error"
         except Exception as exc:
             terminal_update = {
                 "status": "failed",

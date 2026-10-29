@@ -2292,6 +2292,127 @@ def test_execute_remote_operation_persists_success_and_failure(monkeypatch, requ
     assert remote_config_repository.get_remote_server(machine_id)["deployed"] is True
 
 
+def test_execute_remote_operation_recovers_deploy_when_worker_container_is_missing(
+    monkeypatch, request
+):
+    """部署代码发现远端容器已被清理时自动改走完整安装流程。"""
+    from app import remote_config_repository
+
+    monkeypatch.setattr(config, "USE_DATABASE", True)
+    machine_id = "remote-missing-container"
+    operation_id = "m" * 32
+    server = _server(machine_id=machine_id, deployed=True, status="error")
+    request.addfinalizer(lambda: remote_config_repository.delete_remote_server(machine_id))
+    remote_config_repository.save_remote_server(server)
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": machine_id,
+            "action": "deploy",
+            "status": "queued",
+            "previous_server_status": "error",
+        },
+    )
+    actions = []
+
+    def fake_run_remote_action(_server, action, _operation_id):
+        actions.append(action)
+        if action == "deploy":
+            raise remote_workers.RemoteWorkerError(
+                "目标服务器上未找到 worker 容器，请先部署。"
+            )
+        return {"stdout": "worker 已安装并启动", "stderr": "", "heartbeat_ok": True}
+
+    monkeypatch.setattr(remote_workers, "run_remote_action", fake_run_remote_action)
+
+    remote_workers.execute_remote_operation(operation_id, server, "deploy")
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert actions == ["deploy", "install"]
+    assert result["status"] == "completed"
+    assert result["heartbeat_ok"] is True
+    assert "自动改为完整部署" in result["log"]
+    current = remote_config_repository.get_remote_server(machine_id)
+    assert current["deployed"] is True
+    assert current["status"] == "online"
+
+
+def test_execute_remote_operation_marks_missing_worker_as_undeployed(monkeypatch, request):
+    """生命周期操作确认容器不存在后收敛持久化状态，下一次可直接重新部署。"""
+    from app import remote_config_repository
+
+    monkeypatch.setattr(config, "USE_DATABASE", True)
+    machine_id = "remote-missing-state"
+    operation_id = "n" * 32
+    server = _server(machine_id=machine_id, deployed=True, status="online")
+    request.addfinalizer(lambda: remote_config_repository.delete_remote_server(machine_id))
+    remote_config_repository.save_remote_server(server)
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": machine_id,
+            "action": "restart",
+            "status": "queued",
+        },
+    )
+    monkeypatch.setattr(
+        remote_workers,
+        "run_remote_action",
+        lambda *_args: (_ for _ in ()).throw(
+            remote_workers.RemoteWorkerError("目标服务器上未找到 worker 容器，请先部署。")
+        ),
+    )
+
+    remote_workers.execute_remote_operation(operation_id, server, "restart")
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert result["status"] == "failed"
+    assert "未找到 worker 容器" in result["error"]
+    current = remote_config_repository.get_remote_server(machine_id)
+    assert current["deployed"] is False
+    assert current["status"] == "not_deployed"
+
+
+def test_execute_remote_operation_keeps_missing_state_when_recovery_fails(monkeypatch, request):
+    """完整部署也失败时保留未部署事实，避免失败后再次显示旧容器可更新。"""
+    from app import remote_config_repository
+
+    monkeypatch.setattr(config, "USE_DATABASE", True)
+    machine_id = "remote-missing-recovery-failed"
+    operation_id = "o" * 32
+    server = _server(machine_id=machine_id, deployed=True, status="error")
+    request.addfinalizer(lambda: remote_config_repository.delete_remote_server(machine_id))
+    remote_config_repository.save_remote_server(server)
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": machine_id,
+            "action": "deploy",
+            "status": "queued",
+        },
+    )
+    actions = []
+
+    def fail_both(_server, action, _operation_id):
+        actions.append(action)
+        raise remote_workers.RemoteWorkerError("目标服务器未找到 worker 配置文件，请先部署。")
+
+    monkeypatch.setattr(remote_workers, "run_remote_action", fail_both)
+
+    remote_workers.execute_remote_operation(operation_id, server, "deploy")
+
+    result = manager.lease.get_remote_operation(operation_id)
+    assert actions == ["deploy", "install"]
+    assert result["status"] == "failed"
+    current = remote_config_repository.get_remote_server(machine_id)
+    assert current["deployed"] is False
+    assert current["status"] == "not_deployed"
+
+
+
 def test_remote_subprocess_stops_when_operation_is_cancelled():
     """中断信号会终止正在等待的本机 SSH 子进程并返回已中断状态。"""
     operation_id = "a" * 32
