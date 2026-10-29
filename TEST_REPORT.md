@@ -3136,3 +3136,40 @@ docker compose logs --tail=15 worker
 - 若远端容器被手动删除，第一次点击“部署代码”会触发完整镜像构建，耗时可能明显高于复用现有镜像的普通代码部署。
 - 修改远程操作状态机、`remote_worker.sh` 容器错误文本、服务器状态持久化或部署按钮行为时，需重跑远程 worker 专项、API 套件和完整后端套件。
 - 回滚可撤销提交 `d9f542d` 并重新构建平台；无数据迁移。
+
+## 本次变更测试结果：异构设备兼容性补充（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`d252c8a`（Expand heterogeneous device coverage）。
+- **测试日期 / 分支**：2026-10-30 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围**：补充 AMD ROCm、Intel XPU、Apple MPS、NVIDIA CUDA 与 CPU 的设备协议、混合后端 Gloo 选择、Supervisor 设备可见性隔离，以及远程 ROCm/XPU 构建和 MPS Docker 拒绝测试。无新增运行时依赖、数据库迁移或数据格式变更。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 可执行用例 | 结果与场景 |
+|---|---|---|
+| CUDA、ROCm、XPU、MPS、CPU 能力被正确识别并选择 | `test_member_selection_supports_each_device_backend`、`test_device_info_reports_simulated_cross_platform_backends` | 设备后端、厂商、PyTorch device 字符串和通信能力保持一致；正常、兼容、边界 |
+| 异构组不误用 NCCL | `test_mixed_accelerators_use_gloo`、`test_incompatible_members_are_rejected` | ROCm/XPU/MPS/CPU 混合组使用 Gloo；未知后端和不支持架构明确拒绝；异常、安全 |
+| 每个槽位只看到自己的加速器 | `test_cpu_slot_hides_inherited_gpu_visibility`、`test_supervisor_sets_backend_specific_device_visibility` | CUDA、HIP/ROCR、oneAPI 变量按槽位设置，CPU 槽清空继承变量；资源隔离、回归 |
+| 远程节点构建适配目标后端 | `test_remote_build_selects_non_cuda_gpu_backend`、`test_remote_build_rejects_mps_docker_deployment` | ROCm/XPU 注入对应构建参数；MPS 要求 macOS 原生 worker；配置异常、兼容 |
+| 训练和既有 API/数据链路回归 | `pytest tests/`、前端并行训练与资源套件 | 指标、产物、断点、预测、旧数据布局和资源选择保持通过；回归 |
+
+### 测试执行结果
+
+| 命令 | 结果 |
+|---|---|
+| `docker run ... python -m pytest tests/test_device.py tests/test_parallel.py ...` | **68 passed，2 skipped**；跳过真实 NVIDIA GPU/NCCL |
+| `docker run ... python -m pytest tests/test_device.py tests/test_parallel.py tests/test_remote_workers.py -k 'device_info or member_selection_supports or mixed_accelerators or incompatible_members or cpu_slot or supervisor_sets or remote_build_selects_non_cuda or remote_build_rejects_mps'` | **28 passed，202 deselected** |
+| `docker run ... python -m pytest tests/ -q -rs --tb=short` | **571 passed，24 skipped，0 failed**；Python 3.12.15 |
+| `node --test frontend/parallel-training.test.cjs frontend/training-resources.test.cjs` | **25 passed，0 failed** |
+| `node --test frontend/dataset-display.test.cjs frontend/dataset-preview.test.cjs frontend/server-modal.test.cjs` | **55 passed，0 failed** |
+| 临时等价 Compose（现有 Python 3.12.15 依赖镜像，仅复制当前源码） | trainer/frontend 构建、启动和健康检查通过；`/api/health` 返回 `{"ok":true}`，前端 `/healthz` 返回 `ok` |
+| `docker compose up --build -d` | **未通过**：PyTorch 2.15.0 wheel 下载约 9.1/483.7 MiB 时 SHA256 与 requirements 锁定值不一致，已停止重试；不能标记标准 Compose 构建通过 |
+
+### 已知限制
+
+- 当前环境没有 NVIDIA、AMD、Intel 或 Apple GPU，真实 CUDA/ROCm/XPU/MPS 算子和 NCCL 仅做协议模拟测试；应在对应硬件和驱动环境补跑。
+- Apple MPS 只能在 macOS 原生 worker 使用；Linux Docker 不透传 MPS，Windows GPU 使用 WSL2 对应运行时。
+- 标准 Compose 受外部 PyTorch wheel 下载源内容哈希不一致阻塞；网络稳定后需重新执行 `docker compose up --build -d`。
+- 临时等价验证文件和容器不纳入仓库；未执行 `git push`。
