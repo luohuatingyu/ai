@@ -1,3 +1,77 @@
+## 本次变更测试结果：训练启动失租与接手任务写入隔离（2026-10-29）
+
+### Git 基准点与变更范围
+
+- **Commit Hash**：`9013f1c8b0db669523ffba2c81ad0f46e25d97c4`。
+- **基准提交信息**：Fix stalled SSH input streaming during remote deployment。
+- **本次修复提交**：`eb813869fbc31fb21aae306579b4567b173b17de`（Fix training lease lifecycle and authoritative logs）。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **基准说明**：本次训练修复完成后，工作区另行合入远程部署修复 `9013f1c`，因此对该最新提交补跑完整套件。预先存在的 `backend/Dockerfile` 和 `backend/tests/test_remote_workers.py` 未提交修改参与了工作区测试，但不属于本次修改或提交；不能将结果解释为不含这两项改动的纯净 checkout 验收。
+- **范围**：`backend/app/worker.py`、`backend/app/routers/jobs.py` 及现有 Worker/API 测试。取得租约后立即续租，心跳覆盖准备和收尾阶段；共享状态、日志、指标、模型和断点清理写入前校验 token；失租者退出，恢复交给 watchdog；scratch 按执行批次隔离，末级仍为 job_id 以兼容数据库日志；断点发布前上传对应指标和最佳模型；文件日志优先，数据库仅为缺失文件的旧任务回退；结束日志先于结束状态发布。
+- **技术环境**：Python 3.12.15、PyTorch 2.14.1+cu130（CPU）、FastAPI、pytest 9.1.1；测试使用本地仓储/内存协调层和隔离 Redis，现场任务使用部署中的 Redis、S3 与数据库。没有新增依赖、修改配置文件或数据库结构。
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 | 结果说明 |
+|---|---:|---:|---:|---:|---:|---|
+| 修复前新增回归测试 | 9 | 2 | 7 | 0 | 0 | 稳定复现慢启动失租、四种旧槽覆盖路径，以及数据库覆盖完整/空文件日志 |
+| 第一轮修复后新增回归 | 9 | 9 | 0 | 0 | 0 | 原有复现全部转为通过 |
+| 首次相关套件 | 152 | 148 | 1 | 0 | 3 | 取消状态先可见、结束日志后发布的时序缺陷；随后调整发布顺序，未弱化测试 |
+| 相关套件修复后 | 152 | 149 | 0 | 0 | 3 | Worker、JobManager、协调层、训练器、API 全部可执行用例通过 |
+| 首次完整套件 | 340 | 333 | 0 | 0 | 7 | 新增真实 Redis 慢启动参数分支在未配置 Redis 时跳过 |
+| 隔离 Redis 专项 | 8 | 8 | 0 | 0 | 0 | 含真实 Redis 租约、注册、清理与慢启动；补齐完整套件中的 4 个 Redis 环境跳过项 |
+| 合入并行修复后的完整套件 | 351 | 344 | 0 | 0 | 7 | 基准 `9013f1c`；49.17 秒，实际执行用例通过率 100%，含跳过的总通过比例 98.01% |
+
+完整套件保留 2 条已有弃用警告：SQLAlchemy `declarative_base()` 和 Pandas `xlrd`。最初两次启动测试容器引用了已被并行重建替换的历史镜像 ID，Docker 退出 125，未执行测试；改用现有 trainer 镜像后正常执行。
+
+**实际测试命令**（项目根目录执行；一次性容器、仓库只读、测试数据与生产隔离）：
+
+```bash
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_worker.py tests/test_api.py -k 'slow_startup or superseded_worker or authoritative_file' -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-lease-regression
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_worker.py tests/test_jobmanager.py tests/test_coordination.py tests/test_trainer.py tests/test_api.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-lease-targeted
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-lease-full
+docker run -d --rm --pull=never --name mtp-lease-test-redis redis:7-alpine redis-server --save '' --appendonly no
+docker run --rm --pull=never --network container:mtp-lease-test-redis --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env MTP_TEST_REDIS=redis://127.0.0.1:6379/15 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_coordination.py tests/test_worker.py -k 'redis or slow_startup' -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-lease-redis
+docker stop mtp-lease-test-redis
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-lease-final
+git diff --check
+```
+
+第一轮修复前回归命令与上述对应命令相同，但未传 `--tb=short`。`git diff --check` 通过。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与用例 | 输入 → 预期结果和副作用 | 场景 |
+|---|---|---|---|
+| 准备超过初始 TTL 仍可完成 | Worker 集成，真实训练；`test_worker_renews_lease_during_slow_startup[embedded/redis]` | TTL 1 秒、历史下载等待 1.5 秒 → 租约有效、2 个 epoch 连续、completed、best.pt 存在 | 正常、时间边界、慢依赖、Redis 兼容 |
+| 旧执行者不覆盖接手任务 | 双 Worker 集成；`test_superseded_worker_cannot_overwrite_successor[metrics/checkpoint/failure/retry]` | 真实写入后阻塞返回、回收租约、watchdog 重派、新槽训练 → 旧槽退出时共享文件逐字节不变、新目录保留，最终 1–6 轮连续且模型存在 | 并发、异常、状态冲突、重试、回归 |
+| 失租写入失败关闭 | 仓储与真实内存租约；`test_lease_guard_rejects_unowned_mutations` 的 9 个参数组合 | 过期/新 owner/协调面不可达 × 状态/模型/断点清理 → 抛 JobLeaseLost、旧模型不变、不新增暂停状态 | 所有权隔离、安全、依赖失败、边界 |
+| 心跳与信号不会被错误配置破坏 | 控制器；`test_controller_caps_heartbeat_interval_and_clears_old_signals` | 心跳 10 秒、TTL 0.3 秒、旧暂停信号 → 自动缩短周期、准备期不误暂停，清理后取消信号有效 | 配置边界、信号兼容 |
+| 失租能自动接续，手动控制仍有效 | Worker/JobManager/API；`test_lease_lost_yields_to_watchdog`、既有暂停/恢复/取消与重试测试 | 失租后旧槽不写 paused，watchdog 排队，新槽完成 300 轮；手动暂停仍保存断点、恢复和取消生效 | 正常、异常、回归 |
+| 中断原因可见且清日志不复活旧内容 | SQLite + API；`test_job_logs_prefer_authoritative_file_with_legacy_fallback`、`test_job_logs_paginate_authoritative_file`、既有清日志测试 | 文件包含心跳原因/空文件/无文件、数据库有旧记录；505 行分页、负/越界偏移 → 正确来源、顺序和游标 | 正常、空值、兼容、分页边界 |
+| 训练预测和数据兼容保持正确 | 完整套件：Trainer、LLM Trainer、Storage、API | 分类 accuracy、回归 R²/RMSE、模型产物、固定 seed、断点与完整训练比较、重复预测、缺失输入处理、新旧数据布局 | ML 全链路、可复现性、预处理一致性、回归 |
+
+### 容器构建与现场任务验证
+
+1. 已执行 `docker compose up --build -d`。默认依赖层从阿里云镜像下载 454 MB PyTorch，约 4 分钟未完成，停止该次构建（退出 130）；不记为默认从零构建通过。
+2. 校验运行镜像与仓库 `requirements.txt` 的 SHA256 均为 `7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`，复用已验证依赖镜像，临时 Compose 覆盖中通过 `dockerfile_inline` 复制全部 app/static/sample_data 及启动脚本。
+3. 执行 `docker compose -f docker-compose.yml -f /tmp/mtp-lease-build-eb81386/compose.yml up --build -d` 成功，trainer/worker 已重新创建，frontend/SeaweedFS 正常。此为完整 Compose 容器重建，不是宿主机启动 uvicorn。临时覆盖不修改仓库 Dockerfile、Compose 或 `.env`。
+4. `docker exec mtp-worker sha256sum /app/app/worker.py` 与源码一致：`ed13502c18073f5a0c4bd4d256261f927d6921d3ef2964c8b0188480226303eb`；`docker exec mtp-trainer sha256sum /app/app/routers/jobs.py` 与源码一致：`fdc967c382343a2d43f01a9aa3051394fe81ad079968ad5b17a0937fb67c8131`。`curl -fsS --retry 5 --retry-delay 2 --retry-connrefused --max-time 15 http://127.0.0.1:8000/api/health` 返回 `{"ok":true}`。
+5. 已按批准方案执行 `curl -fsS --max-time 30 -X POST http://127.0.0.1:8000/api/jobs/job-20261029-083952-b64fb1/resume`，恢复用户原任务。持续查询详情和日志后确认 **completed、30/30 轮、100%**；`redispatched` 保持原来的 1、`retry_count=0`，没有新增重派或自动重试。
+6. 最佳 epoch 为 **7**，最终以最佳权重评估的 accuracy 为 **0.8333333333333334（83.33%）**，loss 为 0.4520623981952667；训练/验证 240/60 条，5 特征，CPU，耗时 454.9 秒。第 30 轮本身的 accuracy 为 75%，与最终加载最佳权重的 83.33% 不混淆。
+7. 使用 `docker exec -i -e PYTHONDONTWRITEBYTECODE=1 mtp-trainer python -u -` 经 Python 3.12 标准库访问实际 `/model`、`/predict`、`/logs`：模型下载首次 30 秒超时，改为 60 秒后成功下载 **139,939 字节**；`torch.load(io.BytesIO(model_bytes), map_location='cpu', weights_only=True)` 确认 classification、5→128→128→128→2 网络。输入 `{"row":{"年龄":35,"月收入":8000,"月均访问":10,"投诉次数":0,"会员类型":1}}` 连续预测两次，均为“否”，概率均为 `否=0.5208588242530823、是=0.4791412055492401`，完整结果相等。实际日志含最终准确率与“训练完成”。
+
+### 已知限制、未执行项及后续建议
+
+- 默认网络依赖下载的从零构建尚未完成；本次容器交付复用了内容匹配的依赖镜像。建议网络稳定后再验证默认 Dockerfile 全量依赖构建。
+- 完整套件的 7 个跳过项中，4 个 Redis 环境用例已通过专项补跑。**2 个独立 S3 集成测试和 1 个 Supervisor 子进程终止/重启测试未执行**；现场任务已通过真实 S3 的训练、模型下载和预测链路，但不代替上述独立故障测试。测试镜像缺少 Supervisor E2E 所需 `pgrep`，本次未为测试引入系统依赖。
+- 没有 NVIDIA GPU，未验证真实 CUDA、多机跨卡或长时间网络分区。实际任务在 CPU 完成；GPU 不可用提示的文案与 GPU 支持不在本次修改范围。
+- 本次所有权保护在每次共享写入前校验 Redis token；不能撤销已经发送且在租约失效后才完成的远端 PUT。若需要覆盖此类在途写入，应进一步设计存储端条件写入/版本隔离，并注入跨存储请求的网络分区测试；不能将本次保护宣称为 Redis 与 S3 的跨系统事务。
+- 后续修改 Worker、任务状态、日志路由、协调/存储层、训练/预测或业务配置时需重新执行相关套件、完整测试并更新基准；用户明确要求时也重测。
+- 代码回滚可撤销 `eb81386` 后统一重建服务。本次未更改数据结构；原任务已生成的模型、指标和训练报告保留。
+
+**清理与提交**：pytest 临时目录 `/tmp/mtp-lease-*` 随一次性容器清理；隔离 Redis 容器已停止并自动删除；临时构建目录 `/tmp/mtp-lease-build-eb81386/` 和基底镜像标签已删除；现场下载/预测验证新生成的 `data/worker-scratch/serve/job-20261029-083952-b64fb1/` 缓存已删除。没有提交模型、数据、日志或其他运行时产物；业务代码与本测试报告分开提交，不执行 git push。已有 Dockerfile/远程测试改动保留。
+
 ## 远程部署卡住与旧 worker 启动失败诊断（2026-10-29，尚未修复）
 
 **检查版本**：`eb813869fbc31fb21aae306579b4567b173b17de`；分支 `emdash/hot-boxes-clean-y9u6p`。本节是只读诊断及缺陷复现，不更新下文完整测试验收基准，不代表当前工作区通过完整测试。本次仅修改本报告；既有 Dockerfile、远程测试及其它任务的变更不纳入本次提交。
