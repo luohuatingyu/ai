@@ -1468,7 +1468,7 @@ def test_training_page_resource_retry_and_chart_style_contract():
     assert "grid-column: 1 / -1" in css
     assert ".training-page #llmFields > .formgrid" in css
     assert "repeat(auto-fit, minmax(min(100%, 210px), 1fr))" in css
-    assert 'href="/app.css?v=20261029-1"' in html
+    assert 'href="/app.css?v=20261029-2"' in html
 
 
 def test_remote_server_feedback_toasts_render_above_add_modal():
@@ -1486,6 +1486,42 @@ def test_remote_server_feedback_toasts_render_above_add_modal():
     assert toast_z_index > modal_z_index
 
 
+def test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_area():
+    """添加与编辑共用分组表单，折叠高级项时仍可从固定操作栏提交。"""
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    css = (static_dir / "app.css").read_text(encoding="utf-8")
+    modal = html.split('id="addServerModal"', 1)[1].split('id="remoteLogModal"', 1)[0]
+
+    assert 'aria-describedby="addServerDescription"' in modal
+    assert 'id="remoteServerAdvanced"' in modal
+    advanced_tag = modal.split('id="remoteServerAdvanced"', 1)[1].split(">", 1)[0]
+    assert "open" not in advanced_tag
+    assert modal.index('id="remoteServerAdvanced"') < modal.index('id="remoteRedisUrl"')
+    assert modal.index('id="remoteServerAdvanced"') < modal.index('id="remoteS3Endpoint"')
+    assert 'id="remoteServerForm" class="server-form" novalidate' in modal
+    assert 'form="remoteServerForm"' in modal.split('id="btnSubmitRemoteServer"', 1)[1].split(">", 1)[0]
+    assert 'id="remoteServerError"' in modal
+    assert 'id="btnManageRemoteCredentials"' in modal
+    assert 'id="remoteCredentialStatus"' in modal
+    assert "#addServerModal .server-modal-body" in css
+    assert "overscroll-behavior: contain" in css
+    assert "body.server-dialog-open" in css
+
+
+def test_remote_server_dialog_protects_input_and_keyboard_navigation():
+    """关闭前检查未保存内容，遮罩不清空表单，键盘仅在弹窗内移动。"""
+    html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    backdrop_handler = html.split('$("addServerModal").addEventListener("click",', 1)[1].split("});", 1)[0]
+
+    assert "closeAddServerModal" not in backdrop_handler
+    assert "function handleRemoteServerDialogKeydown(event)" in html
+    assert "function remoteServerDialogIsDirty()" in html
+    assert "function validateRemoteServerForm()" in html
+    assert 'addEventListener("keydown", handleRemoteServerDialogKeydown)' in html
+    assert "closeAddServerModal(true)" in html
+
+
 def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads():
     """保存按钮保持可用，页面不再要求远程管理令牌。"""
     backend_dir = Path(__file__).resolve().parents[1]
@@ -1495,7 +1531,7 @@ def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads()
     html = (static_dir / "index.html").read_text(encoding="utf-8")
     button = html.split('id="btnSaveRemoteSshSettings"', 1)[1].split(">", 1)[0]
     credential_form = html.split('id="remoteSshCredentialForm"', 1)[1].split(">", 1)[0]
-    catalog_loader = html.split("async function loadRemoteSshSettings()", 1)[1].split(
+    catalog_loader = html.split("async function loadRemoteSshSettings(", 1)[1].split(
         "// 清空凭证编辑表单", 1
     )[0]
     save_handler = html.split("async function saveRemoteSshSettings()", 1)[1].split(
