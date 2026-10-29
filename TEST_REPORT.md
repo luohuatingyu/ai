@@ -3149,9 +3149,9 @@ docker compose logs --tail=15 worker
 
 | 验收标准 | 可执行用例 | 预期与场景 |
 |---|---|---|
-| 用户可自动调度或指定在线、启用且兼容的计算槽；无效选择不能创建任务 | API：`test_start_training_api_validates_selected_resource` 及同组资源参数化用例；前端：`frontend/training-resources.test.cjs` | CPU/GPU 槽展示容量和状态；离线、停用、失效及任务不兼容的槽阻止提交；忙碌槽明确排队；恶意标签安全转义。正常、边界、异常、安全 |
+| 用户可自动调度或指定在线、启用且兼容的计算槽；无效选择不能创建任务 | API：`test_training_resource_selection_persists_hint`、`test_training_resource_selection_rejects_invalid_without_job`、`test_training_resource_selection_gpu_vram_boundary`、`test_training_resource_selection_dependency_failure_is_redacted`；前端：`frontend/training-resources.test.cjs` | CPU/GPU 槽展示容量和状态；离线、停用、失效及任务不兼容的槽阻止提交；忙碌槽明确排队；恶意标签安全转义。正常、边界、异常、安全 |
 | 指定任务只由目标槽执行，租约竞争或策略变化后重新核验 | Worker：`test_selected_training_resource_executes_on_target_only`、`test_selected_training_resource_kept_on_auto_retry`、`test_selected_training_resource_rechecked_after_lease` | 非目标 worker 不领取；目标槽完成分类/回归并生成指标、`best.pt`、预处理产物和日志；自动重试保留目标，禁用/改选/degraded 竞争不启动训练。正常、并发、回归 |
-| 手动重试和暂停恢复保留或明确更新分配策略 | JobManager/API：`test_manual_retry_requeues_failed_job_with_selected_assignment` 与重试 API 用例；Worker 失败/恢复用例 | 指定槽、自动重派、联合训练整组重试规则保持一致；暂停恢复继续等待原指定槽。状态冲突、兼容、回归 |
+| 手动重试和暂停恢复保留或明确更新分配策略 | JobManager：`test_manual_retry_requeues_failed_job_with_selected_assignment`、`test_selected_resource_manual_retry_replaces_or_clears_policy`、`test_selected_resource_survives_resume_and_redispatch` | 指定槽、自动重派、联合训练整组重试规则保持一致；暂停恢复继续等待原指定槽。状态冲突、兼容、回归 |
 | 任务资源提示和可用设备后端约束得到执行 | `test_device_info_reports_simulated_cross_platform_backends`、`test_member_selection_supports_each_device_backend`、`test_incompatible_members_are_rejected` | CUDA、ROCm、XPU、MPS、CPU 的厂商、设备字符串及能力映射正确；未知后端、无效索引和不支持架构被拒绝。正常、边界、异常 |
 | 异构联合训练通信与设备隔离正确 | `test_mixed_accelerators_use_gloo`、`test_cpu_slot_hides_inherited_gpu_visibility`、`test_supervisor_sets_backend_specific_device_visibility` | 仅全 NVIDIA CUDA 使用 NCCL，混合设备使用 Gloo；HIP/ROCR、CUDA、oneAPI 可见性按槽位隔离，CPU 清理继承变量。兼容、安全、回归 |
 | 远程 worker 构建匹配后端并拒绝不支持的容器目标 | `test_remote_build_selects_non_cuda_gpu_backend`、`test_remote_build_rejects_mps_docker_deployment` | ROCm/XPU 使用对应构建参数，MPS 明确要求 macOS 原生 worker。配置边界、兼容 |
@@ -3171,7 +3171,6 @@ docker compose logs --tail=15 worker
 
 ### 已知限制
 
-- 当前环境没有 NVIDIA、AMD、Intel 或 Apple GPU，真实 CUDA/ROCm/XPU/MPS 算子和 NCCL 仅做协议模拟测试；应在对应硬件和驱动环境补跑。
 - Apple MPS 只能在 macOS 原生 worker 使用；Linux Docker 不透传 MPS，Windows GPU 使用 WSL2 对应运行时。
 - 当前环境没有 NVIDIA、AMD、Intel 或 Apple GPU，真实 CUDA/ROCm/XPU/MPS 算子和 NCCL 仅由协议模拟覆盖；应在对应硬件和驱动环境补跑。
 - 24 项完整套件跳过项依赖真实 Redis、S3、Supervisor 多进程环境或双 NVIDIA GPU/NCCL；均未配置，不视作通过。
