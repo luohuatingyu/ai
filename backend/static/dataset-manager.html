@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>数据集管理 · 可视化模型训练平台</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="/app.css?v=20261029-1">
+    <link rel="stylesheet" href="/app.css?v=20261029-hub-1">
 </head>
 <body class="dataset-page">
     <header class="topbar">
@@ -39,6 +39,26 @@
                 <span class="loading" aria-hidden="true"></span>
                 <span id="uploadStatus" role="status" aria-live="polite">准备上传…</span>
             </div>
+        </section>
+
+        <section class="section-card" aria-labelledby="hubTitle">
+            <h2 class="section-title" id="hubTitle">从 Hugging Face Hub 导入</h2>
+            <p class="section-description">支持无需授权的公开表格与文本数据集。可立即下载，或保存引用，在预览、处理、训练时再下载并缓存。</p>
+            <form id="hubForm" class="hub-form">
+                <div class="hub-fields">
+                    <label>仓库 ID <input id="hubRepo" required maxlength="193" placeholder="例如：stanfordnlp/imdb" autocomplete="off"></label>
+                    <label>版本 <input id="hubRevision" required maxlength="128" value="main" placeholder="分支、标签或 commit"></label>
+                    <label>子集（可选）<input id="hubSubset" maxlength="128" placeholder="使用仓库默认子集"></label>
+                    <label>Split <input id="hubSplit" required maxlength="128" value="train" placeholder="例如：train、test"></label>
+                </div>
+                <fieldset class="hub-modes">
+                    <legend>保存方式</legend>
+                    <label><input type="radio" name="hubMode" value="remote" checked><span><strong>保存远程引用</strong><small>仅保存来源和固定版本，首次使用时下载</small></span></label>
+                    <label><input type="radio" name="hubMode" value="local"><span><strong>立即拉取到本地</strong><small>下载并缓存，完成后即可使用</small></span></label>
+                </fieldset>
+                <div class="hub-submit"><button type="submit" class="btn-primary" id="hubSubmit">导入 Hub 数据集</button><span id="hubStatus" role="status" aria-live="polite"></span></div>
+                <p class="section-description hub-hint">保存时固定当前版本；每个 split 最多 200 万行、100 列、500 MB，不会自动截断。图像、音频及需运行远程代码的数据集暂不支持。</p>
+            </form>
         </section>
 
         <section class="section-card" aria-labelledby="datasetTitle">
@@ -90,6 +110,7 @@
         // 初始化页面事件并加载列表、标签。
         document.addEventListener("DOMContentLoaded", () => {
             initializeUpload();
+            $("hubForm").addEventListener("submit", importHubDataset);
             $("searchInput").addEventListener("input", filterDatasets);
             $("datasetGrid").addEventListener("click", handleDatasetAction);
             $("processingBody").addEventListener("click", handleProcessingAction);
@@ -155,7 +176,10 @@
                 body = {};
             }
             if (!response.ok) {
-                throw new Error(body.detail || "请求失败（HTTP " + response.status + "）");
+                // 参数校验错误为数组，提取说明以免页面显示 [object Object]。
+                const detail = Array.isArray(body.detail)
+                    ? body.detail.map((item) => item.msg || "参数无效").join("；") : body.detail;
+                throw new Error(detail || "请求失败（HTTP " + response.status + "）");
             }
             return body;
         }
@@ -205,6 +229,44 @@
             return apiJson(API_BASE + "/datasets/import", { method: "POST", body: formData });
         }
 
+        // 提交 Hub 引用或立即下载，并在失败时保留列表中的可重试条目。
+        async function importHubDataset(event) {
+            event.preventDefault();
+            const button = $("hubSubmit");
+            const mode = $("hubForm").querySelector('input[name="hubMode"]:checked').value;
+            button.disabled = true;
+            $("hubStatus").textContent = mode === "local" ? "正在下载，完成前请保持页面打开…" : "正在保存远程引用…";
+            try {
+                const result = await apiJson(API_BASE + "/datasets/hub", {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ repo_id: $("hubRepo").value.trim(), revision: $("hubRevision").value.trim(),
+                        subset: $("hubSubset").value.trim() || null, split: $("hubSplit").value.trim(), storage_mode: mode })
+                });
+                $("hubStatus").textContent = result.cache_status === "ready" ? "已下载到本地，可开始使用。" : "远程引用已保存，使用时再下载。";
+                showNotification($("hubStatus").textContent, "success");
+            } catch (error) {
+                $("hubStatus").textContent = error.message;
+                showNotification(error.message, "error");
+            } finally {
+                button.disabled = false;
+                await loadDatasets();
+            }
+        }
+
+        // 显式下载远程数据，按钮反馈等待状态并支持失败后的重试。
+        async function materializeDataset(datasetId, button) {
+            button.disabled = true;
+            button.textContent = "下载中…";
+            try {
+                await apiJson(API_BASE + "/datasets/" + encodeURIComponent(datasetId) + "/materialize", { method: "POST" });
+                showNotification("数据集已下载并缓存", "success");
+            } catch (error) {
+                showNotification(error.message, "error");
+            } finally {
+                await loadDatasets();
+            }
+        }
+
         // 获取数据集列表并更新页面计数。
         async function loadDatasets() {
             try {
@@ -222,6 +284,9 @@
         function createDatasetCard(dataset) {
             const columns = Array.isArray(dataset.columns) ? dataset.columns : [];
             const tags = Array.isArray(dataset.tags) ? dataset.tags : [];
+            const isHub = dataset.source === "huggingface";
+            const needsDownload = isHub && dataset.cache_status !== "ready";
+            const cacheLabels = { remote: "远程引用", downloading: "正在下载", ready: "已缓存", error: "下载失败，可重试" };
             const columnTags = columns.slice(0, 5).map((column) =>
                 '<span class="tag">' + escapeHtml(column) + "</span>"
             ).join("");
@@ -234,13 +299,17 @@
                 '<div class="dataset-header">' +
                     '<h3 class="dataset-title">' + escapeHtml(dataset.name || "未命名数据集") + "</h3>" +
                     '<div class="dataset-actions">' +
-                        '<button type="button" data-action="detail" data-id="' + escapeHtml(dataset.id) + '">详情</button>' +
+                        '<button type="button" data-action="detail" data-id="' + escapeHtml(dataset.id) + '">' + (needsDownload ? "下载并预览" : "详情") + '</button>' +
+                        (needsDownload ? '<button type="button" data-action="download" data-id="' + escapeHtml(dataset.id) + '">下载到本地</button>' : "") +
                         '<button type="button" class="btn-secondary" data-action="process" data-id="' + escapeHtml(dataset.id) + '">处理</button>' +
                         '<button type="button" class="btn-danger" data-action="delete" data-id="' + escapeHtml(dataset.id) + '">删除</button>' +
                     "</div>" +
                 "</div>" +
                 '<div class="dataset-info">' +
-                    '<span class="dataset-meta">' + Number(dataset.rows || 0).toLocaleString("zh-CN") + " 行 · " + columns.length + " 列</span>" +
+                    '<span class="dataset-meta">' + (needsDownload ? "规模将在下载后显示" : Number(dataset.rows || 0).toLocaleString("zh-CN") + " 行 · " + columns.length + " 列") + "</span>" +
+                    (isHub ? '<span class="dataset-meta">Hugging Face · ' + escapeHtml(cacheLabels[dataset.cache_status] || "远程引用") + "</span>" +
+                        '<span class="dataset-meta">' + escapeHtml(dataset.hub.subset || "默认子集") + " / " + escapeHtml(dataset.hub.split) + " · 版本 " + escapeHtml(dataset.hub.revision.slice(0, 12)) + "</span>" : "") +
+                    (dataset.last_error ? '<span class="dataset-meta">' + escapeHtml(dataset.last_error) + "</span>" : "") +
                     '<span class="dataset-meta">创建于 ' + escapeHtml(formatDate(dataset.created_at)) + "</span>" +
                     (dataset.description ? '<span class="dataset-meta">' + escapeHtml(dataset.description) + "</span>" : "") +
                 "</div>" +
@@ -283,10 +352,14 @@
             if (button.dataset.action === "detail") showDatasetDetail(datasetId);
             if (button.dataset.action === "process") processDataset(datasetId);
             if (button.dataset.action === "delete") deleteDataset(datasetId);
+            if (button.dataset.action === "download") materializeDataset(datasetId, button);
         }
 
         // 读取数据集详情并以转义文本展示字段和元信息。
         async function showDatasetDetail(datasetId) {
+            $("modalTitle").textContent = "数据集详情";
+            $("modalBody").textContent = "正在准备数据；远程引用首次使用需要下载，请稍候…";
+            openModal("datasetModal");
             try {
                 const dataset = await apiJson(API_BASE + "/datasets/" + encodeURIComponent(datasetId));
                 $("modalTitle").textContent = dataset.name || "数据集详情";
@@ -322,8 +395,11 @@
                           "</div>"
                         : "");
                 openModal("datasetModal");
+                await loadDatasets();
             } catch (error) {
+                $("modalBody").textContent = error.message;
                 showNotification(error.message, "error");
+                await loadDatasets();
             }
         }
 

@@ -27,7 +27,7 @@ def _dataset_meta_path(ds_id: str) -> Any:
     return config.DATASETS_DIR / f"{ds_id}.meta.json"
 
 
-def _load_meta_or_404(ds_id: str) -> dict:
+def _load_meta_or_404(ds_id: str, materialize: bool = False) -> dict:
     """加载数据集元信息，兼容旧扁平格式与新结构；两种格式均不存在时返回 404"""
     _check_id(ds_id, "数据集")
     # 优先读取旧扁平格式：{ds_id}.meta.json
@@ -41,6 +41,8 @@ def _load_meta_or_404(ds_id: str) -> dict:
     meta = dataset_manager.get_dataset(ds_id)
     if meta is None:
         raise HTTPException(404, "数据集不存在")
+    if materialize and meta.get("source") == "huggingface":
+        return dataset_manager.ensure_local(ds_id)
     return meta
 
 

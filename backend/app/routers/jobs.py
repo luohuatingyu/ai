@@ -49,7 +49,7 @@ router = APIRouter(prefix="/api", tags=["jobs"])
 @router.post("/train")
 def start_training(req: TrainRequest) -> dict:
     llm_task = req.task.startswith("llm_")
-    meta = _load_meta_or_404(req.dataset_id) if req.dataset_source == "local" else None
+    meta = _load_meta_or_404(req.dataset_id, materialize=True) if req.dataset_source == "local" else None
     target = "" if req.task == "clustering" or llm_task else (req.target or "")
     columns = (meta or {}).get("columns", [])
     if req.task in {"classification", "regression", "time_series_forecasting"}:

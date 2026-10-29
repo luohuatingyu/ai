@@ -361,7 +361,7 @@
           <div class="formgrid">
             <div class="field">
               <label>数据来源</label>
-              <select id="p_dataset_source"><option value="local">本地数据集</option><option value="hub">Hugging Face Hub</option></select>
+              <select id="p_dataset_source"><option value="local">已维护的数据集</option><option value="hub">Hugging Face Hub</option></select>
             </div>
             <div class="field" id="hubDatasetField" hidden>
               <label>Hub 数据集 ID</label><input id="p_hub_dataset" maxlength="193" placeholder="例如: org/dataset">
@@ -901,7 +901,8 @@ function renderDatasetSelect() {
   for (const d of state.datasets) {
     const opt = document.createElement("option");
     opt.value = d.id;
-    opt.textContent = `${d.name}（${d.rows} 行 × ${d.columns.length} 列）`;
+    opt.textContent = d.source === "huggingface" && d.cache_status !== "ready"
+      ? `${d.name}（Hub 远程引用）` : `${d.name}（${d.rows} 行 × ${d.columns.length} 列）`;
     sel.appendChild(opt);
   }
   if (state.datasetId && state.datasets.some((d) => d.id === state.datasetId)) {
@@ -920,7 +921,8 @@ async function loadDatasets(keepId) {
   renderDatasetSelect();
 }
 
-async function loadPreview() {
+/** 远程引用仅在用户明确预览时下载，自动加载列表只展示来源状态。 */
+async function loadPreview(materialize = false) {
   const wrap = $("previewWrap"), metaBox = $("previewMeta");
   const targetSel = $("targetSelect");
   const timeColumnSel = $("timeColumnSelect");
@@ -929,8 +931,22 @@ async function loadPreview() {
   $("previewMeta").hidden = true;
   metaBox.textContent = "";
   if (!state.datasetId) { wrap.innerHTML = `<div class="empty">选择或上传数据集后在此预览</div>`; state.preview = null; updateStart(); return; }
+  const selectedId = state.datasetId;
+  const selected = state.datasets.find((dataset) => dataset.id === selectedId);
+  if (!materialize && selected?.source === "huggingface" && selected.cache_status !== "ready") {
+    state.preview = null;
+    wrap.innerHTML = `<div class="empty">Hub 远程引用：首次预览或训练时下载并缓存。<br><button type="button" id="downloadPreviewBtn">下载并预览</button></div>`;
+    $("downloadPreviewBtn").onclick = () => loadPreview(true);
+    updateStart();
+    return;
+  }
+  state.preview = null;
+  wrap.innerHTML = `<div class="empty">正在准备数据，请稍候…</div>`;
+  updateStart();
   try {
     const d = await apiJson(`/api/datasets/${state.datasetId}`);
+    if (state.datasetId !== selectedId) return;
+    state.datasets = state.datasets.map((dataset) => dataset.id === selectedId ? d : dataset);
     state.preview = d;
     // 目标列下拉（默认最后一列）
     for (const c of d.columns) {
@@ -955,6 +971,7 @@ async function loadPreview() {
     metaBox.hidden = false;
     metaBox.textContent = `${d.rows} 行 · ${d.columns.length} 列 · 仅展示前 5 行`;
   } catch (e) {
+    if (state.datasetId !== selectedId) return;
     wrap.innerHTML = `<div class="empty">预览失败：${esc(e.message)}</div>`;
     state.preview = null;
   }

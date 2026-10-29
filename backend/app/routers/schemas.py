@@ -86,6 +86,30 @@ class TrainRequest(BaseModel):
         return self
 
 
+class HubDatasetRequest(BaseModel):
+    """维护页的 Hub 来源，仅允许公开仓库引用，不接收任意下载地址或令牌。"""
+
+    repo_id: str = Field(min_length=1, max_length=193)
+    revision: str = Field(default="main", min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_./-]+$")
+    subset: str | None = Field(default=None, min_length=1, max_length=128)
+    split: str = Field(default="train", min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
+    storage_mode: Literal["local", "remote"] = "remote"
+    description: str = Field(default="", max_length=2000)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def validate_hub_source(self) -> "HubDatasetRequest":
+        """拒绝 URL、本地路径和非法仓库标识，下载器只能访问 Hub 仓库。"""
+        from huggingface_hub.utils import validate_repo_id
+
+        validate_repo_id(self.repo_id)
+        if self.subset and (not self.subset.strip() or any(ord(char) < 32 for char in self.subset)):
+            raise ValueError("子集名称不能为空或包含控制字符")
+        if any(not tag.strip() or len(tag) > 100 for tag in self.tags):
+            raise ValueError("标签须为 1～100 个字符")
+        return self
+
+
 class PredictRequest(BaseModel):
     row: dict[str, Any] | None = None
     history: list[Any] | None = None

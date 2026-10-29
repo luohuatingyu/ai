@@ -418,6 +418,14 @@ def resolve_dataset_csv_local(ds_id: str) -> Path:
     for path in candidates:
         if path.exists():
             return path
+    # 本机执行槽直接使用远程引用时同样按需缓存；远端执行槽由提交 API 先同步 S3。
+    from app.dataset_manager import DatasetManager
+
+    dataset_manager = DatasetManager(config.DATASETS_DIR)
+    metadata = dataset_manager.get_dataset(ds_id)
+    if metadata and metadata.get("source") == "huggingface":
+        dataset_manager.ensure_local(ds_id)
+        return config.DATASETS_DIR / "processed" / f"{ds_id}.csv"
     return candidates[0]
 
 

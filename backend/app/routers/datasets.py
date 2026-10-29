@@ -21,7 +21,7 @@ from app.routers.common import (
     _sync_dataset_csv_to_store,
     _write_metadata,
 )
-from app.routers.schemas import ProcessRequest
+from app.routers.schemas import HubDatasetRequest, ProcessRequest
 from app.state import data_processor, dataset_importer, dataset_manager
 from app.utils import safe_filename
 
@@ -63,10 +63,11 @@ def _rollback_imported_items(items: list[dict]) -> None:
                 pass
 
 
-def _sync_imported_items(items: list[dict]) -> None:
+def _sync_imported_items(items: list[dict], sync_files: bool = True) -> None:
     """同步本次导入的数据集，并更新可选数据库镜像。"""
-    for item in items:
-        _sync_dataset_csv_to_store(str(item["id"]))
+    if sync_files:
+        for item in items:
+            _sync_dataset_csv_to_store(str(item["id"]))
 
     if not config.DB_AVAILABLE:
         return
@@ -170,6 +171,25 @@ def list_datasets(
 
 # 静态路径必须位于 /datasets/{ds_id} 之前（否则被参数路由遮蔽）
 
+@router.post("/datasets/hub")
+def import_hub_dataset(request: HubDatasetRequest) -> dict:
+    """保存固定版本的公开 Hub 引用，可选择立即拉取或在首次使用时拉取。"""
+    metadata = dataset_manager.register_hub_dataset(**request.model_dump())
+    if request.storage_mode == "local":
+        metadata = dataset_manager.ensure_local(metadata["id"])
+    _sync_imported_items([metadata], sync_files=False)
+    return metadata
+
+
+@router.post("/datasets/{ds_id}/materialize")
+def materialize_hub_dataset(ds_id: str) -> dict:
+    """显式下载或重试远程引用，已缓存的数据直接复用。"""
+    _check_id(ds_id, "数据集")
+    metadata = dataset_manager.ensure_local(ds_id)
+    _sync_imported_items([metadata], sync_files=False)
+    return metadata
+
+
 @router.get("/datasets/import-history")
 def get_import_history(limit: int = 100) -> dict:
     """获取导入历史"""
@@ -209,6 +229,7 @@ def get_all_tags() -> dict:
 def dataset_detail(ds_id: str, rows: int = 5) -> dict:
     """获取数据集详情"""
     try:
+        _check_id(ds_id, "数据集")
         return dataset_manager.get_dataset_preview(ds_id, rows)
     except HTTPException:
         raise
@@ -220,6 +241,7 @@ def dataset_detail(ds_id: str, rows: int = 5) -> dict:
 def dataset_stats(ds_id: str) -> dict:
     """获取数据集统计信息"""
     try:
+        _check_id(ds_id, "数据集")
         return dataset_manager.get_dataset_stats(ds_id)
     except HTTPException:
         raise
@@ -335,8 +357,12 @@ def update_dataset_description(ds_id: str, description: str) -> dict:
 def get_data_profile(ds_id: str) -> dict:
     """获取数据概览"""
     try:
-        _get_dataset_or_404(ds_id)
-        df = pd.read_csv(config.DATASETS_DIR / "processed" / f"{ds_id}.csv")
+        _check_id(ds_id, "数据集")
+        dataset_manager.ensure_local(ds_id)
+        source = dataset_manager._resolve_csv(ds_id)
+        if source is None:
+            raise HTTPException(404, "数据集文件不存在")
+        df = pd.read_csv(source)
         return data_processor.get_data_profile(df)
     except HTTPException:
         raise
@@ -349,7 +375,7 @@ def process_dataset(ds_id: str, request: ProcessRequest) -> dict:
     """处理数据集"""
     try:
         _check_id(ds_id, "数据集")
-        dataset = _get_dataset_or_404(ds_id)
+        dataset = dataset_manager.ensure_local(ds_id)
 
         # 优先读取原始数据；旧扁平布局必须排在 processed 文件之前，避免重复处理累积覆盖。
         source_candidates = [

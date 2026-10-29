@@ -989,6 +989,20 @@ body.server-dialog-open { overflow: hidden; }
 .dataset-page .section-title { margin-bottom: 8px; color: #24344d; font-size: 16px; font-weight: 700; }
 .dataset-page .section-title::before { width: 4px; height: 17px; }
 .dataset-page .section-description { margin-bottom: 18px; font-size: 13px; }
+.dataset-page .hub-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+.dataset-page .hub-fields label { display: grid; gap: 8px; color: var(--muted); font-size: 13px; }
+.dataset-page .hub-fields input { width: 100%; min-height: 42px; }
+.dataset-page .hub-modes { display: flex; flex-wrap: wrap; gap: 14px; margin: 20px 0; padding: 14px; border: 1px solid var(--border); border-radius: 12px; }
+.dataset-page .hub-modes legend { padding: 0 6px; color: var(--muted); font-size: 13px; }
+.dataset-page .hub-modes label { display: flex; flex: 1 1 230px; gap: 10px; align-items: flex-start; padding: 12px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+.dataset-page .hub-modes label:has(input:checked) { border-color: var(--accent); background: #f1f6ff; }
+.dataset-page .hub-modes input { width: auto; margin-top: 4px; accent-color: var(--accent); }
+.dataset-page .hub-modes strong, .dataset-page .hub-modes small { display: block; }
+.dataset-page .hub-modes small { margin-top: 5px; color: var(--muted); line-height: 1.6; }
+.dataset-page .hub-submit { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+.dataset-page #hubStatus { color: var(--muted); font-size: 13px; }
+.dataset-page .hub-hint { margin: 14px 0 0; font-size: 12px; }
+
 .dataset-page .upload-area {
   gap: 10px;
   padding: clamp(30px, 4vw, 48px) 18px;
