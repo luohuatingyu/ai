@@ -1,3 +1,80 @@
+## 本次变更测试结果：远程训练节点同步与 CPU 镜像精简（2026-10-29）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`fae7d1e9be2903fac0631aa7442672c3b097a513`。
+- **提交信息**：Slim remote worker packages and CPU dependencies。
+- **测试日期 / 分支**：2026-10-29 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围**：远程 worker 构建/代码包白名单、CPU/GPU 构建参数、镜像类型兼容性检查、独立 `worker.Dockerfile` / `requirements-worker.txt`、平台镜像携带构建资源及对应测试和 README。未操作远端服务器、清理远端镜像、修改数据结构或添加项目依赖。
+- **隔离说明**：工作区同时存在其他会话的联合训练、数据集、前端等未提交改动，以及预先存在的 Dockerfile 下载重试改动。本次最终测试在 `d1f4115` 加本提交修改的独立快照执行；暂存业务源码及测试与快照的 Git blob hash 一致。仅提交本任务的文件/代码块，不将共享工作区其他功能视为已验收。测试后其他会话新增的 `db1d5c6` 心跳注册提交不属于本次验证基准点。
+- **技术环境**：Docker Desktop / Linux ARM64，Python **3.12.15**。完整 pytest 使用现有平台依赖（PyTorch 2.14.1+cu130，以 CPU 执行）；新专用镜像实际安装 **PyTorch 2.15.0+cpu**、transformers 4.57.6、datasets 4.8.5。依赖范围沿用平台清单，worker 不安装管理 API、数据库管理、Excel 导入或测试工具。
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---:|---|
+| 实现前新增回归 | 7 | 0 | 7 | 0 | 0 | 复现携带管理端内容、缺少硬件构建参数及非法模式未拒绝 |
+| 早期共享工作区远程套件 | 126 | 124 | 2 | 0 | 0 | 其他会话新增空的 `WORKER_DISTRIBUTED_HOST` 行，导致两项配置不变断言失败；未通过弱化断言规避 |
+| 最终隔离快照远程套件 | 145 | 145 | 0 | 0 | 0 | 13.29 秒；打包、构建、SSH、生命周期、回滚及模式检查全部通过 |
+| 最终隔离快照完整 pytest | 377 | 370 | 0 | 0 | 7 | **52.08 秒**，已执行用例通过率 100%，含跳过的总通过比例 98.14% |
+| 新 CPU 镜像依赖验证 | 1 | 1 | 0 | 0 | 0 | `pip check`、Python 3.12、`torch.version.cuda is None`；无 nvidia-*、Triton 或平台专用包 |
+| 新 CPU 镜像真实训练 | 3 | 3 | 0 | 0 | 0 | 分类、回归、离线微型 LLM 预训练；验证业务指标、权重/模型包、可复现性和预测/生成 |
+| 隔离 Uvicorn 冒烟 | 1 | 1 | 0 | 0 | 0 | Python 3.12、无数据库/Redis、本地临时存储，`/api/health` 返回 200 和 `{"ok":true}` |
+
+补充边界测试前的完整套件也通过（364 通过、7 跳过），最终数字以上表为准。保留 SQLAlchemy `declarative_base()`、Pandas `xlrd` 两条既有弃用警告；微型 LLM 的默认 loss 提示不影响断言。没有删除、跳过或弱化已有有效测试。
+
+**关键模块覆盖**：远程管理 145/145；完整套件中的数据层、训练器、Worker/协调层及 API 所有可执行用例通过，覆盖旧扁平与新结构数据集、分类/回归/聚类/时间序列、LLM、发起训练/状态/日志/指标/产物和预测回归。新镜像另外直接运行真实训练，不依赖平台中已安装的 API/数据库包。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 测试层级、前置条件及输入 | 预期业务结果 / 实际结果 | 场景 |
+|---|---|---|---|
+| 同步只包含训练运行文件 | 单元/归档集成：`test_worker_packages_exclude_control_plane_and_keep_training`，构建包、压缩代码包两种输入 | 保留 worker、训练器、LLM、队列、存储和入口；排除页面、管理 API、数据库、测试、数据与秘密文件；2/2 通过 | 正常、安全、兼容 |
+| 缺失或不安全源码不发送 | 单元：`test_worker_runtime_rejects_unsafe_or_incomplete_sources`，缺失、符号链接、目录、根目录链接；`test_worker_runtime_validates_optional_training_modules`，两个可选模块的普通文件/断链/目录 | 正常可选模块随包发布，其余拒绝打包；10/10 通过 | 边界、资源不存在、安全、新分支 |
+| CPU/GPU 依赖按目标类型选择 | 单元+真实 Docker：`test_remote_build_selects_worker_runtime`、`test_remote_build_rejects_invalid_runtime`，cpu/gpu、空值/auto/命令注入；CPU 镜像依赖检查 | 参数正确，非法值构建前失败；CPU 安装官方 CPU torch 且无 CUDA；全部通过 | 正常、空值、非法参数、安全 |
+| 精简包能训练并稳定预测 | 进程集成：`test_packaged_worker_trains_without_control_plane`，屏蔽平台依赖，分类/回归各训练两次，输入正常行/空行/非法字段 | 产生 metrics、accuracy 或 R²/RMSE 和非空 best.pt；固定 seed 最终指标一致；同模型重复预测一致；2/2 通过，另在新 CPU 镜像复验通过 | 训练链路、可复现、容错、预处理、回归 |
+| 保留 LLM 能力 | 真实 CPU 镜像：复用 `test_pretraining_from_scratch_saves_metrics_bundle_and_generates` 的原有业务断言，离线微型语料，两次预训练 | loss/perplexity 有限、模型包与 checkpoint 可读、固定 seed 一致、重复生成一致；通过 | 正常、可复现、依赖兼容 |
+| 阻止 CPU 镜像误启 GPU 节点 | shell 集成：`test_gpu_actions_reject_cpu_image_and_accept_legacy`，deploy/restart × cpu/gpu/历史无标签镜像 | CPU 镜像明确拒绝 GPU 操作，且不停止旧容器；GPU/历史镜像保留兼容行为；6/6 通过 | 状态冲突、兼容、生命周期 |
+| 保持原构建与管理流程 | 现有远程套件，含传统 Docker builder、源参数、启动/停止/配置与回滚 | 所有相关用例通过；平台运行容器能找到专用配方并产生精简归档 | 回归、兼容、异常 |
+
+### 实际命令与容器验证
+
+最终快照目录为 `/private/tmp/mtp-worker-slim-yNMojo/`（`/tmp` 对应同一目录）。实际专项及完整测试命令：
+
+```bash
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-worker-slim-yNMojo,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/test_remote_workers.py -q --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-slim-targeted-final
+docker run --rm --pull=never --network none --mount type=bind,src=/private/tmp/mtp-worker-slim-yNMojo,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -v --tb=short -p no:cacheprovider --basetemp=/tmp/mtp-slim-full-delivery
+docker compose up --build -d
+docker compose -f docker-compose.yml -f /private/tmp/mtp-worker-slim-yNMojo/compose-validation.yml up --build -d
+docker image inspect mtp-worker:slim-validation --format 'bytes={{.Size}} mode={{index .Config.Labels "org.mtp.worker.mode"}} arch={{.Architecture}}'
+docker run --rm -i --pull=never --network none --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --mount type=bind,src=/private/tmp/mtp-worker-slim-yNMojo,dst=/workspace,readonly mtp-worker:slim-validation python -u - < /private/tmp/mtp-worker-slim-yNMojo/validate_runtime.py
+git diff --cached --check
+git status --short
+```
+
+- **默认 Compose 从零构建未通过**：torch 的 454.0 MB 下载只得到 11.5 MB，pip SHA256 校验拒绝，进入重试；为避免长期无效等待取消构建，退出 130。不能将其记为默认 Dockerfile 从零构建成功。
+- **统一容器重建与启动通过**：临时 Compose 覆盖仅以现有平台镜像 `sha256:8eb9862184e78e09be326b0f239a4bd68ab8bae94a1b67871d38c1154be03496` 为依赖基底，覆盖本任务快照的 app、静态文件及构建资源。基底 `/app/requirements.txt` 与仓库 SHA256 均为 `7d7733dba1caf8314b89bb5437101c44d52b538d435096ad15a112d45264e71e`。统一构建并重建 trainer/worker、启动全部 Compose 服务成功；实际 `/api/health` 返回 200，前端 `/healthz` 返回 ok；平台容器内专用配方与清单存在，可生成下表中的精简包。仓库 Compose 配置未改动。
+- **本地等价启动通过**：宿主机无 Python 3.12，因此未使用宿主机旧版 Python。一次性隔离容器中以 Python 3.12 执行 `USE_DATABASE=false python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000`（workdir 为挂载的 `backend`，额外设置本地临时 DATA_DIR、STORAGE_BACKEND=local、REDIS_URL 为空），健康业务断言通过。没有 Python 版本差异，未将语法检查当成功能测试。
+- **独立 CPU 镜像实际构建通过**：首次直接下载官方 CPU torch 两次截断，pip 校验拒绝后重试，随后取消。改用仅本机临时 CONNECT 代理（保留端到端 TLS、仅允许 PyTorch/PyPI 域名）后，使用完全相同的专用 Dockerfile 和 `_worker_build_context` 生成的 tar stdin，执行 `docker build --progress=plain --tag mtp-worker:slim-validation --build-arg WORKER_MODE=cpu --build-arg PIP_INDEX_URL=https://pypi.org/simple --build-arg HTTPS_PROXY=http://host.docker.internal:18947 -` 成功。没有改写 CPU 索引、使用 GPU 包替代或跳过 hash 校验。新 CPU 镜像中直接验证依赖与三类训练全部通过。
+
+### 体积实测、限制与回滚
+
+| 项目 | 调整前 | 本提交独立快照 | 减少 |
+|---|---:|---:|---:|
+| 首次上传的原始 tar 构建包 | 757,760 bytes（740 KiB） | 225,280 bytes（220 KiB） | 70.3% |
+| 后续 gzip 代码包 | 127,501 bytes（124.5 KiB） | 57,777 bytes（56.4 KiB） | 54.7% |
+| 本地 ARM64 worker 镜像 | 10,152,772,321 bytes | 2,252,195,111 bytes（CPU） | 77.8% |
+
+归档体积会随后续源码变化；可选联合训练模块存在时也会按白名单携带。以上是本提交快照的数据，不是所有架构/服务器的固定大小保证。镜像减少主要来自去除 CPU 节点不需要的 CUDA/NVIDIA/Triton 依赖；GPU 镜像仍保留 GPU 所需运行时。
+
+**已知限制与未执行项**：完整套件保留 7 个原有环境跳过项（4 个真实 Redis、2 个 S3 集成、1 个 Supervisor E2E），本次没有配置相应测试环境补跑；没有 NVIDIA GPU，未验证真实 CUDA 或 x86_64 镜像，也未执行真实远端安装/网络下载。不能将镜像本地构建通过等同于所有远端网络可访问。默认平台依赖从零构建仍受当前网络截断影响，等价依赖基底的 Compose 验证已通过。
+
+**行为与后续建议**：新建 CPU 节点使用精简 CPU 依赖；既有节点部署代码仍复用现有镜像，不会自动减少旧镜像占用。旧节点需在维护窗口重新构建并替换容器，确认训练已退出后再清理不用的镜像；本次未代用户执行。CPU 镜像切换 GPU 必须先提供 GPU 版镜像。建议在目标架构及稳定网络下验证首次安装，并按需补跑 Redis/S3/Supervisor 与真 GPU 场景。
+
+**重测触发条件与回滚**：修改远程打包白名单、构建配方/依赖、模式兼容性、Worker、训练/预测、数据布局或业务配置后，重新执行对应套件、完整测试和镜像业务验证；用户明确要求时也重测。回滚可撤销 `fae7d1e` 后统一重建平台；既有远端镜像和数据未改动，无数据迁移。
+
+**清理与提交**：临时快照、CPU wheel、验证脚本、补丁、Compose 覆盖及本机代理均在 `/private/tmp/mtp-worker-slim-yNMojo/`，验证完成后清除，代理和隔离 API 容器停止，临时验证镜像标签删除；pytest/训练产物随一次性容器清理。本任务代码与报告分开提交，不执行 git push。共享工作区的其他会话改动保留，未纳入本次提交。
+
 ## 本次变更测试结果：训练启动失租与接手任务写入隔离（2026-10-29）
 
 ### Git 基准点与变更范围
