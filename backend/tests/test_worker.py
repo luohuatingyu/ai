@@ -169,8 +169,10 @@ def test_pause_then_other_worker_resumes(store, make_dataset, make_job, q, ls, s
     wb.stop()
 
 
-def test_lease_lost_graceful_pause(store, make_dataset, make_job, q, ls, spawn_worker):
-    """异常场景：租约被回收（心跳过期/watchdog 重派）→ 本槽优雅让位，任务 paused。"""
+def test_lease_lost_yields_to_watchdog(store, make_dataset, make_job, q, ls, spawn_worker):
+    """失租槽退出且不写 paused，由 watchdog 重排后继续完成训练。"""
+    from app.jobs import JobManager
+
     ds = make_dataset(n=1500)
     job = make_job(ds, epochs=300)
     q.push(job)
@@ -178,9 +180,21 @@ def test_lease_lost_graceful_pause(store, make_dataset, make_job, q, ls, spawn_w
     assert wait_until(lambda: job_status(store, job) == "running", 20)
     with ls._lock:
         ls._leases[job][1] = time.time() - 0.01
-    assert wait_until(lambda: job_status(store, job) == "paused", 20)
-    assert "心跳丢失" in jobstore.read_job_log(store, job)
+    assert wait_until(lambda: w.worker._controller is None, 20)
+    assert job_status(store, job) == "running", "失租 worker 不得自行写共享终态"
     w.stop()
+    manager = JobManager(store=store, queue=q, lease=ls, start_workers=False, start_watchdog=False)
+    try:
+        manager._watchdog_once()
+        assert job_status(store, job) == "queued"
+        assert "心跳丢失" in jobstore.read_job_log(store, job)
+        successor = spawn_worker("w-successor")
+        assert wait_until(lambda: job_status(store, job) == "completed", 60)
+        assert job_epochs(store, job) == list(range(1, 301))
+        assert store.exists(job_key(job, "best.pt"))
+        successor.stop()
+    finally:
+        manager.stop()
 
 
 def test_checkpoint_corrupt_falls_back_to_older(store, make_dataset, make_job, q, ls, spawn_worker):
@@ -428,3 +442,184 @@ def test_worker_survives_queue_pop_error(store, make_dataset, make_job, q, ls):
     assert t.is_alive(), "worker 循环不应因 pop 异常退出"
     w.request_shutdown()
     t.join(timeout=5)
+
+
+@pytest.mark.parametrize("coordination", ["embedded", "redis"])
+def test_worker_renews_lease_during_slow_startup(
+    store, make_dataset, make_job, q, ls, monkeypatch, coordination,
+):
+    """历史日志下载超过租约期限时仍持续续租，并完成真实训练。"""
+    from app.worker import TrainingWorker
+
+    if coordination == "redis":
+        import os
+        import redis
+        from app.coordination import RedisLeaseStore
+
+        endpoint = os.environ.get("MTP_TEST_REDIS")
+        if not endpoint:
+            pytest.skip("未配置 MTP_TEST_REDIS，跳过真实 Redis 慢启动测试")
+        ls = RedisLeaseStore(redis.Redis.from_url(endpoint, decode_responses=True))
+    job = make_job(make_dataset(), epochs=2)
+    jobstore.append_job_log(store, job, "历史日志")
+    monkeypatch.setattr(config, "WORKER_LEASE_TTL", 1.0)
+    observed = []
+
+    class SlowHistoryStore:
+        """仅在历史产物下载时注入真实等待，不替换训练或续租逻辑。"""
+
+        def read_file(self, key, path):
+            """阻塞超过初始租期后观察有效持有者。"""
+            if key == job_key(job, "log.txt"):
+                time.sleep(1.5)
+                observed.append(ls.peek_holder(job))
+            return store.read_file(key, path)
+
+        def __getattr__(self, name):
+            """其余仓储操作继续使用真实本地实现。"""
+            return getattr(store, name)
+
+    worker = TrainingWorker(store=SlowHistoryStore(), queue=q, lease_store=ls,
+                            capabilities=detect_capabilities("slow-start"))
+    worker._execute_job(job)
+    assert observed and observed[0], "准备阶段必须持续持有租约"
+    assert job_status(store, job) == "completed"
+    assert job_epochs(store, job) == [1, 2]
+    assert store.exists(job_key(job, "best.pt"))
+
+
+@pytest.mark.parametrize("loss_point", ["metrics", "checkpoint", "failure", "retry"])
+def test_superseded_worker_cannot_overwrite_successor(
+    store, make_dataset, make_job, q, ls, loss_point,
+):
+    """旧槽在写入返回或异常收尾时失租，不得覆盖接手槽的状态、产物及缓存。"""
+    from app.jobs import JobManager
+    from app.worker import TrainingWorker
+
+    job = make_job(make_dataset(), epochs=6)
+    old_entered, old_release = threading.Event(), threading.Event()
+    new_entered, new_release = threading.Event(), threading.Event()
+    paths = {}
+
+    class GatedStore:
+        """在真实上传完成后阻塞返回，制造可重复的 worker 交接时序。"""
+
+        def __init__(self, label, entered, release):
+            """记录各执行者的单次阻塞点。"""
+            self.label, self.entered, self.release = label, entered, release
+            self.blocked = False
+
+        def write_file(self, key, path):
+            """保留真实产物写入，仅注入外部存储等待或失败。"""
+            store.write_file(key, path)
+            selected = "checkpoints/ckpt-" if self.label == "old" and loss_point == "checkpoint" else "metrics.jsonl"
+            if selected in key and not self.blocked:
+                self.blocked = True
+                paths[self.label] = path.parent.parent if "/checkpoints/" in str(path) else path.parent
+                self.entered.set()
+                if not self.release.wait(20):
+                    raise TimeoutError("测试存储等待超时")
+                if self.label == "old" and loss_point in {"failure", "retry"}:
+                    error = ValueError if loss_point == "failure" else ConnectionError
+                    raise error("storage connection reset after takeover")
+
+        def __getattr__(self, name):
+            """转发未注入故障的真实仓储操作。"""
+            return getattr(store, name)
+
+    old = TrainingWorker(store=GatedStore("old", old_entered, old_release), queue=q,
+                         lease_store=ls, capabilities=detect_capabilities("old-slot"))
+    new = TrainingWorker(store=GatedStore("new", new_entered, new_release), queue=q,
+                         lease_store=ls, capabilities=detect_capabilities("new-slot"))
+    manager = JobManager(store=store, queue=q, lease=ls, start_workers=False, start_watchdog=False)
+    old_thread = threading.Thread(target=old._execute_job, args=(job,), daemon=True)
+    new_thread = threading.Thread(target=new._execute_job, args=(job,), daemon=True)
+    old_thread.start()
+    try:
+        assert old_entered.wait(15), "旧槽应先产生真实训练进度"
+        with ls._lock:
+            ls._leases[job][1] = time.time() - 1
+        manager._watchdog_once()
+        assert job_status(store, job) == "queued"
+        new_thread.start()
+        assert new_entered.wait(15), "接手槽应能从已上传断点继续训练"
+        before = {key: store.read_bytes(key) for key in store.list_keys(job_key(job, ""))}
+        old_release.set()
+        old_thread.join(10)
+        assert not old_thread.is_alive()
+        after = {key: store.read_bytes(key) for key in store.list_keys(job_key(job, ""))}
+        assert after == before, "旧 worker 的退出、失败和 finally 不得修改接手任务"
+        assert paths["old"] != paths["new"], "临时目录必须按执行批次隔离"
+        assert (paths["new"] / "metrics.jsonl").exists(), "旧 worker 不得清理新槽目录"
+        new_release.set()
+        new_thread.join(15)
+        assert job_status(store, job) == "completed"
+        assert job_epochs(store, job) == list(range(1, 7))
+        record = jobstore.read_job(store, job)
+        assert [segment["status"] for segment in record["segments"]] == ["interrupted", "completed"]
+        assert record["summary"]["final"]["val_accuracy"] >= 0
+        assert store.exists(job_key(job, "best.pt"))
+    finally:
+        old_release.set()
+        new_release.set()
+        old_thread.join(10)
+        if new_thread.ident is not None:
+            new_thread.join(10)
+        manager.stop()
+
+
+@pytest.mark.parametrize("operation", ["state", "model", "prune"])
+@pytest.mark.parametrize("lease_failure", ["expired", "new_owner", "unavailable"])
+def test_lease_guard_rejects_unowned_mutations(store, ls, tmp_path, monkeypatch, operation, lease_failure):
+    """失租或协调面不可达时，状态覆盖、模型上传及断点删除都不得产生副作用。"""
+    from app.worker import JobController, JobLeaseLost, _LeaseGuardedStore
+
+    job, token = "guarded-job", "old-token"
+    key = job_key(job, "best.pt")
+    store.write_bytes(key, b"published-model")
+    assert ls.acquire(job, token, 10)
+    controller = JobController(ls, job, token, "old-worker", 0.1, 10)
+    guarded = _LeaseGuardedStore(store, controller.ensure_owned)
+    if lease_failure == "unavailable":
+        def unavailable(*args):
+            """只替换外部协调服务的失败结果，不绕过所有权判断。"""
+            raise ConnectionError("redis temporarily unavailable")
+        monkeypatch.setattr(ls, "renew", unavailable)
+    else:
+        with ls._lock:
+            ls._leases[job][1] = time.time() - 1
+        if lease_failure == "new_owner":
+            assert ls.acquire(job, "new-token", 10)
+    stale_model = tmp_path / "stale.pt"
+    stale_model.write_bytes(b"stale-model")
+    with pytest.raises(JobLeaseLost):
+        if operation == "state":
+            guarded.write_json(job_key(job, "job.json"), {"status": "paused"})
+        elif operation == "model":
+            guarded.write_file(key, stale_model)
+        else:
+            guarded.delete(key)
+    assert store.read_bytes(key) == b"published-model"
+    assert not store.exists(job_key(job, "job.json"))
+    assert controller.lease_lost.is_set() and controller.pause_event.is_set()
+
+
+def test_controller_caps_heartbeat_interval_and_clears_old_signals(ls):
+    """心跳配置大于 TTL 时自动缩短周期；旧暂停信号在清理前不得触发本次执行。"""
+    from app.worker import JobController
+
+    assert ls.acquire("short-lease", "owner", 0.3)
+    ls.set_signal("short-lease", "pause")
+    controller = JobController(ls, "short-lease", "owner", "worker", 10, 0.3)
+    controller.start()
+    try:
+        time.sleep(0.65)
+        assert ls.peek_holder("short-lease") == "owner"
+        assert not controller.pause_event.is_set()
+        ls.clear_signals("short-lease")
+        controller.enable_signals()
+        ls.set_signal("short-lease", "cancel")
+        assert controller.cancel_event.wait(1)
+        assert not controller.pause_event.is_set()
+    finally:
+        controller.stop()

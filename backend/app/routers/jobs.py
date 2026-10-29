@@ -134,6 +134,7 @@ def job_detail(job_id: str) -> dict:
 
 @router.get("/jobs/{job_id}/logs")
 def job_logs(job_id: str, offset: int = 0) -> dict:
+    """分页读取权威文件日志，仅在旧任务没有日志文件时回退数据库镜像。"""
     _check_id(job_id, "任务")
     if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")
@@ -141,13 +142,13 @@ def job_logs(job_id: str, offset: int = 0) -> dict:
     total = 0
     lines: list[str] = []
     # 状态平面日志文件为权威源（续训时各登录点自然衔接）
-    text = jobstore.read_job_log(manager.store, job_id)
+    text = manager.store.read_text(job_key(job_id, "log.txt"))
     if text:
         lines = text.splitlines()
         total = len(lines)
 
-    # 数据库可用且已有日志时，与文件日志合并优先取数据库（训练线程镜像）
-    if config.DB_AVAILABLE:
+    # 空文件表示已清除；数据库只包含训练器镜像，不能覆盖调度/暂停/重派原因。
+    if text is None and config.DB_AVAILABLE:
         try:
             with db_session() as db:
                 db_logs = get_job_logs(db, job_id, 0, 1000000)

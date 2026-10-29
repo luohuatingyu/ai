@@ -8,7 +8,7 @@
 设计约束：
 - 本地磁盘只是 scratch（缓存），所有训练语义状态都写状态平面（对象存储/本地存储抽象）；
 - 任何时刻同一任务只有一个租约持有者（单写者），心跳丢失即被 watchdog 重派，
-  本节点在下一个 epoch 边界优雅退出（先存档再停，绝不双写）；
+  本节点失租后停止发布状态与产物，由接手者恢复最近成功上传的 checkpoint；
 - checkpoint 全 CPU 化：A 服务器训练 1 小时后释放，B 服务器用不同型号显卡即可接手续训。
 """
 from __future__ import annotations
@@ -226,13 +226,57 @@ def classify_retryable(exc: BaseException) -> bool:
     return any(p in text for p in _RETRYABLE_PATTERNS)
 
 
+class JobLeaseLost(Exception):
+    """任务租约已失效或无法确认，旧执行者必须停止发布共享状态。"""
+
+
+class _LeaseGuardedStore(ArtifactStore):
+    """在每次共享写入前校验租约，覆盖正常、异常及 finally 的全部发布路径。"""
+
+    def __init__(self, inner: ArtifactStore, check_owner: Callable[[], None]) -> None:
+        """保留底层仓储实现，统一注入执行者所有权校验。"""
+        self._inner = inner
+        self._check_owner = check_owner
+
+    def read_bytes(self, key: str) -> Optional[bytes]:
+        """读取沿用底层仓储；后续写入独立校验，避免慢读取跨越租期。"""
+        return self._inner.read_bytes(key)
+
+    def read_file(self, key: str, local_path: Path) -> Path:
+        """下载到本次执行独占的临时目录。"""
+        return self._inner.read_file(key, local_path)
+
+    def write_bytes(self, key: str, data: bytes) -> None:
+        """发布任务状态或文本前确认当前 token 仍有效。"""
+        self._check_owner()
+        self._inner.write_bytes(key, data)
+
+    def write_file(self, key: str, local_path: Path) -> None:
+        """上传指标、日志、模型和断点前校验租约。"""
+        self._check_owner()
+        self._inner.write_file(key, local_path)
+
+    def exists(self, key: str) -> bool:
+        """查询共享产物是否存在。"""
+        return self._inner.exists(key)
+
+    def list_keys(self, prefix: str) -> List[str]:
+        """列举历史产物，后续删除仍需独立校验租约。"""
+        return self._inner.list_keys(prefix)
+
+    def delete(self, key: str) -> None:
+        """清理过期断点前校验租约，避免旧 worker 删除接手者的断点。"""
+        self._check_owner()
+        self._inner.delete(key)
+
+
 class JobController:
     """单任务控制信号容器：cancel/pause 事件 + 租约续期心跳线程。
 
     - 分布式模式：后台线程每 heartbeat 周期做三件事——
       读取协调平面信号（cancel/pause -> 置本地事件）、续租（token 校验）、刷新 worker 心跳；
     - 租约续期失败（被 watchdog 重派/心跳丢失）：立即置 pause 事件，
-      训练器在下一个 epoch/批次边界存档并退出，天然杜绝双写者；
+      训练器在下一个回调/批次边界退出，失租后不再上传本地存档；
     - 嵌入式模式与分布式共用同一套逻辑（LeaseStore 接口一致）。
     """
 
@@ -252,12 +296,13 @@ class JobController:
         self._job_id = job_id
         self._token = token
         self._worker_id = worker_id
-        self._interval = max(float(interval), 0.2)
         self._ttl = float(ttl)
+        self._interval = max(min(float(interval), self._ttl / 3.0), 0.05)
         self._hb_ttl = max(float(ttl) * 2.0, self._interval * 3.0)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._err_since: Optional[float] = None
+        self._last_renewed_at = time.monotonic()
+        self._signals_ready = threading.Event()
         self._epoch = 0
         self._state = "starting"
 
@@ -267,11 +312,35 @@ class JobController:
         self._state = state
 
     def start(self) -> None:
-        """启动心跳/续租线程。"""
+        """领取后立即续租并启动线程，使慢准备和收尾阶段也受心跳保护。"""
+        self.ensure_owned()
         self._thread = threading.Thread(
             target=self._loop, name=f"hb-{self._job_id}", daemon=True
         )
         self._thread.start()
+
+    def enable_signals(self) -> None:
+        """旧控制信号清理完成后才开始接收本次执行的暂停和取消请求。"""
+        self._signals_ready.set()
+
+    def _mark_lease_lost(self) -> None:
+        """永久标记本次执行失租，后续成功连接也不能恢复旧执行者写入权。"""
+        self.lease_lost.set()
+        self.pause_event.set()
+
+    def ensure_owned(self) -> None:
+        """写入前原子校验 token 并续租；无法确认所有权时拒绝继续写入。"""
+        if self.lease_lost.is_set():
+            raise JobLeaseLost("worker 任务租约已失效，停止写入并等待 watchdog 接续调度")
+        try:
+            owned = self._lease_store.renew(self._job_id, self._token, self._ttl)
+        except Exception as exc:
+            self._mark_lease_lost()
+            raise JobLeaseLost("无法确认 worker 任务租约，停止共享写入") from exc
+        if not owned:
+            self._mark_lease_lost()
+            raise JobLeaseLost("worker 任务租约已失效，停止写入并等待 watchdog 接续调度")
+        self._last_renewed_at = time.monotonic()
 
     def stop(self) -> None:
         """停止心跳线程（任务收尾时调用）。"""
@@ -284,34 +353,28 @@ class JobController:
         """心跳循环：信号同步 + 租约续期 + worker 存活性刷新。"""
         while not self._stop_event.wait(self._interval):
             try:
-                signals = self._lease_store.get_signals(self._job_id)
+                if self.lease_lost.is_set():
+                    return
+                # 先续租，再读取控制信号；信号读取慢不能吃掉本轮剩余租期。
+                if not self._lease_store.renew(self._job_id, self._token, self._ttl):
+                    self._mark_lease_lost()
+                    return
+                self._last_renewed_at = time.monotonic()
+                signals = self._lease_store.get_signals(self._job_id) if self._signals_ready.is_set() else set()
                 if "cancel" in signals:
                     self.cancel_event.set()
                 if "pause" in signals:
                     self.pause_event.set()
-                if not self._lease_store.renew(self._job_id, self._token, self._ttl):
-                    # token 不匹配/租约已被回收：本节点失去写入资格，优雅暂停
-                    self.lease_lost.set()
-                    self.pause_event.set()
-                else:
-                    self._lease_store.heartbeat_worker(
-                        self._worker_id,
-                        {
-                            "current_job": self._job_id,
-                            "epoch": self._epoch,
-                            "state": self._state,
-                        },
-                        self._hb_ttl,
-                    )
-                self._err_since = None
+                self._lease_store.heartbeat_worker(
+                    self._worker_id,
+                    {"current_job": self._job_id, "epoch": self._epoch, "state": self._state},
+                    self._hb_ttl,
+                )
             except Exception:
-                # 协调平面瞬时不可达：先容忍网络抖动；持续失联超过租约期则让位
-                now = time.time()
-                if self._err_since is None:
-                    self._err_since = now
-                elif now - self._err_since > self._ttl:
-                    self.lease_lost.set()
-                    self.pause_event.set()
+                # 按最后一次成功续租计时，不能从首次错误再额外宽限一个租期。
+                if time.monotonic() - self._last_renewed_at >= self._ttl:
+                    self._mark_lease_lost()
+                    return
 
 
 class TrainingWorker:
@@ -497,24 +560,53 @@ class TrainingWorker:
             time.sleep(min(1.0, self._idle_poll))
             self.queue.push(job_id)
             return
-        # 清除可能遗留的控制信号，保证本轮执行从干净状态开始
-        self.lease_store.clear_signals(job_id)
+        controller = JobController(
+            self.lease_store, job_id, token, self.worker_id,
+            config.WORKER_HEARTBEAT_INTERVAL, config.WORKER_LEASE_TTL,
+        )
+        self._controller = controller
         try:
-            self._run_claimed(job_id, record, spec, token)
+            controller.start()
+            self.lease_store.clear_signals(job_id)
+            controller.enable_signals()
+            # 抢租约前读到的 queued 可能已过时，取得所有权后重新确认。
+            record = jobstore.read_job(self.store, job_id)
+            if record is None or record.get("status") != jobstore.QUEUED:
+                return
+            self._run_claimed(job_id, record, record.get("spec") or {}, controller)
+        except JobLeaseLost as exc:
+            self._log(f"[{job_id}] {exc}")
         except Exception:
             self._log(f"[{job_id}] worker 执行异常:\n{traceback.format_exc()}")
         finally:
+            controller.stop()
+            self._controller = None
             self.lease_store.release(job_id, token)
 
-    def _run_claimed(self, job_id: str, record: dict, spec: dict, token: str) -> None:
+    def _run_claimed(self, job_id: str, record: dict, spec: dict, controller: JobController) -> None:
         """执行已持有租约的任务：拉状态 -> 训练 -> 同步产物 -> 状态收尾。"""
-        store = self.store
-        scratch = config.WORKER_SCRATCH_DIR / job_id
-        controller: Optional[JobController] = None
+        store = _LeaseGuardedStore(self.store, controller.ensure_owned)
+        attempt_id = uuid.uuid4().hex
+        # 保持末级目录名为 job_id（训练器数据库日志依赖），父目录按执行批次隔离。
+        attempt_dir = config.WORKER_SCRATCH_DIR / attempt_id
+        scratch = attempt_dir / job_id
+        log_revision = int(record.get("log_revision", 0))
+
+        def reconcile_log_revision() -> None:
+            """清日志后丢弃本地旧快照；慢读取后再次检查租约，避免旧执行者继续发布。"""
+            nonlocal log_revision
+            controller.ensure_owned()
+            latest = jobstore.read_job(store, job_id) or {}
+            controller.ensure_owned()
+            latest_revision = int(latest.get("log_revision", 0))
+            if latest_revision != log_revision:
+                (scratch / "log.txt").write_text("", encoding="utf-8")
+                log_revision = latest_revision
+
         try:
             gpu = self.caps.get("gpu") or {}
             current_attempt = {
-                "id": uuid.uuid4().hex,
+                "id": attempt_id,
                 "worker_id": self.worker_id,
                 "machine_id": self.caps.get("machine_id"),
                 "slot": self.caps.get("slot"),
@@ -537,19 +629,8 @@ class TrainingWorker:
                 retry_worker_id=None,
                 error=None,
             )
-            shutil.rmtree(scratch, ignore_errors=True)
             scratch.mkdir(parents=True, exist_ok=True)
             params = spec.get("params") or {}
-            log_revision = int(record.get("log_revision", 0))
-
-            def reconcile_log_revision() -> None:
-                """发现控制面清日志后，丢弃本地旧快照，防止同步时恢复旧日志。"""
-                nonlocal log_revision
-                latest = jobstore.read_job(store, job_id) or {}
-                latest_revision = int(latest.get("log_revision", 0))
-                if latest_revision != log_revision:
-                    (scratch / "log.txt").write_text("", encoding="utf-8")
-                    log_revision = latest_revision
 
             def joblog(msg: str) -> None:
                 """统一任务日志通道：本地 scratch 追加 + 整文件同步到状态平面。
@@ -566,6 +647,8 @@ class TrainingWorker:
                     pass
                 try:
                     store.write_file(job_key(job_id, "log.txt"), scratch / "log.txt")
+                except JobLeaseLost:
+                    raise
                 except Exception:
                     pass
 
@@ -607,13 +690,6 @@ class TrainingWorker:
             elif resumed_epoch == 0 and truncated == "":
                 joblog("未找到可用 checkpoint：从头开始训练（此前孤儿进度已回滚）")
 
-            controller = JobController(
-                self.lease_store, job_id, token, self.worker_id,
-                config.WORKER_HEARTBEAT_INTERVAL, config.WORKER_LEASE_TTL,
-            )
-            controller.start()
-            self._controller = controller
-
             dataset_path = None
             if str(params.get("dataset_source", "local")) != "hub":
                 dataset_path = resolve_dataset_for_worker(str(spec["dataset_id"]), scratch)
@@ -621,10 +697,8 @@ class TrainingWorker:
             training_params.setdefault("dataset_id", str(spec["dataset_id"]))
 
             def scratch_log(msg: str) -> None:
-                """训练器日志：写本地 scratch，随 on_epoch_end 整文件幂等同步到状态平面。"""
-                reconcile_log_revision()
-                with (scratch / "log.txt").open("a", encoding="utf-8") as f:
-                    f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+                """训练器日志实时发布到权威文件，首个 epoch 前也能看到启动进度。"""
+                joblog(msg)
 
             def on_epoch_end(rec: dict) -> None:
                 """每 epoch 结束：同步 metrics/日志到状态平面（读方写后即可见）。"""
@@ -634,7 +708,12 @@ class TrainingWorker:
                 controller.set_progress(int(rec.get("epoch", 0)), "training")
 
             def on_checkpoint(epoch_done: int) -> None:
-                """trainer-state 存档回调：上传版本化 checkpoint 并只保留最近 N 个。"""
+                """先同步指标与最佳模型再发布断点，保证接手者不会缺失已存档的进度。"""
+                reconcile_log_revision()
+                for name in ("metrics.jsonl", "log.txt", "best.pt", "last.pt", "preprocessor.json"):
+                    artifact = scratch / name
+                    if artifact.exists():
+                        store.write_file(job_key(job_id, name), artifact)
                 store.write_file(
                     checkpoint_key(job_id, epoch_done),
                     scratch / "checkpoints" / f"ckpt-e{epoch_done:04d}.pt",
@@ -661,18 +740,20 @@ class TrainingWorker:
                     on_checkpoint=on_checkpoint,
                 )
             except JobPaused as exc:
+                controller.ensure_owned()
                 # 优雅暂停：训练器已在暂停点存档并上传（on_checkpoint），
                 # 任务进入 paused，可被任意其它服务器/显卡接手
-                reason = (
-                    "worker 心跳丢失（任务已被重派），本节点停止写入"
-                    if controller.lease_lost.is_set() else str(exc)
-                )
+                reason = str(exc)
                 # 断点产物同步：best/last/preprocessor 一并上传状态平面——
                 # 恢复后即使验证指标不再提升，接手 worker 也有 best.pt 可交付/预测
                 for name in ("best.pt", "last.pt", "preprocessor.json", "best_model.zip"):
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
+                joblog(
+                    f"训练暂停: {reason}；断点与产物已同步，可由任意节点接手"
+                    f"（POST /api/jobs/{job_id}/resume）",
+                )
                 jobstore.finish_current_attempt(
                     store,
                     job_id,
@@ -682,10 +763,6 @@ class TrainingWorker:
                     machine_id=self.caps.get("machine_id"),
                     slot=self.caps.get("slot"),
                 )
-                joblog(
-                    f"训练暂停: {reason}；断点与产物已同步，可由任意节点接手"
-                    f"（POST /api/jobs/{job_id}/resume）",
-                )
                 return
             except JobCancelled:
                 # 取消（可在任意 eopch）：同步已完成部分的最佳产物供交付/预测
@@ -693,6 +770,7 @@ class TrainingWorker:
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
+                joblog("任务已取消")
                 jobstore.finish_current_attempt(
                     store,
                     job_id,
@@ -700,7 +778,6 @@ class TrainingWorker:
                     status=jobstore.CANCELLED,
                     finished_at=time.time(),
                 )
-                joblog("任务已取消")
                 return
 
             # ---- 成功：上传最终产物 + 记录训练分段（UI 分段设备标注数据源） ----
@@ -709,6 +786,10 @@ class TrainingWorker:
                 artifact = scratch / name
                 if artifact.exists():
                     store.write_file(job_key(job_id, name), artifact)
+            joblog(
+                f"训练完成: 最佳 epoch {summary.get('best_epoch')}，"
+                f"用时 {summary.get('duration_sec')}s（worker {self.worker_id}）",
+            )
             jobstore.finish_current_attempt(
                 store, job_id,
                 attempt_status="completed",
@@ -717,27 +798,42 @@ class TrainingWorker:
                 summary=summary,
                 finished_at=time.time(),
             )
-            joblog(
-                f"训练完成: 最佳 epoch {summary.get('best_epoch')}，"
-                f"用时 {summary.get('duration_sec')}s（worker {self.worker_id}）",
-            )
+        except JobLeaseLost:
+            raise
         except Exception as exc:  # noqa: BLE001
             # 失败分类：业务性错误直接 FAILED；环境性错误带 checkpoint 自动重试
-            self._handle_run_failure(job_id, exc, scratch)
+            controller.ensure_owned()
+            self._handle_run_failure(job_id, exc, scratch, store=store)
         finally:
-            if controller is not None:
-                controller.stop()
-            self._controller = None
-            reconcile_log_revision()
-            self._flush_final(scratch, job_id)
-            shutil.rmtree(scratch, ignore_errors=True)
+            try:
+                # 心跳一直维持到收尾上传结束；失租者只能清理自己的本地缓存。
+                if scratch.exists():
+                    reconcile_log_revision()
+                    self._flush_final(scratch, job_id, store=store)
+            finally:
+                shutil.rmtree(attempt_dir, ignore_errors=True)
 
-    def _set_failed(self, job_id: str, error: str, scratch: Optional[Path] = None) -> None:
+    def _set_failed(self, job_id: str, error: str, scratch: Optional[Path] = None,
+                    store: Optional[ArtifactStore] = None) -> None:
         """任务失败收尾：状态/错误信息落状态平面并写日志（日志统一走 joblog 防覆盖）。"""
+        store = store or self.store
         error = str(error).strip()
         try:
+            # 结束状态可见前先发布原因，避免查询端看到 failed 却读不到错误日志。
+            if scratch is not None and scratch.exists():
+                stamp = time.strftime("%H:%M:%S")
+                try:
+                    with (scratch / "log.txt").open("a", encoding="utf-8") as f:
+                        f.write(f"[{stamp}] 任务失败: {error[:2000]}\n")
+                    store.write_file(job_key(job_id, "log.txt"), scratch / "log.txt")
+                except JobLeaseLost:
+                    raise
+                except Exception:
+                    pass
+            else:
+                jobstore.append_job_log(store, job_id, f"任务失败: {error}".strip()[:2000])
             jobstore.finish_current_attempt(
-                self.store,
+                store,
                 job_id,
                 attempt_status="failed",
                 attempt_error=error,
@@ -745,19 +841,13 @@ class TrainingWorker:
                 error=error,
                 finished_at=time.time(),
             )
-            if scratch is not None and scratch.exists():
-                stamp = time.strftime("%H:%M:%S")
-                try:
-                    with (scratch / "log.txt").open("a", encoding="utf-8") as f:
-                        f.write(f"[{stamp}] 任务失败: {error[:2000]}\n")
-                except Exception:
-                    pass
-            else:
-                jobstore.append_job_log(self.store, job_id, f"任务失败: {error}".strip()[:2000])
+        except JobLeaseLost:
+            raise
         except Exception:
             self._log(f"[{job_id}] 失败状态写入异常:\n{traceback.format_exc()}")
 
-    def _handle_run_failure(self, job_id: str, exc: BaseException, scratch: Optional[Path] = None) -> None:
+    def _handle_run_failure(self, job_id: str, exc: BaseException, scratch: Optional[Path] = None,
+                            store: Optional[ArtifactStore] = None) -> None:
         """失败分类收尾：这是"单卡故障不影响整体任务完成"的核心保障。
 
         - 环境性错误（CUDA/OOM/网络瞬断/存储故障等，classify_retryable 判定）：
@@ -768,6 +858,8 @@ class TrainingWorker:
         日志写本地 scratch（若有）：finally 的 _flush_final 会整文件同步，
         避免状态平面直接 append 被 scratch 副本覆盖而丢失。
         """
+        store = store or self.store
+
         def local_log(msg: str) -> None:
             """失败消息写入本地 scratch 日志（随 finally 同步到状态平面）。"""
             if scratch is None or not scratch.exists():
@@ -780,7 +872,7 @@ class TrainingWorker:
 
         retry_count = 0
         try:
-            record = jobstore.read_job(self.store, job_id) or {}
+            record = jobstore.read_job(store, job_id) or {}
             retry_count = int(record.get("retry_count") or 0)
         except Exception:
             pass
@@ -793,7 +885,7 @@ class TrainingWorker:
             )
             try:
                 jobstore.finish_current_attempt(
-                    self.store,
+                    store,
                     job_id,
                     attempt_status="retrying",
                     attempt_error=str(exc),
@@ -805,6 +897,8 @@ class TrainingWorker:
                     retry_worker_id=None,
                     retry_assignment_mode="auto",
                 )
+            except JobLeaseLost:
+                raise
             except Exception:
                 self._log(f"[{job_id}] 重试状态写入异常:\n{traceback.format_exc()}")
             self._log(
@@ -822,16 +916,18 @@ class TrainingWorker:
                 f"{exc}\n[环境性错误自动重试已耗尽 {config.JOB_MAX_AUTO_RETRY} 次]"
                 f"\n{traceback.format_exc(limit=8)}",
                 scratch,
+                store=store,
             )
         else:
-            self._set_failed(job_id, f"{exc}\n{traceback.format_exc(limit=8)}", scratch)
+            self._set_failed(job_id, f"{exc}\n{traceback.format_exc(limit=8)}", scratch, store=store)
 
-    def _flush_final(self, scratch: Path, job_id: str) -> None:
+    def _flush_final(self, scratch: Path, job_id: str, store: Optional[ArtifactStore] = None) -> None:
         """收尾兜底：把本地最后的 metrics/日志/最佳产物同步到状态平面（幂等）。
 
         best.pt/last.pt/preprocessor.json 也纳入兜底：失败路径下本地训练进度
         产生的最佳权重不应丢失（重试/预测/交付都要能取到）。
         """
+        store = store or self.store
         try:
             for name in (
                 "metrics.jsonl", "log.txt", "best.pt", "last.pt",
@@ -839,7 +935,9 @@ class TrainingWorker:
             ):
                 artifact = scratch / name
                 if artifact.exists():
-                    self.store.write_file(job_key(job_id, name), artifact)
+                    store.write_file(job_key(job_id, name), artifact)
+        except JobLeaseLost:
+            raise
         except Exception:
             pass
 

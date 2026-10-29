@@ -138,6 +138,55 @@ def test_clear_job_logs_returns_404_for_missing_job(client):
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize("file_log", [None, "", "[08:42:38] worker 心跳丢失，任务重新排队\n"])
+def test_job_logs_prefer_authoritative_file_with_legacy_fallback(client, monkeypatch, file_log):
+    """完整文件日志优先；已清空文件不复活数据库旧日志，旧任务无文件时可回退。"""
+    from app import database
+    from app.models import Dataset, JobLog, TrainingJob
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-source-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    if file_log is not None:
+        manager.store.write_bytes(job_key(job_id, "log.txt"), file_log.encode())
+    with database.SessionLocal() as db:
+        db.add(Dataset(id=job_id, name=job_id, rows=0, columns=[]))
+        db.add(TrainingJob(id=job_id, dataset_id=job_id, dataset_name=job_id,
+                           target="", task="classification", params={}))
+        db.add(JobLog(job_id=job_id, message="仅数据库保留的旧训练日志"))
+        db.commit()
+    monkeypatch.setattr(config, "DB_AVAILABLE", True)
+    try:
+        result = client.get(f"/api/jobs/{job_id}/logs").json()
+        if file_log is None:
+            assert result["total"] == 1
+            assert "仅数据库保留的旧训练日志" in result["lines"][0]
+        else:
+            assert result == {"lines": file_log.splitlines(),
+                              "next_offset": len(file_log.splitlines()),
+                              "total": len(file_log.splitlines())}
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_paginate_authoritative_file(client):
+    """日志分页保持内容顺序，负偏移和超出末尾的偏移均有确定结果。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-pages-" + uuid4().hex
+    lines = [f"训练记录 {index}" for index in range(505)]
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    manager.store.write_bytes(job_key(job_id, "log.txt"), "\n".join(lines).encode())
+    try:
+        for offset, start, end in [(-1, 0, 500), (500, 500, 505), (999, 505, 505)]:
+            result = client.get(f"/api/jobs/{job_id}/logs?offset={offset}").json()
+            assert result == {"lines": lines[start:end], "next_offset": end, "total": 505}
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
 def test_train_e2e_regression(client, make_dataset):
     ds = make_dataset(kind="regression")
     r = client.post("/api/train", json=_train_payload(ds, epochs=3,
