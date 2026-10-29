@@ -1,3 +1,32 @@
+## 本次变更测试结果：worker 自动补同步历史数据集（2026-10-29）
+
+**Git基准点**：`d808115`（Auto-migrate local datasets for workers）
+**分支**：`emdash/hot-boxes-clean-y9u6p`
+**变更范围**：对象存储缺少数据集对象时，worker 先按新旧目录兼容规则查找当前节点本地 CSV，找到后自动同步到 `datasets/{dataset_id}.csv` 并下载到 scratch；本地也缺失时继续返回迁移脚本提示；对象存储故障继续向上抛出。
+
+**验收标准—测试用例映射**：
+
+| 验收标准 | 测试层级、前置条件与用例 | 输入与预期 | 场景 |
+|---|---|---|---|
+| 本地遗留 CSV 可自动补同步并供 worker 使用 | 存储单元测试 `test_worker_resolve_auto_migrates_local_legacy_dataset`；模拟对象存储缺失、本地 `processed/{id}.csv` 存在 | 解析数据集 → 上传 `datasets/{id}.csv` → scratch 内容与本地 CSV 一致 | 正常、兼容 |
+| 已同步对象保持直接下载行为 | 存储单元测试 `test_worker_resolve_uses_existing_remote_dataset`；模拟对象已存在 | 解析数据集 → 直接下载，不调用本地上传 | 回归 |
+| 双端均缺失仍给出迁移提示 | 存储单元测试 `test_worker_resolve_keeps_migration_error_when_dataset_is_missing` | 对象与本地均无 CSV → `FileNotFoundError` 包含迁移脚本提示 | 边界、异常 |
+| 对象存储故障不伪装为文件缺失 | 存储单元测试 `test_worker_resolve_propagates_auto_migration_failure` | 本地 CSV 存在但上传失败 → 保留 `ArtifactStoreUnavailableError` | 异常、基础设施故障 |
+
+**测试执行结果**：
+
+- Python 3.12.15 容器完整套件：**301 通过、0 失败、0 错误、6 跳过**，命令：
+  `docker run --rm --network none --mount type=bind,src=$PWD,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 sha256:b8b22036d0d888f513973a6c7618f535fc1631467b6da05b85b285c655dea2b2 python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-hot-boxes-tests-full`
+- 存储专项（Python 3.12.15 容器）：**31 通过、0 失败、0 错误、2 跳过**。
+- 宿主机 Python 3.9.6 存储专项：**31 通过、0 失败、0 错误、2 跳过**；仅作辅助验证，不替代 Python 3.12 结果。
+- 完整套件警告：SQLAlchemy `declarative_base()` 弃用警告、Pandas `xlrd` 引擎弃用警告，均为既有警告。
+
+**容器重建结果**：按仓库要求执行 `docker compose up --build -d`。默认配置使用阿里云 PyPI 镜像时，torch wheel 下载内容的 SHA256 与索引声明不一致，pip 重试后构建失败；随后使用 `PIP_INDEX_URL=https://pypi.org/simple` 重试，ARM64 torch 约 483.7 MB 依赖下载速度过低，未在本次验证窗口内完成，已停止。故本次不能标记 Compose 重建通过；完整测试使用已有 Python 3.12.15 镜像并挂载当前仓库代码完成。
+
+**已知问题与限制**：没有本地 CSV 的远程 worker 仍需要先运行 `scripts/migrate_to_object_storage.py`；自动补同步只在对象缺失且当前节点拥有本地副本时生效。未修改迁移脚本、配置或数据库结构。
+
+**下次测试建议**：在可稳定下载依赖的环境重新执行 `docker compose up --build -d`，随后检查 trainer、worker、frontend 健康状态；在真实多机环境验证历史数据集首次被 worker 领取时的自动补同步与并发幂等行为。
+
 ## 远程服务器配置不生效专项检查（2026-10-29，缺陷待修复）
 
 **检查版本**：`82e9cc5bbdd33eee498ac5f4d25c2bf315dda051`（Pass apt/pip mirror build args to local compose build）。
