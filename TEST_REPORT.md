@@ -3176,3 +3176,60 @@ docker compose logs --tail=15 worker
 - 24 项完整套件跳过项依赖真实 Redis、S3、Supervisor 多进程环境或双 NVIDIA GPU/NCCL；均未配置，不视作通过。
 - 标准 Compose 首次安装依赖耗时较长；缓存 wheel 后第二次完整构建成功。
 - 临时等价验证文件和容器不纳入仓库；未执行 `git push`。
+
+## 本次变更测试结果：Linux 训练日志实时返回（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`6331ec3df34b918e6f22e15c77eb1441bcdf11b5`。
+- **提交信息**：Cover live worker log publication。
+- **测试日期 / 分支**：2026-10-30 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围与技术**：训练日志 API 与训练工作台日志轮询；FastAPI、原生 JavaScript、Worker 集成测试、Node.js 内置测试、pytest、Docker Compose。
+- **行为**：日志接口禁止浏览器/反向代理缓存；前端日志请求显式 `cache: "no-store"`，并从详情刷新中拆出独立 1 秒轮询；同一任务慢请求不重叠，切换任务后旧请求不会阻塞新任务或回填旧日志。Worker 仍沿用逐条发布到权威状态存储的既有语义。
+- **缺陷复现**：修复前新增 API 回归用例失败，运行中日志响应没有 `Cache-Control`；修复后运行中增量读取、响应头与实际 Worker 发布测试均通过。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、用例与前置条件 | 输入、预期和场景 |
+|---|---|---|
+| 训练未完成时可读取新增日志 | pytest `test_running_job_logs_are_immediately_visible_and_uncacheable`；local 状态存储，任务保持 `running` | 首次读取启动日志，追加 epoch 日志后按 offset 读取新增行；内容连续且状态仍为 running；正常、边界、兼容 |
+| 真实 Worker 在完成前发布 epoch 日志 | pytest `test_running_job_publishes_epoch_log_before_completion`；真实 CPU Worker 与真实训练循环 | 300 epoch 任务运行中读取 `[epoch 1/300]`，断言任务尚未 completed；训练链路、回归 |
+| Linux/代理不会复用旧日志响应 | 同一 API 用例 + Compose curl 核对 | `/api/jobs/{id}/logs` 返回 `Cache-Control: no-store, no-cache, must-revalidate`、`Pragma: no-cache`、`Expires: 0`；部署、兼容 |
+| 前端日志持续轮询且不重复/不串任务 | Node `frontend/workbench-interactions.test.cjs` 新增日志缓存、慢请求锁、任务切换和独立定时器用例 | 23 个工作台交互用例全部通过；正常、异常、状态竞争、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---|
+| 日志 API 定向 pytest | 7 | 7 | 0 | 0 | 运行中日志、清除、旧数据库回退、分页 |
+| Worker 实时日志定向 pytest | 1 | 1 | 0 | 0 | 真实 CPU 训练 Worker，运行中读取 epoch 日志 |
+| 后端完整 pytest | 597 | 573 | 0 | 24 | Python 3.12.15；执行用例通过率 100% |
+| 前端完整 Node 套件 | 103 | 103 | 0 | 0 | 含工作台、资源、数据集、服务器/凭证页面 |
+| Compose 重建 | 3 镜像 / 4 服务 | 3 构建 | 0 | 0 | trainer、worker、frontend 重建；SeaweedFS 保持 healthy |
+| 部署健康与内容核对 | 4 | 4 | 0 | 0 | `/api/health`、页面脚本、实际日志接口响应头 |
+
+完整 pytest 的 24 项跳过包括未配置真实 Redis 的注册/恢复场景、未配置 S3 的 2 项、Supervisor Redis E2E、真实 NVIDIA GPU/NCCL 场景。保留既有 SQLAlchemy 与 Pandas 弃用警告。未执行真实远程 Linux 服务器部署；Compose 使用当前本地服务完成重建与 HTTP 核对。
+
+### 实际命令与结果
+
+```bash
+docker run --rm --pull=never --network none --mount type=bind,src=$PWD,dst=/workspace --workdir /workspace/backend mtp-resource-deps:validation python -m pytest tests/test_api.py -q -p no:cacheprovider -k 'running_job_logs_are_immediately_visible_and_uncacheable or job_logs_' --tb=short
+docker run --rm --pull=never --network none --mount type=bind,src=$PWD,dst=/workspace --workdir /workspace/backend mtp-resource-deps:validation python -m pytest tests/test_worker.py -q -p no:cacheprovider -k running_job_publishes_epoch_log_before_completion --tb=short
+node --test frontend/*.test.cjs
+docker run --rm --pull=never --network none --mount type=bind,src=$PWD,dst=/workspace --workdir /workspace/backend mtp-resource-deps:validation python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/live-logs-full-2 --tb=short -rs
+docker compose up --build -d
+curl --fail --silent http://127.0.0.1:8000/api/health
+curl --silent --show-error -D - -o /dev/null 'http://127.0.0.1:8000/api/jobs/job-20261029-175056-436cae/logs?offset=0'
+git diff --check
+```
+
+- 复现阶段 API 测试按预期失败：响应缺少 `Cache-Control`；加入防缓存头后定向测试通过。
+- Compose 默认构建成功，trainer、worker、frontend 镜像重新构建并启动；frontend 健康检查通过，复用的 SeaweedFS 保持 healthy。
+- 生产入口 `/api/health` 返回 200；已有完成任务的日志接口返回 `cache-control: no-store, no-cache, must-revalidate`、`pragma: no-cache`、`expires: 0`。
+- 本次未执行 `git push`。未新增调试文件或运行时产物提交。
+
+### 已知问题与后续建议
+
+- 真实 Redis/S3/GPU/NCCL 场景仍需在对应环境补验；本次完整套件的 24 个跳过项沿用仓库既有条件。
+- 日志轮询仅在“日志”标签页激活时运行；切换到日志页会立即拉取当前 offset，避免无意义后台请求。
+- 回滚可撤销 `311f6ff`、`a89f81f`、`6331ec3` 三个本次代码/测试提交并重新执行 Compose 构建；无数据迁移。
