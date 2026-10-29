@@ -72,6 +72,29 @@ git diff --check
 
 **清理与提交**：pytest 临时目录 `/tmp/mtp-lease-*` 随一次性容器清理；隔离 Redis 容器已停止并自动删除；临时构建目录 `/tmp/mtp-lease-build-eb81386/` 和基底镜像标签已删除；现场下载/预测验证新生成的 `data/worker-scratch/serve/job-20261029-083952-b64fb1/` 缓存已删除。没有提交模型、数据、日志或其他运行时产物；业务代码与本测试报告分开提交，不执行 git push。已有 Dockerfile/远程测试改动保留。
 
+## 用户重启远端后的复测（2026-10-29）
+
+**范围与基准**：用户告知已重启 `47.101.33.133`，要求继续尝试。本次只做运行状态复测，不修改业务代码、配置或依赖；业务基准仍为 `9013f1c8b0db669523ffba2c81ad0f46e25d97c4`，不重新运行已通过的完整 pytest 或重建镜像。
+
+**验证结果**：
+
+| 检查 | 实际结果 | 结论 |
+|---|---|---|
+| 初次 SSH/MySQL/Redis 协议响应 | 22/3306/6379 端口分别收到 42/95/34 字节协议响应 | 重启后曾恢复可连接 |
+| GET `/api/workers` 首次查询 | `Linux-cpu0`，active=true，started_at=1793267671.1449924，last_seen=1793267691.2174897 | 新配置下 CPU 槽已启动并注册 |
+| GET `/api/workers` 后续查询 | 同一槽 active=true，last_seen=1793267795.0427866，heartbeat_age_sec=0.8，current_job=null | 心跳至少推进约 104 秒；不是旧记录被误认在线 |
+| 资源槽启用状态 | enabled=false、state=disabled | 受管理槽默认不接单，不代表容器启动失败；未擅自启用接单 |
+| GET `/api/remote-servers` 初次查询 | deployed=true，status=error，上次操作仍为 `f4a8ee96a44b434499dea5f5fcc693a1` | 保留前次心跳验收超时记录，不能用该历史状态否定新心跳 |
+| 训练任务检查 | GET `/api/jobs` 无 queued/running/starting 任务 | 本次没有中断训练，也未发起新训练 |
+| 只读 SSH 容器/资源查询 | 一次 SSH 查询 35 秒超时；另一次尚未取得凭证即卡在 MySQL 握手，随后清理诊断进程 | 未取得新的容器日志、内存、负载、挂载与重启计数 |
+| POST `/api/remote-servers/Linux/restart` | 为验证完整生命周期提交请求；客户端 20 秒超时，无操作 ID 响应 | 执行结果未知，HTTP 超时不等于服务端未执行；未重复提交 |
+| 限时 MySQL 新连接诊断 | 连接等待初始通信包报 `2013 (HY000): Lost connection to MySQL server at 'waiting for initial communication packet'` | 本次失败发生在 SQL 业务查询前；不能仅归因于旧连接池 |
+| 后续协议与 API 复查 | SSH/MySQL/Redis 多次 3–6 秒协议超时，`/api/workers` 返回 500、`/api/remote-servers` 超时；直接 Redis 管线读取也超时 | 远端管理连接仍不稳定，持续可用性未验收 |
+
+**实际执行方式**：运行容器中 Python 3.12 使用 `socket.create_connection` 检测指定三端口，Redis 仅发送无凭证 PING 并统计响应字节；`urllib.request.urlopen` 查询上述 API。只读 SSH 尝试 `uptime`、`free -m`、`docker inspect` 指定状态/挂载字段、目标 `.env` 非敏感字段及 `docker logs --tail=35`；未成功取得结果，不记为通过。SQLAlchemy 在单次诊断进程中使用 `connection_timeout=8/read_timeout=10/write_timeout=10`，没有修改平台配置。所有秘密仅用于现有服务器认证，没有输出凭据；没有保存调试脚本或数据文件。结束前运行 `git diff --check`、`git status --short`，仅提交本报告。
+
+**结果界限与下一步**：已证实修复后的 worker 能在主机重启后自动启动并注册一个 CPU 槽，但主机持续可访问、容器重启次数稳定及完整管理操作尚未验收。网络故障与主机资源压力均未证实，不能将其当成既定根因。已请求用户通过云控制台提供 `uptime`、`free -h`、`docker stats --no-stream` 输出；待连接恢复后先检查超时 restart 请求是否产生操作记录，再检查容器日志与心跳，避免重复提交。SSH 传输代码无需因本次外部连接超时而重复修改；若需变更配置或扩展修复范围，按项目规则确认。
+
 ## SSH 大输入传输修复与远端恢复验证（2026-10-29）
 
 - **Commit Hash**：`9013f1c8b0db669523ffba2c81ad0f46e25d97c4`（Fix stalled SSH input streaming during remote deployment）。
