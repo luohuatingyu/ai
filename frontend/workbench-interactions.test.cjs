@@ -82,7 +82,7 @@ function fixture() {
     ['const taskSelect =', '/* ---------- 图表 ---------- */'],
     ['/* ---------- 日志 ---------- */', '/* ---------- 结果 ---------- */'],
     ['/* ---------- 结果 ---------- */', '/* ---------- 预测 ---------- */'],
-    ['async function fillPredictTemplate()', '$("btnPredict").onclick'],
+    ['async function fillPredictTemplate()', '/* ---------- 计算服务器与手动资源选择 ---------- */'],
     ['/* ---------- Tab 切换 ---------- */', '/* ---------- 启动 ---------- */'],
   ];
   for (const [start, end] of sections) vm.runInContext(html.slice(html.indexOf(start), html.indexOf(end)), context);
@@ -371,6 +371,39 @@ test('预测模板的旧响应不覆盖新任务或用户正在编辑的内容',
   f.context.apiJson = () => pending.promise; const old = f.context.fillPredictTemplate();
   f.state.jobId = 'b'; f.$('predictInput').value = '{"mine":1}'; pending.resolve({ preview: [{ value: 2 }] }); await old;
   assert.equal(f.$('predictInput').value, '{"mine":1}');
+});
+
+test('预测请求期间显示状态、禁止重复提交，成功后恢复按钮并展示结果', async () => {
+  const f = fixture(), pending = deferred();
+  f.state.jobs = [job('predict-job')]; f.state.jobId = 'predict-job';
+  f.$('predictInput').value = '{"feature":1}';
+  f.context.apiJson = (url, options) => { f.requests.push({ url, options }); return pending.promise; };
+  const first = f.$('btnPredict').onclick();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.$('btnPredict').disabled, true);
+  assert.equal(f.$('btnPredict').textContent, '预测中…');
+  assert.equal(f.$('predictOut').hidden, false);
+  assert.match(f.$('predictOut').textContent, /正在预测/);
+  assert.equal(f.$('predictOut').attributes['aria-busy'], 'true');
+  await f.$('btnPredict').onclick();
+  assert.equal(f.requests.length, 1);
+  pending.resolve({ prediction: 0.875 }); await first;
+  assert.equal(f.$('btnPredict').disabled, false);
+  assert.equal(f.$('btnPredict').textContent, '预测');
+  assert.equal(f.$('predictOut').attributes['aria-busy'], 'false');
+  assert.match(f.$('predictOut').textContent, /0\.8750/);
+});
+
+test('预测失败时结果区保留并给出错误反馈，按钮恢复可用', async () => {
+  const f = fixture();
+  f.state.jobs = [job('predict-job')]; f.state.jobId = 'predict-job';
+  f.$('predictInput').value = '{"feature":1}';
+  f.context.apiJson = async () => { throw new Error('模型不可用'); };
+  await f.$('btnPredict').onclick();
+  assert.equal(f.$('btnPredict').disabled, false);
+  assert.equal(f.$('predictOut').hidden, false);
+  assert.match(f.$('predictOut').textContent, /预测失败：模型不可用/);
+  assert.equal(f.$('predictOut').attributes['aria-busy'], 'false');
 });
 
 test('方向键、Home、End 切换标签并同步焦点及无障碍状态', () => {
