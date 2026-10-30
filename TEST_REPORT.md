@@ -1,3 +1,80 @@
+## 本次变更测试结果：曲线 Tab 与训练记录、结果恢复（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：5597f556e8ef00b2efabedfe4a623fb62bb94171。
+- **提交信息**：Add curve tabs and restore training detail views。
+- **测试日期 / 分支**：2026-10-30 / emdash/hot-boxes-clean-y9u6p。
+- **范围与技术**：原生 HTML/CSS/JavaScript、Chart.js；曲线增加 Loss、验证指标、训练吞吐、阶段耗时二级 Tab，每次只展示一张图。详情切换先渲染当前缓存，合并同一任务选择的未完成请求，15 秒超时释放，并保持任务/选择版本隔离。未修改 backend/app/、接口、数据格式、配置或依赖。
+- **提交隔离**：只提交本次 5 个文件的增量。工作区原有历史分页、资源刷新及服务器管理等改动和原暂存状态保持；未将这些内容纳入本次提交。
+- **基准点检查**：原报告首个基准点 f8184d1 与任务开始时 HEAD 的 backend/app/ 存在 coordination.py、routers/jobs.py、worker.py 历史变更，因此执行 Python 3.12 完整回归。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级 / 前置条件与输入 | 可执行用例与预期业务结果 | 场景 |
+|---|---|---|---|
+| 每次只显示一张训练曲线 | 前端交互；加载带指标任务，依次点击四个子 Tab，再切换外层详情 | workbench-interactions.test.cjs「曲线二级标签只展示一张图…」「曲线页面初始只显示 Loss…」；恰好一个可见面板、指标值保留、画布重新测量、返回时保留所选曲线 | 正常、回归 |
+| 二级 Tab 键盘可用且不干扰外层 | 前端交互；方向键、Home、End 和无效标签名 | 同文件「曲线标签支持方向键…」；焦点、ARIA 和可见面板一致，外层仍为曲线；非法选择不改状态 | 边界、无障碍 |
+| 训练记录与结果立即显示 | 前端交互；已完成任务、准确率 0.85，挂起后拒绝详情请求 | 同文件参数化「切换record/result时立即显示已加载详情…」；记录包含逐轮 0.85，结果显示 85.00%，失败后不清空 | 正常、异常 |
+| 慢响应不被轮询持续作废 | 前端异步；连续五次轮询并切到记录页 | 同文件「慢详情请求在连续轮询与切换标签期间合并…」；只发一次请求、绕过缓存、带超时信号，完成后显示记录，错误后可重试 | 并发、超时、恢复 |
+| 跨任务与同 ID 重新选择不串数据 | 前端异步；A 挂起后选 B、A→B→A/选择版本更新、旧请求成功或失败 | 同文件旧响应/乱序用例；只采纳当前选择的数据，旧请求不能清除新请求状态 | 异常、回归 |
+| 旧任务和外部图表组件故障可理解 | 前端；空指标、缺性能、缺 Chart.js，恢复组件 | performance.test.cjs 四种曲线参数化用例及既有单位/数据切换用例；按选中曲线显示空状态、明确组件缺失、恢复后数据正确 | 边界、依赖异常、兼容 |
+| 记录中的不可信文本安全展示 | 前端；任务名/错误/配置含 HTML 文本 | 保留训练记录、任务列表转义断言；输出转义文本，历史任务字段缺失有空状态 | 安全、兼容 |
+| 桌面与窄屏实际可用 | Safari，已完成的既有分类任务；桌面和 390×1080 视口 | 浏览器切换验证指标/阶段耗时/吞吐及外层记录、结果；单图正常绘制，记录含 30 轮指标，结果显示 83.33% 及分类报告 | 视觉、集成 |
+
+### 测试执行结果
+
+| 阶段 / 实际命令 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 修改前工作区 node --test frontend/*.test.cjs | 128 | 125 | 3 | 0 | 0 |
+| 先补复现测试 node --test frontend/workbench-interactions.test.cjs | 34 | 27 | 7 | 0 | 0 |
+| 修复后专项 node --test frontend/workbench-interactions.test.cjs frontend/performance.test.cjs | 42 | 42 | 0 | 0 | 0 |
+| 修复后工作区 node --test frontend/*.test.cjs | 139 | 139 | 0 | 0 | 0 |
+| Python 3.12.15 后端完整 pytest（命令见下） | 648 | 617 | 0 | 0 | 31 |
+| 隔离提交快照 node --test frontend/workbench-interactions.test.cjs frontend/performance.test.cjs | 42 | 42 | 0 | 0 | 0 |
+| 隔离提交快照 node --test frontend/*.test.cjs | 135 | 131 | 4 | 0 | 0 |
+| 原 HEAD 0eac415 对照 node --test frontend/training-resources.test.cjs | 27 | 23 | 4 | 0 | 0 |
+
+- 当前工作区前端通过率 100%；后端执行用例通过率 100%，31 项按已有环境条件跳过，未修改或弱化跳过条件。
+- 修改前 3 项失败来自测试 fixture 未初始化已有分页状态；补齐 jobPage/historyPageCount，保留原业务断言后通过。
+- 先添加的 7 项失败覆盖本次请求竞争、缓存显示和曲线标签缺失；实现后全部通过。原乱序测试改为同一 ID 的新选择版本，继续验证迟到响应不能覆盖新响应。
+- 隔离提交的 4 项失败均为既有 remote-management.js 的 starting/training/running/reserved 状态与样式断言，已在原 HEAD 对照复现。其修复属于开始时即存在的未提交内容；本次不夹带。当前工作区包含原有修复，因此完整 139 项通过。独立检出本提交仍有这 4 项历史失败，不能标记为独立完整回归全绿。
+- 首次生成隔离快照采用无上下文补丁，发生片段位置偏移、脚本语法失败；该临时快照已丢弃，改用三方合并并人工核对唯一状态行冲突后重新验证。真实工作区代码未受影响。
+- 后端包含数据层、训练器、任务管理、API、旧/新布局、预测及 CPU 联合训练回归；2 条既有警告来自 SQLAlchemy declarative_base 与 pandas xlrd。
+
+实际执行命令：
+
+```bash
+node --test frontend/workbench-interactions.test.cjs
+node --test frontend/workbench-interactions.test.cjs frontend/performance.test.cjs
+node --test frontend/*.test.cjs
+docker run --rm --pull=never --network none \
+  --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend \
+  --env PYTHONDONTWRITEBYTECODE=1 \
+  --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest \
+  python -m pytest tests/ -q -p no:cacheprovider \
+    --basetemp=/tmp/mtp-curve-tabs-tests --tb=short -rs
+docker compose up --build -d
+docker compose ps
+docker compose exec -T trainer python --version
+git diff --check
+```
+
+- 容器重建成功，frontend/SeaweedFS 健康，trainer/worker 运行；Node fetch 检查首页和 /api/health 均 200，首页含 4 个曲线标签及新样式版本。Node vm.Script 校验页面内联脚本通过。
+- 浏览器验证使用已有任务，仅切换显示；没有新增或删除训练数据。窄屏验收后已退出响应式模式，恢复桌面视图。
+- 调试/隔离快照保存于 /tmp/mtp-curve-tabs-VmGUxb，交付前删除；后端测试临时数据仅位于 --rm 容器内，随容器退出清理。无运行时产物提交。
+
+### 已知问题、未验证范围与下次建议
+
+- 实际服务仍偶发详情请求超过 15 秒；页面会显示刷新失败提示并在后续轮询重试，已有记录和结果保持可见。后端接口延迟优化不在本次前端修复范围，建议另行分析对象存储/请求耗时。
+- 未配置 MTP_TEST_REDIS、MTP_TEST_S3，且无真实 NVIDIA GPU/多卡 NCCL，31 项相关集成/硬件测试跳过；应在对应环境补验。
+- 实际浏览器验证覆盖 Safari 桌面及响应式 390 像素视口；未执行实体手机和其他浏览器验收。使用已有 AbortSignal.timeout（Safari 16+ 及现代浏览器支持）。
+- 原提交中资源状态 4 项历史失败应由已有资源修复工作提交后再验独立完整套件；本次未修改第三方代码或训练业务逻辑。
+- 后续修改详情请求生命周期、图表 Tab、任务结果格式时重跑上述前端专项与完整套件；修改 backend/app/ 时执行 Python 3.12 完整回归并更新基准点。
+- 回滚方式：撤销 5597f55 后执行 docker compose up --build -d；无数据迁移。
+
 ## 本次变更测试结果：训练性能与计算资源观测（2026-10-30）
 
 ### Git 基准点与范围
