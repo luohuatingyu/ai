@@ -42,7 +42,7 @@
         <input id="remoteHost" name="host" required maxlength="253" pattern="[A-Za-z0-9][A-Za-z0-9.:-]*" placeholder="主机名或 IP 地址">
       </div>
       <div class="field wide">
-        <div class="server-field-heading"><label for="remoteCredentialSelect">SSH 凭证</label><a href="/credential-manager.html" id="btnManageRemoteCredentials" class="server-text-button">管理凭证 ↗</a><button type="button" id="btnRefreshRemoteCredentials" class="server-text-button">刷新</button></div>
+        <div class="server-field-heading"><label for="remoteCredentialSelect">SSH 凭证</label><button type="button" id="btnRefreshRemoteCredentials" class="server-text-button">刷新</button></div>
         <select id="remoteCredentialSelect" name="ssh_credential_id" required>
           <option value="">请先配置 SSH 凭证</option>
         </select>

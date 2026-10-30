@@ -161,7 +161,7 @@ test('高级字段校验失败时自动展开；GPU 不受隐藏 CPU 输入影�
   assert.equal(f.context.validateRemoteServerForm(), false);
 });
 
-test('空凭证与加载状态阻止提交，引导到独立凭证页', async () => {
+test('空凭证与加载状态阻止提交，并把焦点留在凭证选择框', async () => {
   const f = fixture(); f.validServer();
   f.dialog.loading = true;
   assert.equal(f.context.validateRemoteServerForm(), false);
@@ -170,7 +170,15 @@ test('空凭证与加载状态阻止提交，引导到独立凭证页', async ()
   await f.context.loadRemoteSshSettings();
   assert.match(f.nodes.get('remoteCredentialStatus').textContent, /凭证管理/);
   assert.equal(f.context.validateRemoteServerForm(), false);
-  assert.equal(f.document.activeElement.id, 'btnManageRemoteCredentials');
+  assert.equal(f.document.activeElement.id, 'remoteCredentialSelect');
+});
+
+test('工作台和服务器弹窗不再提供跨页管理入口', () => {
+  const workbench = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
+  const server = fs.readFileSync(path.join(staticDir, 'server-manager.html'), 'utf8');
+  assert.doesNotMatch(workbench, /<a href="\/server-manager\.html" class="management-link">管理服务器 ↗<\/a>/);
+  assert.doesNotMatch(server, /id="btnManageRemoteCredentials"/);
+  assert.match(server, /id="btnRefreshRemoteCredentials"/);
 });
 
 test('默认凭证加载不触发未保存提醒；编辑凭证正确恢复', async () => {
