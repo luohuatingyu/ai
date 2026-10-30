@@ -1,3 +1,61 @@
+## 本次变更测试结果：训练性能与计算资源观测（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`f8184d1`（Add training performance observability）。
+- **测试日期 / 分支**：2026-10-30 / `emdash/hot-boxes-clean-y9u6p`。
+- **对照范围**：仅覆盖 `PLATFORM_REPLACEMENT.md` 中与训练性能、吞吐、计算资源占用相关的首批优化；不涉及权限、认证、AMP、LoRA、调度器或异步发布。
+- **实现范围**：新增低频资源采样和 CPU 线程预算；记录每轮 samples/s、LLM 有效 tokens/s、step 和训练/验证/检查点阶段耗时；CUDA pinned memory 与 non-blocking 传输；减少训练循环中的 GPU 标量同步；API 与工作台展示资源卡片和性能曲线；性能记录独立于原有精度指标，续训按 checkpoint epoch 回滚。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 可执行验证 | 结果与场景 |
+|---|---|---|
+| 资源占用可观测且未知值不伪造 | `tests/test_performance.py`：CPU 差分、RSS/线程、GPU UUID 匹配、驱动缺失/超时、采样线程隔离；`test_api.py::test_performance_detail_and_resource_heartbeat` | 通过；首样本为未知，合法 0 保留，采样故障不阻塞心跳；正常、边界、异常、兼容 |
+| 线程预算受 CPU 亲和性/容器配额/槽数约束 | `test_thread_budget_bounds`、`test_cpu_quota_respected`、Supervisor 后端可见性回归 | 通过；每槽预算至少 1，保留更小正整数覆盖，非法值启动前拒绝 |
+| 训练吞吐和阶段时间可追踪 | `test_real_training_records_throughput`（分类/回归/聚类/时序）、`test_pretraining_from_scratch_saves_metrics_bundle_and_generates`、`test_training_artifacts_metrics_and_predictions` | 通过；生成独立 `performance.jsonl`，samples/s 或有效 tokens/s、step、保存/发布耗时均可序列化 |
+| 训练循环减少同步并保持结果兼容 | 训练器和 LLM 既有回归、固定 seed 重复训练、联合训练权重/空尾批/续训用例 | 通过；CPU 路径行为保持，GPU 路径将标量同步推迟到轮次边界 |
+| 检查点耗时与断点恢复曲线正确 | `test_checkpoint_timing_and_errors`、Worker 完成/暂停接手用例、性能文件按恢复 epoch 截断 | 通过；保存与发布分项记录，发布失败原样传播，重试不产生重复轮次 |
+| 页面展示资源和性能曲线 | `node --test frontend/*.test.cjs`，含 `frontend/performance.test.cjs` | 108 通过；覆盖未知/零值/过期、曲线断点、吞吐单位、阶段堆叠和旧任务空状态 |
+
+### 测试执行结果
+
+| 阶段 / 命令 | 总数 | 通过 | 失败 | 跳过 | 说明 |
+|---|---:|---:|---:|---:|---|
+| 后端完整回归 | 597 | 597 | 0 | 24 | Python 3.12.15；2 条既有弃用警告；跳过项来自未配置 Redis/S3/NVIDIA GPU/NCCL |
+| 前端完整回归 `node --test frontend/*.test.cjs` | 108 | 108 | 0 | 0 | Node 内置测试 |
+| 容器重建 `docker compose up --build -d` | 4 服务 | 4 启动 | 0 | 0 | trainer、worker、frontend、SeaweedFS 均正常 |
+| HTTP 健康核对 | 2 | 2 | 0 | 0 | `/api/health` 与首页均返回 200 |
+| 真实 CPU 训练冒烟 | 1 | 1 | 0 | 0 | 示例分类数据集，指定本地 CPU 槽，2 epochs 完成；accuracy、`best.pt`、2 条性能记录均存在 |
+
+完整回归实际命令：
+
+```bash
+docker run --rm --pull=never --network none \
+  --mount type=bind,src="$PWD",dst=/workspace \
+  --workdir /workspace/backend \
+  --env PYTHONDONTWRITEBYTECODE=1 \
+  --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest \
+  python -m pytest tests/ -q -p no:cacheprovider \
+    --basetemp=/tmp/mtp-performance-full --tb=short -rs
+
+node --test frontend/*.test.cjs
+docker compose up --build -d
+git diff --check
+```
+
+真实冒烟通过 API 完成：导入 `classification_demo.csv`，提交到 `2f2d5053373e-cpu0`，任务 `job-20261030-053753-7138d4` 完成后删除任务和临时数据集。训练结果包含 `val_accuracy=0.75`、`best.pt` 和每轮 `samples_per_second`；运行产物未保留在工作区。
+
+### 已知限制与下次测试建议
+
+- 本机没有可用 NVIDIA GPU，GPU 利用率、显存和 CUDA 加速路径只通过 mock/兼容测试验证，不能据此宣称 GPU 提速比例；建议在目标 NVIDIA/ROCm/XPU 环境做基线对照。
+- 主机 CPU 指标是整机口径，同一主机多个槽的百分比不能相加；嵌入式 worker 的进程指标包含共享 API 进程。采样历史限于 worker 生命周期内最近 120 个样本，超过 20 秒标记过期。
+- 未配置真实 Redis、S3 和多卡 NCCL，因此 24 项既有条件测试按项目约定跳过。
+- Safari 原生自动化通道在本次验收中返回 “native pipe closed”，未完成人工视觉检查；DOM/Node 行为测试及 HTTP 内容核对已通过。
+- 后续建议在真实 GPU 节点比较开启前后吞吐、GPU 利用率、显存峰值和检查点发布占比，并补做窄屏页面视觉验收。
+- 回滚方式：撤销业务提交 `f8184d1` 后重新执行 `docker compose up --build -d`；无数据迁移。
+
 ## 本次变更测试结果：服务器与凭证管理拆分（2026-10-29）
 
 ### Git 基准点与范围
