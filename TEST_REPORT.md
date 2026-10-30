@@ -1,3 +1,70 @@
+## 本次变更测试结果：全部训练分页与常驻分页栏（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：a98554bc90b34aa0fff24ca6c49069d182879784。
+- **提交信息**：Paginate training history with persistent controls。
+- **测试日期 / 分支**：2026-10-30 / emdash/hot-boxes-clean-y9u6p。
+- **范围与技术**：原生 HTML/CSS/JavaScript；修改 backend/static/index.html、backend/static/app.css 和 frontend/workbench-interactions.test.cjs。全部训练每页 10 条，筛选后分页；不足一页、零记录和搜索无结果均显示分页栏，边界按钮禁用；主区继续聚焦当前训练。
+- **提交隔离**：从已验证的补丁仅暂存本次 3 个文件的相关增量；保留并行的资源刷新、服务器管理及相关测试改动。未修改 backend/app/、接口、依赖、配置或数据结构，未执行 git push。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级 / 前置条件与输入 | 可执行用例与预期业务结果 | 场景 |
+|---|---|---|---|
+| 不足一页和空集合也显示分页 | 前端交互；真实页面函数及 DOM fixture，0、1、9、10 条记录 | workbench-interactions.test.cjs 参数化「全部训练 N 条时仍显示单页分页栏」；分页栏可见，显示第 1 / 1 页、正确范围，两个按钮禁用且不能越界 | 边界、空集合、兼容 |
+| 每页十条且末页范围准确 | 前端交互；23 条记录，依次进入三页并回退 | 「全部训练每页十条，末页不足十条时仍展示准确范围和翻页按钮」；分别展示 10/10/3 条，顺序与范围正确，主区当前任务不变 | 正常、边界、回归 |
+| 搜索、状态筛选及重置返回首页 | 前端交互；在第 3 页修改搜索或状态，筛出 12 条，再重置和搜索无匹配文本 | 参数化「历史分页修改 jobSearch/jobStatusFilter 回到第一页，重置筛选保留当前训练」；先筛选后分页、恢复第 1 页、当前训练不变、空结果分页仍可见 | 正常、边界、回归 |
+| 轮询更新不会停在无效页或清空已有结果 | 前端异步；第 3 页收到相同数据，随后记录缩至 11/10/0 条，再模拟列表请求失败 | 「历史轮询保留有效页和卡片焦点，记录减少时回退且请求失败保留列表」；卡片复用、焦点保留、页码收敛、失败保留已有列表并提示 | 并发、异常、恢复 |
+| 第二页任务仍可切换为当前训练 | 前端异步；选择第 2 页首条任务，详情返回对应对象，再打开历史弹窗 | 「选择第二页训练关闭弹窗并更新当前详情，重新打开保留历史页码」；弹窗关闭、当前任务与详情 ID 一致、再次打开仍为第 2 页且选中卡片状态正确 | 正常、兼容、回归 |
+| 实际页面不足一页和空结果均可操作 | Safari，运行服务已有 9 条记录；搜索 pagination-no-match-20261030 | 显示第 1 / 1 页 · 1-9 / 9 条及第 1 / 1 页 · 0-0 / 0 条；按钮常驻且禁用，页脚位于列表滚动区外 | 界面、集成、边界 |
+| 保持既有文本转义与访问边界 | 运行完整前端及后端套件；沿用已有安全与兼容断言 | 本次不新增 API 或授权分支；既有文本转义、接口权限、旧/新数据布局、训练及预测回归在相应套件内验证 | 安全、兼容、回归 |
+
+### 测试执行结果
+
+| 阶段 / 实际命令 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 隔离提交快照：node --test frontend/workbench-interactions.test.cjs | 45 | 45 | 0 | 0 | 0 |
+| 隔离提交快照：node --test frontend/*.test.cjs | 145 | 141 | 4 | 0 | 0 |
+| 未修改 62a03c1 对照：node --test --test-reporter=spec frontend/*.test.cjs | 136 | 132 | 4 | 0 | 0 |
+| 共享工作区：node --test --test-reporter=spec frontend/*.test.cjs | 160 | 160 | 0 | 0 | 0 |
+| Docker Python 3.12 后端完整 pytest | 648 | 617 | 0 | 0 | 31 |
+
+- 本次新增 9 项分页测试全部通过；专项及共享工作区前端通过率 100%。后端实际执行的 617 项全部通过，另 31 项按已有环境条件跳过，耗时 136.80 秒，2 条既有警告。未修改、跳过或弱化有效测试。
+- 隔离完整前端的 4 项失败均在未修改 62a03c1 对照中复现：frontend/training-resources.test.cjs:161 对 remote-management.js 的 starting/training/running/reserved 状态预期 wstate running 和“独占”。共享工作区已有独立的资源修复，因此 160 项全通过；这些修复未夹带进本次提交。本次分页未引入新失败，但独立检出本提交的完整前端套件仍存在这 4 项既有失败，不能标记为全部通过。
+- 最初分页选择测试把详情 mock 写为 {job: selected}；按真实 API 返回值更正为 selected 后通过，保留详情 ID 与选择状态的业务断言。
+- 后端覆盖数据层、训练器、任务管理、API、旧/新数据布局、预测及 CPU 联合训练等既有回归；2 条警告来自 SQLAlchemy declarative_base 和 pandas xlrd。
+
+实际执行命令（快照与对照命令在对应隔离目录运行，其余在项目根目录运行）：
+
+```bash
+node --test frontend/workbench-interactions.test.cjs
+node --test frontend/*.test.cjs
+node --test --test-reporter=spec frontend/*.test.cjs
+docker run --rm --pull=never --network none \
+  --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend \
+  --env PYTHONDONTWRITEBYTECODE=1 \
+  --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest \
+  python -m pytest tests/ -q -p no:cacheprovider \
+    --basetemp=/tmp/mtp-jobs-pagination-full --tb=short -rs
+docker compose up --build -d
+docker compose ps
+git diff --check
+```
+
+- docker compose up --build -d 成功；交付前再次检查服务，frontend/SeaweedFS 健康、trainer/worker 运行。/api/health 返回 {"ok":true}，运行首页包含分页实现；Safari 验证上述 9 条记录及空搜索结果。
+- 本次未创建、删除或更改训练数据。隔离快照、补丁及临时索引保存在 /var/folders/tq/11gy5zgj2_b26v80lvy92fm40000gn/T/mtp-jobs-pagination-review-EccFNE，交付前清理；此前简称 /tmp/mtp-jobs-pagination-review-*，以本处完整路径为准。后端临时测试数据在 --rm 容器内，随退出清理；没有运行时产物提交。
+
+### 已知问题、未验证范围与后续建议
+
+- 本次是客户端分页，/api/jobs 仍读取全部记录；改善弹窗展示长度，但不解决大量历史任务的接口传输或查询耗时。服务端分页需另行设计接口兼容性。
+- 隔离完整前端的 4 项资源状态历史失败需待对应资源修复提交后重验；本次仅记录，不把其他任务改动并入分页提交。
+- 未配置 Redis/S3 测试集成环境且无真实 NVIDIA GPU/多卡 NCCL，31 项相关测试未执行；应在具备对应资源的环境补验。浏览器人工验证覆盖 Safari，未额外执行其他浏览器、实体手机和大规模历史任务性能测试。
+- 后续修改历史筛选、分页、轮询或当前任务选择时重跑前端专项与完整套件；修改 backend/app/ 时按规则重跑 Python 3.12 完整后端回归，更新基准点并重建服务。
+- 回滚方式：撤销 a98554bc90b34aa0fff24ca6c49069d182879784，再执行 docker compose up --build -d；无数据迁移。
+
 ## 追加复核：切换训练任务后详情展示（2026-10-30）
 
 - **Commit Hash**：9bbfc1914750381457b04ef8ed77506de30366db；代码修复提交为 5597f556e8ef00b2efabedfe4a623fb62bb94171（Add curve tabs and restore training detail views）。
