@@ -3351,3 +3351,75 @@ git diff --check
 - 本机 Compose worker 若要和远端节点混合训练，还需按部署网络设置主机可达地址及网络模式；本次不自动推断宿主机 LAN IP。
 - 24 项跳过包含真实 Redis、S3、Supervisor 多进程与 GPU/NCCL 环境门控项；没有将其视为通过。
 - 回滚可撤销 `b283356` 和本报告提交，再执行 Compose 重建；无数据迁移。
+## 本次变更测试结果：训练资源独占与状态同步（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`bfe6455`（Synchronize training resource occupancy）。
+- **测试日期 / 分支**：2026-10-30 / `emdash/hot-boxes-clean-y9u6p`。
+- **范围**：训练 Worker 心跳、CPU/GPU 槽位租约、资源 API 状态、训练工作台和服务器资源卡片；不改变任务数据格式、模型产物格式或新增依赖。
+- **行为**：训练领取后立即显示准备中/训练中；槽位租约期间其他训练只能排队；空闲心跳不能覆盖占用状态；旧执行者不能覆盖新任务；完成、失败、暂停和取消后清理任务、轮次和槽位占用。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 可执行验证 | 结果与场景 |
+|---|---|---|
+| 训练状态与资源卡片及时同步 | `test_controller_publishes_progress_before_first_periodic_heartbeat`、`test_resource_api_reports_exclusive_reservations`；前端状态映射测试 | 通过；首次周期心跳前即显示任务和轮次；正常、边界、兼容 |
+| 选定资源训练期间独占，竞争任务排队 | `test_reserved_slot_does_not_poll_competing_jobs_or_publish_idle`、`test_slot_is_exclusive_and_released_with_clean_status`、`test_slot_competition_has_exactly_one_owner` | 通过；同槽并发只有一个租约持有者，后续任务保持 queued；并发、状态冲突、回归 |
+| 旧执行者不能覆盖新任务 | `test_stale_controller_cannot_replace_successor_resource_status`、`test_old_heartbeat_cannot_overwrite_reallocated_slot`、Redis/内存双实现 guarded heartbeat 测试 | 通过；租约 fencing 和原子心跳校验生效；异常、安全 |
+| 原训练链路保持可用 | `python -m pytest tests/ -q`、真实 API CPU 双任务串行冒烟、模型/指标/日志检查 | 后端完整回归 617 通过、31 跳过；容器服务健康；真实训练槽位结束后恢复 idle |
+| 页面正确表达占用和排队 | `node --test frontend/*.test.cjs`（隔离候选快照） | 119 通过；状态中文化、忙碌排队提示、XSS 转义和旧页面回归通过 |
+
+### 测试执行结果
+
+| 阶段 / 实际命令 | 通过 | 失败 | 跳过 | 说明 |
+|---|---:|---:|---:|---|
+| 后端完整回归 `python -m pytest tests/ -q -p no:cacheprovider` | 617 | 0 | 31 | Python 3.12.15；2 条既有弃用警告；跳过项为未配置 Redis/S3/NVIDIA GPU/NCCL 等条件环境 |
+| Redis/内存租约专项回归 | 40 | 0 | 0 | 覆盖原子心跳、槽位竞争、失租和重新分配 |
+| 前端隔离候选回归 `node --test frontend/*.test.cjs` | 119 | 0 | 0 | 只包含本次页面状态变更及已有前端测试 |
+| 容器重建 `docker compose up --build -d` | 4 服务 | 0 | 0 | trainer、worker、frontend、SeaweedFS 均启动 |
+| HTTP 健康检查 | 2 | 0 | 0 | `/api/health` 和 `/api/workers` 返回 200；空闲槽为 `idle`、无任务、无占用 |
+| 真实 CPU 串行训练冒烟 | 2 | 0 | 0 | 两个任务指定同一 CPU 槽；先运行任务占用槽位，后续任务排队，前者释放后才执行；产物、指标、日志可读 |
+
+专项测试使用的实际命令：
+
+```bash
+docker run --rm --name mtp-slot-sync-full --pull=never --network none \
+  --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend \
+  --env PYTHONDONTWRITEBYTECODE=1 \
+  --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest \
+  python -m pytest tests/ -q -p no:cacheprovider \
+    --basetemp=/tmp/mtp-slot-sync-full --tb=short -rs
+
+docker run --rm --pull=never --network container:mtp-slot-sync-redis \
+  --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend \
+  --env PYTHONDONTWRITEBYTECODE=1 \
+  --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 \
+  --env MTP_TEST_REDIS=redis://127.0.0.1:6379/15 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest \
+  python -m pytest tests/test_coordination.py tests/test_worker.py -q \
+    -p no:cacheprovider -k 'redis or heartbeat or slot_competition or reallocated_slot' \
+    --basetemp=/tmp/mtp-slot-sync-redis-tests --tb=short -rs
+
+node --test --test-reporter=tap /tmp/mtp-slot-sync-KDq9gF/snapshot/frontend/*.test.cjs
+docker compose up --build -d
+```
+
+- 先运行缺陷回归得到 7 项预期失败，确认长心跳窗口仍显示 idle、已有槽租约仍会发布空闲、旧心跳可覆盖新状态；修复后这 7 项全部通过。前端新增状态用例在实现前 11 项失败，合并实现后候选快照全套 119 项通过。
+- 一次把专用 `MTP_TEST_REDIS` 直接用于完整 API 回归的尝试得到 4 项超时失败、126 项通过和 1 项跳过，随后人工中断剩余用例。该环境变量会让 `backend/tests/conftest.py` 将 API 测试切换为分布式模式，而该运行没有为 API E2E 启动 Worker；四项任务因此留在队列。移除该变量重新跑完整嵌入式套件后 617 项通过、31 项跳过；Redis 专项另用独立测试容器运行，40 项通过。
+- API 真实训练串行冒烟运行两个指定同一 CPU 槽的分类任务：观察到首项 running 时后项 queued，资源 API 显示占用槽、执行任务和训练状态；首项完成时间早于后项开始时间。两个任务均成功，训练指标、日志和模型端点验证通过；测试任务及数据集随后删除，线上槽位恢复 idle。
+
+### 已知问题与限制
+
+- 当前环境没有 NVIDIA GPU、真实多机 Redis/S3 和 NCCL，因此 GPU 利用率及多卡通信仍按既有条件测试跳过。
+- 主机 CPU 指标仍是整机口径；同一主机多个槽的百分比不能相加。
+- 训练状态依赖协调平面心跳；协调平面完全不可用时，租约/watchdog 的既有接管语义仍需在真实 Redis 环境补验。
+
+### 下次测试建议
+
+- 在真实 Redis 多 worker 环境执行跨进程槽位抢占、worker 崩溃接管和网络抖动测试。
+- 在真实 GPU 节点验证 GPU 槽独占、显存限制和训练吞吐。
+- 修改槽位租约、心跳状态或资源选择逻辑时，重跑本节专项、完整后端套件和前端套件。
