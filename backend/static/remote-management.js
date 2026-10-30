@@ -20,6 +20,7 @@ function toast(msg, kind = "") {
 }
 /* ---------- 计算服务器与手动资源选择 ---------- */
 const workerStateText = {
+  starting: "准备中", reserved: "已占用", training: "训练中",
   idle: "空闲", running: "训练中", degraded: "卡降级", recovering: "恢复中",
   disabled: "未启用", offline: "离线",
 };
@@ -42,8 +43,10 @@ function workerSlotCard(w) {
   const active = Boolean(w.active);
   const enabled = Boolean(w.enabled);
   const rawState = w.state || (active ? "idle" : "offline");
-  const state = !active ? "offline" : (["running", "degraded", "recovering"].includes(rawState)
-    ? rawState : (enabled ? rawState : "disabled"));
+  const busy = Boolean(w.occupied || w.current_job || ["starting", "training", "running", "reserved"].includes(rawState));
+  const state = !active ? "offline" : (["degraded", "recovering"].includes(rawState)
+    ? rawState : busy ? (["starting", "reserved"].includes(rawState) ? rawState : "running") : (enabled ? rawState : "disabled"));
+  const stateClass = ["starting", "reserved"].includes(state) ? "running" : state;
   const job = w.current_job ? `${w.current_job}${w.epoch ? ` · 第 ${w.epoch} 轮` : ""}` : "当前无任务";
   const heartbeat = w.heartbeat_age_sec != null ? `最近心跳 ${w.heartbeat_age_sec}s 前` : "尚无心跳";
   const action = w.managed

@@ -155,3 +155,36 @@ test('训练方式切换时布局样式不能覆盖资源面板的隐藏状态',
   f.$('p_parallel').value = 'single'; f.context.renderTrainingResources();
   assert.equal(f.$('trainingResourceField').hidden, false);
 });
+
+for (const file of ['index.html', 'remote-management.js']) {
+  for (const [raw, label] of [['starting', '准备中'], ['training', '训练中'], ['running', '训练中'], ['reserved', '已占用']]) {
+    test(`${file} 将 ${raw} 显示为中文占用状态且停用接单不掩盖执行`, () => {
+      const source = fs.readFileSync(path.join(__dirname, '../backend/static', file), 'utf8');
+      const start = source.indexOf('const workerStateText =');
+      const fn = source.indexOf('function workerSlotCard(');
+      const context = vm.createContext({ esc: fixture().context.esc, formatMemory: () => '', workerResourceStats: () => '' });
+      vm.runInContext(source.slice(start, source.indexOf('};', start) + 2)
+        + '\n' + source.slice(fn, source.indexOf('\n// ', fn)), context);
+      const worker = { worker_id: 'cpu', slot: 'cpu0', active: true, enabled: false,
+        state: raw, occupied: true, current_job: '<job>', epoch: 1 };
+      const rendered = context.workerSlotCard(worker);
+      assert.match(rendered, new RegExp(`class="wstate running">${label}`));
+      assert.match(rendered, /独占/);
+      assert.match(rendered, /&lt;job&gt;/);
+      worker.active = false;
+      assert.match(context.workerSlotCard(worker), /class="wstate offline">离线/);
+    });
+  }
+}
+
+for (const state of ['starting', 'training', 'reserved']) {
+  test(`资源选择器对 ${state} 显示排队，允许提交但不暗示可立即执行`, () => {
+    const f = fixture();
+    f.workers[0].state = state;
+    f.workers[0].occupied = true;
+    f.$('trainingResourceSelect').value = 'cpu';
+    f.context.renderTrainingResources(); f.context.updateStart();
+    assert.match(f.$('trainingResourceSelect').innerHTML, /忙碌，排队等待/);
+    assert.equal(f.$('btnStart').disabled, false);
+  });
+}

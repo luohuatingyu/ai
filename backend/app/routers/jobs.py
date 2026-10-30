@@ -357,6 +357,10 @@ def list_workers() -> dict:
         info["state"] = state
         info["current_job"] = current_job
         info["epoch"] = epoch
+        # 槽位锁是独占依据，即使首次执行心跳尚未到达也不得显示空闲。
+        info["occupied"] = manager.lease.peek_holder("slot:" + str(info.get("worker_id", ""))) is not None
+        if info.get("active") and info["occupied"] and state in {"idle", "disabled"}:
+            info["state"] = "reserved"
         info["managed"] = bool(info.get("managed", False))
         info["enabled"] = manager.lease.is_worker_enabled(
             str(info.get("worker_id", "")), default=not info["managed"]

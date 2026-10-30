@@ -86,6 +86,31 @@ def test_performance_detail_and_resource_heartbeat(client):
         jobstore.delete_job_artifacts(manager.store, job_id)
 
 
+@pytest.mark.parametrize("state,active,occupied,expected", [
+    ("idle", True, True, "reserved"),
+    ("disabled", True, True, "reserved"),
+    ("starting", True, True, "starting"),
+    ("training", True, True, "training"),
+    ("idle", True, False, "idle"),
+    ("training", False, True, "offline"),
+])
+def test_resource_api_reports_exclusive_reservations(client, monkeypatch, ls, state, active, occupied, expected):
+    """资源 API 以真实槽位租约补齐首次心跳窗口，离线仍优先显示离线。"""
+    from app.state import manager
+
+    monkeypatch.setattr(manager, "lease", ls)
+    ls.register_worker("api-sync-cpu", {"state": state}, 30)
+    if occupied:
+        assert ls.acquire("slot:api-sync-cpu", "owner", 30)
+    if not active:
+        ls._workers["api-sync-cpu"]["last_seen"] = time.time() - 1000
+    response = client.get("/api/workers")
+    assert response.status_code == 200
+    worker, = response.json()["workers"]
+    assert worker["state"] == expected and worker["occupied"] is occupied
+    assert worker["active"] is active
+
+
 def test_running_job_logs_are_immediately_visible_and_uncacheable(client):
     """运行中的追加日志应立即可读，响应不得被浏览器或代理缓存。"""
     from uuid import uuid4

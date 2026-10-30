@@ -56,6 +56,27 @@ end
 return 0
 """
 
+# 状态与租约在同一事务内校验，禁止旧执行者或空闲轮询覆盖新占用者。
+_GUARDED_HEARTBEAT_LUA = """
+local expected = cjson.decode(ARGV[4])
+for i = 4, #KEYS do
+  local actual = redis.call('GET', KEYS[i])
+  local token = expected[i - 3]
+  if token == cjson.null then
+    if actual then return 0 end
+  elseif actual ~= token then
+    return 0
+  end
+end
+local fields = cjson.decode(ARGV[3])
+redis.call('SADD', KEYS[1], ARGV[1])
+for key, value in pairs(fields) do
+  redis.call('HSET', KEYS[2], key, value)
+end
+redis.call('SET', KEYS[3], '1', 'EX', ARGV[2])
+return 1
+"""
+
 
 class JobQueue:
     """任务队列接口：控制平面入队，计算平面出队。"""
@@ -220,8 +241,9 @@ class LeaseStore:
         """worker 启动注册：写入能力信息（显卡/显存/版本）并开启心跳。"""
         raise NotImplementedError
 
-    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float) -> None:
-        """worker 心跳：刷新在线 TTL 并更新动态字段（当前任务/epoch 等）。"""
+    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float,
+                         *, lease_conditions: Optional[Dict[str, Optional[str]]] = None) -> bool:
+        """原子校验可选租约条件后发布心跳；条件值 None 表示该租约必须空闲。"""
         raise NotImplementedError
 
     def deregister_worker(self, worker_id: str) -> None:
@@ -381,12 +403,21 @@ class EmbeddedLeaseStore(LeaseStore):
             merged["ttl"] = ttl
             self._workers[worker_id] = merged
 
-    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float) -> None:
+    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float,
+                         *, lease_conditions: Optional[Dict[str, Optional[str]]] = None) -> bool:
+        """持锁核对所有权再更新状态，空闲发布不能越过并发资源预留。"""
         with self._lock:
+            now = time.time()
+            for key, expected in (lease_conditions or {}).items():
+                holder = self._leases.get(key)
+                actual = holder[0] if holder is not None and holder[1] > now else None
+                if actual != expected:
+                    return False
             info = self._workers.setdefault(worker_id, {})
             info.update(fields)
-            info["last_seen"] = time.time()
+            info["last_seen"] = now
             info["ttl"] = ttl
+            return True
 
     def deregister_worker(self, worker_id: str) -> None:
         with self._lock:
@@ -561,17 +592,27 @@ class RedisLeaseStore(LeaseStore):
         self._worker_capabilities[worker_id] = {str(k): jsonable(v) for k, v in info.items()}
         self.heartbeat_worker(worker_id, {}, ttl)
 
-    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float) -> None:
-        """每次心跳原子补齐索引、能力、动态状态与 TTL，断连后无需重启。"""
+    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float,
+                         *, lease_conditions: Optional[Dict[str, Optional[str]]] = None) -> bool:
+        """原子校验租约并补齐索引、能力与状态，兼容未传条件的旧调用方。"""
         # 能力快照按槽隔离；动态进度最后合并，不能被启动时的旧状态覆盖。
         payload = dict(self._worker_capabilities.get(worker_id, {}))
         payload.update({str(k): jsonable(v) for k, v in fields.items()})
         payload["last_seen"] = time.time()
+        if lease_conditions:
+            keys = [_WORKERS_SET, _WORKER_INFO.format(worker_id=worker_id),
+                    _WORKER_HB.format(worker_id=worker_id)]
+            keys.extend(_LEASE_KEY.format(job_id=key) for key in lease_conditions)
+            return bool(self._redis.eval(
+                _GUARDED_HEARTBEAT_LUA, len(keys), *keys, worker_id, str(int(ttl)),
+                json.dumps(payload), json.dumps(list(lease_conditions.values())),
+            ))
         pipe = self._redis.pipeline()
         pipe.sadd(_WORKERS_SET, worker_id)
         pipe.hset(_WORKER_INFO.format(worker_id=worker_id), mapping=payload)
         pipe.set(_WORKER_HB.format(worker_id=worker_id), "1", ex=int(ttl))
         pipe.execute()
+        return True
 
     def deregister_worker(self, worker_id: str) -> None:
         """显式注销时丢弃能力缓存，避免复用槽 ID 时恢复旧硬件信息。"""

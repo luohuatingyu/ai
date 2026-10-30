@@ -317,17 +317,37 @@ class JobController:
         self._signals_ready = threading.Event()
         self._epoch = 0
         self._state = "starting"
+        self._progress_lock = threading.Lock()
+        self._publishing = False
         self.resources: list[tuple[str, str]] = []
         self.resource_sampler = None
 
     def set_progress(self, epoch: int, state: str = "training") -> None:
-        """训练循环回调：更新当前进度（心跳里上报给 /api/workers 展示）。"""
-        self._epoch = int(epoch)
-        self._state = state
+        """状态转换立即发布，持锁避免周期心跳把新进度覆盖为旧值。"""
+        self.ensure_owned()
+        with self._progress_lock:
+            self._epoch = int(epoch)
+            self._state = state
+            self._publishing = True
+            self._publish_progress()
 
-    def start(self) -> None:
+    def _publish_progress(self) -> None:
+        """在进度锁内原子核对任务和计算槽租约，拒绝失租后的状态写入。"""
+        conditions = {self._job_id: self._token, **dict(self.resources)}
+        if not self._lease_store.heartbeat_worker(
+            self._worker_id,
+            {"current_job": self._job_id, "epoch": self._epoch, "state": self._state,
+             "resources": self.resource_sampler.snapshot() if self.resource_sampler else None},
+            self._hb_ttl, lease_conditions=conditions,
+        ):
+            self._mark_lease_lost()
+            raise JobLeaseLost("计算槽已被重新分配，拒绝覆盖新任务状态")
+
+    def start(self, publish: bool = True) -> None:
         """领取后立即续租并启动线程，使慢准备和收尾阶段也受心跳保护。"""
         self.ensure_owned()
+        if publish:
+            self.set_progress(self._epoch, self._state)
         self._thread = threading.Thread(
             target=self._loop, name=f"hb-{self._job_id}", daemon=True
         )
@@ -387,12 +407,9 @@ class JobController:
                     self.cancel_event.set()
                 if "pause" in signals:
                     self.pause_event.set()
-                self._lease_store.heartbeat_worker(
-                    self._worker_id,
-                    {"current_job": self._job_id, "epoch": self._epoch, "state": self._state,
-                     "resources": self.resource_sampler.snapshot() if self.resource_sampler else None},
-                    self._hb_ttl,
-                )
+                with self._progress_lock:
+                    if self._publishing:
+                        self._publish_progress()
             except Exception:
                 # 按最后一次成功续租计时，不能从首次错误再额外宽限一个租期。
                 if time.monotonic() - self._last_renewed_at >= self._ttl:
@@ -408,6 +425,7 @@ class GroupMemberController(JobController):
         super().__init__(lease, group["job_id"], group["token"], worker_id,
                          config.WORKER_HEARTBEAT_INTERVAL, config.WORKER_LEASE_TTL)
         self._assignment = assignment
+        self.resources.append((slot_key(worker_id), assignment))
 
     def ensure_owned(self) -> None:
         """验证主节点仍拥有任务以及本槽仍属于同一执行轮次。"""
@@ -425,9 +443,8 @@ class GroupMemberController(JobController):
                     self.cancel_event.set()
                 if "pause" in signals:
                     self.pause_event.set()
-                self._lease_store.heartbeat_worker(self._worker_id,
-                    {"current_job": self._job_id, "state": "training", "epoch": self._epoch,
-                     "resources": self.resource_sampler.snapshot() if self.resource_sampler else None}, self._hb_ttl)
+                with self._progress_lock:
+                    self._publish_progress()
             except Exception:
                 self._mark_lease_lost()
                 return
@@ -518,6 +535,20 @@ class TrainingWorker:
             self.lease_store.deregister_worker(self.worker_id)
             self._log(f"worker {self.worker_id} 已退出")
 
+    def _publish_available(self, hb_ttl: float) -> bool:
+        """仅在计算槽无租约时发布空闲并清理旧任务、轮次，防止误报可用。"""
+        enabled = self.lease_store.is_worker_enabled(
+            self.worker_id, default=not bool(self.caps.get("managed"))
+        )
+        return self.lease_store.heartbeat_worker(
+            self.worker_id,
+            {"state": "degraded" if self._degraded else ("idle" if enabled else "disabled"),
+             "current_job": None, "epoch": None, "machine_id": self.caps.get("machine_id"),
+             "slot": self.caps.get("slot"), "managed": bool(self.caps.get("managed")),
+             "resources": self._resource_sampler.snapshot()},
+            hb_ttl, lease_conditions={slot_key(self.worker_id): None},
+        )
+
     def _run_forever_iteration(self, hb_ttl: float) -> None:
         """单轮调度迭代：自探测并心跳；未启用的外部槽只保持在线、不领取任务。"""
         healthy = self._self_probe()
@@ -530,35 +561,25 @@ class TrainingWorker:
         enabled = self.lease_store.is_worker_enabled(
             self.worker_id, default=not bool(self.caps.get("managed"))
         )
-        self.lease_store.heartbeat_worker(
-            self.worker_id,
-            {
-                "state": "degraded" if self._degraded else ("idle" if enabled else "disabled"),
-                "current_job": None,
-                "machine_id": self.caps.get("machine_id"),
-                "slot": self.caps.get("slot"),
-                "managed": bool(self.caps.get("managed")),
-                "resources": self._resource_sampler.snapshot(),
-            },
-            hb_ttl,
-        )
-        if self._degraded or not enabled:
-            # 掉卡或人工停用期间保持心跳，但不领取新任务。
-            self._shutdown.wait(self._idle_poll)
-            return
         assignment = self.lease_store.peek_holder(slot_key(self.worker_id))
         if assignment:
             try:
                 group = json.loads(assignment)
             except (ValueError, TypeError):
                 group = {}
-            if group.get("parallel") and group["members"][0]["worker_id"] != self.worker_id:
+            if isinstance(group, dict) and group.get("parallel") and group["members"][0]["worker_id"] != self.worker_id:
                 if group["group_id"] != self._finished_group:
                     self._join_parallel_group(group, assignment)
                     self._finished_group = group["group_id"]
                 else:
                     self._shutdown.wait(self._idle_poll)
-                return
+            else:
+                self._shutdown.wait(self._idle_poll)
+            # 已被本任务或联合训练预留时，不领取任何竞争任务。
+            return
+        if not self._publish_available(hb_ttl) or self._degraded or not enabled:
+            self._shutdown.wait(self._idle_poll)
+            return
         try:
             job_id = self.queue.pop(timeout=self._idle_poll)
         except Exception as exc:  # noqa: BLE001
@@ -605,6 +626,7 @@ class TrainingWorker:
             resume_path = None
             if request.get("resume_key"):
                 resume_path = self.store.read_file(request["resume_key"], scratch / "resume-ckpt.pt")
+            controller.set_progress(0, "training")
             run_rank_process({**request, "job_dir": str(scratch),
                 "dataset_path": str(dataset_path) if dataset_path else None,
                 "resume_path": str(resume_path) if resume_path else None,
@@ -702,7 +724,7 @@ class TrainingWorker:
         controller.resource_sampler = self._resource_sampler
         self._controller = controller
         try:
-            controller.start()
+            controller.start(publish=False)
             self.lease_store.clear_signals(job_id)
             controller.enable_signals()
             # 抢租约前读到的 queued 可能已过时，取得所有权后重新确认。
@@ -744,6 +766,7 @@ class TrainingWorker:
                     self.queue.push(job_id)
                     return
                 controller.resources.append((key, resource_token))
+            controller.set_progress(0, "starting")
             self._run_claimed(job_id, record, record.get("spec") or {}, controller, group=group)
         except JobLeaseLost as exc:
             self._log(f"[{job_id}] {exc}")
@@ -759,6 +782,7 @@ class TrainingWorker:
             for key, resource_token in controller.resources:
                 self.lease_store.release(key, resource_token)
             self.lease_store.release(job_id, token)
+            self._publish_available(controller._hb_ttl)
 
     def _run_claimed(self, job_id: str, record: dict, spec: dict, controller: JobController, group=None) -> None:
         """执行已持有租约的任务：拉状态 -> 训练 -> 同步产物 -> 状态收尾。"""
@@ -916,6 +940,7 @@ class TrainingWorker:
                 controller.set_progress(epoch_done, "training")
 
             joblog(f"worker {self.worker_id} 开始执行训练任务")
+            controller.set_progress(resumed_epoch, "training")
 
             # 本段执行的起始 epoch（续训场景 = 最近 checkpoint 之后）
 

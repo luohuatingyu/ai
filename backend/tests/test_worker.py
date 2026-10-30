@@ -714,6 +714,102 @@ def test_controller_caps_heartbeat_interval_and_clears_old_signals(ls):
         controller.stop()
 
 
+def test_controller_publishes_progress_before_first_periodic_heartbeat(ls):
+    """十秒心跳间隔内，准备和首轮进度也必须立即关联到计算槽。"""
+    from app.worker import JobController
+
+    ls.register_worker("sync-cpu", {"state": "idle", "current_job": None}, 60)
+    assert ls.acquire("sync-job", "owner", 30)
+    controller = JobController(ls, "sync-job", "owner", "sync-cpu", 10, 30)
+    try:
+        controller.start()
+        worker, = ls.list_workers()
+        assert worker["state"] == "starting" and worker["current_job"] == "sync-job"
+        controller.set_progress(1, "training")
+        worker, = ls.list_workers()
+        assert worker["state"] == "training" and worker["epoch"] == 1
+    finally:
+        controller.stop()
+
+
+def test_reserved_slot_does_not_poll_competing_jobs_or_publish_idle(store, q, ls):
+    """已有槽位租约时保持占用状态，不能取走其它任务或发布空闲心跳。"""
+    from app.parallel_worker import slot_key
+    from app.worker import TrainingWorker
+
+    worker = TrainingWorker(store, q, ls, capabilities=_caps("reserved-cpu"), idle_poll=0.01)
+    ls.register_worker(worker.worker_id, {**worker.caps, "state": "training",
+                       "current_job": "active-job", "epoch": 3}, 60)
+    assert ls.acquire(slot_key(worker.worker_id), "active-owner", 30)
+    q.push("next-job")
+    worker._run_forever_iteration(60)
+    registered, = ls.list_workers()
+    assert registered["state"] == "training" and registered["current_job"] == "active-job"
+    assert registered["epoch"] == 3 and q.snapshot() == ["next-job"]
+    assert ls.peek_holder(slot_key(worker.worker_id)) == "active-owner"
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "paused", "cancelled"])
+def test_slot_is_exclusive_and_released_with_clean_status(
+    store, q, ls, make_dataset, make_job, monkeypatch, outcome
+):
+    """真实领取两项任务；在训练边界注入终态，验证互斥、排队与状态清理。"""
+    from app.parallel_worker import slot_key
+    from app.worker import TrainingWorker
+
+    ds = make_dataset(n=30)
+    first, second = make_job(ds), make_job(ds)
+    owner = TrainingWorker(store, q, ls, capabilities=_caps("exclusive-cpu"))
+    contender = TrainingWorker(store, q, ls, capabilities=_caps("exclusive-cpu"))
+    ls.register_worker(owner.worker_id, {**owner.caps, "state": "idle"}, 60)
+    executed = []
+
+    def execute(job_id, record, spec, controller, group=None):
+        """仅隔离耗时模型计算，保留真实租约获取、竞争和任务状态写入。"""
+        executed.append(job_id)
+        registered, = ls.list_workers()
+        assert registered["state"] == "starting" and registered["current_job"] == job_id
+        assert ls.peek_holder(slot_key(owner.worker_id)) is not None
+        jobstore.update_job(store, job_id, status="running")
+        controller.set_progress(2, "training")
+        if job_id == first:
+            contender._execute_job(second)
+            assert job_status(store, second) == "queued" and executed == [first]
+            registered, = ls.list_workers()
+            assert registered["current_job"] == first and registered["epoch"] == 2
+        jobstore.update_job(store, job_id, status=outcome)
+
+    monkeypatch.setattr(owner, "_run_claimed", execute)
+    monkeypatch.setattr(contender, "_run_claimed", execute)
+    owner._execute_job(first)
+    registered, = ls.list_workers()
+    assert registered["state"] == "idle"
+    assert registered["current_job"] is None and registered["epoch"] is None
+    assert ls.peek_holder(slot_key(owner.worker_id)) is None
+    assert q.pop(0.01) == second
+    contender._execute_job(second)
+    assert executed == [first, second] and job_status(store, second) == outcome
+
+
+def test_stale_controller_cannot_replace_successor_resource_status(ls):
+    """旧执行者的即时进度不得覆盖新任务的槽位状态。"""
+    from app.worker import JobController, JobLeaseLost
+
+    ls.register_worker("handover-cpu", {"state": "idle"}, 60)
+    assert ls.acquire("old-job", "old-owner", 30)
+    controller = JobController(ls, "old-job", "old-owner", "handover-cpu", 10, 30)
+    try:
+        controller.start()
+        ls.release("old-job", "old-owner")
+        ls.heartbeat_worker("handover-cpu", {"state": "training", "current_job": "new-job", "epoch": 8}, 60)
+        with pytest.raises(JobLeaseLost):
+            controller.set_progress(1)
+        registered, = ls.list_workers()
+        assert registered["current_job"] == "new-job" and registered["epoch"] == 8
+    finally:
+        controller.stop()
+
+
 @pytest.mark.parametrize("task", ["classification", "regression"])
 def test_selected_training_resource_executes_on_target_only(store, make_dataset, make_job, q, ls, spawn_worker, task):
     """真实训练只由指定槽执行，验证指标、产物、日志与执行轨迹。"""

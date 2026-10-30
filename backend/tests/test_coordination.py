@@ -189,6 +189,75 @@ def test_worker_register_heartbeat_deregister():
     assert ls.list_workers() == []
 
 
+@pytest.fixture(params=["embedded", "redis"])
+def guarded_registry(request):
+    """同时验证内存实现与专用测试 Redis，绝不连接生产协调面。"""
+    if request.param == "redis":
+        return RedisLeaseStore(request.getfixturevalue("registry_redis"))
+    return EmbeddedLeaseStore()
+
+
+@pytest.mark.parametrize("conditions,accepted", [
+    ({"slot:cpu": "owner", "job": "attempt"}, True),
+    ({"slot:cpu": None}, False),
+    ({"slot:cpu": "stale"}, False),
+    ({"slot:cpu": "owner", "job": "stale"}, False),
+    ({"free-slot": None}, True),
+])
+def test_worker_heartbeat_is_guarded_atomically(guarded_registry, conditions, accepted):
+    """多条件校验必须全部通过，拒绝时不修改状态或刷新存活时间。"""
+    ls = guarded_registry
+    ls.register_worker("cpu", {"state": "training", "current_job": "first", "epoch": 4}, 30)
+    assert ls.acquire("slot:cpu", "owner", 30)
+    assert ls.acquire("job", "attempt", 30)
+    before, = ls.list_workers()
+    result = ls.heartbeat_worker("cpu", {"state": "idle", "current_job": None, "epoch": None},
+                                 30, lease_conditions=conditions)
+    after, = ls.list_workers()
+    assert result is accepted
+    if accepted:
+        assert after["state"] == "idle" and after["current_job"] is None and after["epoch"] is None
+    else:
+        assert after == before
+    assert ls.peek_holder("slot:cpu") == "owner"
+
+
+def test_old_heartbeat_cannot_overwrite_reallocated_slot(guarded_registry):
+    """释放后新租约生效，旧执行者既不能改状态，也不能释放新占用者。"""
+    ls = guarded_registry
+    ls.register_worker("cpu", {"state": "idle"}, 30)
+    assert ls.acquire("slot:cpu", "old", 30)
+    assert ls.release("slot:cpu", "old")
+    assert ls.acquire("slot:cpu", "new", 30)
+    assert ls.heartbeat_worker("cpu", {"state": "training", "current_job": "new-job"},
+                               30, lease_conditions={"slot:cpu": "new"})
+    assert not ls.heartbeat_worker("cpu", {"state": "idle", "current_job": None},
+                                   30, lease_conditions={"slot:cpu": "old"})
+    assert not ls.release("slot:cpu", "old")
+    registered, = ls.list_workers()
+    assert registered["current_job"] == "new-job" and ls.peek_holder("slot:cpu") == "new"
+
+
+def test_slot_competition_has_exactly_one_owner(guarded_registry):
+    """八个同时到达的训练执行者只能有一个获得同一计算槽。"""
+    import concurrent.futures
+    import threading
+
+    ls = guarded_registry
+    ready = threading.Barrier(8)
+
+    def compete(index):
+        """同时执行真实 acquire，返回持有者身份和获得结果。"""
+        ready.wait(timeout=5)
+        token = f"attempt-{index}"
+        return token, ls.acquire("slot:exclusive", token, 30)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(compete, range(8)))
+    winners = [token for token, acquired in results if acquired]
+    assert len(winners) == 1 and ls.peek_holder("slot:exclusive") == winners[0]
+
+
 def test_cleanup_stale_workers_embedded():
     """幽灵槽清理：心跳长期未更新的注册被清除，存活 worker 保留。"""
     ls = EmbeddedLeaseStore()

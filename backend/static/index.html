@@ -1149,7 +1149,8 @@ function renderTrainingResources() {
     const device = gpu.available
       ? `${String(gpu.backend || worker.device_backend || "GPU").toUpperCase()} · ${gpu.name || "GPU"}${gpu.vram_mb ? ` · ${(Number(gpu.vram_mb) / 1024).toFixed(1)} GB` : ""}`
       : `CPU${worker.cpu?.cores ? ` · ${worker.cpu.cores} 线程` : ""}`;
-    const status = reason || (worker.current_job || worker.state === "running" ? "忙碌，排队等待" : "可用");
+    const busy = worker.occupied || worker.current_job || ["starting", "training", "running", "reserved"].includes(worker.state);
+    const status = reason || (busy ? "忙碌，排队等待" : "可用");
     const label = `${worker.machine_id || worker.worker_id} / ${worker.slot || "计算槽"} (${worker.worker_id}) · ${device} · ${status}`;
     options.push(`<option value="${esc(worker.worker_id)}" ${reason ? "disabled" : ""}>${esc(label)}</option>`);
   }
@@ -1169,7 +1170,7 @@ function renderTrainingResources() {
   } else if (selected && !trainingResourceReady()) {
     hint.textContent = "所选资源当前不满足要求，请重新选择或切回自动分配。";
   } else if (selected) {
-    hint.textContent = "任务仅在所选计算槽执行；忙碌或暂时离线时排队等待，失败后可重新分配。";
+    hint.textContent = "任务独占所选计算槽；占用期间其他任务排队，释放后才能执行，失败后可重新分配。";
   } else {
     hint.textContent = available
       ? `当前有 ${available} 个符合要求的计算槽，系统将自动分配；也可指定资源。`
@@ -1886,6 +1887,7 @@ $("btnPredict").onclick = async () => {
 
 /* ---------- 计算服务器与手动资源选择 ---------- */
 const workerStateText = {
+  starting: "准备中", reserved: "已占用", training: "训练中",
   idle: "空闲", running: "训练中", degraded: "卡降级", recovering: "恢复中",
   disabled: "未启用", offline: "离线",
 };
@@ -1940,16 +1942,18 @@ function workerSlotCard(w) {
   const active = Boolean(w.active);
   const enabled = Boolean(w.enabled);
   const rawState = w.state || (active ? "idle" : "offline");
-  const state = !active ? "offline" : (["running", "degraded", "recovering"].includes(rawState)
-    ? rawState : (enabled ? rawState : "disabled"));
+  const busy = Boolean(w.occupied || w.current_job || ["starting", "training", "running", "reserved"].includes(rawState));
+  const state = !active ? "offline" : (["degraded", "recovering"].includes(rawState)
+    ? rawState : busy ? (["starting", "reserved"].includes(rawState) ? rawState : "running") : (enabled ? rawState : "disabled"));
+  const stateClass = ["starting", "reserved"].includes(state) ? "running" : state;
   const job = w.current_job ? `${w.current_job}${w.epoch ? ` · 第 ${w.epoch} 轮` : ""}` : "当前无任务";
   const heartbeat = w.heartbeat_age_sec != null ? `最近心跳 ${w.heartbeat_age_sec}s 前` : "尚无心跳";
   const action = `<span class="server-kind">${enabled ? "已加入资源池" : "未加入资源池"}</span>`;
   return `<div class="resource-slot ${enabled && active ? "enabled" : ""}">
     <div class="slot-main">
       <div class="slot-title"><span class="dot"></span>${isGpu ? "GPU" : "CPU"} · ${esc(w.slot || "计算槽")}
-        <span class="wstate ${esc(state)}">${workerStateText[state] || esc(state)}</span></div>
-      <div class="slot-details">${esc(device)} · ${esc(job)} · ${esc(heartbeat)}</div>
+        <span class="wstate ${esc(stateClass)}">${workerStateText[state] || esc(state)}</span></div>
+      <div class="slot-details">${esc(device)} · ${esc(job)} · ${esc(heartbeat)}${busy && active ? " · 独占使用，其他任务排队" : ""}</div>
       ${workerResourceStats(w)}
     </div>
     ${action}
