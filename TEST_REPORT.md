@@ -1,3 +1,71 @@
+## 本次变更测试结果：合并慢任务列表轮询，恢复资源终态核对（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：f6194edd00be36fb61bb8354198ddd71426e530b。
+- **提交信息**：Coalesce slow job polling requests。
+- **测试日期 / 分支**：2026-10-30 / emdash/hot-boxes-clean-y9u6p。
+- **范围与技术**：原生 JavaScript；仅提交 backend/static/index.html 的列表请求协调和 frontend/workbench-interactions.test.cjs 的 5 个正式回归用例，共 82 行新增、3 行删除。未修改后端、接口、依赖、配置或数据格式。
+- **原因与行为**：观察到任务列表请求耗时约 1～1.9 分钟，原 1.5 秒轮询不断叠加请求并递增响应版本，使完成响应被后续轮询作废。现在未完成的列表请求共用同一 Promise，禁止缓存，120 秒超时后释放；成功后正常接纳完成状态并触发既有资源释放核对。失败保留列表、详情和选择，下次轮询可恢复；切换任务仍受选择版本保护。资源空闲仍由服务端快照确认。
+- **提交隔离**：基于 62e5eb396ab6f04ebd84fd1a30f06b611eb47a1d 构造仅包含本次改动的 tree 604116761e247e2f6be9587145afd9a9e5138322，并验证提交 tree 与该快照相同。预测、日志游标、服务器管理及其他后端未提交改动未混入提交。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级 / 前置条件与输入 | 可执行用例与预期业务结果 | 场景 |
+|---|---|---|---|
+| 慢列表不会不断堆积或丢弃完成响应 | 前端异步；已有运行任务，列表挂起，连续调用刷新 31 次后返回 completed | workbench-interactions.test.cjs「慢任务列表轮询共用一个请求，完成响应仍更新任务并触发资源释放核对」；只发一次请求、共享 Promise，任务与卡片变为已完成，触发目标槽终态核对，请求结束释放锁 | 正常、并发、回归 |
+| 网络错误、超时和拒绝后可恢复 | 前端异步；已有列表、详情和选择，分别网络失败、AbortSignal 中止、HTTP 403，随后成功返回空列表 | 参数化「任务列表 network/timeout/forbidden 后保留选择并释放请求，后续成功可更新」；验证 120000ms 上限、错误保留业务内容且仅写文本、释放请求，恢复后接受空列表并清除已不存在的旧选择 | 异常、时间边界、空集合、安全、恢复 |
+| 迟到列表不能清除新选择 | 前端异步；A 列表挂起，切换到列表尚未包含的新任务，随后返回 A | 「列表慢响应期间切换任务，不清空响应中尚未包含的新选择」；新任务 ID、详情及可见状态保留，合并请求正常释放 | 竞态、兼容、回归 |
+| 资源卡片仍反映真实服务端状态 | 资源专项与完整前端；沿用启动、四类终态、联合槽位、心跳延迟及错误恢复用例 | training-resources.test.cjs 既有断言继续验证：只有服务端确认释放或接手后结束协调；本次不根据任务完成强制伪造空闲 | 状态冲突、边界、回归 |
+| 运行环境使用新轮询实现 | 容器重建后，Node fetch/assert 读取健康接口、首页、任务和 worker 快照 | 健康接口返回 ok；首页含 jobsLoading、共享请求、fetchJobs 和 120 秒超时；列表返回 11 个 completed，3 个槽均 active、idle、occupied=false、current_job=null | HTTP 集成、兼容 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 共享工作区：任务交互及资源专项 | 94 | 94 | 0 | 0 | 0 |
+| 共享工作区：完整前端 | 168 | 168 | 0 | 0 | 0 |
+| 本次隔离快照：任务交互专项 | 50 | 50 | 0 | 0 | 0 |
+| 本次隔离快照：完整前端 | 165 | 161 | 4 | 0 | 0 |
+| 未修改 62e5eb3 对照：完整前端 | 160 | 156 | 4 | 0 | 0 |
+| 共享工作区：Python 3.12 完整后端 | 668 | 636 | 1 | 0 | 31 |
+| 本次隔离快照：Python 3.12 完整后端（归档权限规范化后） | 648 | 617 | 0 | 0 | 31 |
+
+- 本次新增 5 项用例及隔离交互专项全部通过；共享前端通过率 100%。隔离完整前端 161/165（97.58%），不能标记为全量通过。4 项失败在未修改基线全部复现，均为 training-resources.test.cjs 中 remote-management.js 的 starting/training/running/reserved 状态展示断言：starting/reserved 缺少 wstate running 类，training/running 缺少“独占”文字。共享工作区已有独立服务器管理修复，因此共享前端全部通过；这些改动未夹带进本次提交。
+- 共享后端失败为 tests/test_llm_trainer.py::test_generate_api_returns_text_only_for_llm_tasks，直接调用 generate 时缺少 response 参数，与并行预测接口改动有关。本次未修改后端；隔离提交快照中该项通过。该共享工作区失败仍需对应任务处理，不作为本次已通过项目。
+- 隔离后端使用 Python 3.12.15，实际执行 617 项全部通过，耗时 132.96 秒；31 项按已有环境条件跳过，未计作通过。涉及未配置的真实 Redis、S3、GPU/NCCL 和 Supervisor 多进程环境，2 条既有弃用警告来自 SQLAlchemy declarative_base 和 pandas xlrd。
+- 首次隔离归档后端为 616 通过、1 失败、31 跳过：git archive 默认 tar.umask=0002 将可执行 askpass 文件导出为 0775，而已有测试要求 0755。改用单次命令 git -c tar.umask=0022 archive 后完整重跑通过；未修改仓库配置、实现或测试断言。
+- 未删除、跳过或弱化已有有效测试。新测试先复现未合并轮询的失败，再加入实现验证通过。
+
+实际执行命令（项目根目录；隔离命令中的 tree 是上述已验证快照）：
+
+~~~bash
+node --test frontend/workbench-interactions.test.cjs frontend/training-resources.test.cjs
+node --test frontend/*.test.cjs
+git archive 604116761e247e2f6be9587145afd9a9e5138322 | docker run --rm -i --pull=never --network none --entrypoint sh node:20-alpine -c 'umask 022; mkdir /tmp/mtp-job-polling-snapshot && tar -x -C /tmp/mtp-job-polling-snapshot && cd /tmp/mtp-job-polling-snapshot && node --test --test-reporter=spec frontend/*.test.cjs'
+git archive 62e5eb396ab6f04ebd84fd1a30f06b611eb47a1d | docker run --rm -i --pull=never --network none --entrypoint sh node:20-alpine -c 'umask 022; mkdir /tmp/mtp-job-polling-baseline && tar -x -C /tmp/mtp-job-polling-baseline && cd /tmp/mtp-job-polling-baseline && node --test --test-reporter=spec frontend/*.test.cjs'
+git -c tar.umask=0022 archive 604116761e247e2f6be9587145afd9a9e5138322 | docker run --rm -i --pull=never --network none --entrypoint sh node:20-alpine -c 'mkdir /tmp/mtp-job-polling-snapshot && tar -x -C /tmp/mtp-job-polling-snapshot && cd /tmp/mtp-job-polling-snapshot && node --test --test-reporter=spec frontend/workbench-interactions.test.cjs'
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-job-polling-full --tb=short -rs
+git -c tar.umask=0022 archive 604116761e247e2f6be9587145afd9a9e5138322 | docker run --rm -i --pull=never --network none --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --entrypoint sh emdash-hot-boxes-clean-y9u6p-trainer:latest -c 'umask 022; mkdir /tmp/mtp-job-polling-snapshot && tar -x -C /tmp/mtp-job-polling-snapshot && cd /tmp/mtp-job-polling-snapshot/backend && python --version && python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-job-polling-pytest --tb=short -rs'
+docker compose up --build -d
+docker compose ps
+curl -fsS --max-time 15 http://localhost:8000/api/health
+git diff --check
+git diff --cached --check
+~~~
+
+- 容器重建成功，无端口冲突；frontend/SeaweedFS 健康、trainer/worker 运行。Node 内存脚本通过 fetch/assert 检查运行首页的新轮询实现、健康接口及 workers 数组；另一次脚本读取 jobs 和 workers，列表耗时 17543ms，11 条全部 completed，3 个槽均真实空闲。未将读到的任务数据保存至文件。
+- 相对前一报告基准 2dec090，本次代码提交没有 backend/app/ 变更；后端测试为额外回归，不能用共享工作区其他功能的测试结果替代本次隔离验证。
+- 临时数据仅在一次性 --rm 容器 /tmp/mtp-job-polling-* 中，退出自动清理；没有保存宿主机临时脚本、调试文件或运行时产物。
+
+### 已知问题、未验证范围与后续建议
+
+- 后端 /api/jobs 查询延迟未在本次范围优化；资源终态核对需等列表返回后触发，120 秒超时后下次轮询重试。合并请求消除了无限叠加和持续作废完成响应的问题，不保证训练结束瞬间刷新。
+- 尚未重新发起真实 GPU/多机训练，也未完成重建后的浏览器训练全流程复验；不能将一次静态 completed/idle 快照当作训练开始至完成的端到端通过。应在真实环境补验发起训练、轮询、日志、指标与 best.pt，以及开始/完成后的资源卡片。固定 seed、相同模型预测及双布局兼容沿用后端既有回归，本次未修改相应链路。
+- 隔离完整前端 4 项基线失败、共享后端 1 项并行接口测试失败仍如实保留，整体环境不能标记为全量通过；本次只交付已验证的列表轮询修复。
+- 后续修改任务列表、选择、资源状态或请求协调时，重跑任务交互与资源专项、完整前端；修改后端时按规则运行 Python 3.12 完整回归并重建服务。真实 Redis/S3/GPU/NCCL 等 31 项环境用例需在条件具备后补验。
+- 回滚可撤销 f6194edd00be36fb61bb8354198ddd71426e530b 及对应报告提交，再执行 docker compose up --build -d；无数据迁移。
+
 ## 本次变更测试结果：训练开始与结束后及时刷新计算资源（2026-10-30）
 
 ### Git 基准点与范围
