@@ -578,3 +578,13 @@ test('方向键、Home、End 切换标签并同步焦点及无障碍状态', () 
   f.tabs[1].handlers.keydown({ key: 'End', preventDefault() {} }); assert.equal(f.state.activeTab, 'predict');
   f.tabs[4].handlers.keydown({ key: 'Home', preventDefault() {} }); assert.equal(f.state.activeTab, 'curves'); assert.equal(prevented, 1);
 });
+
+// 空参数格保持白底，实际参数项继续显示细分隔线。
+test('训练参数网格的空白位置不再铺灰色背景', () => {
+  const css = fs.readFileSync(path.join(__dirname, '../backend/static/app.css'), 'utf8');
+  const grid = /\.training-page \.training-record-grid \{([^}]+)\}/.exec(css)?.[1] || '';
+  const field = /\.training-page \.training-record-field \{([^}]+)\}/.exec(css)?.[1] || '';
+  assert.match(grid, /gap:\s*0/);
+  assert.match(grid, /background:\s*#fff/);
+  assert.match(field, /box-shadow:\s*inset -1px -1px 0 #e2e8f0/);
+});

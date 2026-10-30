@@ -1524,8 +1524,8 @@ html {
 .training-page .training-record { display: grid; gap: 18px; }
 .training-page .training-record-section { min-width: 0; }
 .training-page .training-record-section h3 { margin: 0 0 10px; color: #2f4059; font-size: 14px; }
-.training-page .training-record-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0; border: 1px solid #e2e8f0; background: #e2e8f0; }
-.training-page .training-record-field { min-width: 0; padding: 9px 11px; background: #fff; }
+.training-page .training-record-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; margin: 0; border: 1px solid #e2e8f0; background: #fff; }
+.training-page .training-record-field { min-width: 0; padding: 9px 11px; background: #fff; box-shadow: inset -1px -1px 0 #e2e8f0; }
 .training-page .training-record-field dt { margin-bottom: 4px; color: #718096; font-size: 11px; }
 .training-page .training-record-field dd { margin: 0; color: #29394f; font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
 .training-page .training-record-table-wrap { max-width: 100%; overflow: auto; border: 1px solid #e2e8f0; border-radius: 7px; }
