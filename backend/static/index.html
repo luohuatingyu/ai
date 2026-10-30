@@ -1168,7 +1168,7 @@ function trainingResourceUnavailable(worker) {
 function trainingResourceReady() {
   const selected = $("trainingResourceSelect").value;
   if ($("p_parallel")?.value === "parallel" || !selected) return true;
-  return state.workerResourcesLoaded && !state.workerResourcesError
+  return state.workerResourcesLoaded
     && !trainingResourceUnavailable(state.workerSlots.find(worker => worker.worker_id === selected));
 }
 
@@ -1205,7 +1205,12 @@ function renderTrainingResources() {
   select.value = selected;
   const hint = $("trainingResourceHint");
   if (state.workerResourcesError) {
-    hint.textContent = "资源状态读取失败，请刷新计算资源；自动分配仍可排队等待。";
+    const issue = selected ? trainingResourceUnavailable(state.workerSlots.find(worker => worker.worker_id === selected)) : "";
+    hint.textContent = selected && issue
+      ? `资源状态刷新失败，当前所选资源不可用（${issue}），请刷新后重试或切回自动分配。`
+      : selected
+        ? "资源状态刷新失败，当前选择按上次成功快照展示。点击训练后由服务端实时校验，资源若已失效将拒绝创建。"
+        : "资源状态读取失败，请刷新计算资源；自动分配仍可排队等待。";
   } else if (selected && !trainingResourceReady()) {
     hint.textContent = "所选资源当前不满足要求，请重新选择或切回自动分配。";
   } else if (selected) {

@@ -132,14 +132,13 @@ test('首次加载历史任务不触发转换刷新，资源协调最多持续 1
   assert.equal(f.state.resourceRefreshJobs.size, 0);
 });
 
-for (const unavailable of ['offline', 'disabled', 'degraded', 'removed', 'fetch-failed']) {
+for (const unavailable of ['offline', 'disabled', 'degraded', 'removed']) {
   test(`轮询后失效选择保留且阻止提交：${unavailable}`, async () => {
     const f = fixture(); f.$('trainingResourceSelect').value = 'cpu';
     if (unavailable === 'offline') f.workers[0].active = false;
     if (unavailable === 'disabled') f.workers[0].enabled = false;
     if (unavailable === 'degraded') f.workers[0].state = 'degraded';
     if (unavailable === 'removed') f.state.workerSlots = [f.workers[1]];
-    if (unavailable === 'fetch-failed') f.state.workerResourcesError = true;
     f.context.renderTrainingResources(); f.context.updateStart();
     assert.equal(f.$('trainingResourceSelect').value, 'cpu');
     assert.equal(f.$('btnStart').disabled, true);
@@ -148,6 +147,30 @@ for (const unavailable of ['offline', 'disabled', 'degraded', 'removed', 'fetch-
     assert.equal(f.$('btnStart').disabled, false);
   });
 }
+
+test('已有成功快照时资源刷新失败仍可尝试提交，界面说明服务端会实时校验', async () => {
+  const f = fixture(); f.$('trainingResourceSelect').value = 'cpu';
+  f.state.workerResourcesError = true;
+  f.context.renderTrainingResources(); f.context.updateStart();
+  assert.equal(f.context.trainingResourceReady(), true);
+  assert.equal(f.$('btnStart').disabled, false);
+  assert.match(f.$('trainingResourceHint').textContent, /上次成功快照/);
+  assert.match(f.$('trainingResourceHint').textContent, /服务端实时校验/);
+  await f.$('btnStart').onclick();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].payload.worker_id, 'cpu');
+});
+
+test('首次资源快照尚未成功时仍阻止指定资源提交', async () => {
+  const f = fixture(); f.$('trainingResourceSelect').value = 'cpu';
+  f.state.workerResourcesLoaded = false;
+  f.state.workerResourcesError = true;
+  f.context.renderTrainingResources(); f.context.updateStart();
+  assert.equal(f.context.trainingResourceReady(), false);
+  assert.equal(f.$('btnStart').disabled, true);
+  await f.$('btnStart').onclick();
+  assert.equal(f.requests.length, 0);
+});
 
 test('资源状态恢复后原选择可提交，忙碌槽明确排队', () => {
   const f = fixture(); f.$('trainingResourceSelect').value = 'cpu';
