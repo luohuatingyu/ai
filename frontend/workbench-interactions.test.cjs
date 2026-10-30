@@ -57,7 +57,7 @@ function fixture() {
   $('taskSelect').value = 'classification'; $('targetSelect').value = 'target';
   $('timeColumnSelect').value = 'time'; $('p_parallel').value = 'single'; $('p_dataset_source').value = 'local';
   $('jobStatusFilter').value = 'all'; $('logFollow').checked = true;
-  const state = { datasetId: 'dataset', datasets: [], jobs: [], workerSlots: [], jobId: null, logOffset: 0,
+  const state = { datasetId: 'dataset', datasets: [], jobs: [], workerSlots: [], jobId: null, logOffset: 0, logCursor: null,
     activeTab: 'curves', trainSubmitting: false, detailRequest: 0, jobsRequest: 0, logRequest: 0,
     jobPage: 1, historyPageCount: 1, resourceRefreshJobs: new Map(), charts: {}, activeChart: 'loss',
     selectionVersion: 0, logVersion: 0, predictTemplateRequest: 0, logUnread: 0 };
@@ -507,6 +507,43 @@ test('日志轮询明确绕过缓存并避免慢请求重叠', async () => {
   assert.equal(requestOptions.cache, 'no-store');
   pending.resolve({ lines: [], next_offset: 0 });
   await Promise.all([first, second]);
+  assert.equal(f.state.logLoading, null);
+});
+
+test('日志分页有后续批次时立即连续拉取并按游标顺序追加', async () => {
+  const f = fixture(); f.state.jobId = 'a';
+  const timers = [], responses = [
+    { lines: ['第一批'], next_cursor: 'file:0:4', has_more: true },
+    { lines: ['第二批'], next_cursor: 'file:0:8', has_more: false },
+  ];
+  f.context.setTimeout = callback => { timers.push(callback); return timers.length; };
+  f.context.apiJson = async url => {
+    f.requests.push({ url });
+    return responses.shift();
+  };
+
+  await f.context.tailLogs('a');
+  assert.equal(f.requests.length, 1);
+  assert.equal(timers.length, 1);
+  assert.match(f.requests[0].url, /cursor=/);
+  const next = timers.shift()();
+  await next;
+  assert.equal(f.requests.length, 2);
+  assert.match(f.requests[1].url, /cursor=file%3A0%3A4/);
+  assert.equal(f.$('logBox').textContent, '第一批\n第二批\n');
+  assert.equal(f.state.logCursor, 'file:0:8');
+});
+
+test('日志分页空批次即使声明有后续也不会忙循环', async () => {
+  const f = fixture(); f.state.jobId = 'a';
+  const timers = [];
+  f.context.setTimeout = callback => { timers.push(callback); return timers.length; };
+  f.context.apiJson = async () => ({ lines: [], next_cursor: 'file:0:4', has_more: true });
+
+  await f.context.tailLogs('a');
+  assert.equal(f.requests.length, 0);
+  assert.equal(timers.length, 0);
+  assert.equal(f.state.logCursor, 'file:0:4');
   assert.equal(f.state.logLoading, null);
 });
 

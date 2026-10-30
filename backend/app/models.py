@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, Integer, String, Text, Float, DateTime, JSON, ForeignKey
+from sqlalchemy import Column, Index, Integer, String, Text, Float, DateTime, JSON, ForeignKey
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -53,6 +53,7 @@ class TrainingJob(Base):
 class JobLog(Base):
     """任务日志模型"""
     __tablename__ = "job_logs"
+    __table_args__ = (Index("ix_job_logs_job_id_id", "job_id", "id"),)
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     job_id = Column(String(50), ForeignKey("training_jobs.id"), nullable=False)

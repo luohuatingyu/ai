@@ -70,6 +70,90 @@ def test_append_text(store):
     assert st.read_text(job_key("j4", "log.txt")) == "a\nb\n"
 
 
+def test_local_log_size_and_byte_ranges(store):
+    """本地日志按元数据取大小并只读取请求字节范围。"""
+    key = job_key("range", "log.txt")
+    store.write_bytes(key, "第一行\nsecond\n".encode("utf-8"))
+    payload = "第一行\nsecond\n".encode("utf-8")
+
+    assert store.get_size(key) == len(payload)
+    assert store.read_bytes_range(key, 0, len("第一行\n".encode("utf-8"))) == "第一行\n".encode("utf-8")
+    assert store.read_bytes_range(key, len("第一行\n".encode("utf-8")), 6) == b"second"
+    assert store.read_bytes_range(key, -5, 0) == b""
+    assert store.read_bytes_range(key, len(payload) + 10, 10) == b""
+    assert store.get_size(job_key("range", "missing.log")) is None
+    assert store.read_bytes_range(job_key("range", "missing.log"), 0, 10) is None
+
+
+def test_s3_log_metadata_and_range_reads_release_response():
+    """S3 日志元数据不下载对象，Range 响应始终关闭并释放连接。"""
+    class Response:
+        def __init__(self, body):
+            self.body = body
+            self.closed = False
+            self.released = False
+
+        def read(self):
+            return self.body
+
+        def close(self):
+            self.closed = True
+
+        def release_conn(self):
+            self.released = True
+
+    class Client:
+        def __init__(self):
+            self.response = Response(b"log chunk")
+            self.range_call = None
+
+        def stat_object(self, bucket, key):
+            return type("Stat", (), {"size": 4096})()
+
+        def get_object(self, bucket, key, **kwargs):
+            self.range_call = (bucket, key, kwargs)
+            return self.response
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = Client()
+    st.bucket = "test-bucket"
+
+    assert st.get_size("jobs/range/log.txt") == 4096
+    assert st.read_bytes_range("jobs/range/log.txt", 17, 9) == b"log chunk"
+    assert st._client.range_call == ("test-bucket", "jobs/range/log.txt", {"offset": 17, "length": 9})
+    assert st._client.response.closed is True
+    assert st._client.response.released is True
+
+
+def test_s3_log_range_missing_object_and_outage():
+    """S3 缺失日志映射为空值，服务故障保留可识别异常。"""
+    class MissingObject(Exception):
+        code = "NoSuchKey"
+
+    class MissingClient:
+        def stat_object(self, bucket, key):
+            raise MissingObject("missing")
+
+        def get_object(self, bucket, key, **kwargs):
+            raise MissingObject("missing")
+
+    missing_store = object.__new__(S3ArtifactStore)
+    missing_store._client = MissingClient()
+    missing_store.bucket = "test-bucket"
+    assert missing_store.get_size("jobs/range/missing.log") is None
+    assert missing_store.read_bytes_range("jobs/range/missing.log", 0, 10) is None
+
+    class OutageClient:
+        def get_object(self, bucket, key, **kwargs):
+            raise ConnectionError("connection reset")
+
+    outage_store = object.__new__(S3ArtifactStore)
+    outage_store._client = OutageClient()
+    outage_store.bucket = "test-bucket"
+    with pytest.raises(ArtifactStoreUnavailableError, match="读取对象存储产物失败"):
+        outage_store.read_bytes_range("jobs/range/log.txt", 0, 10)
+
+
 def test_s3_outage_is_not_treated_as_missing():
     """S3 网络或鉴权故障必须向上抛出，不能伪装成产物不存在。"""
     class FailingClient:

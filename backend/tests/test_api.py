@@ -140,6 +140,213 @@ def test_running_job_logs_are_immediately_visible_and_uncacheable(client):
         jobstore.delete_job_artifacts(manager.store, job_id)
 
 
+def test_job_logs_cursor_reads_only_complete_lines_and_catches_appends(client):
+    """游标只增量返回完整行，活动尾行写完后可从原字节位置继续读取。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-live-" + uuid4().hex
+    log_key = job_key(job_id, "log.txt")
+    jobstore.write_job(manager.store, {"id": job_id, "status": "running"})
+    initial_payload = "第一行\n未完成尾行".encode()
+    manager.store.write_bytes(log_key, initial_payload)
+    try:
+        first = client.get(f"/api/jobs/{job_id}/logs?cursor=")
+        assert first.status_code == 200
+        assert first.json() == {
+            "lines": ["第一行"], "next_cursor": f"file:0:{len('第一行'.encode()) + 1}",
+            "has_more": True, "reset": False,
+        }
+
+        manager.store.append_text(log_key, "追加完成\n")
+        second = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": first.json()["next_cursor"]})
+        assert second.status_code == 200
+        completed_payload = initial_payload + "追加完成\n".encode()
+        assert second.json() == {
+            "lines": ["未完成尾行追加完成"],
+            "next_cursor": f"file:0:{len(completed_payload)}",
+            "has_more": False, "reset": False,
+        }
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_pages_large_file_in_bounded_batches(client):
+    """大日志以字节游标分批返回，不重复读取已消费的历史部分。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-pages-" + uuid4().hex
+    lines = [f"训练记录 {index}" for index in range(1003)]
+    payload = ("\n".join(lines) + "\n").encode()
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    manager.store.write_bytes(job_key(job_id, "log.txt"), payload)
+    try:
+        cursor = ""
+        collected = []
+        batches = []
+        while True:
+            response = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": cursor})
+            assert response.status_code == 200
+            result = response.json()
+            batches.append(result["lines"])
+            collected.extend(result["lines"])
+            cursor = result["next_cursor"]
+            if not result["has_more"]:
+                break
+        assert [len(batch) for batch in batches] == [500, 500, 3]
+        assert collected == lines
+        assert cursor == f"file:0:{len(payload)}"
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_rejects_malformed_values(client):
+    """无效游标返回客户端错误，不触发意外读取。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-invalid-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    try:
+        for cursor in ("not-a-cursor", "f" * 65, "file:0:99999999999999999999999"):
+            response = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": cursor})
+            assert response.status_code == 400
+            assert response.json()["detail"] == "日志游标格式无效"
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_handles_empty_file_and_terminal_unterminated_line(client):
+    """空文件返回稳定空游标，终态任务返回最后一条未换行日志。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-terminal-" + uuid4().hex
+    log_key = job_key(job_id, "log.txt")
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    manager.store.write_bytes(log_key, b"")
+    try:
+        empty = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": ""})
+        assert empty.status_code == 200
+        assert empty.json() == {
+            "lines": [], "next_cursor": "file:0:0", "has_more": False, "reset": False,
+        }
+
+        manager.store.write_bytes(log_key, "最后一行无换行".encode())
+        terminal = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": "file:0:0"})
+        assert terminal.status_code == 200
+        assert terminal.json() == {
+            "lines": ["最后一行无换行"],
+            "next_cursor": f"file:0:{len('最后一行无换行'.encode())}",
+            "has_more": False,
+            "reset": False,
+        }
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_resets_when_storage_source_changes(client):
+    """文件与数据库来源相互切换时重置游标，避免遗漏新来源日志。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-source-" + uuid4().hex
+    log_key = job_key(job_id, "log.txt")
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    manager.store.write_bytes(log_key, b"file line\n")
+    try:
+        file_result = client.get(
+            f"/api/jobs/{job_id}/logs", params={"cursor": ""}
+        ).json()
+        assert file_result["lines"] == ["file line"]
+
+        manager.store.delete(log_key)
+        database_result = client.get(
+            f"/api/jobs/{job_id}/logs",
+            params={"cursor": file_result["next_cursor"]},
+        )
+        assert database_result.status_code == 200
+        assert database_result.json() == {
+            "lines": [], "next_cursor": "database:0:0", "has_more": False, "reset": True,
+        }
+
+        manager.store.write_bytes(log_key, b"new file line\n")
+        resumed = client.get(
+            f"/api/jobs/{job_id}/logs",
+            params={"cursor": database_result.json()["next_cursor"]},
+        )
+        assert resumed.status_code == 200
+        assert resumed.json() == {
+            "lines": ["new file line"], "next_cursor": "file:0:14",
+            "has_more": False, "reset": True,
+        }
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_clearing_job_logs_resets_previous_cursor(client):
+    """日志清空使旧游标重置，从新日志开头继续读取。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-clear-" + uuid4().hex
+    log_key = job_key(job_id, "log.txt")
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed", "log_revision": 0})
+    manager.store.write_bytes(log_key, "清空前\n".encode())
+    try:
+        first = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": ""}).json()
+        assert first["lines"] == ["清空前"]
+        assert client.delete(f"/api/jobs/{job_id}/logs").status_code == 200
+        manager.store.write_bytes(log_key, "清空后\n".encode())
+        resumed = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": first["next_cursor"]})
+        assert resumed.status_code == 200
+        assert resumed.json() == {
+            "lines": ["清空后"], "next_cursor": "file:1:10",
+            "has_more": False, "reset": True,
+        }
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_falls_back_to_database_and_keeps_legacy_offset(client, monkeypatch):
+    """缺少权威文件时数据库游标按主键续读，旧版 offset 响应保持兼容。"""
+    from app import database
+    from app.models import Dataset, JobLog, TrainingJob
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-db-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    with database.SessionLocal() as db:
+        db.add(Dataset(id=job_id, name=job_id, rows=0, columns=[]))
+        db.add(TrainingJob(id=job_id, dataset_id=job_id, dataset_name=job_id,
+                           target="", task="classification", params={}))
+        db.add_all([JobLog(job_id=job_id, message=f"数据库日志 {index}") for index in range(503)])
+        db.commit()
+    monkeypatch.setattr(config, "DB_AVAILABLE", True)
+    try:
+        first = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": ""})
+        assert first.status_code == 200
+        first_result = first.json()
+        assert len(first_result["lines"]) == 500
+        assert first_result["lines"][0].endswith("数据库日志 0")
+        assert first_result["lines"][-1].endswith("数据库日志 499")
+        assert first_result["has_more"] is True
+
+        second = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": first_result["next_cursor"]})
+        assert second.status_code == 200
+        assert [line.rsplit(" ", 1)[-1] for line in second.json()["lines"]] == ["500", "501", "502"]
+        assert second.json()["has_more"] is False
+
+        legacy = client.get(f"/api/jobs/{job_id}/logs?offset=500")
+        assert legacy.status_code == 200
+        assert legacy.json()["total"] == 503
+        assert [line.rsplit(" ", 1)[-1] for line in legacy.json()["lines"]] == ["500", "501", "502"]
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
 def test_static_paths_not_shadowed_by_param_route(client):
     """回归：/api/datasets/tags 与 import-history 不得被 /datasets/{ds_id} 遮蔽。"""
     r = client.get("/api/datasets/tags")

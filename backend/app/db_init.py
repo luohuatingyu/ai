@@ -19,8 +19,13 @@ from app.models import (  # noqa: F401
 
 
 def create_tables() -> None:
-    """创建所有数据库表"""
+    """创建所有数据库表，并为已有日志表补齐游标查询索引。"""
     Base.metadata.create_all(bind=engine)
+    log_index = next(
+        index for index in JobLog.__table__.indexes
+        if index.name == "ix_job_logs_job_id_id"
+    )
+    log_index.create(bind=engine, checkfirst=True)
     print("数据库表创建成功")
 
 

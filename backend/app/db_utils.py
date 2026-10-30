@@ -138,6 +138,22 @@ def get_job_logs(db: Session, job_id: str, offset: int = 0, limit: int = 500) ->
     )
 
 
+def get_job_logs_after(db: Session, job_id: str, after_id: int = 0, limit: int = 501) -> list[JobLog]:
+    """按递增主键读取后续日志，避免轮询时重复扫描旧页。"""
+    return (
+        db.query(JobLog)
+        .filter(JobLog.job_id == job_id, JobLog.id > max(int(after_id), 0))
+        .order_by(JobLog.id)
+        .limit(limit)
+        .all()
+    )
+
+
+def count_job_logs(db: Session, job_id: str) -> int:
+    """仅统计旧版偏移分页所需的行数，不加载日志实体。"""
+    return int(db.query(JobLog.id).filter(JobLog.job_id == job_id).count())
+
+
 def delete_job_logs(db: Session, job_id: str) -> int:
     """删除指定任务的数据库日志，并返回删除条数。"""
     deleted = db.query(JobLog).filter(JobLog.job_id == job_id).delete(synchronize_session=False)

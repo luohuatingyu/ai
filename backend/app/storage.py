@@ -94,6 +94,19 @@ class ArtifactStore:
         data = self.read_bytes(key)
         return None if data is None else data.decode(encoding, errors="replace")
 
+    def get_size(self, key: str) -> Optional[int]:
+        """返回产物字节数；默认实现兼容未实现元数据读取的存储。"""
+        data = self.read_bytes(key)
+        return None if data is None else len(data)
+
+    def read_bytes_range(self, key: str, start: int, length: int) -> Optional[bytes]:
+        """读取指定字节范围；默认实现兼容不支持范围请求的存储。"""
+        data = self.read_bytes(key)
+        if data is None:
+            return None
+        begin = min(max(int(start), 0), len(data))
+        return data[begin:begin + max(int(length), 0)]
+
     def append_text(self, key: str, text: str, encoding: str = "utf-8") -> None:
         """追加文本（日志/metrics 使用）；key 不存在时等同写入。"""
         current = self.read_text(key, encoding) or ""
@@ -174,6 +187,23 @@ class LocalArtifactStore(ArtifactStore):
         if not path.is_file():
             return None
         return path.read_bytes()
+
+    def get_size(self, key: str) -> Optional[int]:
+        """用文件元数据获取日志大小，不读取文件内容。"""
+        path = self._path(key)
+        try:
+            return path.stat().st_size if path.is_file() else None
+        except FileNotFoundError:
+            return None
+
+    def read_bytes_range(self, key: str, start: int, length: int) -> Optional[bytes]:
+        """通过 seek 读取本地日志的指定字节区间。"""
+        path = self._path(key)
+        if not path.is_file():
+            return None
+        with path.open("rb") as source:
+            source.seek(max(int(start), 0))
+            return source.read(max(int(length), 0))
 
     def write_bytes(self, key: str, data: bytes) -> None:
         path = self._path(key)
@@ -257,6 +287,41 @@ class S3ArtifactStore(ArtifactStore):
         validate_key(key)
         try:
             response = self._client.get_object(self.bucket, key)
+            try:
+                return response.read()
+            finally:
+                response.close()
+                response.release_conn()
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return None
+            raise ArtifactStoreUnavailableError(
+                f"读取对象存储产物失败: {key}: {exc}"
+            ) from exc
+
+    def get_size(self, key: str) -> Optional[int]:
+        """使用 S3 对象元数据取大小，避免下载整个日志对象。"""
+        validate_key(key)
+        try:
+            return int(self._client.stat_object(self.bucket, key).size)
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return None
+            raise ArtifactStoreUnavailableError(
+                f"读取对象存储产物元数据失败: {key}: {exc}"
+            ) from exc
+
+    def read_bytes_range(self, key: str, start: int, length: int) -> Optional[bytes]:
+        """用 S3 Range GET 读取日志增量，响应关闭后及时归还连接。"""
+        validate_key(key)
+        begin = max(int(start), 0)
+        count = max(int(length), 0)
+        if count == 0:
+            return b""
+        try:
+            response = self._client.get_object(
+                self.bucket, key, offset=begin, length=count
+            )
             try:
                 return response.read()
             finally:

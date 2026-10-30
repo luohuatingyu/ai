@@ -658,7 +658,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;"
 const state = {
   datasets: [], datasetId: null, preview: null, previewOpen: false, previewError: false, previewRequest: 0,
   previewPage: 1, previewPageCount: 1, previewTotalRows: 0, previewReturnFocus: null,
-  jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
+  jobs: [], jobId: null, logOffset: 0, logCursor: null, activeTab: "curves",
   jobsModalOpen: false, jobsReturnFocus: null, jobPage: 1, historyPageCount: 1,
   charts: { loss: null, metric: null }, metricKind: null, activeChart: "loss",
   workerSlots: [], workerResourcesLoaded: false, workerResourcesError: false, detailRecord: null, retrySubmitting: false,
@@ -1680,6 +1680,7 @@ function selectJob(id, clearLog) {
     state.selectionVersion++;
     state.logVersion++;
     state.logOffset = 0;
+    state.logCursor = null;
     state.logUnread = 0;
     state.detailRecord = null;
     state.predictTemplateJob = null;
@@ -1999,23 +2000,35 @@ function renderCharts(j) {
 /* ---------- 日志 ---------- */
 // 同一游标只追加一次；暂停跟随时记录新行数而不移动阅读位置。
 async function tailLogs(id) {
-  const offset = state.logOffset, version = state.logVersion;
+  const offset = state.logOffset, cursor = state.logCursor, version = state.logVersion;
   const loadingKey = `${id}:${version}`;
   if (state.logsClearing || state.logLoading === loadingKey) return;
   state.logLoading = loadingKey;
+  let continueTail = false;
   try {
-    const data = await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs?offset=${offset}`, { cache: "no-store" });
-    if (id !== state.jobId || version !== state.logVersion || offset !== state.logOffset) return;
+    const data = await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs?cursor=${encodeURIComponent(cursor || "")}`, { cache: "no-store" });
+    if (id !== state.jobId || version !== state.logVersion || offset !== state.logOffset || cursor !== state.logCursor) return;
     const box = $("logBox"), top = box.scrollTop;
+    if (data.reset) {
+      box.textContent = "";
+      state.logUnread = 0;
+    }
+    if (data.next_cursor !== undefined) state.logCursor = data.next_cursor;
     if (data.lines.length) {
       box.textContent += data.lines.join("\n") + "\n";
-      state.logOffset = data.next_offset;
+      if (data.next_offset !== undefined) state.logOffset = data.next_offset;
       if ($("logFollow").checked) followLatestLogs();
       else { box.scrollTop = top; state.logUnread += data.lines.length; updateLogStatus(); }
     }
+    continueTail = Boolean(data.has_more && data.lines.length);
   } catch {
     if (id === state.jobId && version === state.logVersion) $("logStatus").textContent = "日志更新失败，稍后自动重试。";
-  } finally { if (state.logLoading === loadingKey) state.logLoading = null; }
+  } finally {
+    if (state.logLoading === loadingKey) state.logLoading = null;
+    if (continueTail && id === state.jobId && version === state.logVersion) {
+      setTimeout(() => tailLogs(id), 0);
+    }
+  }
 }
 
 // 以简短状态展示阅读模式和积累的新日志数量。
@@ -2042,6 +2055,7 @@ async function clearJobLogs() {
     await apiJson(`/api/jobs/${encodeURIComponent(id)}/logs`, { method: "DELETE" });
     if (id !== state.jobId || selection !== state.selectionVersion) return;
     state.logOffset = 0;
+    state.logCursor = null;
     state.logUnread = 0;
     $("logBox").textContent = "";
     updateLogStatus();
