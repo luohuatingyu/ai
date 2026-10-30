@@ -658,6 +658,8 @@ const state = {
   workerSlots: [], workerResourcesLoaded: false, workerResourcesError: false, detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
   remoteLogOperationId: null, remoteLogPollTimer: null,
+  resourceRefreshTimer: null, resourceRefreshJobs: new Map(),
+  workerRequestVersion: 0, workerSnapshot: null, remoteResourceResult: null,
   editingRemoteMachineId: null,
   trainSubmitting: false, trainError: "", trainingIssue: null,
   jobsRequest: 0, detailRequest: 0, detailLoading: null, selectionVersion: 0,
@@ -1392,6 +1394,9 @@ $("btnStart").onclick = async () => {
     const { job_id } = await apiJson("/api/train", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
+    const resourceIds = payload.parallel_workers?.map(member => member.worker_id)
+      || (payload.worker_id ? [payload.worker_id] : []);
+    requestTaskResourceRefresh(job_id, "starting", resourceIds);
     toast("训练任务已创建: " + job_id, "ok");
     $("jobSearch").value = "";
     $("jobStatusFilter").value = "all";
@@ -1527,6 +1532,96 @@ function closeJobsModal() {
   if (trigger && typeof trigger.focus === "function") trigger.focus();
 }
 
+const terminalJobStatuses = new Set(["completed", "failed", "cancelled", "paused"]);
+
+// 从当前执行记录提取槽位，供结束后的资源状态核对使用。
+function resourceWorkerIds(job) {
+  const hint = job.spec?.resource_hint || {};
+  const attempt = job.current_attempt || job.segments?.at(-1) || {};
+  const ids = [job.worker_id, job.retry_worker_id, hint.worker_id, attempt.worker_id];
+  for (const member of hint.parallel_workers || []) ids.push(member.worker_id);
+  for (const member of attempt.members || []) ids.push(member.worker_id);
+  return [...new Set(ids.filter(Boolean).map(String))];
+}
+
+// 判断指定任务是否已出现在资源心跳中，或其占用槽已释放/交接。
+function isResourceTaskReconciled(jobId, reconciliation) {
+  const workers = state.workerSlots || [];
+  if (reconciliation.phase === "starting") {
+    const assigned = workers.filter(worker => worker.active && String(worker.current_job || "") === jobId);
+    return reconciliation.workerIds.size
+      ? [...reconciliation.workerIds].every(id => assigned.some(worker => String(worker.worker_id) === id))
+      : assigned.length > 0;
+  }
+  if (workers.some(worker => String(worker.current_job || "") === jobId)) return false;
+  if (!reconciliation.workerIds.size) return true;
+  for (const workerId of reconciliation.workerIds) {
+    const worker = workers.find(item => String(item.worker_id) === workerId);
+    if (!worker || !worker.active) continue;
+    if (!worker.current_job && (worker.occupied
+        || ["starting", "training", "running", "reserved"].includes(worker.state))) return false;
+  }
+  return true;
+}
+
+// 合并任务的槽位并要求事件之后发起的新快照，恢复训练时允许重新进入启动协调。
+function requestTaskResourceRefresh(jobId, phase, workerIds = []) {
+  const id = String(jobId || "");
+  if (!id) return;
+  const previous = state.resourceRefreshJobs.get(id);
+  state.resourceRefreshJobs.set(id, {
+    phase,
+    workerIds: new Set([...(previous?.workerIds || []), ...workerIds.map(String).filter(Boolean)]),
+    startedAt: previous?.phase === phase ? previous.startedAt : Date.now(),
+    minRequestVersion: state.workerRequestVersion + 1,
+  });
+  refreshWorkers({ resourcesOnly: true });
+  scheduleResourceRefreshPoll();
+}
+
+// 短时轮询只请求 worker 快照；超时后由常规资源轮询继续维护页面。
+function scheduleResourceRefreshPoll() {
+  if (state.resourceRefreshTimer || !state.resourceRefreshJobs.size) return;
+  state.resourceRefreshTimer = setTimeout(() => {
+    state.resourceRefreshTimer = null;
+    settleResourceRefreshJobs();
+    if (state.resourceRefreshJobs.size) {
+      refreshWorkers({ resourcesOnly: true });
+      scheduleResourceRefreshPoll();
+    }
+  }, 500);
+}
+
+// 收敛或超过 12 秒后结束短时协调，避免持续轮询。
+function settleResourceRefreshJobs(requestVersion = 0) {
+  const now = Date.now();
+  for (const [jobId, reconciliation] of state.resourceRefreshJobs) {
+    if ((requestVersion >= reconciliation.minRequestVersion && isResourceTaskReconciled(jobId, reconciliation))
+        || now - reconciliation.startedAt >= 12000) {
+      state.resourceRefreshJobs.delete(jobId);
+    }
+  }
+  if (!state.resourceRefreshJobs.size && state.resourceRefreshTimer) {
+    clearTimeout(state.resourceRefreshTimer);
+    state.resourceRefreshTimer = null;
+  }
+}
+
+// 对比最近一次任务列表，捕获运行和结束转换并刷新相关资源槽。
+function observeResourceJobTransitions(jobs) {
+  const previous = new Map((state.jobs || []).map(job => [job.id, job]));
+  for (const job of jobs) {
+    const oldStatus = previous.get(job.id)?.status;
+    const workerIds = [...new Set([...resourceWorkerIds(previous.get(job.id) || {}), ...resourceWorkerIds(job)])];
+    if (oldStatus && job.status === "running" && oldStatus !== "running") {
+      requestTaskResourceRefresh(job.id, "starting", workerIds);
+    } else if ((oldStatus || state.resourceRefreshJobs.has(job.id))
+        && terminalJobStatuses.has(job.status) && oldStatus !== job.status) {
+      requestTaskResourceRefresh(job.id, "terminal", workerIds);
+    }
+  }
+}
+
 // 只采纳最近一次任务列表响应；短暂离线保留已有任务及当前选择。
 async function refreshJobs() {
   const request = ++state.jobsRequest;
@@ -1534,6 +1629,7 @@ async function refreshJobs() {
   try {
     const jobs = await apiJson("/api/jobs");
     if (request !== state.jobsRequest) return;
+    observeResourceJobTransitions(jobs);
     state.jobs = jobs;
     $("jobsFeedback").textContent = "";
     if (!state.jobId && state.jobs.length) {
@@ -2233,16 +2329,16 @@ function workerServerCard(machineId, slots, remoteServer = null) {
 }
 
 // 读取仅在当前会话授权的远程服务器状态，缓存操作结果以减少重复请求。
-async function loadRemoteServers() {
+async function loadRemoteServers(options = {}) {
   try {
-    const result = await apiJson("/api/remote-servers");
+    const result = await apiJson("/api/remote-servers", options);
     const servers = result.servers || [];
     for (const server of servers) {
       if (!server.operation_id) continue;
       let operation = state.remoteOperations.get(server.operation_id);
       if (!operation || ["queued", "running"].includes(operation.status)) {
         try {
-          operation = await apiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`);
+          operation = await apiJson(`/api/remote-operations/${encodeURIComponent(server.operation_id)}`, options);
           state.remoteOperations.set(server.operation_id, operation);
           if (["completed", "failed", "cancelled"].includes(operation.status) && !state.remoteOperationNotified.has(server.operation_id)) {
             state.remoteOperationNotified.add(server.operation_id);
@@ -2267,59 +2363,90 @@ async function loadRemoteServers() {
   }
 }
 
-// 刷新服务器和槽位状态，同时合并 SSH 登记记录与 worker 心跳信息。
-async function refreshWorkers() {
+// 从最近的资源快照渲染卡片，远程目录迟到时也使用最新槽位状态。
+function renderWorkerSnapshot() {
+  const d = state.workerSnapshot;
+  if (!d) return;
+  const workers = d.workers || [];
+  const grid = $("workerGrid");
+  const remoteResult = state.remoteResourceResult || { servers: state.remoteServers || [], error: null, authorized: true };
+  const groups = new Map();
+  for (const worker of workers) {
+    const machineId = worker.machine_id || worker.hostname || "未命名服务器";
+    if (!groups.has(machineId)) groups.set(machineId, []);
+    groups.get(machineId).push(worker);
+  }
+  const remoteById = new Map(remoteResult.servers.map((server) => [server.machine_id, server]));
+  for (const server of remoteResult.servers) if (!groups.has(server.machine_id)) groups.set(server.machine_id, []);
+  const servers = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b, "zh-CN"));
+  const cards = servers.map(([machineId, slots]) => workerServerCard(machineId, slots, remoteById.get(machineId))).join("");
+  const authorizationNote = !remoteResult.authorized
+    ? `<div class="empty">SSH 管理服务器需使用管理令牌查看。<a href="/server-manager.html">管理服务器</a></div>`
+    : remoteResult.error
+      ? `<div class="empty">远程服务器列表读取失败：${esc(remoteResult.error)}。请前往服务器管理检查连接。</div>` : "";
+  grid.innerHTML = cards + authorizationNote || `<div class="empty">尚未添加计算服务器。前往「服务器管理」添加服务器并部署计算资源。</div>`;
+  const onlineSlots = workers.filter((worker) => worker.active).length;
+  const selectedSlots = workers.filter((worker) => worker.active && worker.enabled).length;
+  const pendingSlots = workers.filter((worker) => worker.managed && worker.active && !worker.enabled).length;
+  const selectedGpuSlots = workers.filter((worker) => worker.active && worker.enabled && worker.gpu && worker.gpu.available).length;
+  const onlineServers = new Set(workers.filter((worker) => worker.active).map((worker) => worker.machine_id || worker.hostname)).size;
+  $("workerSummary").innerHTML = [
+    `<span class="chip">在线服务器 ${onlineServers}</span>`,
+    `<span class="chip">在线计算槽 ${onlineSlots}</span>`,
+    `<span class="chip">已加入资源池 ${selectedSlots}</span>`,
+    `<span class="chip">待选择 ${pendingSlots}</span>`,
+    `<span class="chip">远程服务器 ${remoteResult.servers.length}</span>`,
+  ].join("");
+  $("gpuResourceHint").textContent = selectedGpuSlots
+    ? `当前有 ${selectedGpuSlots} 个已启用 GPU 槽可接单。`
+    : "当前没有已启用的 GPU 槽；要求 GPU 的任务会排队等待。可先添加服务器并启用 GPU 槽。";
+  $("queueDepth").textContent = `队列 ${d.queue_depth ?? 0}`;
+}
+
+// 独立刷新远程目录，目录慢响应不能阻塞资源卡片和后续资源请求。
+async function refreshResourceServers() {
+  if (state.refreshingResourceServers) return;
+  state.refreshingResourceServers = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    state.remoteResourceResult = await loadRemoteServers({ signal: controller.signal, cache: "no-store" });
+    if (!state.workerResourcesError) renderWorkerSnapshot();
+  } finally {
+    clearTimeout(timeout);
+    state.refreshingResourceServers = false;
+  }
+}
+
+// 资源请求单独限时且禁止缓存；失败保留最近快照，恢复后继续采纳真实状态。
+async function refreshWorkers(options = {}) {
+  if (!options.resourcesOnly) refreshResourceServers();
   if (state.refreshingWorkers) return;
   state.refreshingWorkers = true;
+  const requestVersion = ++state.workerRequestVersion;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
   try {
-    const d = await apiJson("/api/workers");
-    const grid = $("workerGrid");
-    const workers = d.workers || [];
-    state.workerSlots = workers;
+    const d = await apiJson("/api/workers", { signal: controller.signal, cache: "no-store" });
+    state.workerSnapshot = d;
+    state.workerSlots = d.workers || [];
     state.workerResourcesLoaded = true;
     state.workerResourcesError = false;
     renderTrainingResources();
     renderParallelWorkers();
     updateStart();
     renderRetryControls(state.detailRecord);
-    const remoteResult = await loadRemoteServers();
-    const groups = new Map();
-    for (const worker of workers) {
-      const machineId = worker.machine_id || worker.hostname || "未命名服务器";
-      if (!groups.has(machineId)) groups.set(machineId, []);
-      groups.get(machineId).push(worker);
-    }
-    const remoteById = new Map(remoteResult.servers.map((server) => [server.machine_id, server]));
-    for (const server of remoteResult.servers) if (!groups.has(server.machine_id)) groups.set(server.machine_id, []);
-    const servers = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b, "zh-CN"));
-    const cards = servers.map(([machineId, slots]) => workerServerCard(machineId, slots, remoteById.get(machineId))).join("");
-    const authorizationNote = !remoteResult.authorized
-      ? `<div class="empty">SSH 管理服务器需使用管理令牌查看。<a href="/server-manager.html">管理服务器</a></div>`
-      : remoteResult.error
-        ? `<div class="empty">远程服务器列表读取失败：${esc(remoteResult.error)}。请前往服务器管理检查连接。</div>` : "";
-    grid.innerHTML = cards + authorizationNote || `<div class="empty">尚未添加计算服务器。前往「服务器管理」添加服务器并部署计算资源。</div>`;
-    const onlineSlots = workers.filter((worker) => worker.active).length;
-    const selectedSlots = workers.filter((worker) => worker.active && worker.enabled).length;
-    const pendingSlots = workers.filter((worker) => worker.managed && worker.active && !worker.enabled).length;
-    const selectedGpuSlots = workers.filter((worker) => worker.active && worker.enabled && worker.gpu && worker.gpu.available).length;
-    const onlineServers = new Set(workers.filter((worker) => worker.active).map((worker) => worker.machine_id || worker.hostname)).size;
-    $("workerSummary").innerHTML = [
-      `<span class="chip">在线服务器 ${onlineServers}</span>`,
-      `<span class="chip">在线计算槽 ${onlineSlots}</span>`,
-      `<span class="chip">已加入资源池 ${selectedSlots}</span>`,
-      `<span class="chip">待选择 ${pendingSlots}</span>`,
-      `<span class="chip">远程服务器 ${remoteResult.servers.length}</span>`,
-    ].join("");
-    $("gpuResourceHint").textContent = selectedGpuSlots
-      ? `当前有 ${selectedGpuSlots} 个已启用 GPU 槽可接单。`
-      : "当前没有已启用的 GPU 槽；要求 GPU 的任务会排队等待。可先添加服务器并启用 GPU 槽。";
-    $("queueDepth").textContent = `队列 ${d.queue_depth ?? 0}`;
+    renderWorkerSnapshot();
+    settleResourceRefreshJobs(requestVersion);
   } catch {
     state.workerResourcesError = true;
     renderTrainingResources(); updateStart();
     $("gpuResourceHint").textContent = "GPU 资源状态暂不可用，请检查连接后刷新。";
   } finally {
+    clearTimeout(timeout);
     state.refreshingWorkers = false;
+    settleResourceRefreshJobs();
+    scheduleResourceRefreshPoll();
   }
 }
 
