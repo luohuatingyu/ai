@@ -1515,6 +1515,9 @@ html {
 .training-page #allJobCount { margin-left: 5px; }
 .training-page .jobs-modal-card { width: min(900px, 100%); }
 .training-page .jobs-modal-body { min-height: 220px; }
+.training-page .jobs-modal-pagination { flex: none; padding-top: 12px; }
+.training-page .jobs-modal-pagination button { min-width: 92px; }
+.training-page .jobs-modal-pagination button:disabled { cursor: default; opacity: .45; }
 .training-page #allJobList { display: grid; gap: 8px; }
 .training-page .jobs-modal .jobcard { padding: 11px 13px; border-radius: 8px; box-shadow: none; }
 .training-page .jobs-modal .jobcard:hover { transform: none; }
@@ -1544,6 +1547,9 @@ html {
   .training-page .training-submit { bottom: 0; }
   .training-page .training-record-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .training-page .job-focus-heading { align-items: flex-start; }
+  .training-page .jobs-modal-pagination { gap: 7px; padding: 10px 12px 14px; }
+  .training-page .jobs-modal-pagination button { min-width: 0; padding: 7px 9px; }
+  .training-page .jobs-modal-pagination .preview-modal-page { font-size: 11px; }
 }
 
 .training-page .jobcard {

@@ -154,6 +154,102 @@ test('搜索和状态筛选组合在完整训练弹窗中工作，支持空列�
   f.state.jobs = []; f.context.renderJobList(); assert.match(f.$('allJobList').innerHTML, /暂无训练记录/);
 });
 
+// 覆盖不足一页、刚好一页与空集合，分页栏始终保留且按钮不能越界。
+for (const count of [0, 1, 9, 10]) test(`全部训练 ${count} 条时仍显示单页分页栏`, () => {
+  const f = fixture();
+  f.state.jobs = Array.from({ length: count }, (_, i) => job('job-' + i, 'completed'));
+  f.context.openJobsModal();
+  assert.equal(f.$('jobsModal').hidden, false);
+  const footer = html.match(/<div\b[^>]*id="jobsPagination"[^>]*>/)?.[0];
+  assert.ok(footer); assert.doesNotMatch(footer, /\bhidden\b|display\s*:\s*none/);
+  assert.equal(f.$('jobsPagination').hidden, false);
+  assert.equal(f.$('allJobList').children.length, count);
+  assert.equal(f.$('jobsPageStatus').textContent, `第 1 / 1 页 · ${count ? 1 : 0}-${count} / ${count} 条`);
+  assert.equal(f.$('jobsPrev').disabled, true); assert.equal(f.$('jobsNext').disabled, true);
+  f.$('jobsPrev').onclick(); f.$('jobsNext').onclick();
+  assert.equal(f.state.jobPage, 1);
+});
+
+test('全部训练每页十条，末页不足十条时仍展示准确范围和翻页按钮', () => {
+  const f = fixture();
+  f.state.jobs = Array.from({ length: 23 }, (_, i) => job('job-' + i, 'completed'));
+  f.state.jobId = 'job-0'; f.context.openJobsModal();
+  for (let page = 1; page <= 3; page++) {
+    const start = (page - 1) * 10, end = Math.min(page * 10, 23);
+    assert.deepEqual(f.$('allJobList').children.map(card => card.dataset.id), f.state.jobs.slice(start, end).map(item => item.id));
+    assert.equal(f.$('jobsPageStatus').textContent, `第 ${page} / 3 页 · ${start + 1}-${end} / 23 条`);
+    assert.equal(f.$('jobsPrev').disabled, page === 1); assert.equal(f.$('jobsNext').disabled, page === 3);
+    assert.equal(f.$('jobList').children.length, 1); assert.equal(f.$('jobList').children[0].dataset.id, 'job-0');
+    f.$('jobsNext').onclick();
+  }
+  assert.equal(f.state.jobPage, 3);
+  f.$('jobsPrev').onclick(); assert.equal(f.state.jobPage, 2);
+  assert.equal(f.$('allJobList').children[0].dataset.id, 'job-10');
+});
+
+// 搜索和状态筛选均要回到首页，并以筛选后的数量计算页数。
+for (const [field, event, value] of [['jobSearch', 'input', '销售'], ['jobStatusFilter', 'change', 'completed']]) {
+  test(`历史分页修改 ${field} 回到第一页，重置筛选保留当前训练`, () => {
+    const f = fixture();
+    f.state.jobs = Array.from({ length: 23 }, (_, i) => job('job-' + i, i < 12 ? 'completed' : 'running', i < 12 ? '销售' : '库存'));
+    f.state.jobId = 'job-22'; f.context.openJobsModal();
+    f.$('jobsNext').onclick(); f.$('jobsNext').onclick();
+    f.$(field).value = value; f.$(field).handlers[event]();
+    assert.equal(f.state.jobPage, 1); assert.equal(f.state.historyPageCount, 2);
+    assert.equal(f.$('jobsPageStatus').textContent, '第 1 / 2 页 · 1-10 / 12 条');
+    assert.equal(f.$('allJobList').children[0].dataset.id, 'job-0');
+    f.$('jobsNext').onclick(); assert.equal(f.$('allJobList').children.length, 2);
+    f.$('btnResetJobFilters').onclick();
+    assert.equal(f.state.jobPage, 1); assert.equal(f.state.historyPageCount, 3);
+    assert.equal(f.$('jobSearch').value, ''); assert.equal(f.$('jobStatusFilter').value, 'all');
+    assert.equal(f.document.activeElement, f.$('jobSearch')); assert.equal(f.state.jobId, 'job-22');
+    f.$('jobSearch').value = '没有匹配的名称'; f.$('jobSearch').handlers.input();
+    assert.equal(f.$('jobsPageStatus').textContent, '第 1 / 1 页 · 0-0 / 0 条');
+    assert.equal(f.$('jobsPagination').hidden, false);
+    assert.equal(f.$('jobsPrev').disabled, true); assert.equal(f.$('jobsNext').disabled, true);
+    assert.match(f.$('allJobList').innerHTML, /没有匹配的任务/);
+  });
+}
+
+test('历史轮询保留有效页和卡片焦点，记录减少时回退且请求失败保留列表', async () => {
+  const f = fixture();
+  const jobs = Array.from({ length: 23 }, (_, i) => job('job-' + i, 'completed'));
+  f.state.jobs = jobs; f.state.jobId = 'job-0';
+  f.context.fillPredictTemplate = () => {}; f.context.loadDetail = () => {};
+  f.context.openJobsModal(); f.$('jobsNext').onclick(); f.$('jobsNext').onclick();
+  const card = f.$('allJobList').children[0]; card.focus();
+  f.context.apiJson = async () => jobs; await f.context.refreshJobs();
+  assert.equal(f.state.jobPage, 3); assert.equal(f.$('allJobList').children[0], card);
+  assert.equal(f.document.activeElement, card);
+  for (const [count, page, range, firstId] of [[11, 2, '11-11 / 11', 'job-10'], [10, 1, '1-10 / 10', 'job-0'], [0, 1, '0-0 / 0', null]]) {
+    f.context.apiJson = async () => jobs.slice(0, count); await f.context.refreshJobs();
+    assert.equal(f.state.jobPage, page);
+    assert.equal(f.$('jobsPageStatus').textContent, `第 ${page} / ${page} 页 · ${range} 条`);
+    assert.equal(f.$('allJobList').children[0]?.dataset.id || null, firstId);
+    assert.equal(f.$('jobsNext').disabled, true);
+  }
+  f.context.apiJson = async () => jobs; await f.context.refreshJobs(); f.$('jobsNext').onclick();
+  f.context.apiJson = async () => { throw new Error('离线'); }; await f.context.refreshJobs();
+  assert.equal(f.state.jobPage, 2); assert.equal(f.$('allJobList').children[0].dataset.id, 'job-10');
+  assert.match(f.$('jobsFeedback').textContent, /离线.*保留列表/);
+});
+
+test('选择第二页训练关闭弹窗并更新当前详情，重新打开保留历史页码', async () => {
+  const f = fixture();
+  f.state.jobs = Array.from({ length: 23 }, (_, i) => job('job-' + i, 'completed'));
+  f.state.jobId = 'job-0';
+  const selected = f.state.jobs[10];
+  f.context.apiJson = async () => selected;
+  f.context.fillPredictTemplate = () => {};
+  f.context.openJobsModal(); f.$('jobsNext').onclick(); f.$('allJobList').children[0].onclick();
+  await f.state.detailLoading.promise;
+  assert.equal(f.state.jobId, 'job-10'); assert.equal(f.$('jobsModal').hidden, true);
+  assert.equal(f.$('jobList').children[0].dataset.id, 'job-10');
+  assert.equal(f.state.detailRecord.id, 'job-10');
+  f.context.openJobsModal(); assert.equal(f.state.jobPage, 2);
+  assert.equal(f.$('allJobList').children[0].attributes['aria-pressed'], 'true');
+});
+
 test('首次聚焦活跃任务，历史弹窗保留完整卡片并复用焦点', () => {
   const f = fixture(); f.state.jobs = [job('a'), job('b')]; f.state.jobId = 'b';
   assert.equal(f.context.preferredJob(f.state.jobs, null).id, 'a');

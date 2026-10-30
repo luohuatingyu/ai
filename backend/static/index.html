@@ -616,6 +616,11 @@
       <div class="job-list-feedback"><span id="historyCount" class="hint" role="status"></span></div>
       <div id="allJobList"><div class="empty">暂无训练记录</div></div>
     </div>
+    <div id="jobsPagination" class="preview-modal-pagination jobs-modal-pagination" aria-label="训练记录分页">
+      <button id="jobsPrev" type="button" aria-label="上一页训练记录" disabled>← 上一页</button>
+      <span id="jobsPageStatus" class="preview-modal-page" role="status" aria-live="polite">第 1 / 1 页 · 0-0 / 0 条</span>
+      <button id="jobsNext" type="button" aria-label="下一页训练记录" disabled>下一页 →</button>
+    </div>
   </div>
 </div>
 
@@ -648,7 +653,7 @@ const state = {
   datasets: [], datasetId: null, preview: null, previewOpen: false, previewError: false, previewRequest: 0,
   previewPage: 1, previewPageCount: 1, previewTotalRows: 0, previewReturnFocus: null,
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
-  jobsModalOpen: false, jobsReturnFocus: null,
+  jobsModalOpen: false, jobsReturnFocus: null, jobPage: 1, historyPageCount: 1,
   charts: { loss: null, metric: null }, metricKind: null, activeChart: "loss",
   workerSlots: [], workerResourcesLoaded: false, workerResourcesError: false, detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
@@ -1396,6 +1401,7 @@ $("btnStart").onclick = async () => {
 };
 
 const statusText = { queued: "排队中", running: "训练中", completed: "已完成", failed: "失败", cancelled: "已取消", paused: "已暂停" };
+const JOBS_PAGE_SIZE = 10;
 
 // 生成安全转义的任务卡片内容，外层节点由列表按任务 ID 复用。
 function jobCard(j) {
@@ -1468,7 +1474,7 @@ function renderJobCards(box, jobs, emptyText) {
   });
 }
 
-// 主区只展示当前任务；完整记录仍在弹窗中筛选和访问。
+// 主区只展示当前任务；弹窗先筛选后分页，单页和空结果也保留分页栏。
 function renderJobList() {
   const current = state.jobs.find(job => job.id === state.jobId);
   $("jobCount").textContent = current
@@ -1483,8 +1489,18 @@ function renderJobList() {
   const jobs = state.jobs.filter(job => (status === "all" || job.status === status)
     && [job.id, (job.spec || {}).dataset_name, (job.spec || {}).target, taskName((job.spec || {}).task)]
       .some(value => String(value || "").toLocaleLowerCase().includes(query)));
-  $("historyCount").textContent = "显示 " + jobs.length + " / " + state.jobs.length + " 个任务";
-  renderJobCards($("allJobList"), jobs, state.jobs.length ? "没有匹配的任务，请调整或重置筛选。" : "暂无训练记录");
+  // 轮询减少记录时回退到有效页，避免停留在不存在的末页。
+  state.historyPageCount = Math.max(1, Math.ceil(jobs.length / JOBS_PAGE_SIZE));
+  state.jobPage = Math.min(Math.max(1, state.jobPage), state.historyPageCount);
+  const firstJob = jobs.length ? (state.jobPage - 1) * JOBS_PAGE_SIZE + 1 : 0;
+  const lastJob = Math.min(state.jobPage * JOBS_PAGE_SIZE, jobs.length);
+  $("historyCount").textContent = "匹配 " + jobs.length + " / " + state.jobs.length + " 个任务";
+  $("jobsPageStatus").textContent = "第 " + state.jobPage + " / " + state.historyPageCount
+    + " 页 · " + firstJob + "-" + lastJob + " / " + jobs.length + " 条";
+  $("jobsPrev").disabled = state.jobPage <= 1;
+  $("jobsNext").disabled = state.jobPage >= state.historyPageCount;
+  const pageJobs = jobs.slice((state.jobPage - 1) * JOBS_PAGE_SIZE, state.jobPage * JOBS_PAGE_SIZE);
+  renderJobCards($("allJobList"), pageJobs, state.jobs.length ? "没有匹配的任务，请调整或重置筛选。" : "暂无训练记录");
 }
 
 // 打开全部训练弹窗并把焦点移到搜索框。
@@ -2380,9 +2396,12 @@ $("jobsModal").addEventListener("click", event => {
 document.addEventListener("keydown", event => {
   if (event.key === "Escape" && state.jobsModalOpen) closeJobsModal();
 });
-$("jobSearch").addEventListener("input", renderJobList);
-$("jobStatusFilter").addEventListener("change", renderJobList);
-$("btnResetJobFilters").onclick = () => { $("jobSearch").value = ""; $("jobStatusFilter").value = "all"; renderJobList(); $("jobSearch").focus(); };
+// 筛选变更回到首页；页边界同时通过按钮状态和点击守卫限制。
+$("jobSearch").addEventListener("input", () => { state.jobPage = 1; renderJobList(); });
+$("jobStatusFilter").addEventListener("change", () => { state.jobPage = 1; renderJobList(); });
+$("jobsPrev").onclick = () => { if (state.jobPage > 1) { state.jobPage--; renderJobList(); } };
+$("jobsNext").onclick = () => { if (state.jobPage < state.historyPageCount) { state.jobPage++; renderJobList(); } };
+$("btnResetJobFilters").onclick = () => { $("jobSearch").value = ""; $("jobStatusFilter").value = "all"; state.jobPage = 1; renderJobList(); $("jobSearch").focus(); };
 $("btnLocateTrainingIssue").onclick = focusTrainingIssue;
 $("btnLatestLogs").onclick = followLatestLogs;
 $("logFollow").addEventListener("change", () => { if ($("logFollow").checked) followLatestLogs(); else updateLogStatus(); });
