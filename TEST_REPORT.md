@@ -3475,7 +3475,7 @@ docker run --rm --pull=never --network none \
 
 ### Git 基准点与范围
 
-- **Commit Hash**：052b3f6（Focus training workbench on current run）。
+- **Commit Hash**：a5fdf78（Preserve training page navigation cleanup）。
 - **测试日期 / 分支**：2026-10-30 / emdash/hot-boxes-clean-y9u6p。
 - **变更范围**：训练台主区默认聚焦运行中/排队中/暂停中的任务，仅显示当前任务；“全部训练”弹窗保留全部历史搜索、状态筛选和切换；详情新增完整训练记录页，展示参数、生命周期、执行资源与分段、逐轮指标、性能及错误。未修改 API、数据格式或依赖。
 
