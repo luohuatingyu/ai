@@ -1,3 +1,61 @@
+## 本次变更测试结果：训练开始与结束后及时刷新计算资源（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：2dec090139f548f74b7606109ffffccb46329c62。
+- **提交信息**：Synchronize training resource card state。
+- **测试日期 / 分支**：2026-10-30 / emdash/hot-boxes-clean-y9u6p。
+- **范围与技术**：原生 JavaScript；修改 backend/static/index.html 和正式测试 frontend/training-resources.test.cjs。任务创建成功、进入 running 或 completed/failed/cancelled/paused 时立即请求资源快照，以 500ms 间隔短时核对槽位状态，最长持续 12 秒；之后继续原有常规轮询。
+- **关键行为**：按服务端快照确认任务接手、槽位释放或交接；联合训练等待全部指定槽位确认。资源请求禁止缓存并在 5 秒后中止；远程服务器目录独立刷新，不阻塞资源卡片。错误保留最近卡片和已有选择。
+- **提交边界**：只提交上述两个文件的资源刷新相关增量；保留进度展示、服务器管理和存储模块等并行改动。未修改接口、依赖、配置和数据格式，未执行 git push。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级 / 前置条件与输入 | 可执行用例与预期业务结果 | 场景 |
+|---|---|---|---|
+| 创建后立即核对资源 | 前端交互；选择 CPU，训练接口返回 created | training-resources.test.cjs「创建任务成功后立即触发资源协调刷新并限定到指定槽」；携带任务 ID 和所选槽位触发启动协调 | 正常、兼容 |
+| 开始和结束均触发刷新 | 前端交互；queued→running→completed、四种终态、恢复运行 | 「任务从排队转入运行或终态时触发对应资源协调刷新」和参数化「刚提交的短任务首次列出就是…时仍协调资源；恢复后重新协调启动」；启动、终态、短任务和恢复进入正确协调阶段 | 正常、边界、回归 |
+| 确认真实占用或释放后停止 | 前端异步；返回空闲、原任务占用、释放和新任务接手快照 | 「快速轮询真实更新训练和释放卡片，收敛后清除定时器且只请求 worker」「终态刷新等待接口确认目标槽释放，或确认槽已接手其他任务」；卡片显示真实状态，仍占用时不能误判为空闲 | 正常、状态冲突、回归 |
+| 慢响应不能提前结束新协调 | 前端异步；事件前发出的慢请求迟到，再返回旧任务和新任务快照 | 「常规慢请求返回的旧快照不能结束刚发起的终态协调」；只允许事件后发起的快照确认收敛 | 竞态、异常、兼容 |
+| 远程目录不阻塞卡片 | 前端异步；目录挂起，资源由训练变为空闲，目录最后返回 | 「远程目录慢响应不阻塞资源渲染，迟到目录采用最新资源快照」；资源及时渲染，迟到目录不回写旧状态 | 依赖延迟、回归 |
+| 错误和超时保留信息且可恢复 | 前端异步；已有卡片和选择，分别模拟网络错误、5 秒超时、后续成功 | 参数化「资源请求 error/timeout 保留卡片和选择，有限重试结束后手动刷新可恢复」；错误不清空卡片/选择、不用旧快照确认释放，恢复后展示空闲 | 异常、超时、恢复 |
+| 轮询有上限且兼容联合训练 | 前端计时；排队超过 12 秒，联合训练先只有一个槽报告任务 | 「首次加载历史任务不触发转换刷新，资源协调最多持续 12 秒」「排队超过上限不再快速轮询；联合训练全部槽报告任务后才停止」；历史加载不触发协调，超时清理定时器，联合任务需全部槽确认 | 空集合、时间边界、联合训练 |
+| 原有业务与安全行为不回归 | 完整前端及 Python 3.12 后端套件 | 沿用资源名称转义、无效选择、GPU 容量、重复提交、管理权限、数据双布局、训练指标/模型及预测一致性断言；不新增授权或数据处理分支 | 安全、兼容、回归 |
+
+### 测试执行结果
+
+| 阶段 / 实际命令 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 资源专项 node --test frontend/training-resources.test.cjs | 41 | 41 | 0 | 0 | 0 |
+| 前端完整 node --test frontend/*.test.cjs | 160 | 160 | 0 | 0 | 0 |
+| Python 3.12 后端完整 pytest | 648 | 617 | 0 | 0 | 31 |
+
+- 专项及完整前端通过率 100%；后端已执行的 617 项全部通过，耗时 133.72 秒。31 项按既有条件跳过，未计作通过；2 条既有弃用警告来自 SQLAlchemy declarative_base 和 pandas xlrd。未删除、跳过或弱化有效测试。
+- 测试针对共享工作区执行；服务器管理等并行未提交变更未纳入本次提交，结果不作为这些并行功能的独立验收。相对上一报告基准 1e69d42，本次提交没有 backend/app/ 业务变更。
+- docker compose up --build -d 已成功完成；交付前 docker compose ps 确认 frontend/SeaweedFS 健康、trainer/worker 运行。
+- curl -fsS http://localhost:8000/api/health 返回 {"ok":true}。额外通过 Node fetch 和 assert 检查健康接口、首页资源协调函数及 no-store 标记、/api/workers 状态码与 workers 数组，全部通过；服务返回 3 个槽位。
+- 未创建宿主机临时脚本或调试文件。pytest 临时目录位于一次性 --rm 容器的 /tmp/mtp-resource-refresh-full，随容器退出清理；没有提交运行时产物。
+
+实际执行命令（项目根目录）：
+
+~~~bash
+node --test frontend/training-resources.test.cjs
+node --test frontend/*.test.cjs
+docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-resource-refresh-full --tb=short -rs
+docker compose up --build -d
+docker compose ps
+curl -fsS http://localhost:8000/api/health
+git diff --check
+git diff --cached --check
+~~~
+
+### 已知限制、重测建议与回滚
+
+- 实际资源状态仍取决于服务端心跳和网络。任务状态转换由原有 1.5 秒列表轮询发现，不能保证后端变化发生瞬间页面同步；12 秒短时协调到期后继续原有常规资源轮询。
+- 未执行真实浏览器点击和截图，也未针对本次前端改动重新发起真实 GPU/多机训练；HTTP、DOM 与计时测试已覆盖刷新行为。未配置真实 Redis、S3、GPU/NCCL 和 Supervisor 多进程集成条件，31 项相关用例需在对应环境补验。
+- 修改任务状态观察、资源心跳结构或资源请求协调逻辑时，重跑资源专项、完整前端及相关后端回归并重建容器；真实部署建议补验训练开始、完成、暂停、失败、恢复和多槽交接。
+- 回滚可撤销 2dec090 与对应测试报告提交，再执行 docker compose up --build -d；没有数据迁移。
+
 ## 本次变更测试结果：全部训练分页与常驻分页栏（2026-10-30）
 
 ### Git 基准点与范围
