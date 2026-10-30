@@ -49,33 +49,45 @@ function fixture() {
   }
   const $ = id => { if (!nodes.has(id)) nodes.set(id, element(id)); return nodes.get(id); };
   const tabs = ['curves', 'record', 'logs', 'result', 'predict'].map(name => { const node = element('detail-tab-' + name); node.dataset.tab = name; nodes.set(node.id, node); return node; });
-  document.querySelectorAll = () => tabs;
+  const chartTabs = [...html.matchAll(/<button\b[^>]*data-chart="([^"]+)"[^>]*>/g)].map(match => {
+    const node = $('chart-tab-' + match[1]); node.dataset.chart = match[1]; return node;
+  });
+  document.querySelectorAll = selector => selector === '.chart-tabs button' ? chartTabs : tabs;
   document.createElement = () => element();
   $('taskSelect').value = 'classification'; $('targetSelect').value = 'target';
   $('timeColumnSelect').value = 'time'; $('p_parallel').value = 'single'; $('p_dataset_source').value = 'local';
   $('jobStatusFilter').value = 'all'; $('logFollow').checked = true;
   const state = { datasetId: 'dataset', datasets: [], jobs: [], workerSlots: [], jobId: null, logOffset: 0,
     activeTab: 'curves', trainSubmitting: false, detailRequest: 0, jobsRequest: 0, logRequest: 0,
+    jobPage: 1, historyPageCount: 1, resourceRefreshJobs: new Map(), charts: {}, activeChart: 'loss',
     selectionVersion: 0, logVersion: 0, predictTemplateRequest: 0, logUnread: 0 };
   const requests = [];
-  const context = vm.createContext({ $, state, document, window: {}, console,
+  // 只隔离画布绘制，图表数据与训练结果继续使用真实渲染函数。
+  function Chart(node, config) {
+    Object.assign(this, config); this.resizes = 0; this.update = () => {};
+    this.resize = () => { this.resizes++; };
+  }
+  Chart.defaults = { font: {}, plugins: { legend: { labels: {} } } };
+  const context = vm.createContext({ $, state, document, window: {}, console, Chart, AbortSignal,
     esc: value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
     taskName: task => task, fmtLoss: String, fmtTime: String, jobResourceLabel: () => '', resourceText: () => '',
-    toast() {}, renderResourceAllocation() {}, renderRetryControls() {}, renderCharts() {}, renderResult() {},
+    toast() {}, renderResourceAllocation() {}, renderRetryControls() {},
     retryFailedJob() {}, confirm: () => false, setTimeout: () => 1, clearTimeout() {}, location: {},
     apiJson: async (url, options) => { requests.push({ url, options }); return { job_id: 'created' }; },
   });
   // 按稳定的页面区段加载函数；不执行初始化轮询，也不替代被测业务逻辑。
   const sections = [
-    ['function performanceNumber(', 'function renderCharts('],
+    ['/* ---------- 图表 ---------- */', '/* ---------- 日志 ---------- */'],
     ['function updateStart()', '/* 上传 */'],
     ['const taskSelect =', '/* ---------- 图表 ---------- */'],
     ['/* ---------- 日志 ---------- */', '/* ---------- 结果 ---------- */'],
+    ['/* ---------- 结果 ---------- */', '/* ---------- 预测 ---------- */'],
     ['async function fillPredictTemplate()', '$("btnPredict").onclick'],
     ['/* ---------- Tab 切换 ---------- */', '/* ---------- 启动 ---------- */'],
   ];
   for (const [start, end] of sections) vm.runInContext(html.slice(html.indexOf(start), html.indexOf(end)), context);
-  return { context, nodes, $, state, requests, document, tabs };
+  $('lossChart').previousElementSibling = element();
+  return { context, nodes, $, state, requests, document, tabs, chartTabs };
 }
 
 // 可控响应顺序用于复现重复提交、快速切换和轮询竞争。
@@ -211,13 +223,97 @@ for (const failure of [false, true]) test(`切换后旧详情${failure ? '失败
   await old; assert.equal(f.state.jobId, 'b'); assert.equal(f.$('dName').textContent, '当前 B'); assert.equal(f.$('detail').hidden, false);
 });
 
-test('同一任务乱序详情只应用最新响应；当前网络错误保留已有内容并提示', async () => {
+test('重新选择同一任务后乱序详情只应用最新响应；当前网络错误保留已有内容并提示', async () => {
   const f = fixture(), first = deferred(), second = deferred(); f.state.jobId = 'a';
   let count = 0; f.context.apiJson = () => (++count === 1 ? first.promise : second.promise);
-  const a = f.context.loadDetail(), b = f.context.loadDetail(); second.resolve(job('a', 'completed', '最新')); await b;
+  const a = f.context.loadDetail(); f.state.selectionVersion++;
+  const b = f.context.loadDetail(); second.resolve(job('a', 'completed', '最新')); await b;
   first.resolve(job('a', 'running', '旧')); await a; assert.match(f.$('dName').textContent, /最新/);
   f.context.apiJson = async () => { throw new Error('离线'); }; await f.context.loadDetail();
   assert.equal(f.state.jobId, 'a'); assert.match(f.$('detailFeedback').textContent, /离线/);
+});
+
+// 已完成任务提供可核对的真实业务指标，避免仅断言渲染函数被调用。
+function completedJob(id = 'a') {
+  return { ...job(id, 'completed'), metrics: [{ epoch: 1, train_loss: 0.4, val_accuracy: 0.85 }],
+    summary: { best_epoch: 1, epochs_total: 1, final: { val_accuracy: 0.85, val_loss: 0.3 },
+      rows: { train: 80, val: 20 }, features: 4, duration_sec: 2, device: 'cpu' } };
+}
+
+for (const tab of ['record', 'result']) test(`切换${tab}时立即显示已加载详情，慢请求与失败不会清空内容`, async () => {
+  const f = fixture(), pending = deferred(); f.state.jobId = 'a'; f.state.detailRecord = completedJob();
+  f.context.apiJson = () => pending.promise;
+  f.context.activateDetailTab(tab);
+  const box = f.$(tab === 'record' ? 'trainingRecord' : 'resultBox');
+  assert.match(box.innerHTML, tab === 'record' ? /逐轮训练指标[\s\S]*0.85/ : /验证准确率[\s\S]*85.00%/);
+  const before = box.innerHTML;
+  pending.reject(new Error('网络超时')); await f.context.loadDetail();
+  assert.equal(box.innerHTML, before); assert.match(f.$('detailFeedback').textContent, /网络超时/);
+});
+
+test('慢详情请求在连续轮询与切换标签期间合并，完成后展示记录并允许重试', async () => {
+  const f = fixture(), pending = deferred(); f.state.jobId = 'a'; let count = 0, options;
+  f.context.apiJson = (url, opt) => { count++; options = opt; return pending.promise; };
+  const first = f.context.loadDetail();
+  for (let i = 0; i < 5; i++) f.context.loadDetail();
+  f.context.activateDetailTab('record');
+  assert.equal(count, 1); assert.equal(options.cache, 'no-store'); assert.ok(options.signal instanceof AbortSignal);
+  pending.resolve(completedJob()); await first;
+  assert.match(f.$('trainingRecord').innerHTML, /逐轮训练指标[\s\S]*0.85/);
+  assert.equal(f.state.detailLoading, null);
+  f.context.apiJson = async () => { throw new Error('离线'); }; await f.context.loadDetail();
+  assert.equal(f.state.detailLoading, null); assert.match(f.$('detailFeedback').textContent, /离线/);
+  f.context.apiJson = async () => completedJob(); await f.context.loadDetail();
+  assert.equal(f.$('detailFeedback').textContent, '');
+});
+
+test('旧任务请求挂起不阻塞新任务，迟到响应不清除新请求或展示旧记录', async () => {
+  const f = fixture(), old = deferred(), current = deferred(); f.state.jobId = 'a';
+  f.state.detailRecord = completedJob('a');
+  f.context.apiJson = url => url.endsWith('/a') ? old.promise : current.promise;
+  const a = f.context.loadDetail(); f.state.jobId = 'b'; f.state.selectionVersion++;
+  f.context.activateDetailTab('record');
+  assert.doesNotMatch(f.$('trainingRecord').innerHTML, /0.85/);
+  const b = f.context.loadDetail(); old.resolve(completedJob('a')); await a;
+  assert.equal(f.state.detailLoading.id, 'b');
+  current.resolve(completedJob('b')); await b;
+  assert.equal(f.state.detailRecord.id, 'b'); assert.match(f.$('trainingRecord').innerHTML, /<dd>b<\/dd>/);
+});
+
+test('曲线二级标签只展示一张图，保留数据与外层选择，并重算可见画布尺寸', () => {
+  const f = fixture(); f.state.jobId = 'a'; f.state.detailRecord = completedJob();
+  f.context.loadDetail = () => {};
+  assert.equal(f.chartTabs.length, 4);
+  for (const tab of f.chartTabs) {
+    tab.onclick();
+    assert.equal(f.state.activeChart, tab.dataset.chart); assert.equal(f.state.activeTab, 'curves');
+    assert.equal(f.chartTabs.filter(button => !f.$('chart-panel-' + button.dataset.chart).hidden).length, 1);
+    assert.equal(tab.attributes['aria-selected'], 'true');
+    assert.ok(f.state.charts[tab.dataset.chart].resizes > 0);
+    assert.equal(f.state.charts.loss.data.datasets[0].data[0], 0.4);
+  }
+  f.context.activateDetailTab('record'); f.context.activateDetailTab('curves');
+  assert.equal(f.state.activeChart, 'phases'); assert.equal(f.$('chart-panel-loss').hidden, true);
+  f.context.activateChartTab('invalid'); assert.equal(f.state.activeChart, 'phases');
+});
+
+test('曲线标签支持方向键、Home、End，焦点与面板同步且不改变外层标签', () => {
+  const f = fixture(); assert.equal(f.chartTabs.length, 4);
+  const key = (index, name) => f.chartTabs[index].handlers.keydown({ key: name, preventDefault() {} });
+  key(0, 'ArrowLeft'); assert.equal(f.state.activeChart, 'phases'); assert.equal(f.document.activeElement, f.chartTabs[3]);
+  key(3, 'ArrowRight'); assert.equal(f.state.activeChart, 'loss');
+  key(0, 'End'); assert.equal(f.state.activeChart, 'phases');
+  key(3, 'Home'); assert.equal(f.state.activeChart, 'loss'); assert.equal(f.state.activeTab, 'curves');
+});
+
+test('曲线页面初始只显示 Loss，其余三张图有可访问的独立面板', () => {
+  const panels = [...html.matchAll(/<div\b[^>]*id="chart-panel-([^"]+)"[^>]*>/g)];
+  assert.equal(panels.length, 4);
+  assert.deepEqual(panels.filter(match => !/\bhidden\b/.test(match[0])).map(match => match[1]), ['loss']);
+  for (const panel of panels) {
+    assert.match(panel[0], /role="tabpanel"/);
+    assert.ok(panel[0].includes('aria-labelledby="chart-tab-' + panel[1] + '"'));
+  }
 });
 
 test('暂停日志跟随保留阅读位置，回到最新恢复跟随并清除未读', async () => {

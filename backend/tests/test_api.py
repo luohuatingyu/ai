@@ -1545,7 +1545,7 @@ def test_training_page_resource_retry_and_chart_style_contract():
     assert "grid-column: 1 / -1" in css
     assert ".training-page #llmFields > .formgrid" in css
     assert "repeat(auto-fit, minmax(min(100%, 210px), 1fr))" in css
-    assert 'href="/app.css?v=20261029-management-tabs-1"' in html
+    assert 'href="/app.css?v=20261030-curve-tabs-1"' in html
 
 
 def test_remote_server_feedback_toasts_render_above_add_modal():

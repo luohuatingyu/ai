@@ -326,7 +326,7 @@
   /* 资源选择按训练方式切换，避免布局类覆盖原生 hidden 行为。 */
   #trainingResourceField[hidden], #parallelPanel[hidden] { display:none; }
 </style>
-<link rel="stylesheet" href="/app.css?v=20261030-training-focus-1">
+<link rel="stylesheet" href="/app.css?v=20261030-curve-tabs-1">
 </head>
 <body class="training-page">
 
@@ -553,13 +553,21 @@
       </div>
 
       <div role="tabpanel" aria-labelledby="detail-tab-curves" tabindex="0" id="tab-curves">
-        <div class="chartbox"><h3>Loss（训练 / 验证）</h3><canvas id="lossChart" height="150"></canvas></div>
-        <div class="chartbox"><h3 id="metricTitle">验证指标</h3><canvas id="metricChart" height="130"></canvas></div>
+        <div class="chart-tabs" role="tablist" aria-label="选择训练曲线">
+          <button id="chart-tab-loss" type="button" role="tab" data-chart="loss" aria-controls="chart-panel-loss" aria-selected="true" tabindex="0" class="active">Loss</button>
+          <button id="chart-tab-metric" type="button" role="tab" data-chart="metric" aria-controls="chart-panel-metric" aria-selected="false" tabindex="-1">验证指标</button>
+          <button id="chart-tab-throughput" type="button" role="tab" data-chart="throughput" aria-controls="chart-panel-throughput" aria-selected="false" tabindex="-1">训练吞吐</button>
+          <button id="chart-tab-phases" type="button" role="tab" data-chart="phases" aria-controls="chart-panel-phases" aria-selected="false" tabindex="-1">阶段耗时</button>
+        </div>
+        <div class="chartbox" role="tabpanel" aria-labelledby="chart-tab-loss" tabindex="0" id="chart-panel-loss"><h3>Loss（训练 / 验证）</h3><canvas id="lossChart" height="150"></canvas></div>
+        <div class="chartbox" role="tabpanel" aria-labelledby="chart-tab-metric" tabindex="0" id="chart-panel-metric" hidden><h3 id="metricTitle">验证指标</h3><canvas id="metricChart" height="130"></canvas></div>
+        <div class="chartbox" role="tabpanel" aria-labelledby="chart-tab-throughput" tabindex="0" id="chart-panel-throughput" hidden><h3 id="throughputTitle">训练吞吐</h3><canvas id="throughputChart" height="130"></canvas></div>
+        <div class="chartbox" role="tabpanel" aria-labelledby="chart-tab-phases" tabindex="0" id="chart-panel-phases" hidden><h3>每轮阶段耗时（秒）</h3><canvas id="phaseChart" height="130"></canvas></div>
         <div class="hint" id="chartNote"></div>
-        <div id="performanceSummary" class="performance-summary" aria-live="polite"></div>
-        <div class="chartbox"><h3 id="throughputTitle">训练吞吐</h3><canvas id="throughputChart" height="130"></canvas></div>
-        <div class="chartbox"><h3>每轮阶段耗时（秒）</h3><canvas id="phaseChart" height="130"></canvas></div>
-        <div class="hint">训练耗时包含供数与通信；断点发布包含上传及确认等待。GPU 利用率曲线位于计算槽卡片。</div>
+        <div id="chartPerformance" hidden>
+          <div id="performanceSummary" class="performance-summary" aria-live="polite"></div>
+          <div class="hint">训练耗时包含供数与通信；断点发布包含上传及确认等待。GPU 利用率曲线位于计算槽卡片。</div>
+        </div>
       </div>
 
       <div role="tabpanel" aria-labelledby="detail-tab-record" tabindex="0" id="tab-record" hidden>
@@ -641,13 +649,13 @@ const state = {
   previewPage: 1, previewPageCount: 1, previewTotalRows: 0, previewReturnFocus: null,
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
   jobsModalOpen: false, jobsReturnFocus: null,
-  charts: { loss: null, metric: null }, metricKind: null,
+  charts: { loss: null, metric: null }, metricKind: null, activeChart: "loss",
   workerSlots: [], workerResourcesLoaded: false, workerResourcesError: false, detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
   remoteLogOperationId: null, remoteLogPollTimer: null,
   editingRemoteMachineId: null,
   trainSubmitting: false, trainError: "", trainingIssue: null,
-  jobsRequest: 0, detailRequest: 0, selectionVersion: 0,
+  jobsRequest: 0, detailRequest: 0, detailLoading: null, selectionVersion: 0,
   logVersion: 0, logUnread: 0, logLoading: null, predictTemplateRequest: 0,
   remoteCredentials: [], remoteCredentialDefaultId: null, remoteCredentialsCanConfigure: false,
 };
@@ -1544,6 +1552,7 @@ function selectJob(id, clearLog) {
     state.detailRecord = null;
     state.predictTemplateJob = null;
     $("logBox").textContent = "";
+    $("trainingRecord").innerHTML = "";
     $("resultBox").innerHTML = '<div class="empty">任务完成后展示评估结果</div>';
     $("predictInput").value = "";
     $("predictOut").hidden = true;
@@ -1556,12 +1565,23 @@ function selectJob(id, clearLog) {
 }
 
 /* ---------- 详情 ---------- */
-// 请求编号与选择版本共同防止旧响应覆盖当前任务。
-async function loadDetail() {
-  const id = state.jobId, selection = state.selectionVersion, request = ++state.detailRequest;
-  if (!id) return;
+// 同一次任务选择共用未完成的请求，避免轮询不断作废慢响应；切换任务仍可立即加载。
+function loadDetail() {
+  const id = state.jobId, selection = state.selectionVersion;
+  if (!id) return Promise.resolve();
+  if (state.detailLoading?.id === id && state.detailLoading.selection === selection) return state.detailLoading.promise;
+  const pending = { id, selection, request: ++state.detailRequest, promise: null };
+  state.detailLoading = pending;
+  pending.promise = fetchDetail(id, selection, pending.request).finally(() => {
+    if (state.detailLoading === pending) state.detailLoading = null;
+  });
+  return pending.promise;
+}
+
+// 请求编号与选择版本隔离迟到响应，超时后释放请求以便后续轮询重试。
+async function fetchDetail(id, selection, request) {
   let j;
-  try { j = await apiJson(`/api/jobs/${encodeURIComponent(id)}`); }
+  try { j = await apiJson(`/api/jobs/${encodeURIComponent(id)}`, { cache: "no-store", signal: AbortSignal.timeout(15000) }); }
   catch (error) {
     if (id === state.jobId && selection === state.selectionVersion && request === state.detailRequest) $("detailFeedback").textContent = "详情更新失败：" + error.message + "；稍后自动重试。";
     return;
@@ -1622,6 +1642,13 @@ async function loadDetail() {
   $("dProgressText").innerHTML = ptxt;
 
   j.metrics = j.metrics || [];
+  renderActiveDetail();
+}
+
+// 切换标签直接使用当前任务已加载的数据，后台刷新失败也保留可读的记录和结果。
+function renderActiveDetail() {
+  const j = state.detailRecord;
+  if (!j || j.id !== state.jobId) return;
   renderPerformanceSummary(j);
   if (state.activeTab === "curves") renderCharts(j);
   if (state.activeTab === "record") renderTrainingRecord(j);
@@ -1691,6 +1718,7 @@ function renderTrainingRecord(job) {
 }
 
 /* ---------- 图表 ---------- */
+// 复用各图表实例与数据，由曲线标签控制可见面板。
 function ensureCharts() {
   if (typeof Chart === "undefined") {
     $("chartNote").textContent = "图表组件（Chart.js CDN）未加载，检查浏览器网络后刷新。";
@@ -1770,9 +1798,12 @@ function renderPerformanceSummary(job) {
     `断点发布 ${performanceNumber(latest.checkpoint_publish_seconds, 3, " s")}`;
 }
 
+// 切换曲线后重算可见画布尺寸，隐藏图表同步数据但不占据页面高度。
 function renderCharts(j) {
   if (!ensureCharts()) return;
-  const m = j.metrics;
+  const activeChart = state.activeChart || "loss";
+  state.charts[activeChart].resize();
+  const m = j.metrics || [];
   const labels = m.map((r) => r.epoch);
   const loss = state.charts.loss;
   loss.data.labels = labels;
@@ -1811,8 +1842,10 @@ function renderCharts(j) {
   metric.data.labels = labels;
   metric.data.datasets[0].data = m.map((r) => r[key]);
   metric.update("none");
-  $("chartNote").textContent = m.length ? "" : "暂无数据，任务启动后每个 epoch 更新一条记录。";
   const performance = Array.isArray(j.performance) ? j.performance : [];
+  const isPerformance = activeChart === "throughput" || activeChart === "phases";
+  $("chartNote").textContent = (isPerformance ? performance.length : m.length) ? "" : isPerformance
+    ? "暂无性能数据；历史任务可能未采集。" : "暂无数据，任务启动后每个 epoch 更新一条记录。";
   const tokenRate = ["llm_pretraining", "llm_sft"].includes(j.spec.task);
   const rateKey = tokenRate ? "tokens_per_second" : "samples_per_second";
   const throughput = state.charts.throughput;
@@ -1884,6 +1917,7 @@ async function clearJobLogs() {
 }
 
 /* ---------- 结果 ---------- */
+// 按任务类型展示已保存的评估指标，未完成任务保留明确的空状态。
 function renderResult(j) {
   const box = $("resultBox");
   const s = j.summary;
@@ -2268,6 +2302,7 @@ function activateDetailTab(name, focus = false) {
     $("tab-" + button.dataset.tab).hidden = !selected;
     if (selected && focus) button.focus();
   });
+  renderActiveDetail();
   if (state.jobId) loadDetail();
   if (state.jobId && name === "logs") tailLogs(state.jobId);
 }
@@ -2283,6 +2318,38 @@ document.querySelectorAll(".tabs button").forEach((button, index, tabs) => {
     else return;
     event.preventDefault();
     activateDetailTab(tabs[next].dataset.tab, true);
+  });
+});
+
+// 曲线标签独立于外层详情标签，一次只显示一个面板并保留用户的选择。
+function activateChartTab(name, focus = false) {
+  const buttons = [...document.querySelectorAll(".chart-tabs button")];
+  if (!buttons.some(button => button.dataset.chart === name)) return;
+  state.activeChart = name;
+  buttons.forEach(button => {
+    const selected = button.dataset.chart === name;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+    button.setAttribute("tabindex", selected ? "0" : "-1");
+    $("chart-panel-" + button.dataset.chart).hidden = !selected;
+    if (selected && focus) button.focus();
+  });
+  $("chartPerformance").hidden = name !== "throughput" && name !== "phases";
+  renderActiveDetail();
+}
+
+// 二级标签使用独立的键盘导航，方向键与首尾键不影响外层详情标签。
+document.querySelectorAll(".chart-tabs button").forEach((button, index, tabs) => {
+  button.onclick = () => activateChartTab(button.dataset.chart);
+  button.addEventListener("keydown", event => {
+    let next;
+    if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    activateChartTab(tabs[next].dataset.chart, true);
   });
 });
 $("btnOpenJobs").onclick = openJobsModal;

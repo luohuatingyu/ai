@@ -1614,6 +1614,42 @@ html {
   background: #f5f8ff;
 }
 
+/* 曲线二级标签共用一块绘图区；窄屏允许横向滚动，保持单图高度。 */
+.training-page .chart-tabs {
+  display: flex;
+  gap: 4px;
+  max-width: 100%;
+  margin-bottom: 12px;
+  padding: 4px;
+  overflow-x: auto;
+  border: 1px solid #e0e8f2;
+  border-radius: 10px;
+  background: #f4f7fb;
+}
+.training-page .chart-tabs button {
+  flex: 1 0 auto;
+  min-height: 36px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #60718a;
+  box-shadow: none;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.training-page .chart-tabs button.active {
+  border-color: #dce6f5;
+  background: #fff;
+  color: var(--accent-strong);
+  font-weight: 650;
+  box-shadow: 0 1px 4px rgba(30, 57, 95, .06);
+}
+.training-page .chart-tabs button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .training-page .chartbox,
 .training-page .stat,
 .training-page #predictOut {

@@ -13,7 +13,7 @@ function fixture() {
     if (!nodes.has(id)) nodes.set(id, { textContent: '', previousElementSibling: { textContent: '' } });
     return nodes.get(id);
   };
-  function Chart(node, config) { Object.assign(this, config); this.update = () => {}; }
+  function Chart(node, config) { Object.assign(this, config); this.update = () => {}; this.resize = () => {}; }
   Chart.defaults = { font: {}, plugins: { legend: { labels: {} } } };
   const context = vm.createContext({ $, Chart, state: { charts: {} }, console });
   vm.runInContext(html.slice(html.indexOf('function ensureCharts()'), html.indexOf('/* ---------- 日志 ---------- */')), context);
@@ -68,4 +68,16 @@ test('吞吐、阶段曲线与旧任务切换保持数据和单位一致', () =>
   assert.equal(c.state.charts.throughput.data.datasets[0].data.length, 0);
   assert.equal(c.state.charts.phases.data.datasets[0].data.length, 0);
   assert.match($('throughputTitle').textContent, /samples\/s/);
+});
+
+for (const activeChart of ['loss', 'metric', 'throughput', 'phases']) test(`曲线 ${activeChart} 的空状态使用自身数据，缺失图表组件仍可恢复`, () => {
+  const { context: c, $ } = fixture(); c.state.activeChart = activeChart;
+  const job = { spec: { task: 'classification' }, metrics: [{ epoch: 1, train_loss: 0.5, val_accuracy: 0.8 }], performance: [] };
+  const Chart = c.Chart; c.Chart = undefined; c.renderCharts(job);
+  assert.match($('chartNote').textContent, /未加载/);
+  c.Chart = Chart; c.renderCharts(job);
+  assert.equal($('chartNote').textContent, ['throughput', 'phases'].includes(activeChart) ? '暂无性能数据；历史任务可能未采集。' : '');
+  job.metrics = []; c.renderCharts(job);
+  assert.match($('chartNote').textContent, /暂无/);
+  assert.equal(c.state.charts.loss.data.datasets[0].data.length, 0);
 });
