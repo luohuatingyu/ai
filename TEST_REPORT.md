@@ -1,3 +1,30 @@
+## 本次变更测试结果：emdash/hot-boxes-clean-y9u6p 合并至 master（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：06625a9（Merge branch 'emdash/hot-boxes-clean-y9u6p'）。
+- **测试日期 / 分支**：2026-10-30 / master。
+- **范围**：纯合并提交，无新业务变更。合并前分支侧已按 576daa4 基准完成全量测试（见上节）；master 独有变更仅 `PLATFORM_REPLACEMENT.md` 与 `TEST_REPORT.md` 两个文档,合并中 `TEST_REPORT.md` 的"Git基准点"区段按双方内容交集保留（union），其余文件全部自动合并。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 验证方式与输入 | 预期结果 | 场景 |
+|---|---|---|---|
+| 合并后业务代码与已测版本一致 | `git diff 576daa4 06625a9 -- backend/app/ backend/tests/ frontend/ --stat` 为空 | 无需重跑测试，576daa4 的测试结论直接适用；实际验证输出为空，仅 `TEST_REPORT.md` +85 行 | 兼容、回归 |
+| 合并冲突无遗漏标记 | `grep -c "^<<<<<<<\|^=======$\|^>>>>>>>" TEST_REPORT.md` | 0 | 边界 |
+
+### 测试执行结果
+
+- 使用分支侧 576daa4 基准的既有全量结果：后端 690 收集（658 通过、1 既有失败、31 跳过）、前端 184/184 通过。
+- 合并 worktree（master 侧）未重新构建 Compose：master 业务代码与当前运行容器（worktree 栈镜像 `emdash-hot-boxes-clean-y9u6p-*`）完全一致，且两个栈共用固定 `container_name`，重建会中断在运行服务；如需在 master checkout 独立验证，请先停现有 worktree 栈再执行 `docker compose up --build -d`。
+
+实际执行命令：`git -C /Users/xyzc/github/ai diff 576daa4 06625a9 -- backend/app/ backend/tests/ frontend/ --stat`（输出为空）；冲突标记计数检查 0。
+
+### 已知限制、重测建议与回滚
+
+- 本合并未引入新代码差异，无需回滚；如需撤销整个合并，`git revert -m 1 06625a9`。
+- 后续 master 侧 `backend/app/` 变更时按常规触发重测并重建 Compose。
+
 ## 本次变更测试结果：日志游标分页、S3 故障可重试与训练记录展示修正（2026-10-30）
 
 ### Git 基准点与范围
