@@ -1752,7 +1752,7 @@ def test_training_page_resource_retry_and_chart_style_contract():
     assert "grid-column: 1 / -1" in css
     assert ".training-page #llmFields > .formgrid" in css
     assert "repeat(auto-fit, minmax(min(100%, 210px), 1fr))" in css
-    assert 'href="/app.css?v=20261030-curve-tabs-1"' in html
+    assert 'href="/app.css?v=20261030-training-record-2"' in html
 
 
 def test_remote_server_feedback_toasts_render_above_add_modal():
@@ -1786,7 +1786,8 @@ def test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_are
     assert 'id="remoteServerForm" class="server-form" novalidate' in modal
     assert 'form="remoteServerForm"' in modal.split('id="btnSubmitRemoteServer"', 1)[1].split(">", 1)[0]
     assert 'id="remoteServerError"' in modal
-    assert 'id="btnManageRemoteCredentials"' in modal
+    assert 'id="btnManageRemoteCredentials"' not in modal
+    assert 'id="btnRefreshRemoteCredentials"' in modal
     assert 'id="remoteCredentialStatus"' in modal
     assert "#addServerModal .server-modal-body" in css
     assert "overscroll-behavior: contain" in css
