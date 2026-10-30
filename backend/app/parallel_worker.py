@@ -114,6 +114,9 @@ def run_rank_process(request: dict, controller, log_fn, on_epoch_end=None, on_ch
             # 每个 rank 进程只计算模型；任务记录和数据库日志均由父 worker 发布。
             environment.update({"USE_DATABASE": "false", "PYTHONUNBUFFERED": "1"})
             process = subprocess.Popen([sys.executable, "-m", "app.parallel_worker", str(request_path)], env=environment, stdout=output, stderr=subprocess.STDOUT)
+            sampler = getattr(controller, "resource_sampler", None)
+            if sampler is not None:
+                sampler.set_pid(process.pid)
             previous_signal = ""
             last_progress = time.monotonic()
             output_size = 0
@@ -195,6 +198,9 @@ def run_rank_process(request: dict, controller, log_fn, on_epoch_end=None, on_ch
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        sampler = getattr(controller, "resource_sampler", None)
+        if sampler is not None:
+            sampler.set_pid(os.getpid())
         for path in (request_path, events_path, control_path, control_path.with_suffix(".tmp"), output_path, ack_path):
             path.unlink(missing_ok=True)
 
@@ -220,6 +226,9 @@ def rank_main(request_path: str) -> int:
     """子进程入口：初始化进程组、执行现有训练器，并输出结构化结果。"""
     from app.parallel import ParallelContext
     from app.trainer import JobCancelled, JobPaused, load_trainer_state, run_training
+    from app.performance import configure_torch_threads
+
+    configure_torch_threads()
 
     request = json.loads(Path(request_path).read_text(encoding="utf-8"))
     # Linux 父 worker 异常退出时立即结束 rank，避免遗留 GPU 计算进程。

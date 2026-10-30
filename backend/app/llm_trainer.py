@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 import pandas as pd
 import torch
+from app.performance import EpochPerformance
 from torch import nn
 
 from app.device import backend_from_device, seed_device, select_device
@@ -289,9 +290,9 @@ def _batches(items: list, batch_size: int, seed: int, epoch: int):
 def _collate(items: list[dict], pad_id: int, device: torch.device) -> dict[str, torch.Tensor]:
     """将可变长度 token 序列补齐为模型输入张量。"""
     width = max(len(item["input_ids"]) for item in items)
-    input_ids = torch.full((len(items), width), int(pad_id), dtype=torch.long)
-    attention_mask = torch.zeros((len(items), width), dtype=torch.long)
-    labels = torch.full((len(items), width), -100, dtype=torch.long)
+    input_ids = torch.full((len(items), width), int(pad_id), dtype=torch.long, pin_memory=device.type == "cuda")
+    attention_mask = torch.zeros((len(items), width), dtype=torch.long, pin_memory=device.type == "cuda")
+    labels = torch.full((len(items), width), -100, dtype=torch.long, pin_memory=device.type == "cuda")
     for index, item in enumerate(items):
         size = len(item["input_ids"])
         input_ids[index, :size] = torch.tensor(item["input_ids"], dtype=torch.long)
@@ -299,9 +300,9 @@ def _collate(items: list[dict], pad_id: int, device: torch.device) -> dict[str, 
         item_labels = item.get("labels", item["input_ids"])
         labels[index, :len(item_labels)] = torch.tensor(item_labels, dtype=torch.long)
     return {
-        "input_ids": input_ids.to(device),
-        "attention_mask": attention_mask.to(device),
-        "labels": labels.to(device),
+        "input_ids": input_ids.to(device, non_blocking=device.type == "cuda"),
+        "attention_mask": attention_mask.to(device, non_blocking=device.type == "cuda"),
+        "labels": labels.to(device, non_blocking=device.type == "cuda"),
     }
 
 
@@ -640,6 +641,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
     epoch = start_epoch
     record = {}
     for epoch in range(start_epoch + 1, epochs + 1):
+        performance = EpochPerformance(epoch, "group" if parallel is not None else "single")
         if parallel is not None and parallel.control(cancel_event, pause_event, allow_pause=True):
             if parallel.primary:
                 _write_checkpoint(_checkpoint_state(task, params, epoch - 1, best_score, best_epoch, model, optimizer, value_head), job_dir, epoch - 1, on_checkpoint)
@@ -653,11 +655,16 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
             value_head.train()
         losses, extra_metrics = [], []
         weights = []
+        steps = 0
+        samples_seen = 0
+        train_started = time.perf_counter()
         batches = _batches(train_examples, batch_size, seed, epoch) if parallel is None else (
             [train_examples[index] for index in indices]
             for indices in parallel.indices(len(train_examples), epoch)
         )
         for batch in batches:
+            steps += 1
+            samples_seen += len(batch)
             if parallel is not None:
                 parallel.control(cancel_event, pause_event)
             elif cancel_event.is_set() or pause_event.is_set():
@@ -668,7 +675,8 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
                 continue
             if task in {"llm_pretraining", "llm_sft"}:
                 encoded = _collate(batch, tokenizer.pad_token_id, device)
-                weight = int((encoded["labels"][:, 1:] != -100).sum().item())
+                # 标签尚在 CPU 样本中，直接计数有效目标，避免为一个整数同步 GPU。
+                weight = sum(sum(value != -100 for value in item.get("labels", item["input_ids"])[1:]) for item in batch)
                 output = model(**encoded)
                 loss = output.loss
                 optimizer.zero_grad(set_to_none=True)
@@ -678,7 +686,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
                     optimizer.step()
                 else:
                     parallel.step(optimizer, weight, max_norm=1.0)
-                losses.append(float(loss.detach().cpu()))
+                losses.append(float(loss.detach()) if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64))
                 weights.append(weight)
             elif task == "llm_dpo":
                 loss, preference_accuracy = _dpo_loss(model, reference, batch, tokenizer, beta, device)
@@ -689,8 +697,8 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
                     optimizer.step()
                 else:
                     parallel.step(optimizer, len(batch), max_norm=1.0)
-                losses.append(float(loss.detach().cpu()))
-                extra_metrics.append(float(preference_accuracy.detach().cpu()))
+                losses.append(float(loss.detach()) if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64))
+                extra_metrics.append(float(preference_accuracy.detach()) if device.type == "cpu" else preference_accuracy.detach())
                 weights.append(len(batch))
             else:
                 metrics = _ppo_update(
@@ -713,11 +721,15 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
 
         model.eval()
         if parallel is None:
-            epoch_loss = sum(losses) / len(losses)
+            epoch_loss = float(sum(losses) / len(losses))
         else:
-            loss_sum, weight_sum = parallel.totals([sum(loss * weight for loss, weight in zip(losses, weights)), sum(weights)])
+            loss_sum, weight_sum = parallel.totals([float(sum(loss * weight for loss, weight in zip(losses, weights))), sum(weights)])
             epoch_loss = loss_sum / max(weight_sum, 1)
+            samples_seen = int(parallel.totals([samples_seen])[0])
+        performance.record["train_seconds"] = time.perf_counter() - train_started
+        effective_tokens = int(weight_sum if parallel is not None else sum(weights)) if task in {"llm_pretraining", "llm_sft"} else None
         record = {"epoch": epoch, "train_loss": epoch_loss}
+        validation_started = time.perf_counter()
         if task in {"llm_pretraining", "llm_sft"}:
             validation_losses = []
             validation_weights = []
@@ -736,11 +748,12 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
                 val_loss = parallel.json_from_primary(val_loss)
             record["val_loss"] = val_loss
             record["perplexity"] = math.exp(min(val_loss, 80.0))
+            performance.record["validation_seconds"] = time.perf_counter() - validation_started
             score = -val_loss
         elif task == "llm_dpo":
-            accuracy = sum(extra_metrics) / max(len(extra_metrics), 1)
+            accuracy = float(sum(extra_metrics) / max(len(extra_metrics), 1))
             if parallel is not None:
-                correct, count = parallel.totals([sum(value * weight for value, weight in zip(extra_metrics, weights)), sum(weights)])
+                correct, count = parallel.totals([float(sum(value * weight for value, weight in zip(extra_metrics, weights))), sum(weights)])
                 accuracy = correct / max(count, 1)
             record["preference_accuracy"] = accuracy
             score = -epoch_loss
@@ -759,15 +772,21 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
         record["train_loss"] = round(float(record["train_loss"]), 6)
         if parallel is None or parallel.primary:
             _write_metric(job_dir, record)
-        if on_epoch_end is not None:
-            on_epoch_end(record)
         if best_score is None or score > float(best_score):
             best_score, best_epoch = float(score), epoch
             if parallel is None or parallel.primary:
-                _save_bundle(model, tokenizer, job_dir)
+                with performance.measure("checkpoint_save_seconds"):
+                    _save_bundle(model, tokenizer, job_dir)
         if parallel is None or parallel.primary:
-            state = _checkpoint_state(task, params, epoch, best_score, best_epoch, model, optimizer, value_head)
-            _write_checkpoint(state, job_dir, epoch, on_checkpoint)
+            with performance.measure("checkpoint_save_seconds"):
+                state = _checkpoint_state(task, params, epoch, best_score, best_epoch, model, optimizer, value_head)
+                _write_checkpoint(state, job_dir, epoch, None)
+            if on_checkpoint is not None:
+                with performance.measure("checkpoint_publish_seconds"):
+                    on_checkpoint(epoch)
+            performance.write(job_dir, samples_seen, steps, effective_tokens)
+        if on_epoch_end is not None:
+            on_epoch_end(record)
         log_fn(f"[epoch {epoch}/{epochs}] train_loss={record['train_loss']:.4f}")
         if parallel is not None:
             parallel.control(cancel_event, pause_event, allow_pause=True)

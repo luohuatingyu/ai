@@ -79,6 +79,9 @@ def test_worker_completes_job(store, make_dataset, make_job, q, ls, spawn_worker
     assert store.exists(job_key(job, "best.pt"))
     assert store.exists(job_key(job, "preprocessor.json"))
     assert rec["summary"]["epochs_total"] == 4
+    performance_rows = jobstore.parse_metrics_text(store.read_text(job_key(job, "performance.jsonl")) or "")
+    assert [row["epoch"] for row in performance_rows] == [1, 2, 3, 4]
+    assert performance_rows[-1]["samples_per_second"] > 0
     assert rec["segments"] and rec["segments"][0]["worker_id"] == w.worker.worker_id
     assert rec["segments"][0]["machine_id"] == w.worker.caps["machine_id"]
     assert rec["segments"][0]["slot"] == w.worker.caps["slot"]

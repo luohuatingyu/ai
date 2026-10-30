@@ -63,6 +63,29 @@ def test_health_and_system(client):
     assert "device" in sysinfo
 
 
+def test_performance_detail_and_resource_heartbeat(client):
+    """性能产物按详情加载，旧任务为空；采样数据经过真实心跳/API 保留未知值。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "performance-" + uuid4().hex
+    worker_id = "telemetry-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed", "spec": {"params": {"epochs": 1}}})
+    try:
+        assert client.get(f"/api/jobs/{job_id}").json()["performance"] == []
+        row = {"epoch": 1, "samples_per_second": 12.5, "checkpoint_publish_seconds": .2}
+        manager.store.write_bytes(job_key(job_id, "performance.jsonl"), (json.dumps(row) + "\nbad partial line\n").encode())
+        assert client.get(f"/api/jobs/{job_id}").json()["performance"] == [row]
+        manager.lease.register_worker(worker_id, {"worker_id": worker_id}, 30)
+        resources = {"latest": {"sampled_at": time.time(), "host_cpu_percent": 0, "gpu": {"utilization_percent": None}}, "history": []}
+        manager.lease.heartbeat_worker(worker_id, {"resources": resources}, 30)
+        item = next(item for item in client.get("/api/workers").json()["workers"] if item["worker_id"] == worker_id)
+        assert item["resources"] == resources
+    finally:
+        manager.lease.deregister_worker(worker_id)
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
 def test_running_job_logs_are_immediately_visible_and_uncacheable(client):
     """运行中的追加日志应立即可读，响应不得被浏览器或代理缓存。"""
     from uuid import uuid4

@@ -178,6 +178,9 @@ def job_detail(job_id: str) -> dict:
         raise HTTPException(404, "任务不存在")
 
     data = api_view(record, include_metrics=True, include_summary=True, store=manager.store)
+    data["performance"] = jobstore.parse_metrics_text(
+        manager.store.read_text(job_key(job_id, "performance.jsonl")) or ""
+    )
     metrics = data.get("metrics") or []
     epochs_total = (record.get("spec") or {}).get("params", {}).get("epochs", 0)
     current_epoch = metrics[-1]["epoch"] if metrics else 0

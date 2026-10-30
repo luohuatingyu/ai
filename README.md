@@ -171,6 +171,16 @@ STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:9000 S3_ACCESS_KEY=... S3_SECRET_KEY=
 
 ### 4. Worker 进程模型（也可在裸机 GPU 服务器直接跑）
 
+#### 性能与资源观测
+
+计算槽卡片每五秒采样一次资源，保留当前 worker 生命周期内最近 120 个样本（约十分钟）。展示主机 CPU 使用率、当前计算进程使用核数/RSS、主机可用内存、PyTorch 线程预算；NVIDIA 设备按 UUID 匹配 `nvidia-smi` 的利用率和显存用量。采样在独立线程运行，超时不会阻塞租约心跳。驱动工具缺失、不支持的设备指标显示 `—`，超过二十秒或节点离线时标记旧样本。主机 CPU 是整机口径，不应将同一主机各槽显示的百分比相加；嵌入式 worker 的进程指标包含共享 API 进程，联合训练则采集实际 rank PID。
+
+任务详情增加吞吐和阶段耗时曲线。性能记录保存在独立 `performance.jsonl`，不改动原有 loss/accuracy 等指标或 checkpoint 格式；续训时按恢复的 epoch 回滚性能曲线。分类、回归、聚类和时序报告 samples/s；LLM 预训练/SFT 额外报告有效目标 tokens/s，DPO/PPO 报告输入样本吞吐。每步耗时为训练批次（PPO 为 rollout 批次）的平均墙钟耗时，包含供数与通信；联合任务展示全组样本吞吐及主节点观察到的耗时。断点保存与发布分别计时，发布包括上传、清理和跨进程确认等待；分项不包含所有日志及收尾开销。旧任务没有性能文件时显示未采集。
+
+Supervisor 按 CPU 亲和性、容器 CPU 配额和总计算槽数分摊线程预算，并向每个子进程传递 `WORKER_TORCH_THREADS`、`OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS`。已有更小的正整数限制会保留，非法值启动时报错；预算至少为 1，它不是 CPU 绑核或硬隔离。GPU 槽同样分配 CPU 预算。独立 rank 沿用父 worker 预算，嵌入式线程不修改进程级线程设置。
+
+CUDA 训练使用 pinned memory 与非阻塞传输，并将训练 loss 留在设备侧累积到 epoch 边界再读取；CPU 路径及默认批大小、精度、优化器保持原有行为。性能收益必须在目标设备上对照验证，本功能不预设提速百分比。
+
 ```bash
 cd backend
 REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:9000 python -m app.worker

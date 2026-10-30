@@ -42,6 +42,7 @@ from app.storage import (
     prune_checkpoints,
     resolve_dataset_for_worker,
 )
+from app.performance import ResourceSampler, configure_torch_threads, thread_environment
 from app.trainer import JobCancelled, JobPaused, load_trainer_state, run_training
 from app.parallel_worker import make_group, run_rank_process, select_members, slot_key
 from app.device import device_info, probe_device
@@ -317,6 +318,7 @@ class JobController:
         self._epoch = 0
         self._state = "starting"
         self.resources: list[tuple[str, str]] = []
+        self.resource_sampler = None
 
     def set_progress(self, epoch: int, state: str = "training") -> None:
         """训练循环回调：更新当前进度（心跳里上报给 /api/workers 展示）。"""
@@ -387,7 +389,8 @@ class JobController:
                     self.pause_event.set()
                 self._lease_store.heartbeat_worker(
                     self._worker_id,
-                    {"current_job": self._job_id, "epoch": self._epoch, "state": self._state},
+                    {"current_job": self._job_id, "epoch": self._epoch, "state": self._state,
+                     "resources": self.resource_sampler.snapshot() if self.resource_sampler else None},
                     self._hb_ttl,
                 )
             except Exception:
@@ -423,7 +426,8 @@ class GroupMemberController(JobController):
                 if "pause" in signals:
                     self.pause_event.set()
                 self._lease_store.heartbeat_worker(self._worker_id,
-                    {"current_job": self._job_id, "state": "training", "epoch": self._epoch}, self._hb_ttl)
+                    {"current_job": self._job_id, "state": "training", "epoch": self._epoch,
+                     "resources": self.resource_sampler.snapshot() if self.resource_sampler else None}, self._hb_ttl)
             except Exception:
                 self._mark_lease_lost()
                 return
@@ -457,6 +461,7 @@ class TrainingWorker:
         self._gpu_probe_enabled = (
             config.WORKER_GPU_PROBE if gpu_probe_enabled is None else gpu_probe_enabled
         )
+        self._resource_sampler = ResourceSampler(str(self.caps.get("device") or "cpu"))
 
     # ------------------------------------------------------------------
     # 对外
@@ -491,6 +496,7 @@ class TrainingWorker:
         """
         hb_ttl = max(config.WORKER_LEASE_TTL * 2.0, config.WORKER_HEARTBEAT_INTERVAL * 3.0)
         self.lease_store.register_worker(self.worker_id, self.caps, hb_ttl)
+        self._resource_sampler.start()
         gpu = self.caps.get("gpu") or {}
         device_label = f"{gpu.get('backend', 'gpu')}({gpu.get('name')})" if gpu.get("available") else "cpu"
         self._log(
@@ -508,6 +514,7 @@ class TrainingWorker:
                     self._log(f"worker {self.worker_id}: 协调面异常，稍后重试: {exc}")
                     self._shutdown.wait(self._idle_poll)
         finally:
+            self._resource_sampler.stop()
             self.lease_store.deregister_worker(self.worker_id)
             self._log(f"worker {self.worker_id} 已退出")
 
@@ -531,6 +538,7 @@ class TrainingWorker:
                 "machine_id": self.caps.get("machine_id"),
                 "slot": self.caps.get("slot"),
                 "managed": bool(self.caps.get("managed")),
+                "resources": self._resource_sampler.snapshot(),
             },
             hb_ttl,
         )
@@ -576,6 +584,7 @@ class TrainingWorker:
     def _join_parallel_group(self, group: dict, assignment: str) -> None:
         """跟随主节点清单运行独立 rank，绝不写入共享模型或任务终态。"""
         controller = GroupMemberController(self.lease_store, group, self.worker_id, assignment)
+        controller.resource_sampler = self._resource_sampler
         self._controller = controller
         scratch = config.WORKER_SCRATCH_DIR / f"member-{group['group_id']}-{self.worker_id}" / group["job_id"]
         try:
@@ -690,6 +699,7 @@ class TrainingWorker:
             self.lease_store, job_id, token, self.worker_id,
             config.WORKER_HEARTBEAT_INTERVAL, config.WORKER_LEASE_TTL,
         )
+        controller.resource_sampler = self._resource_sampler
         self._controller = controller
         try:
             controller.start()
@@ -826,7 +836,7 @@ class TrainingWorker:
                     pass
 
             # 拉取历史产物到 scratch：日志/指标延续既有内容，best.pt 供最终报告加载
-            for name in ("log.txt", "metrics.jsonl", "best.pt", "best_model.zip"):
+            for name in ("log.txt", "metrics.jsonl", "performance.jsonl", "best.pt", "best_model.zip"):
                 key = job_key(job_id, name)
                 if store.exists(key):
                     store.read_file(key, scratch / name)
@@ -852,6 +862,13 @@ class TrainingWorker:
             # （resume_state 为空时回滚到 0——孤儿进度清空，重试曲线不会出现重复 epoch）
             truncated = jobstore.truncate_metrics_to_epoch(store, job_id, resumed_epoch)
             (scratch / "metrics.jsonl").write_text(truncated, encoding="utf-8")
+            # 性能曲线同样以已恢复断点为准，避免重试后出现重复轮次。
+            performance_path = scratch / "performance.jsonl"
+            if performance_path.exists():
+                rows = jobstore.parse_metrics_text(performance_path.read_text(encoding="utf-8"))
+                kept = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows if int(row.get("epoch", 0)) <= resumed_epoch)
+                performance_path.write_text(kept, encoding="utf-8")
+                store.write_file(job_key(job_id, "performance.jsonl"), performance_path)
             segment_start = (int(resume_state.get("epoch", 0)) + 1) if resume_state else 1
             current_attempt["from_epoch"] = segment_start
             jobstore.update_job(store, job_id, current_attempt=current_attempt)
@@ -880,6 +897,8 @@ class TrainingWorker:
                 reconcile_log_revision()
                 store.write_file(job_key(job_id, "metrics.jsonl"), scratch / "metrics.jsonl")
                 store.write_file(job_key(job_id, "log.txt"), scratch / "log.txt")
+                if (scratch / "performance.jsonl").exists():
+                    store.write_file(job_key(job_id, "performance.jsonl"), scratch / "performance.jsonl")
                 controller.set_progress(int(rec.get("epoch", 0)), "training")
 
             def on_checkpoint(epoch_done: int) -> None:
@@ -1122,7 +1141,7 @@ class TrainingWorker:
         store = store or self.store
         try:
             for name in (
-                "metrics.jsonl", "log.txt", "best.pt", "last.pt",
+                "metrics.jsonl", "performance.jsonl", "log.txt", "best.pt", "last.pt",
                 "preprocessor.json", "best_model.zip",
             ):
                 artifact = scratch / name
@@ -1212,7 +1231,7 @@ class WorkerSupervisor:
     # ------------------------------------------------------------------
     def _spawn(self, slot: str, gpu_index: Optional[str]) -> "subprocess.Popen":
         """启动一个卡槽子进程，并按后端隔离 CUDA/ROCm 或 XPU 设备。"""
-        env = dict(os.environ)
+        env = thread_environment(os.environ, len(self._slots))
         env.pop("_", None)  # 防止个别环境变量干扰 torch 启动偏好
         backend = self._slot_backends.get(slot, "cpu")
         if gpu_index is not None and backend == "cpu":
@@ -1401,6 +1420,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- 卡槽子进程模式：本进程绑定单卡，注册后进入领取循环 ----
     if args.slot is not None:
+        configure_torch_threads()
         machine_id = config.WORKER_MACHINE_ID or socket.gethostname()
         worker_prefix = config.WORKER_ID or machine_id
         slot_worker_id = f"{worker_prefix}-{args.slot}"

@@ -169,6 +169,10 @@
   .resource-slot { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px;
     padding:10px 11px; border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.42); }
   .resource-slot.enabled { border-color:rgba(63,185,80,.35); }
+  .resource-stats { margin-top:8px; display:flex; flex-wrap:wrap; gap:5px 14px; color:var(--muted); font-size:12px; }
+  .resource-history { margin-top:6px; max-width:360px; }
+  .resource-history svg { display:block; width:100%; height:44px; }
+  .performance-summary { padding:10px 12px; margin:12px 0; background:var(--panel); border:1px solid var(--border); border-radius:8px; line-height:1.8; }
   .slot-main { min-width:0; }
   .slot-title { display:flex; align-items:center; gap:7px; font-weight:650; }
   .slot-title .dot { width:7px; height:7px; border-radius:50%; background:var(--muted); }
@@ -556,6 +560,10 @@
         <div class="chartbox"><h3>Loss（训练 / 验证）</h3><canvas id="lossChart" height="150"></canvas></div>
         <div class="chartbox"><h3 id="metricTitle">验证指标</h3><canvas id="metricChart" height="130"></canvas></div>
         <div class="hint" id="chartNote"></div>
+        <div id="performanceSummary" class="performance-summary" aria-live="polite"></div>
+        <div class="chartbox"><h3 id="throughputTitle">训练吞吐</h3><canvas id="throughputChart" height="130"></canvas></div>
+        <div class="chartbox"><h3>每轮阶段耗时（秒）</h3><canvas id="phaseChart" height="130"></canvas></div>
+        <div class="hint">训练耗时包含供数与通信；断点发布包含上传及确认等待。GPU 利用率曲线位于计算槽卡片。</div>
       </div>
 
       <div role="tabpanel" aria-labelledby="detail-tab-logs" tabindex="0" id="tab-logs" hidden>
@@ -1538,6 +1546,7 @@ async function loadDetail() {
   $("dProgressText").innerHTML = ptxt;
 
   j.metrics = j.metrics || [];
+  renderPerformanceSummary(j);
   if (state.activeTab === "curves") renderCharts(j);
   // 日志由独立定时器持续读取，详情请求较慢时也不能阻塞日志刷新。
   if (state.activeTab === "result") renderResult(j);
@@ -1587,7 +1596,40 @@ function ensureCharts() {
       },
     });
   }
+  if (!state.charts.throughput) {
+    state.charts.throughput = new Chart($("throughputChart"), {
+      type: "line", data: { labels: [], datasets: [{ label: "samples/s", data: [], borderColor: "#2f81f7", pointRadius: 0, tension: 0.2 }] },
+      options: { animation: false, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } },
+    });
+    state.charts.phases = new Chart($("phaseChart"), {
+      type: "bar", data: { labels: [], datasets: [
+        { label: "训练（含通信）", data: [], backgroundColor: "#58a6ff" },
+        { label: "验证", data: [], backgroundColor: "#3fb950" },
+        { label: "断点保存", data: [], backgroundColor: "#d29922" },
+        { label: "断点发布", data: [], backgroundColor: "#bc8cff" },
+      ] },
+      options: { animation: false, maintainAspectRatio: false, scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } } },
+    });
+  }
   return true;
+}
+
+// 缺失资源指标显示未知，保留合法零值，拒绝非有限值和伪装数值的字符串。
+function performanceNumber(value, digits = 1, unit = "") {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? `${value.toFixed(digits)}${unit}` : "—";
+}
+
+// 性能文件与精度指标独立；旧任务继续正常展示，未知指标不显示为零。
+function renderPerformanceSummary(job) {
+  const rows = Array.isArray(job.performance) ? job.performance : [];
+  const latest = rows.at(-1);
+  const box = $("performanceSummary");
+  if (!latest) { box.textContent = "尚无性能记录；新任务在完成每轮训练后更新。历史任务可能未采集。"; return; }
+  const tokens = typeof latest.tokens_per_second === "number";
+  const rate = tokens ? latest.tokens_per_second : latest.samples_per_second;
+  box.textContent = `第 ${latest.epoch} 轮 · ${latest.scope === "group" ? "联合任务总吞吐" : "单任务吞吐"} ${performanceNumber(rate, 1, tokens ? " 有效 tokens/s" : " samples/s")} · ` +
+    `平均 step ${performanceNumber(latest.step_ms, 1, " ms")} · 断点保存 ${performanceNumber(latest.checkpoint_save_seconds, 3, " s")} · ` +
+    `断点发布 ${performanceNumber(latest.checkpoint_publish_seconds, 3, " s")}`;
 }
 
 function renderCharts(j) {
@@ -1632,6 +1674,21 @@ function renderCharts(j) {
   metric.data.datasets[0].data = m.map((r) => r[key]);
   metric.update("none");
   $("chartNote").textContent = m.length ? "" : "暂无数据，任务启动后每个 epoch 更新一条记录。";
+  const performance = Array.isArray(j.performance) ? j.performance : [];
+  const tokenRate = ["llm_pretraining", "llm_sft"].includes(j.spec.task);
+  const rateKey = tokenRate ? "tokens_per_second" : "samples_per_second";
+  const throughput = state.charts.throughput;
+  throughput.data.labels = performance.map(row => row.epoch);
+  throughput.data.datasets[0].label = tokenRate ? "有效 tokens/s" : "samples/s";
+  throughput.data.datasets[0].data = performance.map(row => row[rateKey] ?? null);
+  $("throughputTitle").textContent = `训练吞吐（${tokenRate ? "有效 tokens/s" : "samples/s"}）`;
+  throughput.update("none");
+  const phases = state.charts.phases;
+  phases.data.labels = performance.map(row => row.epoch);
+  ["train_seconds", "validation_seconds", "checkpoint_save_seconds", "checkpoint_publish_seconds"].forEach((key, index) => {
+    phases.data.datasets[index].data = performance.map(row => row[key] ?? null);
+  });
+  phases.update("none");
 }
 
 /* ---------- 日志 ---------- */
@@ -1840,6 +1897,38 @@ function formatMemory(memoryMb) {
   return `${gb >= 10 ? gb.toFixed(0) : gb.toFixed(1)} GB 内存`;
 }
 
+// 将有限历史转换成折线，缺测点断开；时间轴按采样时间计算。
+function resourceSparkline(history, key, color) {
+  const rows = history.filter(row => typeof row.sampled_at === "number" && Number.isFinite(row.sampled_at)).slice(-120);
+  if (rows.length < 2) return "";
+  const first = rows[0].sampled_at, span = Math.max(rows.at(-1).sampled_at - first, 1);
+  let path = "", connected = false;
+  for (const row of rows) {
+    const value = row[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 100) { connected = false; continue; }
+    path += `${connected ? "L" : "M"}${(4 + 232 * (row.sampled_at - first) / span).toFixed(1)},${(40 - value * .36).toFixed(1)} `;
+    connected = true;
+  }
+  return path ? `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.5"/>` : "";
+}
+
+// 显示测量口径、采样年龄和历史曲线；离线或采样失败时明确标记旧数据。
+function workerResourceStats(worker) {
+  const sample = worker.resources?.latest;
+  if (!sample) return '<div class="resource-stats">资源指标等待采样</div>';
+  const age = Math.max(0, Date.now() / 1000 - Number(sample.sampled_at));
+  const stale = !worker.active || !Number.isFinite(age) || age > 20;
+  const gpu = sample.gpu || {};
+  const history = Array.isArray(worker.resources.history) ? worker.resources.history : [];
+  const paths = resourceSparkline(history, "host_cpu_percent", "#2f81f7") + resourceSparkline(history, "gpu_percent", "#3fb950");
+  const accelerator = worker.gpu?.available ? `<span>GPU ${performanceNumber(gpu.utilization_percent, 1, "%")}</span><span>显存 ${performanceNumber(gpu.used_mb, 0)} / ${performanceNumber(gpu.total_mb, 0)} MiB</span>` : "";
+  return `<div class="resource-stats"><span>${stale ? "采样已过期" : "实时采样"} · ${performanceNumber(age, 0, "s 前")}</span>` +
+    `<span>主机 CPU ${performanceNumber(sample.host_cpu_percent, 1, "%")}</span><span>进程使用 ${performanceNumber(sample.process_cpu_cores, 2)} 核</span>` +
+    `<span>计算线程预算 ${performanceNumber(sample.torch_threads, 0)}</span><span>进程内存 ${performanceNumber(sample.rss_mb, 0, " MiB")}</span>` +
+    `<span>主机可用内存 ${performanceNumber(sample.host_available_mb, 0, " MiB")}</span>${accelerator}</div>` +
+    (paths ? `<div class="resource-history"><svg viewBox="0 0 240 44" role="img" aria-label="最近十分钟主机 CPU 与 GPU 利用率，蓝色 CPU、绿色 GPU">${paths}</svg><span class="hint">近十分钟 · 蓝：主机 CPU · 绿：GPU · 纵轴 0–100%</span></div>` : "");
+}
+
 // 渲染单个 CPU/GPU 执行槽，并把加入资源池的操作绑定到槽位 ID。
 function workerSlotCard(w) {
   const gpu = w.gpu || {};
@@ -1861,6 +1950,7 @@ function workerSlotCard(w) {
       <div class="slot-title"><span class="dot"></span>${isGpu ? "GPU" : "CPU"} · ${esc(w.slot || "计算槽")}
         <span class="wstate ${esc(state)}">${workerStateText[state] || esc(state)}</span></div>
       <div class="slot-details">${esc(device)} · ${esc(job)} · ${esc(heartbeat)}</div>
+      ${workerResourceStats(w)}
     </div>
     ${action}
   </div>`;

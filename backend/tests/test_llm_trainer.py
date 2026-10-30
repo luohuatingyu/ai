@@ -133,6 +133,11 @@ def test_pretraining_from_scratch_saves_metrics_bundle_and_generates(tmp_path):
     assert np.isfinite(metric["perplexity"]) and metric["perplexity"] >= 1
     assert (tmp_path / "pretraining" / "best_model.zip").is_file()
     assert load_trainer_state(tmp_path / "pretraining" / "checkpoints" / "ckpt-e0002.pt")["kind"] == "llm_trainer_state"
+    performance = [json.loads(line) for line in (tmp_path / "pretraining" / "performance.jsonl").read_text().splitlines()]
+    assert [row["epoch"] for row in performance] == [1, 2]
+    assert all(row["effective_tokens"] > 0 and row["tokens_per_second"] > 0 for row in performance)
+    assert all(row["samples"] == result["rows"]["train"] for row in performance)
+    assert performance[-1]["checkpoint_save_seconds"] > 0
     repeated = _run("llm_pretraining", data_path, params, tmp_path / "pretraining-repeat")
     assert repeated["final"]["train_loss"] == result["final"]["train_loss"]
     completion = llm_trainer.generate_text(

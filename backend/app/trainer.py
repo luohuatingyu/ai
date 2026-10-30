@@ -35,6 +35,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
 import app.config as config
+from app.performance import EpochPerformance
 from app.device import (
     backend_from_device,
     device_rng_state,
@@ -600,6 +601,7 @@ def _run_kmeans_training(
 
     def persist_state(finished_iteration: int) -> None:
         """保存当前聚类中心和随机状态，支持暂停、重派及跨机续训。"""
+        saved_at = time.perf_counter()
         save_trainer_state(
             job_dir / "checkpoints" / f"ckpt-e{finished_iteration:04d}.pt",
             model=model,
@@ -614,9 +616,12 @@ def _run_kmeans_training(
             best_record=best_record,
             device=device,
         )
+        performance.record["checkpoint_save_seconds"] += time.perf_counter() - saved_at
         if on_checkpoint is not None:
-            on_checkpoint(finished_iteration)
+            with performance.measure("checkpoint_publish_seconds"):
+                on_checkpoint(finished_iteration)
 
+    performance = EpochPerformance(start_epoch)
     if pause_event.is_set():
         persist_state(start_epoch)
         raise JobPaused(f"KMeans 聚类已在第 {start_epoch} 次迭代后暂停")
@@ -631,6 +636,7 @@ def _run_kmeans_training(
     iterations_done = start_epoch
     final_labels = previous_labels
     for iteration in range(start_epoch + 1, max_iter + 1):
+        performance = EpochPerformance(iteration)
         if cancel_event.is_set():
             raise JobCancelled()
         if pause_event.is_set():
@@ -666,6 +672,7 @@ def _run_kmeans_training(
             "val_loss": round(inertia / len(values), 6),
             "inertia": round(inertia, 6),
         }
+        performance.record["train_seconds"] = time.perf_counter() - performance.started
         _append_jsonl(metrics_path, record)
         score = -inertia
         if best_score is None or score > best_score:
@@ -680,6 +687,7 @@ def _run_kmeans_training(
         )
         iterations_done = iteration
         persist_state(iteration)
+        performance.write(job_dir, len(values), 1)
         if on_epoch_end is not None:
             on_epoch_end(record)
         db_log_fn(
@@ -1015,21 +1023,25 @@ def run_training(
         TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
         batch_size=batch_size,
         shuffle=True,
+        pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)),
         batch_size=512,
+        pin_memory=device.type == "cuda",
     )
 
     # ---- 训练循环 ----
     metrics_path = job_dir / "metrics.jsonl"
     # trainer-state 存档间隔（epoch 数）：进度兜底线，暂停/崩溃时可回退到最近存档
     ckpt_interval = max(int(getattr(config, "WORKER_CHECKPOINT_INTERVAL", 5)), 1)
+    performance = EpochPerformance(start_epoch)
 
     def _persist_state(finished_epoch: int) -> None:
         """保存完整训练上下文到本地 scratch，并回调 worker 上传到状态平面。"""
         if parallel is not None and not parallel.primary:
             return
+        saved_at = time.perf_counter()
         save_trainer_state(
             job_dir / "checkpoints" / f"ckpt-e{finished_epoch:04d}.pt",
             model=model,
@@ -1048,10 +1060,14 @@ def run_training(
             best_record=best_record,
             device=device,
         )
+        performance.record["checkpoint_save_seconds"] += time.perf_counter() - saved_at
         if on_checkpoint is not None:
+            published_at = time.perf_counter()
             on_checkpoint(finished_epoch)
+            performance.record["checkpoint_publish_seconds"] += time.perf_counter() - published_at
 
     for epoch in range(start_epoch + 1, epochs + 1):
+        performance = EpochPerformance(epoch, "group" if parallel is not None else "single")
         if parallel is not None:
             parallel.control(cancel_event, pause_event, allow_pause=True)
         if cancel_event.is_set():
@@ -1063,11 +1079,14 @@ def run_training(
 
         model.train()
         running, seen = 0.0, 0
+        steps = 0
+        train_started = time.perf_counter()
         batches = train_loader if parallel is None else (
             (torch.from_numpy(X_train[indices]), torch.from_numpy(y_train[indices]))
             for indices in parallel.indices(len(X_train), epoch)
         )
         for X_batch, y_batch in batches:
+            steps += 1
             if parallel is not None:
                 parallel.control(cancel_event, pause_event)
             elif cancel_event.is_set():
@@ -1079,28 +1098,34 @@ def run_training(
             if len(y_batch) == 0:
                 parallel.step(optimizer, 0)
                 continue
-            out = model(X_batch.to(device))
+            out = model(X_batch.to(device, non_blocking=device.type == "cuda"))
             pred = out if task == "classification" else out.squeeze(-1)
-            loss = nn.functional.cross_entropy(out, y_batch.to(device)) if task == "classification" \
-                else nn.functional.mse_loss(pred, y_batch.to(device))
+            loss = nn.functional.cross_entropy(out, y_batch.to(device, non_blocking=device.type == "cuda")) if task == "classification" \
+                else nn.functional.mse_loss(pred, y_batch.to(device, non_blocking=device.type == "cuda"))
             loss.backward()
             if parallel is None:
                 optimizer.step()
             else:
                 parallel.step(optimizer, len(y_batch))
-            running += loss.item() * len(y_batch)
+            # GPU 标量留在设备累计，轮次结束才同步；CPU 沿用原有精度与行为。
+            value = loss.item() if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64)
+            running = running + value * len(y_batch)
             seen += len(y_batch)
+        running = float(running)
         if parallel is not None:
             running, seen = parallel.totals([running, seen])
+        performance.record["train_seconds"] = time.perf_counter() - train_started
         train_loss = running / max(seen, 1)
         if y_scale:  # 反归一化到目标原始量纲，保持 train/val 曲线单位一致
             train_loss *= y_scale[1] ** 2
 
         val_result = None
+        validation_started = time.perf_counter()
         if parallel is None or parallel.primary:
             val_result, _, _ = _evaluate(model, val_loader, task, device, y_scale=y_scale)
         if parallel is not None:
             val_result = parallel.json_from_primary(val_result)
+        performance.record["validation_seconds"] = time.perf_counter() - validation_started
         record: dict[str, Any] = {"epoch": epoch, "train_loss": round(train_loss, 6),
                                   "val_loss": round(val_result["val_loss"], 6)}
         if task == "classification":
@@ -1135,6 +1160,8 @@ def run_training(
         # 周期性保存完整训练上下文（断点续训依据），并同步 metrics/日志到状态平面
         if epoch % ckpt_interval == 0 or epoch == epochs:
             _persist_state(epoch)
+        if parallel is None or parallel.primary:
+            performance.write(job_dir, int(seen), steps)
         if on_epoch_end is not None:
             on_epoch_end(record)
         if parallel is not None and parallel.control(cancel_event, pause_event, allow_pause=True):

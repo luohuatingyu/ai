@@ -196,6 +196,12 @@ def test_training_artifacts_metrics_and_predictions(tmp_path, task):
     metrics = [json.loads(line) for line in (root / "metrics.jsonl").read_text().splitlines()]
     assert [record["epoch"] for record in metrics] == [1]
     assert np.isfinite(metrics[0]["train_loss"])
+    performance = [json.loads(line) for line in (root / "performance.jsonl").read_text().splitlines()]
+    assert len(performance) == 1 and performance[0]["scope"] == "group"
+    assert performance[0]["samples"] == summary["rows"]["train"]
+    assert performance[0]["samples_per_second"] > 0
+    if task == "llm_pretraining":
+        assert performance[0]["tokens_per_second"] > 0
     assert (root / "checkpoints" / "ckpt-e0001.pt").exists()
     if task == "llm_pretraining":
         assert (root / "best_model.zip").stat().st_size > 0

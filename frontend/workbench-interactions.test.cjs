@@ -66,6 +66,7 @@ function fixture() {
   });
   // 按稳定的页面区段加载函数；不执行初始化轮询，也不替代被测业务逻辑。
   const sections = [
+    ['function performanceNumber(', 'function renderCharts('],
     ['function updateStart()', '/* 上传 */'],
     ['const taskSelect =', '/* ---------- 图表 ---------- */'],
     ['/* ---------- 日志 ---------- */', '/* ---------- 结果 ---------- */'],
