@@ -1579,8 +1579,7 @@ def test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_are
     assert 'id="remoteServerForm" class="server-form" novalidate' in modal
     assert 'form="remoteServerForm"' in modal.split('id="btnSubmitRemoteServer"', 1)[1].split(">", 1)[0]
     assert 'id="remoteServerError"' in modal
-    assert 'id="btnManageRemoteCredentials"' not in modal
-    assert 'id="btnRefreshRemoteCredentials"' in modal
+    assert 'id="btnManageRemoteCredentials"' in modal
     assert 'id="remoteCredentialStatus"' in modal
     assert "#addServerModal .server-modal-body" in css
     assert "overscroll-behavior: contain" in css

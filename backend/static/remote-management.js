@@ -307,7 +307,7 @@ function validateRemoteServerForm() {
   }
   if (!select.value) {
     showRemoteServerError("请先添加并选择 SSH 凭证，再保存服务器。");
-    select.focus();
+    $("btnManageRemoteCredentials").focus();
     return false;
   }
   showRemoteServerError();
