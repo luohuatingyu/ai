@@ -12,6 +12,7 @@ REDIS_URL 为空时自动切换 Embedded 实现（进程内队列/锁，单机�
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import threading
 import time
@@ -105,6 +106,11 @@ class JobQueue:
         """当前在队的任务 id 列表（watchdog 防丢失重派用，尽力而为）。"""
         raise NotImplementedError
 
+    def inference_queue(self, worker_id: str) -> JobQueue:
+        """在同一协调实例中共享各计算槽的独立预测队列。"""
+        queues = self.__dict__.setdefault("_inference_queues", {})
+        return queues.setdefault(worker_id, EmbeddedJobQueue())
+
 
 class EmbeddedJobQueue(JobQueue):
     """进程内队列（单机嵌入式模式）：deque + 条件变量实现阻塞 pop。"""
@@ -152,19 +158,28 @@ class EmbeddedJobQueue(JobQueue):
 class RedisJobQueue(JobQueue):
     """Redis List 实现的任务队列（多机模式）。"""
 
-    def __init__(self, redis_client) -> None:
+    def __init__(self, redis_client, queue_key: str = _QUEUE_KEY) -> None:
+        """允许独立业务队列复用协调连接，默认保持训练队列不变。"""
         self._redis = redis_client
+        self._queue_key = queue_key
+
+    def inference_queue(self, worker_id: str) -> JobQueue:
+        """按计算槽分队列，避免其它 Worker 领取指定资源的预测。"""
+        suffix = hashlib.sha256(worker_id.encode()).hexdigest()
+        return RedisJobQueue(self._redis, f"mtp:queue:inference:{suffix}")
 
     def push(self, job_id: str) -> None:
         # RPUSH 尾插：列表顺序 = 入队顺序（snapshot 与 pop 方向一致）
-        self._redis.rpush(_QUEUE_KEY, job_id)
+        self._redis.rpush(self._queue_key, job_id)
 
     def pop(self, timeout: float = 1.0) -> Optional[str]:
         # BLPOP 是单命令原子出队（队首）：两个 worker 同时领取不会拿到同一个任务。
         # 阻塞窗口与 socket 超时相等的边界竞态下 redis-py 会抛 TimeoutError，
         # 语义上等价于"窗口内无任务"——捕获并返回 None（worker 退避后重试）。
         try:
-            result = self._redis.blpop(_QUEUE_KEY, timeout=max(int(timeout), 1))
+            if timeout <= 0:
+                return self._redis.lpop(self._queue_key)
+            result = self._redis.blpop(self._queue_key, timeout=max(int(timeout), 1))
         except Exception:
             return None
         if result is None:
@@ -174,20 +189,20 @@ class RedisJobQueue(JobQueue):
 
     def remove(self, job_id: str) -> bool:
         # LREM 尽力移除；任务可能已被 worker 领走，返回 False 属正常
-        return bool(self._redis.lrem(_QUEUE_KEY, 0, job_id))
+        return bool(self._redis.lrem(self._queue_key, 0, job_id))
 
     def rebuild(self, job_ids: List[str]) -> None:
         pipe = self._redis.pipeline()
-        pipe.delete(_QUEUE_KEY)
+        pipe.delete(self._queue_key)
         if job_ids:
-            pipe.rpush(_QUEUE_KEY, *job_ids)  # 尾插保持原顺序（队首=第一个任务）
+            pipe.rpush(self._queue_key, *job_ids)  # 尾插保持原顺序（队首=第一个任务）
         pipe.execute()
 
     def size(self) -> int:
-        return int(self._redis.llen(_QUEUE_KEY))
+        return int(self._redis.llen(self._queue_key))
 
     def snapshot(self) -> List[str]:
-        return [str(item) for item in self._redis.lrange(_QUEUE_KEY, 0, -1)]
+        return [str(item) for item in self._redis.lrange(self._queue_key, 0, -1)]
 
 
 class LeaseStore:

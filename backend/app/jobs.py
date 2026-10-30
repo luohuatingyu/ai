@@ -20,6 +20,7 @@ from typing import Any, List, Optional
 import app.config as config
 from app import jobstore
 from app.coordination import build_coordination
+from app.inference import InferenceService
 from app.jobstore import (
     CANCELLED,
     COMPLETED,
@@ -101,6 +102,7 @@ class JobManager:
             self.lease = lease
             self.distributed = config.REDIS_URL != ""
         self._db_available = config.DB_AVAILABLE
+        self.inference = InferenceService(self.store, self.queue, self.lease)
         self._stop = threading.Event()
         self._workers: List[TrainingWorker] = []
         self._threads: List[threading.Thread] = []
@@ -384,6 +386,10 @@ class JobManager:
         - queued 但不在队列里 → 补投（防丢失；重复入队由领取方按状态跳过）；
         - 清理崩溃残留的 worker 注册条目（心跳长期未更新的幽灵槽）。
         """
+        try:
+            self.inference.recover()
+        except Exception:
+            pass  # 预测存储故障不得阻断训练任务巡检
         try:
             self.lease.cleanup_stale_workers(config.WORKER_STALE_CLEANUP_AGE)
         except Exception:

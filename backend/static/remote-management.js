@@ -22,7 +22,7 @@ function toast(msg, kind = "") {
 const workerStateText = {
   starting: "准备中", reserved: "已占用", training: "训练中",
   idle: "空闲", running: "训练中", degraded: "卡降级", recovering: "恢复中",
-  disabled: "未启用", offline: "离线",
+  disabled: "未启用", offline: "离线", predicting: "预测中",
 };
 
 // 把检测到的内存统一格式化为用户容易比较的容量。
@@ -43,10 +43,10 @@ function workerSlotCard(w) {
   const active = Boolean(w.active);
   const enabled = Boolean(w.enabled);
   const rawState = w.state || (active ? "idle" : "offline");
-  const busy = Boolean(w.occupied || w.current_job || ["starting", "training", "running", "reserved"].includes(rawState));
+  const busy = Boolean(w.occupied || w.current_job || ["starting", "training", "running", "reserved", "predicting"].includes(rawState));
   const state = !active ? "offline" : (["degraded", "recovering"].includes(rawState)
-    ? rawState : busy ? (["starting", "reserved"].includes(rawState) ? rawState : "running") : (enabled ? rawState : "disabled"));
-  const stateClass = ["starting", "reserved"].includes(state) ? "running" : state;
+    ? rawState : busy ? (["starting", "reserved", "predicting"].includes(rawState) ? rawState : "running") : (enabled ? rawState : "disabled"));
+  const stateClass = ["starting", "reserved", "predicting"].includes(state) ? "running" : state;
   const job = w.current_job ? `${w.current_job}${w.epoch ? ` · 第 ${w.epoch} 轮` : ""}` : "当前无任务";
   const heartbeat = w.heartbeat_age_sec != null ? `最近心跳 ${w.heartbeat_age_sec}s 前` : "尚无心跳";
   const action = w.managed
@@ -55,8 +55,8 @@ function workerSlotCard(w) {
   return `<div class="resource-slot ${enabled && active ? "enabled" : ""}">
     <div class="slot-main">
       <div class="slot-title"><span class="dot"></span>${isGpu ? "GPU" : "CPU"} · ${esc(w.slot || "计算槽")}
-        <span class="wstate ${esc(state)}">${workerStateText[state] || esc(state)}</span></div>
-      <div class="slot-details">${esc(device)} · ${esc(job)} · ${esc(heartbeat)}</div>
+        <span class="wstate ${esc(stateClass)}">${workerStateText[state] || esc(state)}</span></div>
+      <div class="slot-details">${esc(device)} · ${esc(job)} · ${esc(heartbeat)}${busy && active ? " · 独占使用，其他任务排队" : ""}</div>
     </div>
     ${action}
   </div>`;

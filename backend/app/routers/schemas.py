@@ -142,6 +142,7 @@ class HubDatasetRequest(BaseModel):
 
 
 class PredictRequest(BaseModel):
+    worker_id: str | None = Field(default=None, min_length=1, max_length=160)
     row: dict[str, Any] | None = None
     history: list[Any] | None = None
 
@@ -156,6 +157,7 @@ class PredictRequest(BaseModel):
 class GenerateRequest(BaseModel):
     """LLM 文本生成请求，并限制单次推理的资源消耗。"""
 
+    worker_id: str | None = Field(default=None, min_length=1, max_length=160)
     prompt: str = Field(min_length=1, max_length=32768)
     max_new_tokens: int = Field(default=32, ge=1, le=512)
     temperature: float = Field(default=0.0, ge=0, le=2.0)

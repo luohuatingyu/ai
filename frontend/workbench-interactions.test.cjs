@@ -588,3 +588,108 @@ test('训练参数网格的空白位置不再铺灰色背景', () => {
   assert.match(grid, /background:\s*#fff/);
   assert.match(field, /box-shadow:\s*inset -1px -1px 0 #e2e8f0/);
 });
+// 使用真实预测处理函数，仅模拟网络响应与定时器边界。
+function predictionFixture() {
+  const f = fixture();
+  f.state.jobs = [job('predict-model', 'completed')];
+  f.state.jobId = 'predict-model';
+  f.state.workerResourcesLoaded = true;
+  f.state.workerSlots = [{ worker_id: 'chosen', hostname: 'cpu-host', active: true, enabled: true,
+    device_backend: 'cpu', device: 'cpu', state: 'idle', gpu: { healthy: true } }];
+  f.$('predictWorker').value = 'chosen';
+  f.$('predictInput').value = '{"x":1}';
+  f.context.setTimeout = fn => { fn(); return 1; };
+  return f;
+}
+
+test('指定资源预测排队后展示实际机器和设备，重复提交不会创建第二条任务', async () => {
+  const f = predictionFixture(), pending = deferred();
+  const record = { id: 'infer-selected', worker_id: 'chosen', hostname: '<img src=x onerror=alert(1)>', device: 'cpu', device_name: 'CPU' };
+  f.context.apiJson = (url, options) => {
+    f.requests.push({ url, options });
+    return options.method === 'POST' ? pending.promise : Promise.resolve({ ...record, status: 'completed', result: { prediction: 0.75 } });
+  };
+  const first = f.$('btnPredict').onclick();
+  await f.$('btnPredict').onclick();
+  assert.equal(f.requests.length, 1);
+  assert.deepEqual(JSON.parse(f.requests[0].options.body), { row: { x: 1 }, worker_id: 'chosen' });
+  assert.equal(f.$('predictWorker').disabled, true);
+  pending.resolve({ ...record, status: 'queued' });
+  await first;
+  assert.equal(f.requests.length, 2);
+  assert.ok(f.requests[1].url.endsWith('/predict-model/inferences/infer-selected'));
+  assert.equal(f.requests[1].options.cache, 'no-store');
+  assert.match(f.$('predictOut').textContent, /0\.7500/);
+  assert.match(f.$('predictOut').textContent, /Worker：chosen/);
+  assert.match(f.$('predictOut').textContent, /设备：cpu \(CPU\)/);
+  assert.match(f.$('predictOut').textContent, /<img src=x onerror=alert\(1\)>/);
+  assert.doesNotMatch(f.$('predictOut').innerHTML, /<img/);
+  assert.equal(f.$('btnPredict').disabled, false);
+  assert.equal(f.$('predictWorker').disabled, false);
+  assert.equal(f.$('predictOut').attributes['aria-busy'], 'false');
+});
+
+test('指定资源后端失败保留编号和原因，允许重新提交', async () => {
+  const f = predictionFixture();
+  f.context.apiJson = async () => ({ id: 'infer-failed', worker_id: 'chosen', status: 'failed', error: '设备已失效，未切换资源' });
+  await f.$('btnPredict').onclick();
+  assert.match(f.$('predictOut').textContent, /预测失败：设备已失效/);
+  assert.match(f.$('predictOut').textContent, /infer-failed/);
+  assert.equal(f.$('btnPredict').disabled, false);
+});
+
+for (const recover of [true, false]) test('预测状态查询失败' + (recover ? '可自动恢复' : '三次后保留后台执行提示'), async () => {
+  const f = predictionFixture();
+  let polls = 0;
+  const record = { id: 'infer-retry', worker_id: 'chosen' };
+  f.context.apiJson = async (url, options) => {
+    if (options.method === 'POST') return { ...record, status: 'queued' };
+    polls++;
+    if (recover && polls === 2) return { ...record, status: 'completed', result: { prediction: 7 } };
+    throw new Error('网络暂时不可用');
+  };
+  await f.$('btnPredict').onclick();
+  assert.equal(polls, recover ? 2 : 3);
+  assert.match(f.$('predictOut').textContent, recover ? /7\.0000/ : /后台预测可能仍在执行/);
+  assert.match(f.$('predictOut').textContent, /infer-retry/);
+  assert.equal(f.$('btnPredict').disabled, false);
+});
+
+test('切换模型后旧预测响应不能覆盖结果或解锁新请求', async () => {
+  const f = predictionFixture(), old = deferred(), current = deferred();
+  f.context.apiJson = url => url.includes('/predict-model/') ? old.promise : current.promise;
+  const first = f.$('btnPredict').onclick();
+  f.state.jobs.push(job('new-model', 'completed'));
+  f.state.jobId = 'new-model';
+  f.state.selectionVersion++;
+  f.context.resetPrediction();
+  const second = f.$('btnPredict').onclick();
+  old.resolve({ id: 'old', status: 'completed', worker_id: 'chosen', result: { prediction: 12345 } });
+  await first;
+  assert.equal(f.$('btnPredict').disabled, true);
+  assert.doesNotMatch(f.$('predictOut').textContent, /12345/);
+  current.resolve({ id: 'new', status: 'completed', worker_id: 'chosen', result: { prediction: 9 } });
+  await second;
+  assert.match(f.$('predictOut').textContent, /9\.0000/);
+  assert.equal(f.$('btnPredict').disabled, false);
+});
+
+for (const issue of ['missing', 'offline', 'disabled', 'stale', 'unhealthy', 'clustering-gpu']) {
+  test('不可用预测资源阻止提交并保留原选择：' + issue, async () => {
+    const f = predictionFixture(), worker = f.state.workerSlots[0];
+    if (issue === 'missing') f.state.workerSlots = [];
+    if (issue === 'offline') worker.active = false;
+    if (issue === 'disabled') worker.enabled = false;
+    if (issue === 'stale') f.state.workerResourcesError = '资源服务不可用';
+    if (issue === 'unhealthy') worker.gpu.healthy = false;
+    if (issue === 'clustering-gpu') {
+      f.state.jobs[0].spec.task = 'clustering'; worker.device_backend = 'cuda'; worker.gpu.available = true;
+    }
+    f.context.renderPredictionResources();
+    await f.$('btnPredict').onclick();
+    assert.equal(f.$('predictWorker').value, 'chosen');
+    assert.equal(f.requests.length, 0);
+    assert.match(f.$('predictOut').textContent, /预测资源不可用/);
+    assert.match(f.$('predictOut').textContent, /不会自动回退/);
+  });
+}

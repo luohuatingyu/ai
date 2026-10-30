@@ -1232,14 +1232,18 @@ def run_training(
 # ---------------------------------------------------------------------------
 
 def predict_row(
-    ckpt_path: Path, row: dict | None = None, history: list[Any] | None = None
+    ckpt_path: Path, row: dict | None = None, history: list[Any] | None = None,
+    device: str = "cpu",
 ) -> dict:
     """加载 best.pt，对单条表格记录、KMeans 样本或时间序列历史窗口进行预测。"""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     pre: dict = ckpt["preprocessor"]
     task = ckpt["task"]
+    target_device = torch.device(device)
 
     if task == "clustering":
+        if target_device.type != "cpu":
+            raise ValueError("KMeans 聚类预测仅支持 CPU")
         if row is None:
             raise ValueError("KMeans 聚类预测需要提供 row 对象")
         x = _featurize_row(row, pre)
@@ -1274,12 +1278,12 @@ def predict_row(
 
     model = _build_model(
         arch["in_dim"], arch["out_dim"], arch["hidden_size"], arch["hidden_layers"],
-        torch.device("cpu"),
+        target_device,
     )
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     with torch.no_grad():
-        out = model(torch.from_numpy(x))
+        out = model(torch.from_numpy(x).to(target_device))
 
     if task == "classification":
         prob = torch.softmax(out, dim=1)[0]

@@ -866,7 +866,8 @@ def download_model(job_id: str) -> FileResponse:
 
 
 @router.post("/jobs/{job_id}/predict")
-def predict(job_id: str, body: PredictRequest) -> dict:
+def predict(job_id: str, body: PredictRequest, response: Response = None) -> dict:
+    """保留同步预测，指定 Worker 时提交独立异步预测任务。"""
     _check_id(job_id, "任务")
     if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")
@@ -876,6 +877,8 @@ def predict(job_id: str, body: PredictRequest) -> dict:
     key = job_key(job_id, "best.pt")
     if not manager.store.exists(key):
         raise HTTPException(400, "模型文件尚未生成（任务可能仍在训练）")
+    if body.worker_id:
+        return _submit_inference(job_id, task, body, response)
     local_ckpt = manager.store.read_file(
         key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best.pt"
     )
@@ -886,7 +889,7 @@ def predict(job_id: str, body: PredictRequest) -> dict:
 
 
 @router.post("/jobs/{job_id}/generate")
-def generate(job_id: str, body: GenerateRequest) -> dict:
+def generate(job_id: str, body: GenerateRequest, response: Response = None) -> dict:
     """从已训练的 LLM 模型包生成文本，不执行任何远程代码。"""
     _check_id(job_id, "任务")
     record = manager.get(job_id)
@@ -898,6 +901,8 @@ def generate(job_id: str, body: GenerateRequest) -> dict:
     key = job_key(job_id, "best_model.zip")
     if not manager.store.exists(key):
         raise HTTPException(400, "LLM 模型文件尚未生成（任务可能仍在训练）")
+    if body.worker_id:
+        return _submit_inference(job_id, task, body, response)
     local_bundle = manager.store.read_file(
         key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best_model.zip"
     )
@@ -914,3 +919,28 @@ def generate(job_id: str, body: GenerateRequest) -> dict:
         return {"prompt": body.prompt, "generated_text": generated}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"文本生成失败: {exc}") from exc
+
+
+def _submit_inference(job_id: str, task: str, body, response: Response) -> dict:
+    """拒绝不可用资源；请求体只保存预测参数，状态接口隐藏输入。"""
+    try:
+        result = manager.inference.submit(job_id, task, body.worker_id,
+                                          body.model_dump(exclude={"worker_id"}, exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if response is not None:
+        response.status_code = 202
+    return result
+
+
+@router.get("/jobs/{job_id}/inferences/{inference_id}")
+def inference_status(job_id: str, inference_id: str) -> dict:
+    """按所属模型查询预测，拒绝跨任务读取及非法路径编号。"""
+    _check_id(job_id, "任务")
+    try:
+        result = manager.inference.get(inference_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not result or result["job_id"] != job_id or not manager.get(job_id):
+        raise HTTPException(404, "预测任务不存在")
+    return result

@@ -12,6 +12,7 @@ function fixture() {
   function node(id) {
     if (!nodes.has(id)) nodes.set(id, { id, value: '', checked: false, hidden: false, disabled: false,
       dataset: {}, handlers: {}, textContent: '', innerHTML: '', children: [],
+      replaceChildren(...children) { this.children = children; },
       addEventListener(key, fn) { this.handlers[key] = fn; },
       contains(element) { return element === this; }, closest() { return null; },
       focus() { document.activeElement = this; }, blur() {}, scrollIntoView() {},
@@ -28,7 +29,8 @@ function fixture() {
     { worker_id: 'cpu', machine_id: 'server-a', slot: 'cpu0', cpu: { cores: 8 }, gpu: { available: false } },
     { worker_id: 'gpu', machine_id: 'server-b', slot: 'gpu0', gpu: { available: true, name: 'GPU test', vram_mb: 8192 } },
   ].map(worker => ({ ...worker, active: true, enabled: true, state: 'idle' }));
-  const state = { datasetId: 'dataset', workerSlots: workers, workerResourcesLoaded: true, workerResourcesError: false, trainSubmitting: false,
+  document.createElement = () => ({ value: '', textContent: '', disabled: false });
+  const state = { jobs: [], datasetId: 'dataset', workerSlots: workers, workerResourcesLoaded: true, workerResourcesError: false, trainSubmitting: false,
     resourceRefreshJobs: new Map(), resourceRefreshTimer: null };
   const requests = [];
   const resourceRefreshRequests = [];
@@ -48,6 +50,7 @@ function fixture() {
   vm.runInContext(html.slice(html.indexOf('const taskSelect ='), html.indexOf('const statusText =')), context);
   vm.runInContext(html.slice(html.indexOf('function jobResourceLabel('), html.indexOf('// 仅提供在线')), context);
   vm.runInContext(html.slice(html.indexOf('function renderResourceAllocation('), html.indexOf('// 用最近一次实际执行位置')), context);
+  vm.runInContext(html.slice(html.indexOf('function predictionWorkerIssue('), html.indexOf('$("predictWorker").onchange')), context);
   return { context, state, workers, requests, resourceRefreshRequests, $: node };
 }
 
@@ -245,7 +248,7 @@ test('训练方式切换时布局样式不能覆盖资源面板的隐藏状态',
 });
 
 for (const file of ['index.html', 'remote-management.js']) {
-  for (const [raw, label] of [['starting', '准备中'], ['training', '训练中'], ['running', '训练中'], ['reserved', '已占用']]) {
+  for (const [raw, label] of [['starting', '准备中'], ['training', '训练中'], ['running', '训练中'], ['reserved', '已占用'], ['predicting', '预测中']]) {
     test(`${file} 将 ${raw} 显示为中文占用状态且停用接单不掩盖执行`, () => {
       const source = fs.readFileSync(path.join(__dirname, '../backend/static', file), 'utf8');
       const start = source.indexOf('const workerStateText =');

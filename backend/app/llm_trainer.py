@@ -831,7 +831,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
 
 
 def generate_text(bundle_path: Path, prompt: str, *, max_new_tokens: int,
-                  temperature: float, top_p: float) -> str:
+                  temperature: float, top_p: float, device: str | None = None) -> str:
     """从安全解压后的模型包加载 CausalLM 并对 prompt 生成续写。"""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -856,7 +856,8 @@ def generate_text(bundle_path: Path, prompt: str, *, max_new_tokens: int,
         model = AutoModelForCausalLM.from_pretrained(
             extract_dir, trust_remote_code=False, local_files_only=True
         )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 指定设备必须原样执行；旧同步调用继续使用原有自动选择规则。
+        device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
         model.to(device).eval()
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         generation_params = {

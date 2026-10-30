@@ -479,6 +479,10 @@ class TrainingWorker:
             config.WORKER_GPU_PROBE if gpu_probe_enabled is None else gpu_probe_enabled
         )
         self._resource_sampler = ResourceSampler(str(self.caps.get("device") or "cpu"))
+        from app.inference import InferenceService
+
+        self.inference = InferenceService(self.store, self.queue, self.lease_store)
+        self._prefer_inference = True
 
     # ------------------------------------------------------------------
     # 对外
@@ -581,7 +585,17 @@ class TrainingWorker:
             self._shutdown.wait(self._idle_poll)
             return
         try:
-            job_id = self.queue.pop(timeout=self._idle_poll)
+            # 两类任务交替优先，忙碌槽保留排队；计算槽租约仍是最终互斥条件。
+            job_id = None if self._prefer_inference else self.queue.pop(timeout=0)
+            if job_id is None:
+                inference_id = self.queue.inference_queue(self.worker_id).pop(timeout=0)
+                if inference_id is not None:
+                    self._prefer_inference = False
+                    self.inference.execute(self, inference_id)
+                    return
+            self._prefer_inference = True
+            if job_id is None:
+                job_id = self.queue.pop(timeout=self._idle_poll)
         except Exception as exc:  # noqa: BLE001
             # 队列领取异常：退避后由外层循环重试
             self._log(f"worker {self.worker_id}: 队列领取异常，稍后重试: {exc}")

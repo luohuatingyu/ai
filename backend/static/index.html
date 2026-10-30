@@ -589,6 +589,12 @@
       <div role="tabpanel" aria-labelledby="detail-tab-predict" tabindex="0" id="tab-predict" hidden>
         <div class="hint" style="margin-bottom:6px;">使用最佳模型进行单条预测（JSON，与数据集列同名字段）：</div>
         <textarea id="predictInput" spellcheck="false"></textarea>
+        <div class="row" style="margin-top:12px;align-items:center;">
+          <label for="predictWorker">预测计算资源</label>
+          <select id="predictWorker" style="flex:1;min-width:180px;" aria-describedby="predictResourceHint"><option value="">默认 · API 服务进程</option></select>
+          <button id="btnRefreshPredictWorkers" type="button">刷新资源</button>
+        </div>
+        <div id="predictResourceHint" class="hint" style="margin-top:6px;" role="status"></div>
         <div class="row" style="margin-top:8px;"><button id="btnPredict" class="primary">预测</button></div>
         <div id="predictOut" role="status" aria-live="polite" aria-busy="false" hidden></div>
       </div>
@@ -1682,6 +1688,8 @@ function selectJob(id, clearLog) {
     $("resultBox").innerHTML = '<div class="empty">任务完成后展示评估结果</div>';
     $("predictInput").value = "";
     $("predictOut").hidden = true;
+    resetPrediction();
+    renderPredictionResources();
     $("detail").hidden = true;
     $("detailFeedback").textContent = "正在加载任务详情…";
     fillPredictTemplate();
@@ -2154,13 +2162,68 @@ async function fillPredictTemplate() {
   } catch { /* 无预览则留空 */ }
 }
 
-let predictionRequestPending = false;
-// 请求期间锁定按钮并把等待、失败状态直接展示在预测结果区。
+// 根据真实槽位快照检查可选性；忙碌资源可排队，失效选择必须由用户重新选择。
+function predictionWorkerIssue(worker, task) {
+  if (!worker || !worker.active) return "已离线";
+  if (!worker.enabled) return "未启用";
+  const gpu = worker.gpu || {}, backend = worker.device_backend || gpu.backend || "cpu";
+  if (["degraded", "recovering"].includes(worker.state) || gpu.healthy === false) return "设备异常";
+  if (!["cpu", "cuda", "rocm", "xpu", "mps"].includes(backend)) return "不支持的计算后端";
+  if (task === "clustering" && backend !== "cpu") return "聚类仅支持 CPU";
+  if (backend !== "cpu" && !gpu.available) return "加速设备不可用";
+  return "";
+}
+
+// 资源名称使用原生文本节点，刷新后保留原选择及其不可用原因。
+function renderPredictionResources() {
+  const select = $("predictWorker"), selected = select.value;
+  const task = state.jobs.find(item => item.id === state.jobId)?.spec.task || "";
+  const options = [{ id: "", label: "默认 · API 服务进程", issue: "" }];
+  for (const worker of state.workerSlots || []) {
+    const issue = predictionWorkerIssue(worker, task);
+    const backend = worker.device_backend || worker.gpu?.backend || "cpu";
+    const busy = worker.occupied || worker.current_job || ["starting", "training", "running", "reserved", "predicting"].includes(worker.state);
+    options.push({ id: worker.worker_id, issue, label: `${worker.hostname || worker.machine_id || "未知主机"} · ${backend.toUpperCase()} ${worker.device || ""} · ${worker.worker_id} · ${issue || (busy ? "忙碌，可排队" : "空闲")}` });
+  }
+  if (selected && !options.some(option => option.id === selected)) options.push({ id: selected, label: `${selected} · 已离线`, issue: "已离线" });
+  select.replaceChildren(...options.map(option => {
+    const node = document.createElement("option");
+    node.value = option.id; node.textContent = option.label; node.disabled = Boolean(option.issue);
+    return node;
+  }));
+  select.value = selected;
+  const issue = selected ? (state.workerResourcesError || !state.workerResourcesLoaded ? "资源状态无法确认，请刷新后重试" : options.find(option => option.id === selected)?.issue) : "";
+  $("predictResourceHint").textContent = issue ? `当前选择不可用：${issue}。不会自动切换资源。` : selected
+    ? "仅在所选 Worker 上执行；忙碌时排队，设备失效会明确报错。"
+    : `默认在 API 服务进程执行${task.startsWith("llm_") ? "，文本生成沿用服务端自动选择 CUDA/CPU" : "，使用 CPU"}；可选择 Worker 查看实际执行机器和设备。`;
+}
+
+// 切换模型时撤销旧界面的请求身份，旧响应和 finally 均不能解锁新请求。
+function resetPrediction() {
+  state.predictionRequest = null;
+  $("btnPredict").disabled = false;
+  $("predictWorker").disabled = false;
+  $("predictOut").setAttribute("aria-busy", "false");
+}
+
+// 执行记录来自服务端；始终以文本展示机器、Worker 和实际设备。
+function predictionExecutionText(record) {
+  return `机器：${record.hostname || record.machine_id || "等待分配"}\nWorker：${record.worker_id}\n设备：${record.device ? `${record.device} (${record.device_name || record.device_backend})` : "等待执行确认"}\n预测编号：${record.id}`;
+}
+
+$("predictWorker").onchange = renderPredictionResources;
+$("btnRefreshPredictWorkers").onclick = () => refreshWorkers({ resourcesOnly: true });
+
+// 提交身份绑定模型与选择版本；轮询独立预测记录，不改写训练任务状态。
 $("btnPredict").onclick = async () => {
   const button = $("btnPredict");
-  if (predictionRequestPending) return;
+  if (state.predictionRequest) return;
   const out = $("predictOut");
   const job = state.jobs.find((item) => item.id === state.jobId);
+  if (!job) return;
+  const workerId = $("predictWorker").value;
+  const issue = workerId ? (state.workerResourcesError || !state.workerResourcesLoaded ? "资源状态无法确认，请刷新后重试" : predictionWorkerIssue((state.workerSlots || []).find(worker => worker.worker_id === workerId), job.spec.task)) : "";
+  if (issue) { out.hidden = false; out.textContent = `预测资源不可用：${issue}。请重新选择，不会自动回退。`; return; }
   let body;
   const isLLM = Boolean(job && job.spec.task.startsWith("llm_"));
   try {
@@ -2171,7 +2234,11 @@ $("btnPredict").onclick = async () => {
     }
   }
   catch (e) { toast("预测输入不是合法 JSON: " + e.message, "err"); return; }
-  predictionRequestPending = true;
+  if (workerId) body.worker_id = workerId;
+  const request = { jobId: job.id, selection: state.selectionVersion };
+  state.predictionRequest = request;
+  const current = () => state.predictionRequest === request && state.jobId === request.jobId && state.selectionVersion === request.selection;
+  $("predictWorker").disabled = true;
   button.disabled = true;
   button.textContent = isLLM ? "生成中…" : "预测中…";
   out.hidden = false;
@@ -2179,9 +2246,34 @@ $("btnPredict").onclick = async () => {
   out.textContent = isLLM ? "正在生成文本，请稍候…" : "正在预测，请稍候…";
   out.setAttribute("aria-busy", "true");
   try {
-    const r = await apiJson(`/api/jobs/${state.jobId}/${isLLM ? "generate" : "predict"}`, {
+    let r = await apiJson(`/api/jobs/${encodeURIComponent(request.jobId)}/${isLLM ? "generate" : "predict"}`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(workerId ? 15000 : 300000),
     });
+    if (!current()) return;
+    let execution = "";
+    if (workerId) {
+      const inferenceId = r.id;
+      let failures = 0;
+      while (current()) {
+        execution = predictionExecutionText(r);
+        out.textContent = `${r.status === "queued" ? "已排队，等待所选计算槽" : "正在所选 Worker 上预测"}\n${execution}`;
+        if (r.status === "failed") throw new Error(`${r.error || "预测失败"}\n${execution}`);
+        if (r.status === "completed") { r = r.result; break; }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        if (!current()) return;
+        try {
+          r = await apiJson(`/api/jobs/${encodeURIComponent(request.jobId)}/inferences/${encodeURIComponent(inferenceId)}`, { cache: "no-store", signal: AbortSignal.timeout(15000) });
+          failures = 0;
+        } catch (error) {
+          if (!current()) return;
+          if (++failures >= 3) throw new Error(`状态查询失败，后台预测可能仍在执行：${error.message}\n${execution}`);
+          out.textContent = `状态查询暂时失败，正在重试（${failures}/3）…\n${execution}`;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+    }
+    if (!current()) return;
     out.hidden = false;
     let txt = isLLM
       ? r.generated_text
@@ -2189,24 +2281,24 @@ $("btnPredict").onclick = async () => {
       ? `所属簇：${r.prediction}（中心距离 ${Number(r.distance).toFixed(4)}）`
       : "预测结果: " + (typeof r.prediction === "number" ? r.prediction.toFixed(4) : r.prediction);
     if (r.probabilities) txt += "\n各类别概率:\n" + Object.entries(r.probabilities).map(([k, v]) => `  ${k}: ${(v * 100).toFixed(2)}%`).join("\n");
-    out.textContent = txt;
+    out.textContent = txt + (execution ? `\n\n${execution}` : "\n\n执行位置：API 服务进程（默认模式）");
   } catch (e) {
+    if (!current()) return;
     const message = e.message || "未知错误";
     out.className = "hint feedback-error";
     out.textContent = `${isLLM ? "生成失败" : "预测失败"}：${message}`;
     toast(message, "err");
   } finally {
-    predictionRequestPending = false;
-    button.disabled = false;
-    const currentJob = state.jobs.find((item) => item.id === state.jobId);
-    button.textContent = currentJob && currentJob.spec.task.startsWith("llm_") ? "生成文本" : "预测";
-    out.setAttribute("aria-busy", "false");
+    if (current()) {
+      resetPrediction();
+      button.textContent = isLLM ? "生成文本" : "预测";
+    }
   }
 };
 
 /* ---------- 计算服务器与手动资源选择 ---------- */
 const workerStateText = {
-  starting: "准备中", reserved: "已占用", training: "训练中",
+  starting: "准备中", reserved: "已占用", training: "训练中", predicting: "预测中",
   idle: "空闲", running: "训练中", degraded: "卡降级", recovering: "恢复中",
   disabled: "未启用", offline: "离线",
 };
@@ -2261,10 +2353,10 @@ function workerSlotCard(w) {
   const active = Boolean(w.active);
   const enabled = Boolean(w.enabled);
   const rawState = w.state || (active ? "idle" : "offline");
-  const busy = Boolean(w.occupied || w.current_job || ["starting", "training", "running", "reserved"].includes(rawState));
+  const busy = Boolean(w.occupied || w.current_job || ["starting", "training", "running", "reserved", "predicting"].includes(rawState));
   const state = !active ? "offline" : (["degraded", "recovering"].includes(rawState)
-    ? rawState : busy ? (["starting", "reserved"].includes(rawState) ? rawState : "running") : (enabled ? rawState : "disabled"));
-  const stateClass = ["starting", "reserved"].includes(state) ? "running" : state;
+    ? rawState : busy ? (["starting", "reserved", "predicting"].includes(rawState) ? rawState : "running") : (enabled ? rawState : "disabled"));
+  const stateClass = ["starting", "reserved", "predicting"].includes(state) ? "running" : state;
   const job = w.current_job ? `${w.current_job}${w.epoch ? ` · 第 ${w.epoch} 轮` : ""}` : "当前无任务";
   const heartbeat = w.heartbeat_age_sec != null ? `最近心跳 ${w.heartbeat_age_sec}s 前` : "尚无心跳";
   const action = `<span class="server-kind">${enabled ? "已加入资源池" : "未加入资源池"}</span>`;
@@ -2448,6 +2540,7 @@ async function refreshWorkers(options = {}) {
     state.workerSlots = d.workers || [];
     state.workerResourcesLoaded = true;
     state.workerResourcesError = false;
+    renderPredictionResources();
     renderTrainingResources();
     renderParallelWorkers();
     updateStart();
@@ -2456,6 +2549,7 @@ async function refreshWorkers(options = {}) {
     settleResourceRefreshJobs(requestVersion);
   } catch {
     state.workerResourcesError = true;
+    renderPredictionResources();
     renderTrainingResources(); updateStart();
     $("gpuResourceHint").textContent = "GPU 资源状态暂不可用，请检查连接后刷新。";
   } finally {
