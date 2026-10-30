@@ -326,7 +326,7 @@
   /* 资源选择按训练方式切换，避免布局类覆盖原生 hidden 行为。 */
   #trainingResourceField[hidden], #parallelPanel[hidden] { display:none; }
 </style>
-<link rel="stylesheet" href="/app.css?v=20261029-management-tabs-1">
+<link rel="stylesheet" href="/app.css?v=20261030-training-focus-1">
 </head>
 <body class="training-page">
 
@@ -503,22 +503,19 @@
       </div>
       <div class="compute-actions">
         <button id="btnRefreshWorkers" title="重新读取服务器和计算槽状态">↻ 刷新</button>
+        <a href="/server-manager.html" class="management-link">管理服务器 ↗</a>
       </div>
     </div>
     <div class="hint" style="margin-top:4px;">平台通过 SSH 连接服务器并执行单文件脚本，不同步项目源码；worker 自动检测 CPU / GPU，槽位需手动加入资源池。停用后不再领取新任务，运行中的任务会完成后退出。</div>
     <div id="workerSummary" class="compute-summary" aria-live="polite"></div>
     <div id="workerGrid" class="server-grid"><div class="empty">尚未发现计算服务器。添加服务器后，页面会显示检测到的计算资源。</div></div>
 
-    <h2>③ 训练任务</h2>
-    <div class="job-filters">
-      <label class="sr-only" for="jobSearch">搜索任务</label>
-      <input id="jobSearch" type="search" placeholder="搜索数据集、目标列或任务 ID…" maxlength="200">
-      <label class="sr-only" for="jobStatusFilter">任务状态</label>
-      <select id="jobStatusFilter"><option value="all">全部状态</option><option value="running">训练中</option><option value="queued">排队中</option><option value="paused">已暂停</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select>
-      <button id="btnResetJobFilters" type="button">重置筛选</button>
+    <div class="job-focus-heading">
+      <div><h2>③ 本次训练</h2><span id="jobCount" class="hint" role="status">暂无训练</span></div>
+      <button id="btnOpenJobs" type="button" aria-controls="jobsModal" aria-expanded="false">全部训练 <span id="allJobCount" class="chip">0</span></button>
     </div>
-    <div class="job-list-feedback"><span id="jobCount" class="hint" role="status"></span><span id="jobsFeedback" class="hint" role="status"></span></div>
-    <div id="jobList"><div class="empty">暂无任务，先在左侧发起训练</div></div>
+    <div id="jobsFeedback" class="hint" role="status"></div>
+    <div id="jobList"><div class="empty">暂无训练，完成配置后即可开始</div></div>
 
     <div id="detailFeedback" class="hint feedback-error" role="status"></div>
     <div id="detail" hidden>
@@ -550,6 +547,7 @@
 
       <div class="tabs" role="tablist" aria-label="任务详情">
         <button id="detail-tab-curves" type="button" role="tab" data-tab="curves" aria-controls="tab-curves" aria-selected="true" tabindex="0" class="active">📈 曲线</button>
+        <button id="detail-tab-record" type="button" role="tab" data-tab="record" aria-controls="tab-record" aria-selected="false" tabindex="-1">🧾 训练记录</button>
         <button id="detail-tab-logs" type="button" role="tab" data-tab="logs" aria-controls="tab-logs" aria-selected="false" tabindex="-1">📜 日志</button>
         <button id="detail-tab-result" type="button" role="tab" data-tab="result" aria-controls="tab-result" aria-selected="false" tabindex="-1">🏆 结果</button>
         <button id="detail-tab-predict" type="button" role="tab" data-tab="predict" aria-controls="tab-predict" aria-selected="false" tabindex="-1">🔮 预测</button>
@@ -563,6 +561,10 @@
         <div class="chartbox"><h3 id="throughputTitle">训练吞吐</h3><canvas id="throughputChart" height="130"></canvas></div>
         <div class="chartbox"><h3>每轮阶段耗时（秒）</h3><canvas id="phaseChart" height="130"></canvas></div>
         <div class="hint">训练耗时包含供数与通信；断点发布包含上传及确认等待。GPU 利用率曲线位于计算槽卡片。</div>
+      </div>
+
+      <div role="tabpanel" aria-labelledby="detail-tab-record" tabindex="0" id="tab-record" hidden>
+        <div id="trainingRecord" class="training-record"></div>
       </div>
 
       <div role="tabpanel" aria-labelledby="detail-tab-logs" tabindex="0" id="tab-logs" hidden>
@@ -586,6 +588,29 @@
     </div>
   </section>
 </main>
+
+<div id="jobsModal" class="preview-modal jobs-modal" role="dialog" aria-modal="true" aria-labelledby="jobsModalTitle" aria-describedby="historyCount" hidden>
+  <div class="preview-modal-card jobs-modal-card" tabindex="-1">
+    <div class="preview-modal-head">
+      <div>
+        <h2 id="jobsModalTitle" class="preview-modal-title">全部训练</h2>
+        <p class="preview-modal-subtitle">搜索并打开任意一次训练记录</p>
+      </div>
+      <button id="btnCloseJobs" type="button" aria-label="关闭全部训练">×</button>
+    </div>
+    <div class="preview-modal-body jobs-modal-body">
+      <div class="job-filters">
+        <label class="sr-only" for="jobSearch">搜索任务</label>
+        <input id="jobSearch" type="search" placeholder="搜索数据集、目标列或任务 ID…" maxlength="200">
+        <label class="sr-only" for="jobStatusFilter">任务状态</label>
+        <select id="jobStatusFilter"><option value="all">全部状态</option><option value="running">训练中</option><option value="queued">排队中</option><option value="paused">已暂停</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select>
+        <button id="btnResetJobFilters" type="button">重置筛选</button>
+      </div>
+      <div class="job-list-feedback"><span id="historyCount" class="hint" role="status"></span></div>
+      <div id="allJobList"><div class="empty">暂无训练记录</div></div>
+    </div>
+  </div>
+</div>
 
 <div id="previewModal" class="preview-modal" role="dialog" aria-modal="true" aria-labelledby="previewModalTitle" aria-describedby="previewModalMeta" hidden>
   <div class="preview-modal-card" tabindex="-1">
@@ -616,6 +641,7 @@ const state = {
   datasets: [], datasetId: null, preview: null, previewOpen: false, previewError: false, previewRequest: 0,
   previewPage: 1, previewPageCount: 1, previewTotalRows: 0, previewReturnFocus: null,
   jobs: [], jobId: null, logOffset: 0, activeTab: "curves",
+  jobsModalOpen: false, jobsReturnFocus: null,
   charts: { loss: null, metric: null }, metricKind: null,
   workerSlots: [], workerResourcesLoaded: false, workerResourcesError: false, detailRecord: null, retrySubmitting: false,
   remoteServers: [], remoteOperations: new Map(), remoteOperationNotified: new Set(),
@@ -1399,16 +1425,18 @@ function jobCard(j) {
   </div>`;
 }
 
-// 在内存中组合筛选，按 ID 更新卡片，避免轮询销毁键盘焦点。
-function renderJobList() {
-  const query = $("jobSearch").value.trim().toLocaleLowerCase();
-  const status = $("jobStatusFilter").value;
-  const jobs = state.jobs.filter(job => (status === "all" || job.status === status)
-    && [job.id, job.spec.dataset_name, job.spec.target, taskName(job.spec.task)].some(value => String(value || "").toLocaleLowerCase().includes(query)));
-  $("jobCount").textContent = "显示 " + jobs.length + " / " + state.jobs.length + " 个任务" + (state.jobId && !jobs.some(job => job.id === state.jobId) ? " · 当前查看的任务不在筛选结果中" : "");
-  const box = $("jobList");
+// 首次进入训练台时优先定位运行中、排队中或暂停中的任务。
+function preferredJob(jobs, selectedId) {
+  return jobs.find(job => job.id === selectedId)
+    || ["running", "queued", "paused"].map(status => jobs.find(job => job.status === status)).find(Boolean)
+    || jobs[0]
+    || null;
+}
+
+// 按任务 ID 更新卡片，避免轮询销毁键盘焦点。
+function renderJobCards(box, jobs, emptyText) {
   if (!jobs.length) {
-    box.innerHTML = '<div class="empty">' + (state.jobs.length ? '没有匹配的任务，请调整或重置筛选。' : '暂无任务，完成配置后即可开始训练。') + '</div>';
+    box.innerHTML = '<div class="empty">' + esc(emptyText) + '</div>';
     return;
   }
   const existing = new Map([...box.querySelectorAll(".jobcard")].map(card => [card.dataset.id, card]));
@@ -1424,13 +1452,56 @@ function renderJobList() {
     card.setAttribute("role", "button");
     card.setAttribute("tabindex", "0");
     card.setAttribute("aria-pressed", String(job.id === state.jobId));
-    card.setAttribute("aria-label", (job.spec.dataset_name || job.id) + "，" + (statusText[job.status] || job.status));
+    card.setAttribute("aria-label", ((job.spec || {}).dataset_name || job.id) + "，" + (statusText[job.status] || job.status));
     card.onclick = () => selectJob(job.id);
     card.onkeydown = event => {
       if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectJob(job.id); }
     };
     if (box.children[index] !== card) box.insertBefore(card, box.children[index] || null);
   });
+}
+
+// 主区只展示当前任务；完整记录仍在弹窗中筛选和访问。
+function renderJobList() {
+  const current = state.jobs.find(job => job.id === state.jobId);
+  $("jobCount").textContent = current
+    ? (statusText[current.status] || current.status) + " · " + fmtTime(current.created_at)
+    : (state.jobs.length ? "选择全部训练查看记录" : "暂无训练");
+  $("allJobCount").textContent = String(state.jobs.length);
+  $("btnOpenJobs").setAttribute("aria-label", "查看全部 " + state.jobs.length + " 个训练任务");
+  renderJobCards($("jobList"), current ? [current] : [], "暂无训练，完成配置后即可开始");
+
+  const query = $("jobSearch").value.trim().toLocaleLowerCase();
+  const status = $("jobStatusFilter").value;
+  const jobs = state.jobs.filter(job => (status === "all" || job.status === status)
+    && [job.id, (job.spec || {}).dataset_name, (job.spec || {}).target, taskName((job.spec || {}).task)]
+      .some(value => String(value || "").toLocaleLowerCase().includes(query)));
+  $("historyCount").textContent = "显示 " + jobs.length + " / " + state.jobs.length + " 个任务";
+  renderJobCards($("allJobList"), jobs, state.jobs.length ? "没有匹配的任务，请调整或重置筛选。" : "暂无训练记录");
+}
+
+// 打开全部训练弹窗并把焦点移到搜索框。
+function openJobsModal() {
+  state.jobsReturnFocus = document.activeElement;
+  state.jobsModalOpen = true;
+  $("jobsModal").hidden = false;
+  $("jobsModal").classList.add("is-open");
+  if (document.body && document.body.classList) document.body.classList.add("preview-modal-open");
+  $("btnOpenJobs").setAttribute("aria-expanded", "true");
+  renderJobList();
+  $("jobSearch").focus();
+}
+
+// 关闭全部训练弹窗并将焦点还给触发按钮。
+function closeJobsModal() {
+  state.jobsModalOpen = false;
+  $("jobsModal").hidden = true;
+  $("jobsModal").classList.remove("is-open");
+  if (!state.previewOpen && document.body && document.body.classList) document.body.classList.remove("preview-modal-open");
+  $("btnOpenJobs").setAttribute("aria-expanded", "false");
+  const trigger = state.jobsReturnFocus || $("btnOpenJobs");
+  state.jobsReturnFocus = null;
+  if (trigger && typeof trigger.focus === "function") trigger.focus();
 }
 
 // 只采纳最近一次任务列表响应；短暂离线保留已有任务及当前选择。
@@ -1442,7 +1513,10 @@ async function refreshJobs() {
     if (request !== state.jobsRequest) return;
     state.jobs = jobs;
     $("jobsFeedback").textContent = "";
-    if (!state.jobId && state.jobs.length) selectJob(state.jobs[0].id);
+    if (!state.jobId && state.jobs.length) {
+      const focusJob = preferredJob(state.jobs, null);
+      if (focusJob) selectJob(focusJob.id);
+    }
     else if (selection === state.selectionVersion && state.jobId && !state.jobs.some(job => job.id === state.jobId)) {
       state.jobId = null;
       state.selectionVersion++;
@@ -1459,6 +1533,7 @@ async function refreshJobs() {
 
 // 切换时立即清除旧详情与输出，响应版本同时隔离 A→B→A 的快速切换。
 function selectJob(id, clearLog) {
+  if (state.jobsModalOpen) closeJobsModal();
   if (state.jobId !== id || clearLog) {
     state.jobId = id;
     state.selectionVersion++;
@@ -1548,8 +1623,70 @@ async function loadDetail() {
   j.metrics = j.metrics || [];
   renderPerformanceSummary(j);
   if (state.activeTab === "curves") renderCharts(j);
+  if (state.activeTab === "record") renderTrainingRecord(j);
   // 日志由独立定时器持续读取，详情请求较慢时也不能阻塞日志刷新。
   if (state.activeTab === "result") renderResult(j);
+}
+
+// 将结构化训练参数和执行轨迹完整显示，缺少的旧任务字段以短横线表示。
+function renderTrainingRecord(job) {
+  const spec = job.spec || {};
+  const params = spec.params || {};
+  const summary = job.summary || {};
+  const segments = [...(job.segments || [])];
+  if (job.current_attempt) segments.push(job.current_attempt);
+  const metrics = job.metrics || [];
+  const performance = job.performance || [];
+  const formatValue = value => value === null || value === undefined || value === "" ? "-" : esc(String(value));
+  const row = (label, value) => '<div class="training-record-field"><dt>' + esc(label) + '</dt><dd>' + formatValue(value) + '</dd></div>';
+  const duration = summary.duration_sec ?? (
+    job.started_at && job.finished_at ? Math.max(0, Math.round(job.finished_at - job.started_at)) : null
+  );
+  const configRows = Object.entries(params).map(([key, value]) => row(key, typeof value === "object" && value !== null ? JSON.stringify(value) : value)).join("");
+  const segmentRows = segments.length ? segments.map((segment, index) => {
+    const from = segment.from_epoch ?? "-";
+    const to = segment.to_epoch ?? (job.progress && job.progress.epoch) ?? "-";
+    const resource = resourceText(segment) || segment.worker_id || segment.machine_id || "-";
+    return '<tr><td>' + (index + 1) + '</td><td>' + formatValue(segment.status) + '</td><td>'
+      + formatValue(from + " - " + to) + '</td><td>' + formatValue(resource) + '</td><td>'
+      + formatValue(fmtTime(segment.started_at)) + '</td><td>'
+      + formatValue(fmtTime(segment.finished_at)) + '</td></tr>';
+  }).join("") : '<tr><td colspan="6">暂无执行记录</td></tr>';
+  const metricKeys = [...new Set(metrics.flatMap(item => Object.keys(item)))];
+  const metricTable = metrics.length
+    ? '<div class="training-record-table-wrap"><table><thead><tr>' + metricKeys.map(key => '<th>' + esc(key) + '</th>').join("")
+      + '</tr></thead><tbody>' + metrics.map(item => '<tr>' + metricKeys.map(key => '<td>' + formatValue(item[key]) + '</td>').join("") + '</tr>').join("")
+      + '</tbody></table></div>'
+    : '<div class="empty">暂无逐轮指标</div>';
+  const performanceKeys = [...new Set(performance.flatMap(item => Object.keys(item)))];
+  const performanceTable = performance.length
+    ? '<div class="training-record-table-wrap"><table><thead><tr>' + performanceKeys.map(key => '<th>' + esc(key) + '</th>').join("")
+      + '</tr></thead><tbody>' + performance.map(item => '<tr>' + performanceKeys.map(key => '<td>' + formatValue(item[key]) + '</td>').join("") + '</tr>').join("")
+      + '</tbody></table></div>'
+    : '<div class="hint">该任务没有性能采集记录。</div>';
+  const summaryJson = summary && Object.keys(summary).length
+    ? '<details class="training-record-json"><summary>训练结果摘要</summary><pre>' + esc(JSON.stringify(summary, null, 2)) + '</pre></details>'
+    : "";
+  const segmentJson = segments.length
+    ? '<details class="training-record-json"><summary>完整执行环境记录</summary><pre>' + esc(JSON.stringify(segments, null, 2)) + '</pre></details>'
+    : "";
+  const specJson = '<details class="training-record-json"><summary>完整任务规格</summary><pre>' + esc(JSON.stringify(spec, null, 2)) + '</pre></details>';
+  const error = job.error || job.last_error;
+
+  $("trainingRecord").innerHTML = '<section class="training-record-section"><h3>任务概览</h3><dl class="training-record-grid">'
+    + row("任务 ID", job.id) + row("状态", statusText[job.status] || job.status) + row("任务类型", taskName(spec.task))
+    + row("数据集", spec.dataset_name || spec.dataset_id) + row("目标列", spec.target || "无目标列")
+    + row("创建时间", fmtTime(job.created_at)) + row("开始时间", fmtTime(job.started_at))
+    + row("结束时间", fmtTime(job.finished_at)) + row("训练用时", duration == null ? null : duration + " 秒")
+    + row("设备", job.device || (job.current_attempt && resourceText(job.current_attempt)))
+    + row("自动重试", job.retry_count || 0) + row("手动重试", job.manual_retry_count || 0)
+    + '</dl>' + (error ? '<p class="training-record-error"><strong>错误信息</strong><br>' + esc(error) + '</p>' : "")
+    + '</section><section class="training-record-section"><h3>训练参数</h3>'
+    + (Object.keys(params).length ? '<dl class="training-record-grid">' + configRows + '</dl>' : '<div class="hint">该任务未保存参数。</div>')
+    + specJson + '</section><section class="training-record-section"><h3>执行轨迹</h3><div class="training-record-table-wrap"><table><thead><tr><th>#</th><th>状态</th><th>轮次</th><th>资源</th><th>开始</th><th>结束</th></tr></thead><tbody>'
+    + segmentRows + '</tbody></table></div>' + segmentJson + summaryJson + '</section><section class="training-record-section"><h3>逐轮训练指标</h3>'
+    + metricTable + '</section><section class="training-record-section"><h3>吞吐与阶段耗时</h3>'
+    + performanceTable + '</section>';
 }
 
 /* ---------- 图表 ---------- */
@@ -2146,6 +2283,14 @@ document.querySelectorAll(".tabs button").forEach((button, index, tabs) => {
     event.preventDefault();
     activateDetailTab(tabs[next].dataset.tab, true);
   });
+});
+$("btnOpenJobs").onclick = openJobsModal;
+$("btnCloseJobs").onclick = closeJobsModal;
+$("jobsModal").addEventListener("click", event => {
+  if (event.target === $("jobsModal")) closeJobsModal();
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && state.jobsModalOpen) closeJobsModal();
 });
 $("jobSearch").addEventListener("input", renderJobList);
 $("jobStatusFilter").addEventListener("change", renderJobList);

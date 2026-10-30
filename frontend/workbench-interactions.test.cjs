@@ -9,7 +9,8 @@ const html = fs.readFileSync(path.join(__dirname, '../backend/static/index.html'
 // 只模拟 DOM 和网络边界，校验、任务状态、请求载荷与响应处理执行真实页面函数。
 function fixture() {
   const nodes = new Map();
-  const document = { activeElement: null };
+  const document = { activeElement: null, handlers: {}, body: { classList: { add() {}, remove() {} } },
+    addEventListener(name, fn) { this.handlers[name] = fn; } };
   function element(id = '') {
     const node = { id, value: '', textContent: '', hidden: false, disabled: false, checked: false,
       dataset: {}, attributes: {}, children: [], style: {}, handlers: {}, open: false,
@@ -47,7 +48,7 @@ function fixture() {
     nodes.set(node.id, node);
   }
   const $ = id => { if (!nodes.has(id)) nodes.set(id, element(id)); return nodes.get(id); };
-  const tabs = ['curves', 'logs', 'result', 'predict'].map(name => { const node = element('detail-tab-' + name); node.dataset.tab = name; nodes.set(node.id, node); return node; });
+  const tabs = ['curves', 'record', 'logs', 'result', 'predict'].map(name => { const node = element('detail-tab-' + name); node.dataset.tab = name; nodes.set(node.id, node); return node; });
   document.querySelectorAll = () => tabs;
   document.createElement = () => element();
   $('taskSelect').value = 'classification'; $('targetSelect').value = 'target';
@@ -131,21 +132,76 @@ test('LLM 预训练注意力维度不整除时阻止提交', async () => {
   assert.match(f.$('trainFeedback').textContent, /整除/);
 });
 
-test('搜索和状态筛选组合，支持空列表、无匹配与恶意名称的纯文本显示', () => {
+test('搜索和状态筛选组合在完整训练弹窗中工作，支持空列表和恶意名称转义', () => {
   const f = fixture(); f.state.jobs = [job('a', 'running', '<img src=x>'), job('b', 'completed', '销售数据')];
   f.$('jobSearch').value = '销售'; f.$('jobStatusFilter').value = 'completed';
-  f.context.renderJobList(); assert.equal(f.$('jobList').children.length, 1); assert.equal(f.$('jobList').children[0].dataset.id, 'b');
-  f.$('jobStatusFilter').value = 'running'; f.context.renderJobList(); assert.match(f.$('jobList').innerHTML, /没有匹配/);
-  f.$('jobSearch').value = ''; f.context.renderJobList(); assert.match(f.$('jobList').children[0].innerHTML, /&lt;img/);
-  f.state.jobs = []; f.context.renderJobList(); assert.match(f.$('jobList').innerHTML, /暂无任务/);
+  f.context.renderJobList(); assert.equal(f.$('jobList').children.length, 0);
+  assert.equal(f.$('allJobList').children.length, 1); assert.equal(f.$('allJobList').children[0].dataset.id, 'b');
+  f.$('jobStatusFilter').value = 'running'; f.context.renderJobList(); assert.match(f.$('allJobList').innerHTML, /没有匹配/);
+  f.$('jobSearch').value = ''; f.context.renderJobList(); assert.match(f.$('allJobList').children[0].innerHTML, /&lt;img/);
+  f.state.jobs = []; f.context.renderJobList(); assert.match(f.$('allJobList').innerHTML, /暂无训练记录/);
 });
 
-test('轮询更新复用任务卡片，保留焦点和选中状态', () => {
+test('首次聚焦活跃任务，历史弹窗保留完整卡片并复用焦点', () => {
   const f = fixture(); f.state.jobs = [job('a'), job('b')]; f.state.jobId = 'b';
-  f.context.renderJobList(); const card = f.$('jobList').children[1]; card.focus();
+  assert.equal(f.context.preferredJob(f.state.jobs, null).id, 'a');
+  f.state.jobs[0].status = 'completed';
+  assert.equal(f.context.preferredJob(f.state.jobs, null).id, 'b');
+  assert.equal(f.context.preferredJob(f.state.jobs, 'a').id, 'a');
+  f.context.renderJobList(); assert.equal(f.$('jobList').children.length, 1);
+  assert.equal(f.$('jobList').children[0].dataset.id, 'b');
+  const card = f.$('allJobList').children[1]; card.focus();
   f.state.jobs[1].progress.percent = 60; f.context.renderJobList();
-  assert.equal(f.$('jobList').children[1], card); assert.equal(f.document.activeElement, card);
+  assert.equal(f.$('allJobList').children[1], card); assert.equal(f.document.activeElement, card);
   assert.equal(card.attributes['aria-pressed'], 'true'); assert.match(card.innerHTML, /60%/);
+});
+
+test('历史选择关闭弹窗并切换当前训练，焦点状态和入口数量同步', () => {
+  const f = fixture(); f.state.jobs = [job('a', 'completed'), job('b', 'running')];
+  f.context.fillPredictTemplate = () => {}; f.context.loadDetail = () => {};
+  f.context.openJobsModal();
+  assert.equal(f.$('jobsModal').hidden, false); assert.equal(f.$('jobSearch').focus && f.document.activeElement, f.$('jobSearch'));
+  assert.equal(f.$('allJobCount').textContent, '2');
+  f.$('allJobList').children[0].onclick();
+  assert.equal(f.state.jobId, 'a'); assert.equal(f.$('jobsModal').hidden, true);
+  assert.equal(f.$('jobList').children[0].dataset.id, 'a');
+  assert.equal(f.$('btnOpenJobs').attributes['aria-expanded'], 'false');
+});
+
+test('Escape 关闭历史弹窗并恢复入口焦点', () => {
+  const f = fixture(); f.context.openJobsModal();
+  f.document.handlers.keydown({ key: 'Escape' });
+  assert.equal(f.$('jobsModal').hidden, true);
+  assert.equal(f.document.activeElement, f.$('btnOpenJobs'));
+});
+
+test('训练记录展示配置、完整指标、性能和跨节点执行段，并转义异常文本', () => {
+  const f = fixture();
+  f.context.renderTrainingRecord({
+    ...job('record', 'failed'),
+    spec: { task: 'regression', target: '<script>x</script>', dataset_name: 'sales', params: { epochs: 2, nested: { seed: 7 } }, resource_hint: { require_gpu: true } },
+    created_at: 10, started_at: 11, finished_at: 15, error: '<img src=x>',
+    segments: [{ status: 'completed', from_epoch: 1, to_epoch: 2, worker_id: 'worker-a', started_at: 11, finished_at: 15 }],
+    metrics: [{ epoch: 1, train_loss: 0.7, val_r2: 0.2 }, { epoch: 2, train_loss: 0.3, val_r2: 0.8 }],
+    performance: [{ epoch: 1, samples_per_second: 120, train_seconds: 0.2 }],
+    summary: { duration_sec: 4, final: { val_r2: 0.8 } },
+  });
+  const record = f.$('trainingRecord').innerHTML;
+  for (const value of ['任务 ID', '开始时间', '嵌套', 'worker-a', 'val_r2', 'samples_per_second', '训练结果摘要']) {
+    if (value === '嵌套') assert.match(record, /nested/);
+    else assert.match(record, new RegExp(value));
+  }
+  assert.match(record, /&lt;script&gt;/); assert.match(record, /&lt;img src=x&gt;/);
+  assert.doesNotMatch(record, /<script>x/); assert.doesNotMatch(record, /<img src=x>/);
+});
+
+test('旧任务缺少时间、性能和执行段时记录页提供明确空状态', () => {
+  const f = fixture(), legacy = job('legacy', 'completed');
+  legacy.spec = { task: 'classification', target: 'target', dataset_name: 'legacy' };
+  f.context.renderTrainingRecord(legacy);
+  const record = f.$('trainingRecord').innerHTML;
+  assert.match(record, /暂无执行记录/); assert.match(record, /暂无逐轮指标/);
+  assert.match(record, /没有性能采集记录/); assert.match(record, /该任务未保存参数/);
 });
 
 for (const failure of [false, true]) test(`切换后旧详情${failure ? '失败' : '成功'}响应不污染当前任务`, async () => {
@@ -224,8 +280,8 @@ test('预测模板的旧响应不覆盖新任务或用户正在编辑的内容',
 test('方向键、Home、End 切换标签并同步焦点及无障碍状态', () => {
   const f = fixture(); let prevented = 0;
   f.tabs[0].handlers.keydown({ key: 'ArrowRight', preventDefault() { prevented++; } });
-  assert.equal(f.state.activeTab, 'logs'); assert.equal(f.document.activeElement, f.tabs[1]);
-  assert.equal(f.tabs[1].attributes['aria-selected'], 'true'); assert.equal(f.$('tab-logs').hidden, false);
+  assert.equal(f.state.activeTab, 'record'); assert.equal(f.document.activeElement, f.tabs[1]);
+  assert.equal(f.tabs[1].attributes['aria-selected'], 'true'); assert.equal(f.$('tab-record').hidden, false);
   f.tabs[1].handlers.keydown({ key: 'End', preventDefault() {} }); assert.equal(f.state.activeTab, 'predict');
-  f.tabs[3].handlers.keydown({ key: 'Home', preventDefault() {} }); assert.equal(f.state.activeTab, 'curves'); assert.equal(prevented, 1);
+  f.tabs[4].handlers.keydown({ key: 'Home', preventDefault() {} }); assert.equal(f.state.activeTab, 'curves'); assert.equal(prevented, 1);
 });

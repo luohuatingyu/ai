@@ -1508,6 +1508,31 @@ html {
 .training-page .job-filters button { white-space: nowrap; }
 .training-page .job-list-feedback { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 12px; }
 .training-page #jobsFeedback { color: var(--warning); }
+.training-page .job-focus-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 20px 0 10px; }
+.training-page .job-focus-heading > div { min-width: 0; }
+.training-page .job-focus-heading h2 { display: inline; margin: 0 10px 0 0; }
+.training-page #btnOpenJobs { flex: none; }
+.training-page #allJobCount { margin-left: 5px; }
+.training-page .jobs-modal-card { width: min(900px, 100%); }
+.training-page .jobs-modal-body { min-height: 220px; }
+.training-page #allJobList { display: grid; gap: 8px; }
+.training-page .jobs-modal .jobcard { padding: 11px 13px; border-radius: 8px; box-shadow: none; }
+.training-page .jobs-modal .jobcard:hover { transform: none; }
+.training-page .training-record { display: grid; gap: 18px; }
+.training-page .training-record-section { min-width: 0; }
+.training-page .training-record-section h3 { margin: 0 0 10px; color: #2f4059; font-size: 14px; }
+.training-page .training-record-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0; border: 1px solid #e2e8f0; background: #e2e8f0; }
+.training-page .training-record-field { min-width: 0; padding: 9px 11px; background: #fff; }
+.training-page .training-record-field dt { margin-bottom: 4px; color: #718096; font-size: 11px; }
+.training-page .training-record-field dd { margin: 0; color: #29394f; font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.training-page .training-record-table-wrap { max-width: 100%; overflow: auto; border: 1px solid #e2e8f0; border-radius: 7px; }
+.training-page .training-record-table-wrap table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 12px; }
+.training-page .training-record-table-wrap th, .training-page .training-record-table-wrap td { padding: 8px 10px; border-bottom: 1px solid #e8edf4; text-align: left; white-space: nowrap; }
+.training-page .training-record-table-wrap th { position: sticky; top: 0; background: #f5f8fc; color: #52647c; }
+.training-page .training-record-error { padding: 10px 12px; border-left: 3px solid #dc4c48; background: #fff5f4; color: #9c302d; font-size: 12px; overflow-wrap: anywhere; }
+.training-page .training-record-json { margin-top: 10px; border-top: 1px solid #e8edf4; padding-top: 9px; }
+.training-page .training-record-json summary { cursor: pointer; color: #52647c; font-size: 12px; }
+.training-page .training-record-json pre { max-height: 320px; overflow: auto; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; color: #334155; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .training-page .log-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 10px 0; }
 .training-page .log-toolbar label { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; cursor: pointer; }
 .training-page .log-toolbar #logStatus { flex: 1 1 130px; }
@@ -1517,6 +1542,8 @@ html {
   .training-page .job-filters input { flex-basis: 100%; }
   .training-page .job-filters select { flex: 1; }
   .training-page .training-submit { bottom: 0; }
+  .training-page .training-record-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .training-page .job-focus-heading { align-items: flex-start; }
 }
 
 .training-page .jobcard {
