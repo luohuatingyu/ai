@@ -13,12 +13,15 @@ import pytest
 
 from app import config, jobstore
 from app.storage import (
+    ArtifactStoreUnavailableError,
+    S3ArtifactStore,
     checkpoint_key,
     get_store,
     job_key,
     parse_checkpoint_epoch,
     prune_checkpoints,
     resolve_dataset_csv_local,
+    resolve_dataset_for_worker,
     sync_dataset_to_store,
 )
 
@@ -65,6 +68,249 @@ def test_append_text(store):
     st.append_text(job_key("j4", "log.txt"), "a\n")
     st.append_text(job_key("j4", "log.txt"), "b\n")
     assert st.read_text(job_key("j4", "log.txt")) == "a\nb\n"
+
+
+def test_local_log_size_and_byte_ranges(store):
+    """本地日志按元数据取大小并只读取请求字节范围。"""
+    key = job_key("range", "log.txt")
+    store.write_bytes(key, "第一行\nsecond\n".encode("utf-8"))
+    payload = "第一行\nsecond\n".encode("utf-8")
+
+    assert store.get_size(key) == len(payload)
+    assert store.read_bytes_range(key, 0, len("第一行\n".encode("utf-8"))) == "第一行\n".encode("utf-8")
+    assert store.read_bytes_range(key, len("第一行\n".encode("utf-8")), 6) == b"second"
+    assert store.read_bytes_range(key, -5, 0) == b""
+    assert store.read_bytes_range(key, len(payload) + 10, 10) == b""
+    assert store.get_size(job_key("range", "missing.log")) is None
+    assert store.read_bytes_range(job_key("range", "missing.log"), 0, 10) is None
+
+
+def test_s3_log_metadata_and_range_reads_release_response():
+    """S3 日志元数据不下载对象，Range 响应始终关闭并释放连接。"""
+    class Response:
+        def __init__(self, body):
+            self.body = body
+            self.closed = False
+            self.released = False
+
+        def read(self):
+            return self.body
+
+        def close(self):
+            self.closed = True
+
+        def release_conn(self):
+            self.released = True
+
+    class Client:
+        def __init__(self):
+            self.response = Response(b"log chunk")
+            self.range_call = None
+
+        def stat_object(self, bucket, key):
+            return type("Stat", (), {"size": 4096})()
+
+        def get_object(self, bucket, key, **kwargs):
+            self.range_call = (bucket, key, kwargs)
+            return self.response
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = Client()
+    st.bucket = "test-bucket"
+
+    assert st.get_size("jobs/range/log.txt") == 4096
+    assert st.read_bytes_range("jobs/range/log.txt", 17, 9) == b"log chunk"
+    assert st._client.range_call == ("test-bucket", "jobs/range/log.txt", {"offset": 17, "length": 9})
+    assert st._client.response.closed is True
+    assert st._client.response.released is True
+
+
+def test_s3_log_range_missing_object_and_outage():
+    """S3 缺失日志映射为空值，服务故障保留可识别异常。"""
+    class MissingObject(Exception):
+        code = "NoSuchKey"
+
+    class MissingClient:
+        def stat_object(self, bucket, key):
+            raise MissingObject("missing")
+
+        def get_object(self, bucket, key, **kwargs):
+            raise MissingObject("missing")
+
+    missing_store = object.__new__(S3ArtifactStore)
+    missing_store._client = MissingClient()
+    missing_store.bucket = "test-bucket"
+    assert missing_store.get_size("jobs/range/missing.log") is None
+    assert missing_store.read_bytes_range("jobs/range/missing.log", 0, 10) is None
+
+    class OutageClient:
+        def get_object(self, bucket, key, **kwargs):
+            raise ConnectionError("connection reset")
+
+    outage_store = object.__new__(S3ArtifactStore)
+    outage_store._client = OutageClient()
+    outage_store.bucket = "test-bucket"
+    with pytest.raises(ArtifactStoreUnavailableError, match="读取对象存储产物失败"):
+        outage_store.read_bytes_range("jobs/range/log.txt", 0, 10)
+
+
+def test_s3_outage_is_not_treated_as_missing():
+    """S3 网络或鉴权故障必须向上抛出，不能伪装成产物不存在。"""
+    class FailingClient:
+        def get_object(self, *args, **kwargs):
+            raise ConnectionError("connection reset")
+
+        def stat_object(self, *args, **kwargs):
+            raise ConnectionError("connection reset")
+
+        def remove_object(self, *args, **kwargs):
+            raise ConnectionError("connection reset")
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = FailingClient()
+    st.bucket = "test-bucket"
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="读取对象存储"):
+        st.read_bytes("jobs/j4/log.txt")
+    with pytest.raises(ArtifactStoreUnavailableError, match="检查对象存储"):
+        st.exists("jobs/j4/log.txt")
+    with pytest.raises(ArtifactStoreUnavailableError, match="删除对象存储"):
+        st.delete("jobs/j4/log.txt")
+
+
+def test_s3_missing_object_keeps_missing_semantics():
+    """仅 NoSuchKey 继续表示对象不存在，避免把正常缺失当成基础设施故障。"""
+    class MissingObject(Exception):
+        code = "NoSuchKey"
+
+    class MissingClient:
+        def get_object(self, *args, **kwargs):
+            raise MissingObject()
+
+        def stat_object(self, *args, **kwargs):
+            raise MissingObject()
+
+        def remove_object(self, *args, **kwargs):
+            raise MissingObject()
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = MissingClient()
+    st.bucket = "test-bucket"
+
+    assert st.read_bytes("jobs/j4/missing.txt") is None
+    assert st.exists("jobs/j4/missing.txt") is False
+    st.delete("jobs/j4/missing.txt")
+
+
+def test_dataset_sync_propagates_remote_failure(monkeypatch, tmp_path):
+    """S3 同步失败应让导入调用方回滚，不能留下无法被远端 worker 使用的数据集。"""
+    class FailingRemoteStore:
+        def write_file(self, *args, **kwargs):
+            raise ArtifactStoreUnavailableError("对象存储暂时不可用")
+
+    csv = tmp_path / "dataset.csv"
+    csv.write_text("feature,target\n1,0\n", encoding="utf-8")
+    monkeypatch.setattr("app.storage.get_store", lambda: FailingRemoteStore())
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="暂时不可用"):
+        sync_dataset_to_store("ds-remote-failure", csv)
+
+
+def test_worker_resolve_auto_migrates_local_legacy_dataset(monkeypatch, tmp_path):
+    """对象缺失但节点有本地副本时，worker 自动补同步并下载数据集。"""
+    class RecoveringRemoteStore:
+        def __init__(self):
+            """初始化一个记录上传对象的内存状态平面替身。"""
+            self.objects = {}
+
+        def exists(self, key):
+            """返回对象是否已经上传。"""
+            return key in self.objects
+
+        def write_file(self, key, local_path):
+            """记录本地文件上传内容。"""
+            self.objects[key] = local_path.read_bytes()
+
+        def read_file(self, key, local_path):
+            """把已上传对象下载到 worker scratch。"""
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(self.objects[key])
+            return local_path
+
+    ds_id = "ds-local-recovery"
+    local_csv = config.DATASETS_DIR / "processed" / f"{ds_id}.csv"
+    local_csv.parent.mkdir(parents=True, exist_ok=True)
+    local_csv.write_text("feature,target\n1,0\n", encoding="utf-8")
+    remote = RecoveringRemoteStore()
+    monkeypatch.setattr("app.storage.get_store", lambda: remote)
+
+    pulled = resolve_dataset_for_worker(ds_id, tmp_path)
+
+    assert pulled.read_text(encoding="utf-8") == "feature,target\n1,0\n"
+    assert remote.objects[f"datasets/{ds_id}.csv"] == local_csv.read_bytes()
+
+
+def test_worker_resolve_uses_existing_remote_dataset(monkeypatch, tmp_path):
+    """对象存储已有数据集时直接下载，不重复读取或上传本地副本。"""
+    ds_id = "ds-remote-existing"
+    key = f"datasets/{ds_id}.csv"
+
+    class ExistingRemoteStore:
+        def exists(self, object_key):
+            """只报告预置对象存在。"""
+            return object_key == key
+
+        def write_file(self, object_key, local_path):
+            """已有远端对象不应触发上传。"""
+            raise AssertionError(f"不应上传已有对象: {object_key}")
+
+        def read_file(self, object_key, local_path):
+            """写出预置对象内容。"""
+            assert object_key == key
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_text("feature,target\n2,1\n", encoding="utf-8")
+            return local_path
+
+    monkeypatch.setattr("app.storage.get_store", lambda: ExistingRemoteStore())
+
+    pulled = resolve_dataset_for_worker(ds_id, tmp_path)
+
+    assert pulled.read_text(encoding="utf-8") == "feature,target\n2,1\n"
+
+
+def test_worker_resolve_keeps_migration_error_when_dataset_is_missing(
+    monkeypatch, tmp_path
+):
+    """对象存储和本地目录均无数据集时，继续给出迁移提示。"""
+    class MissingRemoteStore:
+        def exists(self, key):
+            """报告对象缺失。"""
+            return False
+
+    monkeypatch.setattr("app.storage.get_store", lambda: MissingRemoteStore())
+
+    with pytest.raises(FileNotFoundError, match="请先运行迁移脚本"):
+        resolve_dataset_for_worker("ds-missing-recovery", tmp_path)
+
+
+def test_worker_resolve_propagates_auto_migration_failure(monkeypatch, tmp_path):
+    """自动补同步遇到对象存储故障时，必须保留基础设施异常。"""
+    class FailingRemoteStore:
+        def exists(self, key):
+            """报告对象缺失以触发自动补同步。"""
+            return False
+
+        def write_file(self, key, local_path):
+            """模拟状态平面上传故障。"""
+            raise ArtifactStoreUnavailableError("对象存储暂时不可用")
+
+    ds_id = "ds-failed-recovery"
+    local_csv = config.DATASETS_DIR / f"{ds_id}.csv"
+    local_csv.write_text("feature,target\n1,0\n", encoding="utf-8")
+    monkeypatch.setattr("app.storage.get_store", lambda: FailingRemoteStore())
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="暂时不可用"):
+        resolve_dataset_for_worker(ds_id, tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +451,47 @@ def test_job_log_helpers(store):
     assert "第一步" in text and "第二步" in text
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "expected_region"),
+    [
+        ("oss-cn-shanghai.aliyuncs.com", "cn-shanghai"),
+        ("oss-cn-shanghai-internal.aliyuncs.com:443", "cn-shanghai"),
+        ("s3.oss-cn-shanghai.aliyuncs.com", "cn-shanghai"),
+        ("s3.oss-cn-hangzhou.aliyuncs.com", "cn-hangzhou"),
+        ("s3.oss-cn-shanghai-internal.aliyuncs.com:443", "cn-shanghai"),
+        ("seaweedfs:8333", None),
+        ("s3.oss-accelerate.aliyuncs.com", None),
+    ],
+)
+def test_s3_store_infers_region_only_for_regional_oss_endpoints(
+    monkeypatch, endpoint, expected_region
+):
+    """阿里云区域端点跳过路径式区域探测，其他 S3 服务保持 SDK 默认行为。"""
+    from app.storage import S3ArtifactStore
+
+    captured = {}
+
+    class CapturingMinio:
+        def __init__(self, endpoint, **kwargs):
+            captured["endpoint"] = endpoint
+            captured.update(kwargs)
+
+        def bucket_exists(self, bucket):
+            return True
+
+    monkeypatch.setattr("minio.Minio", CapturingMinio)
+    S3ArtifactStore(
+        endpoint=endpoint,
+        access_key="test-access",
+        secret_key="test-secret",
+        bucket="test-bucket",
+        secure=True,
+    )
+
+    assert captured["endpoint"] == endpoint
+    assert captured["region"] == expected_region
+
+
 # ---------------------------------------------------------------------------
 # S3 后端集成（需 MTP_TEST_S3 指向 S3 兼容端点，如 SeaweedFS；默认跳过）
 # ---------------------------------------------------------------------------
@@ -258,3 +545,17 @@ def test_s3_backend_roundtrip():
     finally:
         for k in st.list_keys("jobs/it-s3/"):
             st.delete(k)  # 清理测试遗留对象
+
+
+def test_s3_write_failure_is_reported_as_storage_unavailable():
+    """S3 上传连接故障包装成可识别的存储异常供 API 安全映射。"""
+    class FailingClient:
+        def put_object(self, *args, **kwargs):
+            raise ConnectionError("TLS connection reset")
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = FailingClient()
+    st.bucket = "test-bucket"
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="写入对象存储产物失败"):
+        st.write_bytes("jobs/test/job.json", b"{}")

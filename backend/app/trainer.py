@@ -35,6 +35,14 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
 import app.config as config
+from app.performance import EpochPerformance
+from app.device import (
+    backend_from_device,
+    device_rng_state,
+    restore_device_rng_state,
+    seed_device,
+    select_device,
+)
 
 LogFn = Callable[[str], None]
 
@@ -102,10 +110,11 @@ def _rng_snapshot() -> dict:
         },
         "python": {"version": int(py_state[0]), "state": list(py_state[1]), "gauss": py_state[2]},
     }
-    # CUDA 随机数状态一并无损保存（GPU 上 Dropout 等算子使用设备侧 RNG）；
-    # 恢复时设备数不同则跳过（跨卡续训本就不承诺逐位一致）
-    if torch.cuda.is_available():
-        snapshot["cuda"] = torch.cuda.get_rng_state_all()
+    # 保存设备侧 RNG；跨设备续训时状态不匹配会被安全跳过。
+    device = select_device()
+    states = device_rng_state(device)
+    if states is not None:
+        snapshot[backend_from_device(device)] = states
     return snapshot
 
 
@@ -124,13 +133,14 @@ def _rng_restore(snapshot: dict, log_fn: LogFn | None = None) -> None:
     except (KeyError, TypeError, ValueError) as exc:
         if log_fn:
             log_fn(f"随机数状态恢复失败（不影响续训，仅 shuffle 序列变化）: {exc}")
-    cuda_states = snapshot.get("cuda")
-    if cuda_states and torch.cuda.is_available() and torch.cuda.device_count() >= len(cuda_states):
-        try:
-            torch.cuda.set_rng_state_all([s.cpu() for s in cuda_states])
-        except (RuntimeError, ValueError) as exc:
-            if log_fn:
-                log_fn(f"CUDA 随机数状态恢复跳过: {exc}")
+    # checkpoint 可能由另一种 GPU 生成，按当前设备后端尽力恢复。
+    try:
+        current_device = select_device()
+        backend = backend_from_device(current_device)
+        restore_device_rng_state(current_device, snapshot.get(backend), log_fn)
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"设备随机数状态恢复跳过: {exc}")
 
 
 def _version_tuple(version: str) -> tuple:
@@ -169,21 +179,8 @@ class _KMeansCenters(nn.Module):
 
 
 def _pick_device(log_fn: LogFn) -> torch.device:
-    # 首先尝试初始化GPU
-    try:
-        if torch.cuda.is_available():
-            # 尝试获取GPU设备名称，如果失败则抛出异常
-            name = torch.cuda.get_device_name(0)
-            # 尝试创建一个张量来测试GPU是否真正可用
-            test_tensor = torch.tensor([1.0], device='cuda')
-            log_fn(f"成功启动 GPU: {name} (CUDA {torch.version.cuda})")
-            return torch.device("cuda")
-        else:
-            raise RuntimeError("CUDA 不可用")
-    except Exception as e:
-        # GPU初始化失败，回退到CPU
-        log_fn(f"GPU 初始化失败: {str(e)}，回退到 CPU 训练（速度较慢，可检查 GPU 驱动和 CUDA 版本）")
-        return torch.device("cpu")
+    """选择 NVIDIA/ROCm/XPU/MPS/CPU，并保留自动回退 CPU 的旧行为。"""
+    return select_device(log_fn=log_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +189,8 @@ def _pick_device(log_fn: LogFn) -> torch.device:
 
 def _prepare_features(df: pd.DataFrame, target: str | None) -> tuple[pd.DataFrame, dict]:
     """数值列中位数填充；类别列众数填充并 one-hot 展开；返回特征表与元信息。"""
-    X = df.drop(columns=[target]).copy() if target else df.copy()
+    # 每列清洗都会生成新列；浅拷贝即可隔离列赋值，避免先复制整张原始表。
+    X = df.drop(columns=[target]) if target else df.copy(deep=False)
     cat_cols = [c for c in X.columns if str(X[c].dtype) in ("object", "category", "bool")]
     num_cols = [c for c in X.columns if c not in cat_cols]
 
@@ -202,7 +200,8 @@ def _prepare_features(df: pd.DataFrame, target: str | None) -> tuple[pd.DataFram
         col = col.replace([np.inf, -np.inf], np.nan)
         median = col.median()
         num_medians[c] = 0.0 if pd.isna(median) else float(median)
-        X[c] = col.fillna(num_medians[c]).astype(np.float64)
+        # 中位数仍以原始精度计算，填充后直接使用训练矩阵原有的 float32 精度。
+        X[c] = col.fillna(num_medians[c]).astype(np.float32)
 
     cat_modes: dict[str, str] = {}
     for c in cat_cols:
@@ -212,7 +211,7 @@ def _prepare_features(df: pd.DataFrame, target: str | None) -> tuple[pd.DataFram
 
     if cat_cols:
         dummies = pd.get_dummies(
-            X[cat_cols], columns=cat_cols, prefix=cat_cols, prefix_sep="=", dtype=float
+            X[cat_cols], columns=cat_cols, prefix=cat_cols, prefix_sep="=", dtype=np.float32
         )
         X = pd.concat([X[num_cols], dummies], axis=1)
 
@@ -522,7 +521,10 @@ def _run_kmeans_training(
         raise ValueError("KMeans 最大迭代次数必须在 1 到 500 之间")
     if clusters < 2 or clusters > 64:
         raise ValueError("聚类数必须在 2 到 64 之间")
+    # KMeans 当前固定在 CPU 执行；先确定设备再保存设备侧随机种子。
+    device = torch.device("cpu")
     torch.manual_seed(seed)
+    seed_device(seed, device)
     np.random.seed(seed)
     df = pd.read_csv(dataset_path)
     if len(df) < 2:
@@ -534,7 +536,11 @@ def _run_kmeans_training(
     if feature_frame.empty or feature_frame.shape[1] == 0:
         raise ValueError("数据集没有可用于聚类的特征列")
 
-    raw = feature_frame.to_numpy(dtype=np.float32)
+    feature_names = [str(column) for column in feature_frame.columns]
+    # Pandas Copy-on-Write 可能返回只读视图；聚类原地标准化需要独立可写矩阵。
+    raw = feature_frame.to_numpy(dtype=np.float32, copy=True)
+    # 后续只使用特征矩阵与元信息，避免整个训练期间同时保留两个 DataFrame。
+    del df, feature_frame
     unique_rows = np.unique(raw, axis=0).shape[0]
     if clusters >= len(raw):
         raise ValueError(f"聚类数必须小于样本数（{len(raw)}）")
@@ -546,11 +552,14 @@ def _run_kmeans_training(
     mean = raw.mean(axis=0).astype(np.float32)
     std = raw.std(axis=0).astype(np.float32)
     std[std < 1e-8] = 1.0
-    values = ((raw - mean) / std).astype(np.float32)
+    # raw 是本次预处理专用矩阵，不再用于原始值计算，可复用其存储完成标准化。
+    np.subtract(raw, mean, out=raw)
+    np.divide(raw, std, out=raw)
+    values = raw
     n_features = values.shape[1]
     arch = {"model_type": "kmeans", "in_dim": n_features, "n_clusters": clusters}
     preprocessor = {
-        "feature_names": [str(column) for column in feature_frame.columns],
+        "feature_names": feature_names,
         "num_cols": feature_meta["num_cols"],
         "cat_cols": feature_meta["cat_cols"],
         "num_medians": feature_meta["num_medians"],
@@ -585,7 +594,6 @@ def _run_kmeans_training(
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     if resume_state is not None:
         optimizer.load_state_dict(resume_state["optimizer"])
-    device = torch.device("cpu")
     db_log_fn(
         f"KMeans 聚类: 样本 {len(values)} 条，特征 {n_features} 个，簇数 {clusters}，"
         f"最大迭代 {max_iter} 次（CPU）"
@@ -593,6 +601,7 @@ def _run_kmeans_training(
 
     def persist_state(finished_iteration: int) -> None:
         """保存当前聚类中心和随机状态，支持暂停、重派及跨机续训。"""
+        saved_at = time.perf_counter()
         save_trainer_state(
             job_dir / "checkpoints" / f"ckpt-e{finished_iteration:04d}.pt",
             model=model,
@@ -607,9 +616,12 @@ def _run_kmeans_training(
             best_record=best_record,
             device=device,
         )
+        performance.record["checkpoint_save_seconds"] += time.perf_counter() - saved_at
         if on_checkpoint is not None:
-            on_checkpoint(finished_iteration)
+            with performance.measure("checkpoint_publish_seconds"):
+                on_checkpoint(finished_iteration)
 
+    performance = EpochPerformance(start_epoch)
     if pause_event.is_set():
         persist_state(start_epoch)
         raise JobPaused(f"KMeans 聚类已在第 {start_epoch} 次迭代后暂停")
@@ -624,6 +636,7 @@ def _run_kmeans_training(
     iterations_done = start_epoch
     final_labels = previous_labels
     for iteration in range(start_epoch + 1, max_iter + 1):
+        performance = EpochPerformance(iteration)
         if cancel_event.is_set():
             raise JobCancelled()
         if pause_event.is_set():
@@ -659,6 +672,7 @@ def _run_kmeans_training(
             "val_loss": round(inertia / len(values), 6),
             "inertia": round(inertia, 6),
         }
+        performance.record["train_seconds"] = time.perf_counter() - performance.started
         _append_jsonl(metrics_path, record)
         score = -inertia
         if best_score is None or score > best_score:
@@ -673,6 +687,7 @@ def _run_kmeans_training(
         )
         iterations_done = iteration
         persist_state(iteration)
+        performance.write(job_dir, len(values), 1)
         if on_epoch_end is not None:
             on_epoch_end(record)
         db_log_fn(
@@ -724,6 +739,7 @@ def _run_kmeans_training(
         "device": "cpu",
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
+        "device_backend": backend_from_device(device),
         "epochs_total": iterations_done,
         "epochs_done": iterations_done,
         "resumed_from": start_epoch,
@@ -765,6 +781,7 @@ def run_training(
     resume_state: dict | None = None,
     on_epoch_end: Callable[[dict], None] | None = None,
     on_checkpoint: Callable[[int], None] | None = None,
+    parallel=None,
 ) -> dict:
     """执行（或续训执行）一次训练，返回 summary。
 
@@ -808,6 +825,7 @@ def run_training(
             resume_state=resume_state,
             on_epoch_end=on_epoch_end,
             on_checkpoint=on_checkpoint,
+            parallel=parallel,
         )
     if dataset_path is None or not dataset_path.exists():
         raise ValueError("数据集文件不存在（可能已被删除）")
@@ -819,6 +837,8 @@ def run_training(
     seed = int(params.get("seed", 42))
 
     if task == "clustering":
+        if parallel is not None:
+            raise ValueError("KMeans 不使用梯度训练，请使用单节点模式")
         return _run_kmeans_training(
             dataset_path=dataset_path,
             params={**params, "epochs": epochs, "seed": seed},
@@ -839,7 +859,7 @@ def run_training(
     test_split = float(params["test_split"])
 
     # ---- 环境 ----
-    device = _pick_device(db_log_fn)
+    device = parallel.device if parallel is not None else _pick_device(db_log_fn)
     torch.manual_seed(seed)
     np.random.seed(seed)
     db_log_fn(
@@ -862,6 +882,7 @@ def run_training(
         )
         classes = None
         feat_meta = {"num_cols": [], "cat_cols": [], "num_medians": {}, "cat_modes": {}}
+        feature_names = [f"lag_{sequence_meta['lookback'] - index}" for index in range(sequence_meta["lookback"])]
     else:
         if not target or target not in df.columns:
             raise ValueError(f"目标列 '{target}' 不在数据集中")
@@ -877,6 +898,10 @@ def run_training(
         except ValueError as exc:
             raise ValueError("回归任务要求目标列全部为数值") from exc
         X_all = X_df.to_numpy(dtype=np.float32)
+        feature_names = [str(c) for c in X_df.columns]
+        del X_df
+    # 元信息与数组已独立保存，释放原始表，降低切分和标准化阶段的峰值内存。
+    del df
 
     n_features = X_all.shape[1]
     db_log_fn(
@@ -910,12 +935,17 @@ def run_training(
             X_all, y_all, test_size=test_split, random_state=seed, stratify=stratify
         )
     db_log_fn(f"划分: 训练 {X_train.shape[0]} 条 / 验证 {X_val.shape[0]} 条")
+    # 随机切分生成独立数组；时间序列为互不重叠的行切片，底层存储由切片继续持有。
+    del X_all, y_all, stratify
 
     mean = np.asarray(X_train.mean(axis=0), dtype=np.float32)
     std = np.asarray(X_train.std(axis=0), dtype=np.float32)
     std[std < 1e-8] = 1.0
-    X_train = (X_train - mean) / std
-    X_val = (X_val - mean) / std
+    # 只修改本任务独占且训练/验证互不重叠的数组，保持运算顺序和 float32 舍入。
+    np.subtract(X_train, mean, out=X_train)
+    np.divide(X_train, std, out=X_train)
+    np.subtract(X_val, mean, out=X_val)
+    np.divide(X_val, std, out=X_val)
 
     # 回归目标标准化（避免大数值目标导致 loss 梯度过小、训练不动）
     y_scale: tuple[float, float] | None = None
@@ -926,13 +956,10 @@ def run_training(
             y_std = 1.0
         y_scale = (y_mean, y_std)
         log_fn(f"回归目标标准化: mean={y_mean:.2f}, std={y_std:.2f}（评估与预测时反归一化）")
-        y_train = ((y_train - y_mean) / y_std).astype(np.float32)
-        y_val = ((y_val - y_mean) / y_std).astype(np.float32)
-
-    feature_names = (
-        [f"lag_{sequence_meta['lookback'] - index}" for index in range(sequence_meta["lookback"])]
-        if sequence_meta else [str(c) for c in X_df.columns]
-    )
+        np.subtract(y_train, y_mean, out=y_train)
+        np.divide(y_train, y_std, out=y_train)
+        np.subtract(y_val, y_mean, out=y_val)
+        np.divide(y_val, y_std, out=y_val)
     preprocessor = {
         "feature_names": feature_names,
         "num_cols": feat_meta["num_cols"],
@@ -987,23 +1014,34 @@ def run_training(
         # 随机数状态恢复必须在模型构建之后：续训的数据 shuffle 序列与未中断时完全一致
         _rng_restore(resume_state.get("rng") or {}, db_log_fn)
 
+    if parallel is not None:
+        # 每个节点必须读取同一数据快照并生成相同的特征与标签映射。
+        identity = dataset_path.read_bytes() + json.dumps(_py(preprocessor), sort_keys=True).encode()
+        parallel.initialize([model], identity)
+
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
         batch_size=batch_size,
         shuffle=True,
+        pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)),
         batch_size=512,
+        pin_memory=device.type == "cuda",
     )
 
     # ---- 训练循环 ----
     metrics_path = job_dir / "metrics.jsonl"
     # trainer-state 存档间隔（epoch 数）：进度兜底线，暂停/崩溃时可回退到最近存档
     ckpt_interval = max(int(getattr(config, "WORKER_CHECKPOINT_INTERVAL", 5)), 1)
+    performance = EpochPerformance(start_epoch)
 
     def _persist_state(finished_epoch: int) -> None:
         """保存完整训练上下文到本地 scratch，并回调 worker 上传到状态平面。"""
+        if parallel is not None and not parallel.primary:
+            return
+        saved_at = time.perf_counter()
         save_trainer_state(
             job_dir / "checkpoints" / f"ckpt-e{finished_epoch:04d}.pt",
             model=model,
@@ -1022,10 +1060,16 @@ def run_training(
             best_record=best_record,
             device=device,
         )
+        performance.record["checkpoint_save_seconds"] += time.perf_counter() - saved_at
         if on_checkpoint is not None:
+            published_at = time.perf_counter()
             on_checkpoint(finished_epoch)
+            performance.record["checkpoint_publish_seconds"] += time.perf_counter() - published_at
 
     for epoch in range(start_epoch + 1, epochs + 1):
+        performance = EpochPerformance(epoch, "group" if parallel is not None else "single")
+        if parallel is not None:
+            parallel.control(cancel_event, pause_event, allow_pause=True)
         if cancel_event.is_set():
             raise JobCancelled()
         if pause_event.is_set():
@@ -1035,26 +1079,53 @@ def run_training(
 
         model.train()
         running, seen = 0.0, 0
-        for X_batch, y_batch in train_loader:
-            if cancel_event.is_set():
+        steps = 0
+        train_started = time.perf_counter()
+        batches = train_loader if parallel is None else (
+            (torch.from_numpy(X_train[indices]), torch.from_numpy(y_train[indices]))
+            for indices in parallel.indices(len(X_train), epoch)
+        )
+        for X_batch, y_batch in batches:
+            steps += 1
+            if parallel is not None:
+                parallel.control(cancel_event, pause_event)
+            elif cancel_event.is_set():
                 raise JobCancelled()
-            if pause_event.is_set():
+            if parallel is None and pause_event.is_set():
                 _persist_state(epoch - 1)
                 raise JobPaused(f"训练已在第 {epoch - 1} 个 epoch 后暂停（epoch {epoch} 中途）")
             optimizer.zero_grad()
-            out = model(X_batch.to(device))
+            if len(y_batch) == 0:
+                parallel.step(optimizer, 0)
+                continue
+            out = model(X_batch.to(device, non_blocking=device.type == "cuda"))
             pred = out if task == "classification" else out.squeeze(-1)
-            loss = nn.functional.cross_entropy(out, y_batch.to(device)) if task == "classification" \
-                else nn.functional.mse_loss(pred, y_batch.to(device))
+            loss = nn.functional.cross_entropy(out, y_batch.to(device, non_blocking=device.type == "cuda")) if task == "classification" \
+                else nn.functional.mse_loss(pred, y_batch.to(device, non_blocking=device.type == "cuda"))
             loss.backward()
-            optimizer.step()
-            running += loss.item() * len(y_batch)
+            if parallel is None:
+                optimizer.step()
+            else:
+                parallel.step(optimizer, len(y_batch))
+            # GPU 标量留在设备累计，轮次结束才同步；CPU 沿用原有精度与行为。
+            value = loss.item() if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64)
+            running = running + value * len(y_batch)
             seen += len(y_batch)
+        running = float(running)
+        if parallel is not None:
+            running, seen = parallel.totals([running, seen])
+        performance.record["train_seconds"] = time.perf_counter() - train_started
         train_loss = running / max(seen, 1)
         if y_scale:  # 反归一化到目标原始量纲，保持 train/val 曲线单位一致
             train_loss *= y_scale[1] ** 2
 
-        val_result, _, _ = _evaluate(model, val_loader, task, device, y_scale=y_scale)
+        val_result = None
+        validation_started = time.perf_counter()
+        if parallel is None or parallel.primary:
+            val_result, _, _ = _evaluate(model, val_loader, task, device, y_scale=y_scale)
+        if parallel is not None:
+            val_result = parallel.json_from_primary(val_result)
+        performance.record["validation_seconds"] = time.perf_counter() - validation_started
         record: dict[str, Any] = {"epoch": epoch, "train_loss": round(train_loss, 6),
                                   "val_loss": round(val_result["val_loss"], 6)}
         if task == "classification":
@@ -1062,7 +1133,8 @@ def run_training(
         else:
             record["val_mse"] = round(val_result["val_mse"], 6)
             record["val_r2"] = round(val_result["val_r2"], 6)
-        _append_jsonl(metrics_path, record)
+        if parallel is None or parallel.primary:
+            _append_jsonl(metrics_path, record)
 
         if task == "classification":
             db_log_fn(
@@ -1080,17 +1152,25 @@ def run_training(
         # 以验证集指标保留最佳权重（分类看 acc；回归看最小 val_loss）
         if best_record is None or score > best_score:
             best_score, best_epoch, best_record = score, epoch, dict(record)
-            _save_checkpoint(job_dir / "best.pt", model, arch, preprocessor, task, "best", record)
-        if epoch % 5 == 0 or epoch == epochs:
+            if parallel is None or parallel.primary:
+                _save_checkpoint(job_dir / "best.pt", model, arch, preprocessor, task, "best", record)
+        if (epoch % 5 == 0 or epoch == epochs) and (parallel is None or parallel.primary):
             _save_checkpoint(job_dir / "last.pt", model, arch, preprocessor, task, "last", record)
 
         # 周期性保存完整训练上下文（断点续训依据），并同步 metrics/日志到状态平面
         if epoch % ckpt_interval == 0 or epoch == epochs:
             _persist_state(epoch)
+        if parallel is None or parallel.primary:
+            performance.write(job_dir, int(seen), steps)
         if on_epoch_end is not None:
             on_epoch_end(record)
+        if parallel is not None and parallel.control(cancel_event, pause_event, allow_pause=True):
+            _persist_state(epoch)
+            raise JobPaused(f"联合训练已在完整 epoch {epoch} 后暂停")
 
     # ---- 最终报告（用最佳权重）----
+    if parallel is not None and not parallel.primary:
+        return {}
     best_path = job_dir / "best.pt"
     if not best_path.exists():
         raise ValueError(
@@ -1107,6 +1187,7 @@ def run_training(
         "device": str(device),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
+        "device_backend": backend_from_device(device),
         "epochs_total": epochs,
         "epochs_done": epochs,
         "resumed_from": start_epoch,          # 本次运行起始 epoch（0 表示全新训练）
@@ -1120,6 +1201,9 @@ def run_training(
     }
     if sequence_meta:
         summary.update(sequence_meta)
+    if parallel is not None:
+        summary["parallel"] = {"workers": parallel.world_size, "backend": parallel.backend,
+                               "batch_sizes": parallel.sizes, "global_batch_size": sum(parallel.sizes)}
     if task == "classification":
         report = classification_report(
             y_true, y_pred,
@@ -1148,14 +1232,18 @@ def run_training(
 # ---------------------------------------------------------------------------
 
 def predict_row(
-    ckpt_path: Path, row: dict | None = None, history: list[Any] | None = None
+    ckpt_path: Path, row: dict | None = None, history: list[Any] | None = None,
+    device: str = "cpu",
 ) -> dict:
     """加载 best.pt，对单条表格记录、KMeans 样本或时间序列历史窗口进行预测。"""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     pre: dict = ckpt["preprocessor"]
     task = ckpt["task"]
+    target_device = torch.device(device)
 
     if task == "clustering":
+        if target_device.type != "cpu":
+            raise ValueError("KMeans 聚类预测仅支持 CPU")
         if row is None:
             raise ValueError("KMeans 聚类预测需要提供 row 对象")
         x = _featurize_row(row, pre)
@@ -1190,12 +1278,12 @@ def predict_row(
 
     model = _build_model(
         arch["in_dim"], arch["out_dim"], arch["hidden_size"], arch["hidden_layers"],
-        torch.device("cpu"),
+        target_device,
     )
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     with torch.no_grad():
-        out = model(torch.from_numpy(x))
+        out = model(torch.from_numpy(x).to(target_device))
 
     if task == "classification":
         prob = torch.softmax(out, dim=1)[0]

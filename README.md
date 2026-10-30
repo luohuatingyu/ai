@@ -8,9 +8,10 @@
 - 📜 实时训练日志，任务可排队、暂停（保存断点）、恢复（跨卡/跨机接续）、取消、删除
 - 🖥 计算资源管理：平台通过 SSH 远程执行单文件部署脚本、自动检测 CPU/GPU、手动选择计算槽加入资源池，并可远程启动/停止/重启 worker
 - 🏆 支持分类、回归、KMeans 聚类、单序列预测、LLM 从零预训练、全参数 SFT、DPO 与 PPO/RLHF
+- 🔗 多节点联合训练同一个模型：支持 NVIDIA CUDA、AMD ROCm、Intel XPU、Apple MPS、纯 CPU 和 CPU/GPU 混合，按节点设置批大小
 - 🔮 表格模型在线单条预测；LLM 可输入 prompt 生成文本，模型包可下载
 - ♻️ 环境性故障（CUDA/OOM/网络瞬断）自动从断点续训（`JOB_MAX_AUTO_RETRY` 次内），单卡故障不影响整体任务完成
-- 🔧 预留 GPU 接入：镜像内置 CUDA 12 构建 torch，宿主机装好驱动即自动启用 GPU
+- 🔧 统一设备适配：自动识别 CUDA、ROCm、XPU、MPS 和 CPU；模型 checkpoint 可在不同设备与操作系统间续训
 - 💾 支持MySQL数据库存储（可选镜像），使用已有MySQL服务器
 
 无需任何登录/权限逻辑，开放访问。
@@ -110,19 +111,25 @@ bash scripts/start-platform.sh   # 默认 CPU；设置 PLATFORM_MODE=gpu 选择 
 
 打开 http://localhost:8000：页面由 frontend 容器托管，API 经同源代理转发。
 
+Compose 启动的本机 worker 默认使用 `worker` 服务名作为联合训练互联地址，因此同一容器内的多个 CPU/GPU 槽可以直接在训练页选择。若要让本机 Compose worker 与其它服务器联合训练，必须在 `.env` 中设置该主机可被所有节点访问的训练网地址，并按实际网络方式部署；远端受管 worker 仍需在服务器管理页填写各自的联合训练互联地址后重新部署。
+
 ### 2. 追加计算服务器（CPU / GPU 均可）
 
-外接服务器由平台直接通过 SSH 管理。目标服务器不需要检出或接收本项目源码，也不需要访问镜像仓库；平台通过 Docker socket 导出本机 worker 镜像，经 SSH 流式传输到目标机。开始前准备：
+外接服务器由平台直接通过 SSH 管理。目标服务器不需要检出或接收本项目源码，也不需要访问镜像仓库；首次部署时平台把精简构建上下文经 SSH 发送到目标机，由目标机 Docker 构建 worker 镜像。开始前准备：
 
 1. 无需手工准备 `known_hosts`。平台首次连接目标主机时会自动信任并持久化其主机密钥；之后检测到密钥变化会拒绝连接。首次连接采用自动信任，需确保目标主机地址正确。
 2. 在项目 `.env` 中设置平台默认配置：
    ```dotenv
    WORKER_IMAGE=mtp-worker:local
    REDIS_URL=redis://目标服务器可访问的Redis主机:6379/0
+   REDIS_PASSWORD=平台Redis密码（可选；URL内嵌认证优先）
+   WORKER_REMOTE_REDIS_URL=远程worker专用Redis地址（可选；与平台Redis不同时配置）
+   WORKER_REMOTE_REDIS_PASSWORD=远程worker专用Redis密码（可选；密码未内嵌在远程URL中时配置）
    S3_ENDPOINT=目标服务器可访问的S3主机:8333
    WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY=使用Fernet生成的稳定密钥
    ```
-   `WORKER_IMAGE` 是平台 Docker 中 worker 镜像的本地标签，默认镜像由 Compose 构建；无需配置仓库地址。添加或编辑服务器时可用本机镜像标签覆盖平台默认值。远程安装或重新部署时，平台通过 Docker socket 导出镜像，再通过 SSH 流式传输到目标机执行 `docker load`；目标机不需要访问镜像仓库或执行 `docker pull`。目标机必须能访问同一 Redis 和 S3 存储。远程服务器和 SSH 凭证目录保存到 MySQL；远程管理 Compose 默认启用 MySQL，需在 `.env` 配置可从 trainer 容器访问的 `DB_HOST`、`DB_USER`、`DB_PASSWORD`、`DB_NAME` 等连接参数。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 用于页面凭证加密，可用 `python3.12 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'` 生成并长期保管。更换此密钥后，MySQL 中已有的页面凭证无法解密，需要重新保存。在「SSH 凭证管理」中添加用户名 + 密码、用户名 + 密钥或用户名 + 密钥 + 密码凭证。第三种方式先尝试密钥认证，失败后再尝试密码。私钥、登录密码和可选私钥口令都由页面提交并加密保存到 MySQL；登录凭证无需写入 `.env`，页面不会回显已保存的秘密。添加服务器时选择凭证；SSH 用户名留空时使用凭证用户名，填写后则覆盖该服务器的凭证用户名。OpenSSH 会按密钥内容识别其支持的 Ed25519、ECDSA、RSA OpenSSH/PEM 格式。建议将 `.env` 权限限制为 `600`。`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 可单独设置为平台默认值；未设置时分别回退到 `REDIS_URL` 和 `S3_ENDPOINT`。服务器级 Redis URL 使用页面 SSH 凭证加密密钥加密保存，不会在列表中回显。修改后需点击服务器卡片上的“重新部署并应用配置”，目标 worker 才会使用新设置。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 是服务端加密密钥，不是目标 SSH 登录凭证。
+   `WORKER_IMAGE` 是平台 Docker 中 worker 镜像的本地标签，默认镜像由 Compose 构建；无需配置仓库地址，服务器页面不单独配置镜像。首次部署时，平台经 SSH 把精简构建上下文发送到目标机，由目标机 Docker 构建 worker 镜像（目标机不需要访问镜像仓库或执行 `docker pull`）。目标机必须能访问同一 Redis 和 S3 存储。远程服务器和 SSH 凭证目录保存到 MySQL；远程管理 Compose 默认启用 MySQL，需在 `.env` 配置可从 trainer 容器访问的 `DB_HOST`、`DB_USER`、`DB_PASSWORD`、`DB_NAME` 等连接参数。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 用于页面凭证加密，可用 `python3.12 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'` 生成并长期保管。更换此密钥后，MySQL 中已有的页面凭证无法解密，需要重新保存。在「SSH 凭证管理」中添加用户名 + 密码、用户名 + 密钥或用户名 + 密钥 + 密码凭证。第三种方式先尝试密钥认证，失败后再尝试密码。私钥、登录密码和可选私钥口令都由页面提交并加密保存到 MySQL；登录凭证无需写入 `.env`，页面不会回显已保存的秘密。添加服务器时选择凭证；SSH 用户名留空时使用凭证用户名，填写后则覆盖该服务器的凭证用户名。OpenSSH 会按密钥内容识别其支持的 Ed25519、ECDSA、RSA OpenSSH/PEM 格式。建议将 `.env` 权限限制为 `600`。服务器没有专属 Redis URL 或 S3 地址时，分别使用 `.env` 中的 `REDIS_URL` 和 `S3_ENDPOINT` 覆盖远程 worker 配置；`WORKER_REMOTE_REDIS_URL` 和 `WORKER_REMOTE_S3_ENDPOINT` 可单独设置平台级默认值。远程 Redis 密码优先取 `WORKER_REMOTE_REDIS_PASSWORD`；仅当远程 worker 直接复用平台 `REDIS_URL`（未配置远程专用 URL）时才自动沿用 `REDIS_PASSWORD`，避免平台密码被误发给其他 Redis。服务器卡片的「生效配置」可查看平台当前解析出的镜像、Redis/S3 地址、来源和目标状态，认证信息会脱敏；查看结果是待下发配置。修改服务器配置时，平台只把新配置覆盖到目标机配置文件（`~/.config/mtp-worker/<machine_id>.env`），不影响运行中的 worker；新配置在容器下次启动/重启时由 worker 容器入口脚本读取外部 `.env` 自动生效。部署操作只同步最新 worker 代码并重建容器，不重写配置。启动/重启会先把平台最新配置下发到目标机（仅写文件，不重建容器），再执行 `docker start`/`docker restart`，容器启动时自动读取最新配置；停止/状态查询只操作容器，不修改配置或代码。`WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY` 是服务端加密密钥，不是目标 SSH 登录凭证。
+   更新已部署服务器时，先等待配置下发操作成功，再点击卡片上的「重启」；在线服务器同样提供该按钮。旧容器若未使用外部配置入口/目录挂载，或更改了 CPU/GPU 类型，启动/重启会明确提示先「部署代码」以重建容器。部署会保持容器原来的运行/停止状态，已停止的容器需再点击「启动」。配置写入失败会中止操作；配置文件缺失时 worker 拒绝使用旧环境启动。修改平台项目 `.env` 后需重新创建平台容器；Docker/pip/apt 源仅影响镜像构建，部署代码复用现有镜像。
 3. 构建平台 worker 镜像。GPU 平台使用默认 Compose 文件；纯 CPU 平台使用 CPU 文件：
    ```bash
    docker compose build worker
@@ -130,7 +137,7 @@ bash scripts/start-platform.sh   # 默认 CPU；设置 PLATFORM_MODE=gpu 选择 
    # CPU 版
    docker compose -f docker-compose.cpu.yml build worker
    ```
-   远程管理覆盖文件会将 `/var/run/docker.sock` 挂载到 trainer，以便导出平台本地镜像。Docker socket 可控制宿主 Docker，权限接近宿主 root；应限制平台管理 API 的网络访问。镜像会在每次安装或重新部署时通过 SSH 传输，传输耗时取决于镜像大小和网络带宽。
+   远程管理覆盖文件会将 `/var/run/docker.sock` 挂载到 trainer，以便导出平台本地镜像。Docker socket 可控制宿主 Docker，权限接近宿主 root；应限制平台管理 API 的网络访问。镜像只在首次安装时通过 SSH 传输，传输耗时取决于镜像大小和网络带宽；后续部署只同步最新 worker 代码并重建容器。
 4. 使用远程管理 Compose 覆盖文件启动平台。GPU / CPU 两种启动方式如下：
    ```bash
    PLATFORM_MODE=gpu REMOTE_MANAGEMENT=true bash scripts/start-platform.sh
@@ -146,6 +153,12 @@ bash scripts/start-platform.sh   # 默认 CPU；设置 PLATFORM_MODE=gpu 选择 
 
 远程操作配置以单文件脚本通过 SSH stdin 发送；脚本会把 worker 运行所需配置以权限 `600` 保存到目标机用户的 `~/.config/mtp-worker/`，不会把平台源码复制到目标服务器。服务器记录不保存 SSH 密钥或 S3 密钥。平台 API 尚未提供身份认证，远程管理 API 默认启用且不使用独立令牌；部署时必须限制平台管理页面的网络访问，只允许可信网络访问。
 
+远程 worker 使用独立的 `backend/worker.Dockerfile` 和 `backend/requirements-worker.txt`。平台按服务器的 CPU/GPU 类型传入 `WORKER_MODE`：CPU 版从 PyTorch 官方 CPU 索引安装 torch，不安装 CUDA；GPU 版保留 CUDA 训练依赖。其余依赖继续使用服务器配置的 pip 源。CPU 索引不可访问时构建会报错，不会自动回退到 GPU 包。worker 不再需要 apt/SSH 工具，因此 apt 源设置不参与专用镜像构建。
+
+首次构建包和后续代码包只包含 worker 入口、训练器、队列/租约、存储及运行配置；不包含页面、管理 API、数据库管理、样例数据或测试工具。分类、回归、聚类、时间序列和 LLM 能力均保留。配置中的数据库功能在远程 worker 固定关闭，数据集和训练产物仍通过既有 Redis/S3 链路协作。
+
+已部署节点的“部署代码”继续复用现有镜像，不重新下载依赖，旧镜像的磁盘占用不会自动减少。要让旧节点采用精简依赖，需要在维护窗口重新构建镜像并替换容器；不要在训练期间删除现用镜像。CPU 版镜像改为 GPU 节点时，也必须先换用 GPU 版镜像；平台会明确拒绝不兼容的启动。停止、启动、重启和配置更新的既有语义保持不变。
+
 ### 3. 迁移历史数据（老版本升级）
 
 ```bash
@@ -158,6 +171,16 @@ STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:9000 S3_ACCESS_KEY=... S3_SECRET_KEY=
 
 ### 4. Worker 进程模型（也可在裸机 GPU 服务器直接跑）
 
+#### 性能与资源观测
+
+计算槽卡片每五秒采样一次资源，保留当前 worker 生命周期内最近 120 个样本（约十分钟）。展示主机 CPU 使用率、当前计算进程使用核数/RSS、主机可用内存、PyTorch 线程预算；NVIDIA 设备按 UUID 匹配 `nvidia-smi` 的利用率和显存用量。采样在独立线程运行，超时不会阻塞租约心跳。驱动工具缺失、不支持的设备指标显示 `—`，超过二十秒或节点离线时标记旧样本。主机 CPU 是整机口径，不应将同一主机各槽显示的百分比相加；嵌入式 worker 的进程指标包含共享 API 进程，联合训练则采集实际 rank PID。
+
+任务详情增加吞吐和阶段耗时曲线。性能记录保存在独立 `performance.jsonl`，不改动原有 loss/accuracy 等指标或 checkpoint 格式；续训时按恢复的 epoch 回滚性能曲线。分类、回归、聚类和时序报告 samples/s；LLM 预训练/SFT 额外报告有效目标 tokens/s，DPO/PPO 报告输入样本吞吐。每步耗时为训练批次（PPO 为 rollout 批次）的平均墙钟耗时，包含供数与通信；联合任务展示全组样本吞吐及主节点观察到的耗时。断点保存与发布分别计时，发布包括上传、清理和跨进程确认等待；分项不包含所有日志及收尾开销。旧任务没有性能文件时显示未采集。
+
+Supervisor 按 CPU 亲和性、容器 CPU 配额和总计算槽数分摊线程预算，并向每个子进程传递 `WORKER_TORCH_THREADS`、`OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS`。已有更小的正整数限制会保留，非法值启动时报错；预算至少为 1，它不是 CPU 绑核或硬隔离。GPU 槽同样分配 CPU 预算。独立 rank 沿用父 worker 预算，嵌入式线程不修改进程级线程设置。
+
+CUDA 训练使用 pinned memory 与非阻塞传输，并将训练 loss 留在设备侧累积到 epoch 边界再读取；CPU 路径及默认批大小、精度、优化器保持原有行为。性能收益必须在目标设备上对照验证，本功能不预设提速百分比。
+
 ```bash
 cd backend
 REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:9000 python -m app.worker
@@ -165,6 +188,49 @@ REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:
 python -m app.worker --slot A-gpu0   # 单卡子进程（CUDA_VISIBLE_DEVICES 由 supervisor 注入）
 python -m app.worker --probe-gpu     # 一次性卡健康探测（退出码 0=健康）
 ```
+
+Apple Silicon worker 需要在 macOS 主机直接运行，不能使用 Linux Docker 透传 MPS。先在仓库根目录创建 Python 3.12 虚拟环境并安装 `backend/requirements-worker.txt`（Apple 的 PyTorch 构建应包含 MPS），再执行：
+
+```bash
+python3.12 -m venv .venv-worker
+. .venv-worker/bin/activate
+pip install -r backend/requirements-worker.txt
+REDIS_URL=redis://主节点IP:6379/0 STORAGE_BACKEND=s3 S3_ENDPOINT=主节点IP:9000 \
+  bash scripts/worker-native.sh
+```
+
+`worker-native.sh` 会自动切换到 `backend/` 目录，默认使用 `WORKER_DEVICE=mps`；无 Apple GPU 时可显式设置 `WORKER_DEVICE=cpu`。macOS 原生 worker 与 Linux/Windows WSL2 worker 共用 Redis、S3 和项目代码版本，互联地址仍需填写该主机可被其他节点访问的地址。
+
+### 5. 多台机器联合训练一个模型
+
+在「添加/编辑服务器」中填写各机器的「联合训练互联地址」，例如训练内网 IP `10.0.0.12`。部署最新版 worker、启动并将所需计算槽加入资源池后，在训练参数中选择「多节点联合训练一个模型」，选取 **2～32 个不同计算槽**，分别设置本地批大小。服务器可以使用不同型号的 NVIDIA 显卡，也可以全部使用 CPU 或混合 CPU/GPU；每个计算槽必须能容纳完整模型，PPO 还需要参考模型、奖励模型和 value head。KMeans 继续使用单节点。
+
+各节点必须使用 **Python 3.12、相同版本的项目代码和 PyTorch**；CPU/CUDA/ROCm/XPU 构建后缀可以不同，但同一联合组的 PyTorch 主版本必须一致。AMD 节点使用 ROCm PyTorch 构建，Intel 节点使用带 XPU 支持的 PyTorch/oneAPI 环境，Apple GPU 使用 macOS 原生 worker（`scripts/worker-native.sh`），Linux Docker 不能透传 MPS；Windows 采用 WSL2 + 对应 Linux GPU 运行时。各节点使用同一 Redis 和 S3 状态存储，互联地址必须能被所有节点访问；`localhost`、Docker 内部服务名不能用作跨机器地址。使用 Linux host 网络部署受管理 worker：旧 bridge 容器添加互联地址后，必须先「部署代码」重建容器，再启动，普通重启不能切换网络模式。
+
+首次选择的计算槽为主节点。全 NVIDIA CUDA 且支持 NCCL 时使用 NCCL，其余组合（ROCm、XPU、MPS、CPU 或混合）使用 Gloo，通信张量放在 CPU；数据按固定 seed 分片，不补齐或丢弃尾批。每步按实际样本数加权合并梯度，LLM 预训练/SFT 按有效目标 token 数加权，主节点统一执行优化器更新并广播参数。最终只发布一份模型：表格/时间序列为 `best.pt`，LLM 为 `best_model.zip`。这要求节点从同一模型和数据开始同步训练，不能直接合并任意独立训练产生的权重。
+
+全局批大小为各节点批大小之和；算力弱的节点建议从较小批大小开始。联合模式以各节点批大小为准，普通 `batch_size` 仍用于验证集分批。通信和最慢节点会影响每步耗时，CPU 加入 GPU 组不保证加速。表格节点批大小范围为 1～4096，LLM 为 1～64。`parallel_timeout` 默认为 300 秒，可设 10～3600 秒；需覆盖单步计算、模型准备、验证或上传断点的最长等待。
+
+暂停在完整 epoch 边界保存主节点模型和优化器断点；取消、成员退出或通信超时会结束本轮组执行并释放计算槽。可重试故障按原成员整组重试，缺失成员上线前保持排队；手动重试也不能改成单节点。相同成员、批大小、数据和 seed 的 CPU 执行支持可复现续训；不同设备和 GPU 算法不承诺逐位一致。训练和预测沿用同一预处理参数，表格预测的缺失/非法数值按训练中位数填充，类别缺失按训练众数填充。
+
+API 示例（计算槽 ID 从 `/api/workers` 获取；CPU 或混合组不设置仅 GPU 限制）：
+
+```json
+{
+  "dataset_id": "数据集ID",
+  "target": "target",
+  "task": "classification",
+  "epochs": 30,
+  "parallel_workers": [
+    {"worker_id": "node-a-gpu0", "batch_size": 64},
+    {"worker_id": "node-b-cpu0", "batch_size": 4}
+  ],
+  "parallel_timeout": 300,
+  "require_gpu": false
+}
+```
+
+裸机启动可设置 `WORKER_DISTRIBUTED_HOST=本机训练内网IP`，并按需设置 `WORKER_DISTRIBUTED_PORT`（默认基数 29500，GPU 槽加槽号，CPU 槽加 256 再加槽号）。同机多个 supervisor 需分配不冲突的端口段。Gloo/NCCL 还会建立动态数据连接，仅开放 rendezvous 端口不足以完成训练；部署在互信、双向可达的内网，勿向公网暴露训练通信。多网卡或主机名解析到回环地址时，在 worker 环境显式设置 `GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME` 为训练网卡，例如 `eth0`；所有节点需选择实际可互通的网卡。
 
 ## GPU 环境接入（后续补充）
 
@@ -176,7 +242,7 @@ python -m app.worker --probe-gpu     # 一次性卡健康探测（退出码 0=�
 | 启动 | 使用 `PLATFORM_MODE=gpu bash scripts/start-platform.sh` |
 | 页面确认 | 顶栏徽章显示 GPU 型号即成功；每次训练的「设备」统计也会显示 GPU/CPU |
 
-CPU→GPU 无需改一行代码或镜像：训练器启动时自动探测 `torch.cuda.is_available()`，无 GPU 时仅打印提示并回退 CPU。
+平台默认完整镜像中的训练器会自动探测 `torch.cuda.is_available()`，无 GPU 时提示并回退 CPU。远程专用 CPU 镜像切换为 GPU 节点时，必须先换用 GPU 版镜像。
 
 ## 数据库（MySQL，可选镜像存储）
 

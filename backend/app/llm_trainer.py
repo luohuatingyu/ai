@@ -9,12 +9,17 @@ import shutil
 import tempfile
 import time
 import zipfile
+from io import StringIO
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
 import torch
+from app.performance import EpochPerformance
 from torch import nn
+
+from app.device import backend_from_device, seed_device, select_device
 
 LogFn = Callable[[str], None]
 _REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?$")
@@ -29,6 +34,13 @@ def _safe_hub_id(value: str, label: str) -> str:
 
 def _load_rows(dataset_path: Path | None, params: dict, task: str, log_fn: LogFn) -> list[dict]:
     """从本地表格/JSONL 或 Hugging Face Hub 读取训练样本。"""
+    # 与 API 的样本范围一致，在任何磁盘/网络读取之前拒绝无界或非法请求。
+    try:
+        limit = int(params.get("max_samples", 5000))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("max_samples 必须为 1 到 1000000 的整数") from exc
+    if not 1 <= limit <= 1_000_000:
+        raise ValueError("max_samples 必须为 1 到 1000000 的整数")
     source = str(params.get("dataset_source", "local"))
     if source == "hub":
         from datasets import load_dataset
@@ -36,7 +48,6 @@ def _load_rows(dataset_path: Path | None, params: dict, task: str, log_fn: LogFn
         dataset_id = _safe_hub_id(str(params.get("dataset_id", "")), "数据集 ID")
         dataset_config = params.get("dataset_config") or None
         split = str(params.get("dataset_split", "train"))
-        limit = int(params.get("max_samples", 5000))
         if "[" not in split:
             split = f"{split}[:{limit}]"
         cache_dir = str(_cache_dir())
@@ -48,20 +59,25 @@ def _load_rows(dataset_path: Path | None, params: dict, task: str, log_fn: LogFn
             cache_dir=cache_dir,
             trust_remote_code=False,
         )
-        rows = data.to_list() if hasattr(data, "to_list") else [dict(row) for row in data]
+        # Dataset 与 IterableDataset 都按样本迭代，显式切片 split 也不得绕过上限。
+        rows = [dict(row) for row in islice(data, limit)]
     else:
         if dataset_path is None or not Path(dataset_path).is_file():
             raise ValueError("本地 LLM 训练数据集文件不存在")
         path = Path(dataset_path)
         log_fn(f"读取本地 LLM 语料 {path.name}")
         if path.suffix.lower() in {".jsonl", ".ndjson"}:
-            rows = pd.read_json(path, lines=True).to_dict(orient="records")
+            # 只解析所选的非空记录，空行不消耗样本额度；保留 Pandas 的嵌套字段处理。
+            with path.open("r", encoding="utf-8") as stream:
+                selected = "".join(islice((line for line in stream if line.strip()), limit))
+            frame = pd.read_json(StringIO(selected), lines=True) if selected else pd.DataFrame()
         elif path.suffix.lower() == ".json":
-            rows = pd.read_json(path).to_dict(orient="records")
+            # 普通 JSON 保持原有布局兼容；截取后再转字典，避免物化未选中的记录。
+            frame = pd.read_json(path).iloc[:limit]
         else:
-            rows = pd.read_csv(path).to_dict(orient="records")
-    limit = int(params.get("max_samples", 5000))
-    rows = rows[:limit]
+            frame = pd.read_csv(path, nrows=limit)
+        rows = frame.to_dict(orient="records")
+        log_fn(f"按 max_samples={limit} 读取样本；CSV/JSONL 类型推断仅基于选中的记录")
     if not rows:
         raise ValueError("LLM 训练数据集为空")
     log_fn(f"读取到 {len(rows)} 条样本")
@@ -274,9 +290,9 @@ def _batches(items: list, batch_size: int, seed: int, epoch: int):
 def _collate(items: list[dict], pad_id: int, device: torch.device) -> dict[str, torch.Tensor]:
     """将可变长度 token 序列补齐为模型输入张量。"""
     width = max(len(item["input_ids"]) for item in items)
-    input_ids = torch.full((len(items), width), int(pad_id), dtype=torch.long)
-    attention_mask = torch.zeros((len(items), width), dtype=torch.long)
-    labels = torch.full((len(items), width), -100, dtype=torch.long)
+    input_ids = torch.full((len(items), width), int(pad_id), dtype=torch.long, pin_memory=device.type == "cuda")
+    attention_mask = torch.zeros((len(items), width), dtype=torch.long, pin_memory=device.type == "cuda")
+    labels = torch.full((len(items), width), -100, dtype=torch.long, pin_memory=device.type == "cuda")
     for index, item in enumerate(items):
         size = len(item["input_ids"])
         input_ids[index, :size] = torch.tensor(item["input_ids"], dtype=torch.long)
@@ -284,9 +300,9 @@ def _collate(items: list[dict], pad_id: int, device: torch.device) -> dict[str, 
         item_labels = item.get("labels", item["input_ids"])
         labels[index, :len(item_labels)] = torch.tensor(item_labels, dtype=torch.long)
     return {
-        "input_ids": input_ids.to(device),
-        "attention_mask": attention_mask.to(device),
-        "labels": labels.to(device),
+        "input_ids": input_ids.to(device, non_blocking=device.type == "cuda"),
+        "attention_mask": attention_mask.to(device, non_blocking=device.type == "cuda"),
+        "labels": labels.to(device, non_blocking=device.type == "cuda"),
     }
 
 
@@ -442,7 +458,7 @@ def _dpo_loss(policy, reference, batch: list[dict], tokenizer, beta: float, devi
 
 
 def _ppo_update(policy, reference, reward_model, reward_tokenizer, tokenizer, value_head,
-                optimizer, prompts: list[str], params: dict, device: torch.device):
+                optimizer, prompts: list[str], params: dict, device: torch.device, parallel=None):
     """采样回答并执行带 KL 惩罚和裁剪目标的 PPO policy/value 更新。"""
     old_logprobs, ref_logprobs, rewards, prompt_tokens = [], [], [], []
     for prompt in prompts:
@@ -482,9 +498,9 @@ def _ppo_update(policy, reference, reward_model, reward_tokenizer, tokenizer, va
         rewards.append(raw_reward)
         prompt_tokens.append((full_ids, full_mask, labels))
 
-    old_logprob_tensor = torch.stack(old_logprobs).detach()
-    ref_logprob_tensor = torch.stack(ref_logprobs).detach()
-    raw_reward_tensor = torch.stack(rewards).detach()
+    old_logprob_tensor = torch.stack(old_logprobs).detach() if prompts else torch.empty(0, device=device)
+    ref_logprob_tensor = torch.stack(ref_logprobs).detach() if prompts else torch.empty(0, device=device)
+    raw_reward_tensor = torch.stack(rewards).detach() if prompts else torch.empty(0, device=device)
     kl = old_logprob_tensor - ref_logprob_tensor
     adjusted_rewards = raw_reward_tensor - float(params.get("kl_beta", 0.1)) * kl
     with torch.no_grad():
@@ -492,14 +508,25 @@ def _ppo_update(policy, reference, reward_model, reward_tokenizer, tokenizer, va
         for ids, mask, _ in prompt_tokens:
             output = policy(input_ids=ids, attention_mask=mask, output_hidden_states=True)
             old_values.append(value_head(output.hidden_states[-1][:, -1, :]).reshape(()))
-        advantages = adjusted_rewards - torch.stack(old_values).detach()
-        scale = advantages.std(unbiased=False).clamp(min=1e-6)
-        advantages = (advantages - advantages.mean()) / scale
+        advantages = adjusted_rewards - (torch.stack(old_values).detach() if prompts else torch.empty(0, device=device))
+        if parallel is None:
+            scale = advantages.std(unbiased=False).clamp(min=1e-6)
+            advantages = (advantages - advantages.mean()) / scale
+        else:
+            # PPO 优势归一化必须覆盖全局批次，不能让不同大小的节点各自归一化。
+            total, squares, count = parallel.totals([float(advantages.sum()), float(advantages.square().sum()), len(prompts)])
+            mean = total / max(count, 1)
+            scale = max(squares / max(count, 1) - mean * mean, 1e-12) ** 0.5
+            advantages = (advantages - mean) / scale
 
     ppo_epochs = int(params.get("ppo_updates", 4))
     clip_range = float(params.get("clip_range", 0.2))
     total_loss = 0.0
     for _ in range(ppo_epochs):
+        if not prompts and parallel is not None:
+            optimizer.zero_grad(set_to_none=True)
+            parallel.step(optimizer, 0, max_norm=1.0)
+            continue
         new_logprobs, values = [], []
         for ids, mask, labels in prompt_tokens:
             new_logp, hidden = _sequence_logprob(policy, ids, mask, labels)
@@ -515,20 +542,23 @@ def _ppo_update(policy, reference, reward_model, reward_tokenizer, tokenizer, va
         loss = actor_loss + 0.5 * value_loss
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(policy.parameters()) + list(value_head.parameters()), 1.0)
-        optimizer.step()
+        if parallel is None:
+            torch.nn.utils.clip_grad_norm_(list(policy.parameters()) + list(value_head.parameters()), 1.0)
+            optimizer.step()
+        else:
+            parallel.step(optimizer, len(prompts), max_norm=1.0)
         total_loss += float(loss.detach().cpu())
     return {
         "loss": total_loss / ppo_epochs,
-        "reward": float(raw_reward_tensor.mean().cpu()),
-        "kl": float(kl.mean().cpu()),
+        "reward": float(raw_reward_tensor.mean().cpu()) if prompts else 0.0,
+        "kl": float(kl.mean().cpu()) if prompts else 0.0,
     }
 
 
 def run_llm_training(task: str, dataset_path: Path | None, params: dict,
                      cancel_event, pause_event, log_fn: LogFn, job_dir: Path,
                      resume_state: dict | None = None, on_epoch_end=None,
-                     on_checkpoint=None) -> dict:
+                     on_checkpoint=None, parallel=None) -> dict:
     """执行从零预训练、全参数 SFT、DPO 或基于奖励模型的 PPO-RLHF。"""
     from transformers import AutoModelForSequenceClassification
 
@@ -536,8 +566,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
     job_dir.mkdir(parents=True, exist_ok=True)
     seed = int(params.get("seed", 42))
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    seed_device(seed, parallel.device if parallel is not None else None)
     rows = _load_rows(dataset_path, params, task, log_fn)
     cache = _cache_dir()
 
@@ -545,11 +574,15 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
         texts = [_text_from_row(row, params).strip() for row in rows]
         tokenizer = _make_pretraining_tokenizer(texts, int(params.get("vocab_size", 8000)))
         examples, tokenizer = _prepare_examples(rows, task, params, tokenizer, log_fn)
+        # 编码结果已包含训练所需内容，构建模型前释放语料和 tokenizer 训练文本。
+        del rows, texts
         model = _new_model(tokenizer, params)
         reference = reward_model = reward_tokenizer = value_head = None
     else:
         model, tokenizer = _load_base_components(str(params.get("base_model", "")), params)
         examples, tokenizer = _prepare_examples(rows, task, params, tokenizer, log_fn)
+        # 后续偏好/奖励模型只依赖编码样本，无需继续保留原始语料字典。
+        del rows
         reference = reward_model = reward_tokenizer = value_head = None
         if task in {"llm_dpo", "llm_ppo"}:
             reference, _ = _load_base_components(str(params.get("base_model", "")), params)
@@ -577,7 +610,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
             value_head = nn.Linear(hidden_size, 1)
 
     train_examples, val_examples = _split_examples(examples, seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = parallel.device if parallel is not None else select_device(log_fn=log_fn)
     model.to(device)
     if reference is not None:
         reference.to(device)
@@ -593,6 +626,13 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
     start_epoch, best_score, best_epoch = _restore_checkpoint(
         resume_state, task, params, model, optimizer, value_head
     )
+    if parallel is not None:
+        identity = json.dumps({"examples": examples, "vocabulary": tokenizer.get_vocab()}, sort_keys=True).encode()
+        parallel.initialize([model] + ([value_head] if value_head is not None else []), identity)
+        # 冻结的参考/奖励模型也必须一致，否则各节点在优化不同的目标函数。
+        for fixed_model in (reference, reward_model):
+            if fixed_model is not None:
+                parallel.sync_module(fixed_model)
     batch_size = max(1, min(int(params.get("batch_size", 1)), 64))
     epochs = int(params.get("epochs", 1))
     beta = float(params.get("dpo_beta", 0.1))
@@ -601,6 +641,12 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
     epoch = start_epoch
     record = {}
     for epoch in range(start_epoch + 1, epochs + 1):
+        performance = EpochPerformance(epoch, "group" if parallel is not None else "single")
+        if parallel is not None and parallel.control(cancel_event, pause_event, allow_pause=True):
+            if parallel.primary:
+                _write_checkpoint(_checkpoint_state(task, params, epoch - 1, best_score, best_epoch, model, optimizer, value_head), job_dir, epoch - 1, on_checkpoint)
+            from app.trainer import JobPaused
+            raise JobPaused(f"联合训练已在 epoch {epoch - 1} 后暂停")
         if cancel_event.is_set():
             from app.trainer import JobCancelled
             raise JobCancelled()
@@ -608,79 +654,148 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
         if task == "llm_ppo":
             value_head.train()
         losses, extra_metrics = [], []
-        for batch in _batches(train_examples, batch_size, seed, epoch):
-            if cancel_event.is_set() or pause_event.is_set():
+        weights = []
+        steps = 0
+        samples_seen = 0
+        train_started = time.perf_counter()
+        batches = _batches(train_examples, batch_size, seed, epoch) if parallel is None else (
+            [train_examples[index] for index in indices]
+            for indices in parallel.indices(len(train_examples), epoch)
+        )
+        for batch in batches:
+            steps += 1
+            samples_seen += len(batch)
+            if parallel is not None:
+                parallel.control(cancel_event, pause_event)
+            elif cancel_event.is_set() or pause_event.is_set():
                 break
+            if not batch and task != "llm_ppo":
+                optimizer.zero_grad(set_to_none=True)
+                parallel.step(optimizer, 0, max_norm=1.0)
+                continue
             if task in {"llm_pretraining", "llm_sft"}:
                 encoded = _collate(batch, tokenizer.pad_token_id, device)
+                # 标签尚在 CPU 样本中，直接计数有效目标，避免为一个整数同步 GPU。
+                weight = sum(sum(value != -100 for value in item.get("labels", item["input_ids"])[1:]) for item in batch)
                 output = model(**encoded)
                 loss = output.loss
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                losses.append(float(loss.detach().cpu()))
+                if parallel is None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                else:
+                    parallel.step(optimizer, weight, max_norm=1.0)
+                losses.append(float(loss.detach()) if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64))
+                weights.append(weight)
             elif task == "llm_dpo":
                 loss, preference_accuracy = _dpo_loss(model, reference, batch, tokenizer, beta, device)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                losses.append(float(loss.detach().cpu()))
-                extra_metrics.append(float(preference_accuracy.detach().cpu()))
+                if parallel is None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                else:
+                    parallel.step(optimizer, len(batch), max_norm=1.0)
+                losses.append(float(loss.detach()) if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64))
+                extra_metrics.append(float(preference_accuracy.detach()) if device.type == "cpu" else preference_accuracy.detach())
+                weights.append(len(batch))
             else:
                 metrics = _ppo_update(
                     model, reference, reward_model, reward_tokenizer, tokenizer, value_head,
-                    optimizer, [item["prompt"] for item in batch], params, device,
+                    optimizer, [item["prompt"] for item in batch], params, device, parallel=parallel,
                 )
                 losses.append(metrics["loss"])
                 extra_metrics.append(metrics)
-        if cancel_event.is_set():
+                weights.append(len(batch))
+        if parallel is not None:
+            parallel.control(cancel_event, pause_event)
+        if parallel is None and cancel_event.is_set():
             from app.trainer import JobCancelled
             raise JobCancelled()
-        if not losses:
+        if not losses and parallel is None:
             if pause_event.is_set():
                 from app.trainer import JobPaused
                 raise JobPaused("LLM 训练已暂停；最近完成的 epoch checkpoint 保留")
             raise ValueError("训练没有产生有效 batch")
 
         model.eval()
-        epoch_loss = sum(losses) / len(losses)
+        if parallel is None:
+            epoch_loss = float(sum(losses) / len(losses))
+        else:
+            loss_sum, weight_sum = parallel.totals([float(sum(loss * weight for loss, weight in zip(losses, weights))), sum(weights)])
+            epoch_loss = loss_sum / max(weight_sum, 1)
+            samples_seen = int(parallel.totals([samples_seen])[0])
+        performance.record["train_seconds"] = time.perf_counter() - train_started
+        effective_tokens = int(weight_sum if parallel is not None else sum(weights)) if task in {"llm_pretraining", "llm_sft"} else None
         record = {"epoch": epoch, "train_loss": epoch_loss}
+        validation_started = time.perf_counter()
         if task in {"llm_pretraining", "llm_sft"}:
             validation_losses = []
+            validation_weights = []
             with torch.no_grad():
                 for batch in _batches(val_examples or train_examples, batch_size, seed, epoch + 10_000):
-                    output = model(**_collate(batch, tokenizer.pad_token_id, device))
+                    if parallel is not None and not parallel.primary:
+                        break
+                    encoded = _collate(batch, tokenizer.pad_token_id, device)
+                    output = model(**encoded)
                     validation_losses.append(float(output.loss.cpu()))
-            val_loss = sum(validation_losses) / len(validation_losses)
+                    validation_weights.append(int((encoded["labels"][:, 1:] != -100).sum().item()))
+            if parallel is None:
+                val_loss = sum(validation_losses) / len(validation_losses)
+            else:
+                val_loss = sum(loss * weight for loss, weight in zip(validation_losses, validation_weights)) / max(sum(validation_weights), 1)
+                val_loss = parallel.json_from_primary(val_loss)
             record["val_loss"] = val_loss
             record["perplexity"] = math.exp(min(val_loss, 80.0))
+            performance.record["validation_seconds"] = time.perf_counter() - validation_started
             score = -val_loss
         elif task == "llm_dpo":
-            accuracy = sum(extra_metrics) / max(len(extra_metrics), 1)
+            accuracy = float(sum(extra_metrics) / max(len(extra_metrics), 1))
+            if parallel is not None:
+                correct, count = parallel.totals([float(sum(value * weight for value, weight in zip(extra_metrics, weights))), sum(weights)])
+                accuracy = correct / max(count, 1)
             record["preference_accuracy"] = accuracy
             score = -epoch_loss
         else:
             ppo_metrics = [item for item in extra_metrics if isinstance(item, dict)]
             mean_reward = sum(item["reward"] for item in ppo_metrics) / max(len(ppo_metrics), 1)
             mean_kl = sum(item["kl"] for item in ppo_metrics) / max(len(ppo_metrics), 1)
+            if parallel is not None:
+                reward_sum, kl_sum, count = parallel.totals([
+                    sum(item["reward"] * weight for item, weight in zip(ppo_metrics, weights)),
+                    sum(item["kl"] * weight for item, weight in zip(ppo_metrics, weights)), sum(weights),
+                ])
+                mean_reward, mean_kl = reward_sum / max(count, 1), kl_sum / max(count, 1)
             record.update({"reward": mean_reward, "kl": mean_kl})
             score = mean_reward
         record["train_loss"] = round(float(record["train_loss"]), 6)
-        _write_metric(job_dir, record)
-        if on_epoch_end is not None:
-            on_epoch_end(record)
+        if parallel is None or parallel.primary:
+            _write_metric(job_dir, record)
         if best_score is None or score > float(best_score):
             best_score, best_epoch = float(score), epoch
-            _save_bundle(model, tokenizer, job_dir)
-        state = _checkpoint_state(task, params, epoch, best_score, best_epoch, model, optimizer, value_head)
-        _write_checkpoint(state, job_dir, epoch, on_checkpoint)
+            if parallel is None or parallel.primary:
+                with performance.measure("checkpoint_save_seconds"):
+                    _save_bundle(model, tokenizer, job_dir)
+        if parallel is None or parallel.primary:
+            with performance.measure("checkpoint_save_seconds"):
+                state = _checkpoint_state(task, params, epoch, best_score, best_epoch, model, optimizer, value_head)
+                _write_checkpoint(state, job_dir, epoch, None)
+            if on_checkpoint is not None:
+                with performance.measure("checkpoint_publish_seconds"):
+                    on_checkpoint(epoch)
+            performance.write(job_dir, samples_seen, steps, effective_tokens)
+        if on_epoch_end is not None:
+            on_epoch_end(record)
         log_fn(f"[epoch {epoch}/{epochs}] train_loss={record['train_loss']:.4f}")
+        if parallel is not None:
+            parallel.control(cancel_event, pause_event, allow_pause=True)
         if pause_event.is_set():
             from app.trainer import JobPaused
             raise JobPaused(f"LLM 训练已在 epoch {epoch} 后暂停")
 
+    if parallel is not None and not parallel.primary:
+        return {}
     if not record:
         metric_path = job_dir / "metrics.jsonl"
         if metric_path.exists():
@@ -693,6 +808,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
     summary = {
         "task": task,
         "device": str(device),
+        "device_backend": backend_from_device(device),
         "epochs_total": epoch,
         "epochs_done": epoch,
         "resumed_from": start_epoch,
@@ -704,6 +820,9 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
         "training_mode": "full_parameter",
         "duration_sec": round(time.time() - started_at, 1),
     }
+    if parallel is not None:
+        summary["parallel"] = {"workers": parallel.world_size, "backend": parallel.backend,
+                               "batch_sizes": parallel.sizes, "global_batch_size": sum(parallel.sizes)}
     (job_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
@@ -712,7 +831,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
 
 
 def generate_text(bundle_path: Path, prompt: str, *, max_new_tokens: int,
-                  temperature: float, top_p: float) -> str:
+                  temperature: float, top_p: float, device: str | None = None) -> str:
     """从安全解压后的模型包加载 CausalLM 并对 prompt 生成续写。"""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -737,7 +856,8 @@ def generate_text(bundle_path: Path, prompt: str, *, max_new_tokens: int,
         model = AutoModelForCausalLM.from_pretrained(
             extract_dir, trust_remote_code=False, local_files_only=True
         )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 指定设备必须原样执行；旧同步调用继续使用原有自动选择规则。
+        device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
         model.to(device).eval()
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         generation_params = {

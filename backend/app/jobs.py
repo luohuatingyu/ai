@@ -20,6 +20,7 @@ from typing import Any, List, Optional
 import app.config as config
 from app import jobstore
 from app.coordination import build_coordination
+from app.inference import InferenceService
 from app.jobstore import (
     CANCELLED,
     COMPLETED,
@@ -101,6 +102,7 @@ class JobManager:
             self.lease = lease
             self.distributed = config.REDIS_URL != ""
         self._db_available = config.DB_AVAILABLE
+        self.inference = InferenceService(self.store, self.queue, self.lease)
         self._stop = threading.Event()
         self._workers: List[TrainingWorker] = []
         self._threads: List[threading.Thread] = []
@@ -214,7 +216,7 @@ class JobManager:
         return updated
 
     def resume(self, job_id: str) -> dict:
-        """恢复暂停的任务：回到队列，任意可用卡/机器从 checkpoint 接续。"""
+        """恢复暂停任务，保留指定槽或自动调度策略并从断点接续。"""
         record = self.get(job_id)
         if record is None:
             raise KeyError(job_id)
@@ -224,12 +226,19 @@ class JobManager:
         self.queue.push(job_id)
         jobstore.append_job_log(
             self.store, job_id,
-            "任务恢复：重新排队，任意可用卡/机器将从最近 checkpoint 接续训练",
+            "任务恢复：重新排队，" + (
+                f"等待指定计算槽 {record['spec']['resource_hint']['worker_id']} 从最近 checkpoint 接续训练"
+                if ((record.get("spec") or {}).get("resource_hint") or {}).get("worker_id")
+                else "任意可用卡/机器将从最近 checkpoint 接续训练"
+            ),
         )
         return updated
 
     def retry(self, job_id: str, worker_id: Optional[str] = None) -> dict:
         """重试失败任务；可将下一次执行固定到一个 worker 或交回自动调度。"""
+        record = self.get(job_id)
+        if worker_id and record and ((record.get("spec") or {}).get("resource_hint") or {}).get("parallel_workers"):
+            raise ValueError("联合训练必须按原成员整组重试")
         token = f"manual-retry:{uuid.uuid4().hex}"
         if not self.lease.acquire(
             job_id, token, max(float(config.WORKER_LEASE_TTL), 10.0)
@@ -242,6 +251,15 @@ class JobManager:
             if record.get("status") != FAILED:
                 raise ValueError("仅失败任务可重新排队")
 
+            # 定向训练的手动重试显式更新策略；旧任务仍保持单次重试选槽语义。
+            spec = dict(record.get("spec") or {})
+            hint = dict(spec.get("resource_hint") or {})
+            if hint.get("worker_id"):
+                if worker_id:
+                    hint["worker_id"] = worker_id
+                else:
+                    hint.pop("worker_id", None)
+                spec["resource_hint"] = hint
             previous_error = record.get("error") or record.get("last_error")
             assignment_mode = "worker" if worker_id else "auto"
             updated = jobstore.update_job(
@@ -257,6 +275,7 @@ class JobManager:
                 retry_worker_id=worker_id,
                 retry_assignment_mode=assignment_mode,
                 retry_requested_at=time.time(),
+                spec=spec,
             )
             jobstore.append_job_log(
                 self.store,
@@ -368,6 +387,10 @@ class JobManager:
         - 清理崩溃残留的 worker 注册条目（心跳长期未更新的幽灵槽）。
         """
         try:
+            self.inference.recover()
+        except Exception:
+            pass  # 预测存储故障不得阻断训练任务巡检
+        try:
             self.lease.cleanup_stale_workers(config.WORKER_STALE_CLEANUP_AGE)
         except Exception:
             pass  # 清理失败不影响本轮巡检主逻辑
@@ -398,7 +421,11 @@ class JobManager:
                 jobstore.append_job_log(
                     self.store, job_id,
                     "watchdog: 执行槽心跳丢失（租约已过期），任务重新排队"
-                    "——进度由 checkpoint 保留，任意可用卡可接手",
+                    "——进度由 checkpoint 保留，" + (
+                        f"等待指定计算槽 {record['spec']['resource_hint']['worker_id']} 恢复"
+                        if ((record.get("spec") or {}).get("resource_hint") or {}).get("worker_id")
+                        else "任意可用卡可接手"
+                    ),
                 )
                 self.queue.push(job_id)
             elif status == QUEUED and inflight is not None and job_id not in inflight:

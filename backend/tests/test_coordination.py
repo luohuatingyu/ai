@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore, RedisLeaseStore
 
 
@@ -143,6 +145,35 @@ def test_redis_remote_operation_cancel_signal_is_shared_and_clearable():
     assert lease.is_remote_operation_cancel_requested("operation-a") is False
 
 
+def test_remote_operation_executor_heartbeat_embedded_and_redis():
+    """执行者存活标记：嵌入式实现不提供跨进程存活信息，Redis 实现可写读清。"""
+    embedded = EmbeddedLeaseStore()
+    embedded.set_remote_operation_executor("operation-a")
+    assert embedded.is_remote_operation_executor_active("operation-a") is False
+    embedded.clear_remote_operation_executor("operation-a")
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, key, value, ex=None):
+            self.values[key] = value
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+    redis_client = FakeRedis()
+    lease = RedisLeaseStore(redis_client)
+    assert lease.is_remote_operation_executor_active("operation-b") is False
+    lease.set_remote_operation_executor("operation-b")
+    assert lease.is_remote_operation_executor_active("operation-b") is True
+    lease.clear_remote_operation_executor("operation-b")
+    assert lease.is_remote_operation_executor_active("operation-b") is False
+
+
 # ---------------------------------------------------------------------------
 # worker 注册（/api/workers 数据源）
 # ---------------------------------------------------------------------------
@@ -156,6 +187,75 @@ def test_worker_register_heartbeat_deregister():
     assert workers[0]["active"] is True
     ls.deregister_worker("w1")
     assert ls.list_workers() == []
+
+
+@pytest.fixture(params=["embedded", "redis"])
+def guarded_registry(request):
+    """同时验证内存实现与专用测试 Redis，绝不连接生产协调面。"""
+    if request.param == "redis":
+        return RedisLeaseStore(request.getfixturevalue("registry_redis"))
+    return EmbeddedLeaseStore()
+
+
+@pytest.mark.parametrize("conditions,accepted", [
+    ({"slot:cpu": "owner", "job": "attempt"}, True),
+    ({"slot:cpu": None}, False),
+    ({"slot:cpu": "stale"}, False),
+    ({"slot:cpu": "owner", "job": "stale"}, False),
+    ({"free-slot": None}, True),
+])
+def test_worker_heartbeat_is_guarded_atomically(guarded_registry, conditions, accepted):
+    """多条件校验必须全部通过，拒绝时不修改状态或刷新存活时间。"""
+    ls = guarded_registry
+    ls.register_worker("cpu", {"state": "training", "current_job": "first", "epoch": 4}, 30)
+    assert ls.acquire("slot:cpu", "owner", 30)
+    assert ls.acquire("job", "attempt", 30)
+    before, = ls.list_workers()
+    result = ls.heartbeat_worker("cpu", {"state": "idle", "current_job": None, "epoch": None},
+                                 30, lease_conditions=conditions)
+    after, = ls.list_workers()
+    assert result is accepted
+    if accepted:
+        assert after["state"] == "idle" and after["current_job"] is None and after["epoch"] is None
+    else:
+        assert after == before
+    assert ls.peek_holder("slot:cpu") == "owner"
+
+
+def test_old_heartbeat_cannot_overwrite_reallocated_slot(guarded_registry):
+    """释放后新租约生效，旧执行者既不能改状态，也不能释放新占用者。"""
+    ls = guarded_registry
+    ls.register_worker("cpu", {"state": "idle"}, 30)
+    assert ls.acquire("slot:cpu", "old", 30)
+    assert ls.release("slot:cpu", "old")
+    assert ls.acquire("slot:cpu", "new", 30)
+    assert ls.heartbeat_worker("cpu", {"state": "training", "current_job": "new-job"},
+                               30, lease_conditions={"slot:cpu": "new"})
+    assert not ls.heartbeat_worker("cpu", {"state": "idle", "current_job": None},
+                                   30, lease_conditions={"slot:cpu": "old"})
+    assert not ls.release("slot:cpu", "old")
+    registered, = ls.list_workers()
+    assert registered["current_job"] == "new-job" and ls.peek_holder("slot:cpu") == "new"
+
+
+def test_slot_competition_has_exactly_one_owner(guarded_registry):
+    """八个同时到达的训练执行者只能有一个获得同一计算槽。"""
+    import concurrent.futures
+    import threading
+
+    ls = guarded_registry
+    ready = threading.Barrier(8)
+
+    def compete(index):
+        """同时执行真实 acquire，返回持有者身份和获得结果。"""
+        ready.wait(timeout=5)
+        token = f"attempt-{index}"
+        return token, ls.acquire("slot:exclusive", token, 30)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(compete, range(8)))
+    winners = [token for token, acquired in results if acquired]
+    assert len(winners) == 1 and ls.peek_holder("slot:exclusive") == winners[0]
 
 
 def test_cleanup_stale_workers_embedded():
@@ -326,6 +426,124 @@ def test_redis_worker_registry_roundtrip_nested_caps():
     assert w["started_at"] == 1700000000.5
     assert w["active"] is True
     ls.deregister_worker("w-nested")
+
+
+@pytest.fixture
+def registry_redis():
+    """使用显式配置的隔离 Redis，清理本组故障注入产生的状态。"""
+    import os
+    import redis
+
+    endpoint = os.environ.get("MTP_TEST_REDIS")
+    if not endpoint:
+        pytest.skip("未配置 MTP_TEST_REDIS，跳过真实 Redis 注册恢复测试")
+    client = redis.Redis.from_url(endpoint, decode_responses=True,
+                                  socket_connect_timeout=3, socket_timeout=3)
+    client.flushdb()
+    try:
+        yield client
+    finally:
+        client.flushdb()
+        client.close()
+
+
+@pytest.mark.parametrize("missing", ["index", "info", "all"])
+@pytest.mark.parametrize("state", ["idle", "training", "disabled"])
+def test_redis_heartbeat_restores_worker_registration(registry_redis, missing, state):
+    """注册索引或详情丢失后，下一心跳恢复完整硬件信息和最新训练状态。"""
+    client = registry_redis
+    ls = RedisLeaseStore(client)
+    caps = {
+        "worker_id": "recover-gpu0", "machine_id": "recover", "slot": "gpu0",
+        "hostname": "recover-host", "managed": True,
+        "cpu": {"cores": 8, "memory_mb": 16384},
+        "gpu": {"available": True, "name": "TestGPU", "count": 1, "vram_mb": 8192},
+        "torch_version": "2.8.0", "python_version": "3.12.15",
+        "cuda_version": "12.8", "started_at": 1700000000.5,
+        "parallel": {"protocol": 1, "host": "recover-host", "gloo": True},
+    }
+    worker_id = caps["worker_id"]
+    ls.register_worker(worker_id, caps, ttl=30)
+    registered, = ls.list_workers()
+    expected_caps = {key: registered[key] for key in caps}
+    ls.set_worker_enabled(worker_id, state != "disabled")
+    if missing in ("index", "all"):
+        client.delete("mtp:workers:all")
+    if missing in ("info", "all"):
+        client.delete(f"mtp:worker:{worker_id}:info", f"mtp:worker:{worker_id}:hb")
+    before = time.time()
+    fields = {"state": state, "current_job": "job-recover" if state == "training" else None,
+              "epoch": 7 if state == "training" else 0}
+    ls.heartbeat_worker(worker_id, fields, ttl=30)
+
+    workers = ls.list_workers()
+    assert len(workers) == 1, "存活槽必须重新进入资源列表"
+    worker = workers[0]
+    for key, value in {**expected_caps, **fields}.items():
+        assert worker[key] == value, f"恢复后字段不完整或状态过期：{key}"
+    assert worker["active"] is True
+    assert before <= worker["last_seen"] <= time.time()
+    assert 0 < client.ttl(f"mtp:worker:{worker_id}:hb") <= 30
+    assert ls.is_worker_enabled(worker_id) is (state != "disabled")
+
+
+def test_redis_heartbeat_restores_after_stale_cleanup(registry_redis):
+    """长断连导致旧注册被清理后仍可恢复，且不复活已丢失的任务租约。"""
+    client = registry_redis
+    ls = RedisLeaseStore(client)
+    caps = {"worker_id": "recover-cpu0", "managed": True,
+            "cpu": {"cores": 4}, "gpu": {"available": False}}
+    ls.register_worker(caps["worker_id"], caps, ttl=30)
+    ls.set_worker_enabled(caps["worker_id"], False)
+    assert ls.acquire("lost-job", "old-owner", ttl=30)
+    client.delete("mtp:worker:recover-cpu0:hb", "mtp:lease:lost-job")
+    client.hset("mtp:worker:recover-cpu0:info", "last_seen", time.time() - 1000)
+    assert ls.cleanup_stale_workers(grace_seconds=300) == 1
+    assert ls.list_workers() == []
+
+    ls.heartbeat_worker(caps["worker_id"], {"state": "disabled", "current_job": None}, ttl=30)
+
+    worker, = ls.list_workers()
+    assert worker["cpu"] == caps["cpu"] and worker["gpu"] == caps["gpu"]
+    assert worker["managed"] == 1 and worker["active"] is True
+    assert worker["state"] == "disabled" and worker["current_job"] is None
+    assert ls.is_worker_enabled(caps["worker_id"], default=True) is False
+    assert ls.renew("lost-job", "old-owner", ttl=30) is False
+    assert ls.peek_holder("lost-job") is None
+
+
+def test_redis_heartbeat_handles_empty_fields_and_uncached_worker(registry_redis):
+    """没有本地注册缓存的调用保持兼容，空心跳也不会带入其他槽的信息。"""
+    client = registry_redis
+    ls = RedisLeaseStore(client)
+    ls.register_worker("cached", {"gpu": {"available": True, "name": "other-gpu"}}, ttl=30)
+    ls.heartbeat_worker("uncached", {}, ttl=30)
+    workers = {worker["worker_id"]: worker for worker in ls.list_workers()}
+    assert set(workers) == {"cached", "uncached"}
+    assert workers["uncached"]["active"] is True
+    assert "gpu" not in workers["uncached"]
+    assert workers["uncached"]["last_seen"] > 0
+    observer = RedisLeaseStore(client)
+    observer.heartbeat_worker("cached", {"state": "training", "epoch": 3}, ttl=30)
+    worker = next(worker for worker in observer.list_workers() if worker["worker_id"] == "cached")
+    assert worker["gpu"]["name"] == "other-gpu" and worker["epoch"] == 3
+
+
+def test_redis_deregister_discards_cached_capabilities(registry_redis):
+    """显式注销后不保留旧硬件快照，再次注册应使用新能力信息。"""
+    ls = RedisLeaseStore(registry_redis)
+    caps = {"gpu": {"available": True, "name": "old-gpu"}}
+    ls.register_worker("reused", caps, ttl=30)
+    ls.deregister_worker("reused")
+    assert ls.list_workers() == []
+    ls.heartbeat_worker("reused", {}, ttl=30)
+    worker, = ls.list_workers()
+    assert "gpu" not in worker
+    ls.register_worker("reused", {"gpu": {"available": False}}, ttl=30)
+    registry_redis.delete("mtp:workers:all", "mtp:worker:reused:info")
+    ls.heartbeat_worker("reused", {}, ttl=30)
+    worker, = ls.list_workers()
+    assert worker["gpu"] == {"available": False}
 
 
 def test_cleanup_stale_workers_redis():

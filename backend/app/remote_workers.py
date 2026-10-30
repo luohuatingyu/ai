@@ -1,10 +1,12 @@
 """远程 worker 管理：校验接入参数、经 SSH 执行单个部署脚本并保存操作状态。"""
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -15,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Callable, Dict, List
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -44,7 +46,55 @@ _ACTIVE_REMOTE_OPERATIONS: Dict[str, threading.Event] = {}
 _ACTIVE_REMOTE_OPERATIONS_LOCK = threading.Lock()
 _REMOTE_OPERATION_LOG_LOCK = threading.Lock()
 _REMOTE_OPERATION_LOG_LIMIT = 24_000
-_WORKER_STARTUP_HEARTBEAT_TIMEOUT = 15.0
+_REMOTE_BUILD_IDLE_PROGRESS_INTERVAL = 30.0
+_WORKER_STARTUP_HEARTBEAT_TIMEOUT = 30.0
+_REMOTE_EXECUTOR_HEARTBEAT_INTERVAL = 20.0
+_REMOTE_OPERATION_STALE_GRACE = 120.0
+
+
+def _safe_startup_endpoint(value: object) -> str:
+    """仅保留连接地址的非敏感部分，避免启动日志输出凭证或查询参数。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return "(未配置)"
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme and parsed.hostname:
+            hostname = parsed.hostname
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            port = f":{parsed.port}" if parsed.port else ""
+            path = parsed.path or ""
+            return f"{parsed.scheme}://{hostname}{port}{path}"
+    except ValueError:
+        pass
+    # 非 URL 形式的 endpoint 不含认证时可直接展示；含 @ 时只显示已配置状态。
+    return "[已配置]" if "@" in raw else raw
+
+
+def format_remote_startup_config(server: Dict[str, object], action: str) -> str:
+    """生成远程服务器操作的脱敏启动配置日志，和训练任务日志明确区分。"""
+    deployment = remote_deployment_settings(server)
+    try:
+        cpu_slots = int(server.get("cpu_slots", 2))
+    except (TypeError, ValueError):
+        cpu_slots = server.get("cpu_slots")
+    summary = {
+        "action": action,
+        "machine_id": server.get("machine_id"),
+        "host": server.get("host"),
+        "port": server.get("port"),
+        "mode": server.get("mode", "cpu"),
+        "cpu_slots": cpu_slots,
+        "worker_image": deployment.get("worker_image") or "(未配置)",
+        "redis_url": _safe_startup_endpoint(deployment.get("redis_url")),
+        "s3_endpoint": _safe_startup_endpoint(deployment.get("s3_endpoint")),
+        "s3_bucket": config.S3_BUCKET,
+        "s3_secure": config.S3_SECURE,
+    }
+    return "[远程服务器启动配置] " + json.dumps(
+        summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    )
 
 
 def _append_remote_operation_log(
@@ -81,6 +131,25 @@ def _append_remote_operation_log(
     except Exception:
         # 诊断日志失败不能中断实际 SSH 部署。
         return
+
+
+def clear_remote_operation_log(operation_id: str) -> bool:
+    """清除远程操作的可见输出，保留状态和阶段等操作元数据。"""
+    with _REMOTE_OPERATION_LOG_LOCK:
+        operation = manager.lease.get_remote_operation(operation_id)
+        if operation is None:
+            return False
+        operation.update(
+            {
+                "log": "",
+                "output": "",
+                "stderr": "",
+                "error": None,
+                "updated_at": time.time(),
+            }
+        )
+        manager.lease.set_remote_operation(operation_id, operation)
+    return True
 
 
 def _emit_progress(
@@ -143,6 +212,63 @@ def _remote_operation_cancel_requested(operation_id: str | None) -> bool:
     return manager.lease.is_remote_operation_cancel_requested(operation_id)
 
 
+def _executor_heartbeat_loop(operation_id: str, stop_event: threading.Event) -> None:
+    """周期性续写执行者存活标记；写失败不影响远程操作本身。"""
+    while not stop_event.wait(_REMOTE_EXECUTOR_HEARTBEAT_INTERVAL):
+        try:
+            manager.lease.set_remote_operation_executor(operation_id)
+        except Exception:
+            continue
+
+
+def recover_stale_remote_operation(
+    operation_id: str, operation: Dict[str, object]
+) -> Dict[str, object]:
+    """把执行进程已消失（API 服务重启/崩溃）的操作收敛为失败状态。
+
+    判定依据：操作仍处于 queued/running，但协调存储中不存在执行者存活标记
+    （Redis TTL 到期）且当前进程也不在执行；超过宽限期后标记失败并恢复服务器
+    状态，避免服务器永久停留在"远程操作中"而拒绝一切后续操作。
+    """
+    if operation.get("status") not in {"queued", "running"}:
+        return operation
+    if is_remote_operation_active(operation_id):
+        return operation
+    if manager.lease.is_remote_operation_executor_active(operation_id):
+        return operation
+    reference = float(operation.get("started_at") or operation.get("created_at") or 0)
+    if not reference or time.time() - reference < _REMOTE_OPERATION_STALE_GRACE:
+        return operation
+    error_message = "远程操作执行进程已中断（API 服务可能重启），请检查服务器状态后重新操作"
+    latest = manager.lease.get_remote_operation(operation_id) or operation
+    latest.update(
+        {
+            "status": "failed",
+            "updated_at": time.time(),
+            "error": error_message,
+            "phase": "操作失败",
+            "heartbeat_ok": False,
+        }
+    )
+    manager.lease.set_remote_operation(operation_id, latest)
+    manager.lease.clear_remote_operation_cancel(operation_id)
+    machine_id = str(latest.get("machine_id", ""))
+    if machine_id:
+        try:
+            server = remote_config_repository.get_remote_server(machine_id)
+        except remote_config_repository.RemoteConfigPersistenceError:
+            server = None
+        # 仅当服务器记录仍指向本操作时才恢复状态，避免覆盖更新的操作。
+        if server and str(server.get("operation_id", "")) == operation_id:
+            server["status"] = "error"
+            try:
+                remote_config_repository.save_remote_server(server)
+            except remote_config_repository.RemoteConfigPersistenceError:
+                pass
+    _append_remote_operation_log(operation_id, "操作失败", error_message)
+    return latest
+
+
 def _terminate_remote_process(process: subprocess.Popen) -> None:
     """终止本机 SSH 客户端并收集管道输出，避免遗留子进程。"""
     if process.poll() is not None:
@@ -169,12 +295,17 @@ def _communicate_remote_process(
 ):
     """轮询 SSH 子进程，实时转发输出并保留中断与超时语义。"""
     started_at = time.monotonic()
-    pending_input = input_data
+    last_output_at = started_at
+    input_stream = process.stdin if input_data is not None else None
+    input_stop = threading.Event()
+    input_errors: List[OSError] = []
+    input_thread: threading.Thread | None = None
     seen_output = {"stdout": "", "stderr": ""}
     pending_lines = {"stdout": "", "stderr": ""}
 
     def consume_output(name: str, value: object, flush: bool = False) -> None:
-        """仅将新增完整行发送给进度回调，避免重复显示 communicate 缓冲区。"""
+        """将新增换行或回车分隔的输出发送给进度回调，避免重复显示缓冲区。"""
+        nonlocal last_output_at
         if value is None:
             return
         if isinstance(value, bytes):
@@ -192,42 +323,110 @@ def _communicate_remote_process(
         else:
             delta = current
             seen_output[name] = current
+        if delta:
+            last_output_at = time.monotonic()
         pending_lines[name] += delta
-        chunks = pending_lines[name].split("\n")
+        # BuildKit 的部分进度格式用裸回车刷新；将其转换为日志行以便及时展示。
+        chunks = re.split(r"\r\n|\r|\n", pending_lines[name])
         pending_lines[name] = chunks.pop()
         for line in chunks:
-            line = line.rstrip("\r")
             if line:
                 _emit_progress(progress_callback, progress_phase, f"{name}: {line}")
         if flush and pending_lines[name]:
-            line = pending_lines[name].rstrip("\r")
+            line = pending_lines[name]
             pending_lines[name] = ""
             if line:
                 _emit_progress(progress_callback, progress_phase, f"{name}: {line}")
 
-    while True:
-        if _remote_operation_cancel_requested(operation_id):
-            _terminate_remote_process(process)
-            raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
-        remaining = None if timeout is None else timeout - (time.monotonic() - started_at)
-        if remaining is not None and remaining <= 0:
-            process.kill()
-            stdout, stderr = process.communicate()
-            consume_output("stdout", stdout, flush=True)
-            consume_output("stderr", stderr, flush=True)
-            raise subprocess.TimeoutExpired(
-                process.args, timeout, output=stdout, stderr=stderr
-            )
-        poll_interval = 0.25 if remaining is None else min(0.25, remaining)
+    def send_input(payload: bytes) -> None:
+        """持续发送全部输入并关闭管道；非阻塞写保证取消时线程能够及时退出。"""
         try:
-            output = process.communicate(input=pending_input, timeout=poll_interval)
-            consume_output("stdout", output[0], flush=True)
-            consume_output("stderr", output[1], flush=True)
-            return output
-        except subprocess.TimeoutExpired as exc:
-            consume_output("stdout", exc.output)
-            consume_output("stderr", exc.stderr)
-            pending_input = None
+            with input_stream:
+                descriptor = input_stream.fileno()
+                data = memoryview(payload)
+                offset = 0
+                while offset < len(data) and not input_stop.is_set():
+                    _, writable, _ = select.select([], [descriptor], [], 0.1)
+                    if not writable:
+                        continue
+                    try:
+                        offset += os.write(descriptor, data[offset:offset + 65536])
+                    except BlockingIOError:
+                        continue
+        except BrokenPipeError:
+            # SSH 提前失败时保留进程退出码和 stderr，与 communicate 的语义一致。
+            pass
+        except OSError as exc:
+            input_errors.append(exc)
+
+    try:
+        if input_stream is not None:
+            payload = (
+                input_data.encode(input_stream.encoding, input_stream.errors)
+                if isinstance(input_data, str) else input_data
+            )
+            os.set_blocking(input_stream.fileno(), False)
+            # communicate 在超时重试时不会继续发送未完成的 input；由独立线程
+            # 独占 stdin，主线程只收输出，避免它提前 flush/close 同一个输入流。
+            process.stdin = None
+            input_thread = threading.Thread(
+                target=send_input, args=(payload,),
+                name=f"remote-ssh-input-{process.pid}", daemon=True,
+            )
+            input_thread.start()
+
+        while True:
+            if input_errors:
+                raise RemoteWorkerError("向 SSH 进程发送输入失败") from input_errors[0]
+            if _remote_operation_cancel_requested(operation_id):
+                _terminate_remote_process(process)
+                raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
+            remaining = None if timeout is None else timeout - (time.monotonic() - started_at)
+            if remaining is not None and remaining <= 0:
+                process.kill()
+                stdout, stderr = process.communicate()
+                consume_output("stdout", stdout, flush=True)
+                consume_output("stderr", stderr, flush=True)
+                raise subprocess.TimeoutExpired(
+                    process.args, timeout, output=stdout, stderr=stderr
+                )
+            poll_interval = 0.25 if remaining is None else min(0.25, remaining)
+            try:
+                output = process.communicate(timeout=poll_interval)
+                if input_thread is not None:
+                    input_stop.set()
+                    input_thread.join()
+                if input_errors:
+                    raise RemoteWorkerError("向 SSH 进程发送输入失败") from input_errors[0]
+                consume_output("stdout", output[0], flush=True)
+                consume_output("stderr", output[1], flush=True)
+                return output
+            except subprocess.TimeoutExpired as exc:
+                consume_output("stdout", exc.output)
+                consume_output("stderr", exc.stderr)
+                now = time.monotonic()
+                if (
+                    progress_callback is not None
+                    and progress_phase == "构建目标架构镜像"
+                    and now - last_output_at >= _REMOTE_BUILD_IDLE_PROGRESS_INTERVAL
+                ):
+                    # 无输出时定期说明仍在等待，帮助区分网络拉取耗时和操作已失联。
+                    seconds = int(_REMOTE_BUILD_IDLE_PROGRESS_INTERVAL)
+                    _emit_progress(
+                        progress_callback,
+                        progress_phase,
+                        f"目标机仍在构建镜像，{seconds} 秒未收到新 Docker 输出；"
+                        "可能正在下载基础镜像或 Python 依赖。",
+                    )
+                    last_output_at = now
+    except BaseException:
+        if input_thread is not None and process.poll() is None:
+            _terminate_remote_process(process)
+        raise
+    finally:
+        if input_thread is not None:
+            input_stop.set()
+            input_thread.join()
 
 
 def _run_remote_subprocess(
@@ -347,28 +546,42 @@ def _canonical_docker_platform(platform: str) -> str:
     return f"{operating_system}/{architecture}"
 
 
-def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
-    """从可信后端目录打包 worker 构建上下文，拒绝同名的错误 Dockerfile。"""
+def _worker_runtime_files(app_root: Path) -> List[Path]:
+    """按白名单收集计算节点源码，拒绝缺失文件和符号链接，避免夹带管理端或秘密。"""
+    if app_root.is_symlink():
+        raise RemoteWorkerError("worker 源码目录不能是符号链接")
+    names = [
+        "__init__.py", "config.py", "coordination.py", "storage.py", "jobstore.py",
+        "device.py", "performance.py", "trainer.py", "llm_trainer.py", "worker.py", "worker-entrypoint.sh",
+    ]
+    # 联合训练模块在支持该功能的版本中随 worker 一起部署，兼容未启用该功能的版本。
+    names.extend(name for name in ("parallel.py", "parallel_worker.py")
+                 if (app_root / name).exists() or (app_root / name).is_symlink())
+    files = [app_root / name for name in names]
+    for path in files:
+        if path.is_symlink() or not path.is_file():
+            raise RemoteWorkerError(f"worker 运行文件缺失或不是普通文件：{path.name}")
+    return files
+
+
+def _worker_build_context(
+    context_roots: List[Path] | None = None, legacy_builder: bool = False
+) -> bytes:
+    """打包专用 worker 配方、运行依赖和源码；兼容旧 Docker 构建器。"""
     import io
     import tarfile
 
-    context_paths = (
-        "Dockerfile",
-        "requirements.txt",
-        "app",
-        "static",
-        "sample_data",
-        "init_db.sh",
-        "start.sh",
-    )
     roots = context_roots or [
+        # 优先使用当前模块所属源码，避免容器中旧的 /app 副本漏掉新运行文件。
+        Path(__file__).resolve().parents[1],
         config.APP_ROOT.parent,
         Path("/app"),
-        Path(__file__).resolve().parents[1],
     ]
     context_root = None
     for candidate in dict.fromkeys(Path(root).resolve() for root in roots):
-        dockerfile = candidate / "Dockerfile"
+        dockerfile = candidate / "worker.Dockerfile"
+        if dockerfile.is_symlink():
+            continue
         try:
             dockerfile_text = dockerfile.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -377,15 +590,16 @@ def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
             "dict(os.environ)" in dockerfile_text
             or not re.search(r"(?m)^FROM\s+\S+", dockerfile_text)
             or "COPY app ./app" not in dockerfile_text
-            or "COPY Dockerfile ./Dockerfile" not in dockerfile_text
+            or "COPY requirements.txt ./" not in dockerfile_text
         ):
             continue
-        if all((candidate / relative_path).exists() for relative_path in context_paths):
+        requirements = candidate / "requirements-worker.txt"
+        if requirements.is_file() and not requirements.is_symlink() and (candidate / "app").is_dir():
             context_root = candidate
             break
     if context_root is None:
         raise RemoteWorkerError(
-            "无法自动构建 worker 镜像：未找到完整且有效的后端 Docker 构建目录"
+            "无法自动构建 worker 镜像：未找到完整且有效的 worker 构建目录"
         )
 
     archive_buffer = io.BytesIO()
@@ -395,26 +609,85 @@ def _worker_build_context(context_roots: List[Path] | None = None) -> bytes:
         with tarfile.open(
             fileobj=archive_buffer, mode="w", format=tarfile.GNU_FORMAT
         ) as archive:
-            for relative_path in context_paths:
-                source = context_root / relative_path
-                if not source.exists():
-                    raise RemoteWorkerError(
-                        f"无法自动构建 worker 镜像：构建文件 {relative_path} 不存在"
+            context_files = [
+                (context_root / "worker.Dockerfile", "Dockerfile"),
+                (context_root / "requirements-worker.txt", "requirements.txt"),
+                *((path, f"app/{path.name}") for path in _worker_runtime_files(context_root / "app")),
+            ]
+            for source, relative_path in context_files:
+                if relative_path == "Dockerfile" and legacy_builder:
+                    # 传统构建器不支持 RUN --mount；移除仅用于 pip 下载缓存的挂载。
+                    cache_mount = re.compile(
+                        r"(?m)^RUN --mount=type=cache,target=/root/\.cache/pip \\\n[ \t]*"
                     )
-                archive.add(
-                    source,
-                    arcname=relative_path,
-                    recursive=True,
-                    filter=lambda item: None
-                    if Path(item.name).name in {"__pycache__", ".pytest_cache"}
-                    or item.name.endswith((".pyc", ".pyo"))
-                    else item,
-                )
+                    compatible_dockerfile, replacements = cache_mount.subn(
+                        "RUN ", dockerfile_text
+                    )
+                    if replacements != 1:
+                        raise RemoteWorkerError(
+                            "无法自动构建兼容 worker 镜像：Dockerfile 缓存挂载语法不符合预期"
+                        )
+                    dockerfile_bytes = compatible_dockerfile.encode("utf-8")
+                    dockerfile_info = archive.gettarinfo(
+                        str(source), arcname=relative_path
+                    )
+                    dockerfile_info.size = len(dockerfile_bytes)
+                    archive.addfile(dockerfile_info, io.BytesIO(dockerfile_bytes))
+                    continue
+                archive.add(source, arcname=relative_path, recursive=False)
     except RemoteWorkerError:
         raise
     except (OSError, tarfile.TarError) as exc:
         raise RemoteWorkerError("打包 worker 镜像构建上下文失败") from exc
     return archive_buffer.getvalue()
+
+
+def _worker_code_archive() -> bytes:
+    """使用与首次构建相同的运行文件白名单，压缩代码并复用远端现有镜像。"""
+    import io
+    import tarfile
+
+    app_root = Path(__file__).resolve().parent
+    archive_buffer = io.BytesIO()
+    try:
+        with tarfile.open(
+            fileobj=archive_buffer, mode="w:gz", format=tarfile.GNU_FORMAT
+        ) as archive:
+            for path in _worker_runtime_files(app_root):
+                archive.add(path, arcname=f"app/{path.name}", recursive=False)
+    except (OSError, tarfile.TarError) as exc:
+        raise RemoteWorkerError("打包 worker Python 代码失败") from exc
+    return archive_buffer.getvalue()
+
+
+def _remote_build_args(server: Dict[str, object]) -> str:
+    """按目标硬件选择 CPU/CUDA/ROCm/XPU 依赖，继续支持基础镜像和 pip 加速源。"""
+    mode = str(server.get("mode", "cpu"))
+    if mode not in {"cpu", "gpu"}:
+        raise RemoteWorkerError("资源类型必须是 cpu 或 gpu")
+    backend = str(server.get("device_backend", "auto") or "auto").lower()
+    if backend not in {"auto", "cuda", "rocm", "xpu", "mps", "cpu"}:
+        raise RemoteWorkerError("计算后端必须是 auto、cuda、rocm、xpu、mps 或 cpu")
+    if mode == "cpu" and backend not in {"auto", "cpu"}:
+        raise RemoteWorkerError("CPU 资源类型不能选择 GPU 后端")
+    if mode == "gpu" and backend == "cpu":
+        raise RemoteWorkerError("GPU 资源类型不能选择 CPU 后端")
+    if backend == "mps":
+        raise RemoteWorkerError("Apple MPS 需要 macOS 原生 worker，不能通过 Linux Docker 部署")
+    args: List[str] = [f"--build-arg WORKER_MODE={mode}"]
+    if backend != "auto":
+        args.append(f"--build-arg WORKER_BACKEND={backend}")
+    docker_registry = str(server.get("docker_registry") or "").strip()
+    if docker_registry:
+        base_image = f"{docker_registry}/library/python:3.12-slim"
+        args.append(f"--build-arg BASE_IMAGE={shlex.quote(base_image)}")
+    pip_index = str(server.get("pip_index_url") or "").strip()
+    if pip_index:
+        args.append(f"--build-arg PIP_INDEX_URL={shlex.quote(pip_index)}")
+    apt_mirror = str(server.get("apt_mirror") or "").strip()
+    if apt_mirror:
+        args.append(f"--build-arg APT_MIRROR={shlex.quote(apt_mirror)}")
+    return " ".join(args)
 
 
 def _build_worker_image_on_remote(
@@ -434,43 +707,79 @@ def _build_worker_image_on_remote(
         raise RemoteWorkerError(f"远程 worker 暂不支持目标镜像平台 {platform}")
 
     build_context = _worker_build_context()
-    remote_build_command = "DOCKER_BUILDKIT=1 docker build --platform {} --tag {} -".format(
-        shlex.quote(canonical_platform), shlex.quote(image)
-    )
-    command = ssh_command[:-1] + [remote_build_command]
+
+    def run_build(remote_build_command: str, context: bytes):
+        """运行一次远程构建并返回进程结果及脱敏输出。"""
+        command = ssh_command[:-1] + [remote_build_command]
+        try:
+            result = _run_remote_subprocess(
+                command,
+                input_data=context,
+                timeout=timeout,
+                environment=environment,
+                operation_id=operation_id,
+                progress_callback=progress_callback,
+                progress_phase="构建目标架构镜像",
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteWorkerError("目标机构建 worker 镜像超时") from exc
+        except OSError as exc:
+            raise RemoteWorkerError(
+                "无法启动 SSH 客户端在目标机构建 worker 镜像"
+            ) from exc
+
+        stdout = (
+            result.stdout.decode("utf-8", "replace")
+            if isinstance(result.stdout, bytes)
+            else result.stdout
+        )
+        stderr = (
+            result.stderr.decode("utf-8", "replace")
+            if isinstance(result.stderr, bytes)
+            else result.stderr
+        )
+        return result, stdout, stderr, _redact_output(
+            stdout, stderr, credentials, server
+        )
+
+    build_args = _remote_build_args(server)
+    build_arg_clause = f" {build_args}" if build_args else ""
+    remote_build_command = (
+        "DOCKER_BUILDKIT=1 docker build --progress=plain --platform {} --tag {}{} -"
+    ).format(shlex.quote(canonical_platform), shlex.quote(image), build_arg_clause)
     _emit_progress(
         progress_callback,
         "构建目标架构镜像",
         f"经 SSH 发送精简构建上下文（{len(build_context) / (1024 * 1024):.1f} MiB）；"
         "目标机将拉取或复用通用基础镜像和依赖。",
     )
-    try:
-        result = _run_remote_subprocess(
-            command,
-            input_data=build_context,
-            timeout=timeout,
-            environment=environment,
-            operation_id=operation_id,
-            progress_callback=progress_callback,
-            progress_phase="构建目标架构镜像",
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RemoteWorkerError("目标机构建 worker 镜像超时") from exc
-    except OSError as exc:
-        raise RemoteWorkerError("无法启动 SSH 客户端在目标机构建 worker 镜像") from exc
-
-    stdout = (
-        result.stdout.decode("utf-8", "replace")
-        if isinstance(result.stdout, bytes)
-        else result.stdout
-    )
-    stderr = (
-        result.stderr.decode("utf-8", "replace")
-        if isinstance(result.stderr, bytes)
-        else result.stderr
-    )
-    output = _redact_output(stdout, stderr, credentials, server)
+    result, stdout, stderr, output = run_build(remote_build_command, build_context)
     if result.returncode != 0:
+        buildkit_error = f"{stdout}\n{stderr}"
+        if (
+            "BuildKit is enabled but the buildx component is missing or broken"
+            in buildkit_error
+        ):
+            _emit_progress(
+                progress_callback,
+                "构建目标架构镜像",
+                "目标机缺少 Docker Buildx，改用本机架构的兼容构建器重试。",
+            )
+            legacy_context = _worker_build_context(legacy_builder=True)
+            # 目标平台刚从此 Docker daemon 读取；传统构建器按 daemon 本机架构构建。
+            legacy_command = "DOCKER_BUILDKIT=0 docker build --tag {}{} -".format(
+                shlex.quote(image), build_arg_clause
+            )
+            result, _stdout, _stderr, output = run_build(
+                legacy_command, legacy_context
+            )
+            if result.returncode == 0:
+                _emit_progress(
+                    progress_callback,
+                    "构建目标架构镜像",
+                    "目标机 worker 镜像兼容构建完成。",
+                )
+                return
         detail = (output["stderr"] or output["stdout"] or "目标机 Docker 构建失败").strip()
         raise RemoteWorkerError(f"目标机 Docker 构建 worker 镜像失败：{detail[-1500:]}")
     _emit_progress(progress_callback, "构建目标架构镜像", "目标机 worker 镜像构建完成。")
@@ -482,7 +791,12 @@ def _build_local_docker_image_for_platform(
     operation_id: str | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> None:
-    """通过平台 Docker Engine 为目标架构重建 worker 镜像并校验结果。"""
+    """通过平台 Docker Engine 为目标架构重建 worker 镜像并校验结果。
+
+    保留的备用路径（当前未接入操作流程）：现网安装走目标机构建
+    （_build_worker_image_on_remote），本函数与 _stream_worker_image_to_remote
+    构成"平台导出镜像再 SSH 传输"的旧传输链路，供回退与测试使用。
+    """
     canonical_platform = _canonical_docker_platform(platform)
     if not canonical_platform.startswith("linux/"):
         raise RemoteWorkerError(f"远程 worker 暂不支持目标镜像平台 {platform}")
@@ -648,9 +962,12 @@ _ENVIRONMENT_KEYS = (
     "MTP_ACTION",
     "MTP_MACHINE_ID",
     "MTP_MODE",
+    "MTP_DEVICE_BACKEND",
     "MTP_CPU_SLOTS",
+    "MTP_DISTRIBUTED_HOST",
     "MTP_WORKER_IMAGE",
     "MTP_REDIS_URL",
+    "MTP_REDIS_PASSWORD",
     "MTP_S3_ENDPOINT",
     "MTP_S3_ACCESS_KEY",
     "MTP_S3_SECRET_KEY",
@@ -943,30 +1260,25 @@ def resolve_remote_server_credentials(server: Dict[str, object]) -> Dict[str, st
 
 
 def apply_remote_server_overrides(
-    server: Dict[str, object], overrides: Dict[str, object], *, is_update: bool = False
+    server: Dict[str, object], overrides: Dict[str, object]
 ) -> Dict[str, object]:
-    """应用服务器级部署覆盖值，并将可能含密码的 Redis URL 加密后保存。"""
+    """应用服务器级 Redis/S3 覆盖值，并将 Redis URL 加密后保存。"""
     updated = dict(server)
-    for request_key, stored_key in (
-        ("worker_image", "worker_image_override"),
-        ("remote_s3_endpoint", "remote_s3_endpoint_override"),
-    ):
-        if request_key not in overrides:
-            continue
-        value = str(overrides.get(request_key) or "").strip()
-        updated[stored_key] = value or None
+    # Worker 镜像只由平台环境配置决定，不再支持服务器级镜像覆盖。
+    updated.pop("worker_image_override", None)
+    if "remote_s3_endpoint" in overrides:
+        value = str(overrides.get("remote_s3_endpoint") or "").strip()
+        updated["remote_s3_endpoint_override"] = value or None
 
     redis_was_sent = "remote_redis_url" in overrides
     redis_url = str(overrides.get("remote_redis_url") or "").strip()
     clear_redis = bool(overrides.get("clear_remote_redis_url_override"))
-    if clear_redis:
+    if clear_redis or (redis_was_sent and not redis_url):
         updated.pop("remote_redis_url_encrypted", None)
     elif redis_was_sent and redis_url:
         updated["remote_redis_url_encrypted"] = _credential_fernet().encrypt(
             redis_url.encode("utf-8")
         ).decode("ascii")
-    elif redis_was_sent and not is_update:
-        updated.pop("remote_redis_url_encrypted", None)
 
     # 兼容请求构造时的临时字段，绝不把 Redis URL 明文留在服务器记录中。
     updated.pop("remote_redis_url", None)
@@ -975,17 +1287,29 @@ def apply_remote_server_overrides(
 
 
 def remote_server_public_view(server: Dict[str, object]) -> Dict[str, object]:
-    """返回服务器可公开配置，隐藏加密 Redis URL 并只暴露是否设置覆盖值。"""
+    """返回公开服务器配置，隐藏敏感 Redis 密文和已移除的镜像覆盖字段。"""
     public = dict(server)
     encrypted_redis_url = public.pop("remote_redis_url_encrypted", None)
+    public.pop("worker_image_override", None)
     public.pop("remote_redis_url", None)
     public.pop("clear_remote_redis_url_override", None)
     public["has_remote_redis_url_override"] = bool(encrypted_redis_url)
+    public["deployed"] = remote_server_is_deployed(server)
     return public
 
 
+def remote_server_is_deployed(server: Dict[str, object]) -> bool:
+    """读取持久化部署标记，并从旧状态推断已部署服务器。"""
+    # 数据库旧记录可能把尚未迁移的标记读成 None；仅非空标记才覆盖状态推断。
+    if server.get("deployed") is not None:
+        return bool(server.get("deployed"))
+    return str(server.get("status", "")) in {
+        "online", "stopped", "running", "starting", "stopping", "restarting"
+    }
+
+
 def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[str, str]:
-    """解析单机覆盖值与平台默认值，返回远程 worker 所需的部署配置。"""
+    """解析服务器 Redis/S3 覆盖值，未配置时回退平台 .env 配置。"""
     server = server or {}
     encrypted_redis_url = str(server.get("remote_redis_url_encrypted", "") or "")
     redis_override = ""
@@ -996,13 +1320,21 @@ def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[
             ).decode("utf-8")
         except (InvalidToken, ValueError, UnicodeError) as exc:
             raise RemoteWorkerError("服务器 Redis 覆盖配置无法解密；请检查平台加密主密钥") from exc
+    redis_url = str(
+        redis_override or config.WORKER_REMOTE_REDIS_URL or config.REDIS_URL or ""
+    ).strip()
+    # Redis 密码按"远程专用 > 平台密码"解析：平台密码只在远程 worker 复用平台
+    # REDIS_URL（未配置远程专用 URL）时沿用，避免把平台密码误发给其他 Redis。
+    if config.WORKER_REMOTE_REDIS_PASSWORD:
+        redis_password = str(config.WORKER_REMOTE_REDIS_PASSWORD).strip()
+    elif not redis_override and not config.WORKER_REMOTE_REDIS_URL:
+        redis_password = str(config.REDIS_PASSWORD or "").strip()
+    else:
+        redis_password = ""
     return {
-        "worker_image": str(
-            server.get("worker_image_override") or config.WORKER_REMOTE_IMAGE or ""
-        ).strip(),
-        "redis_url": str(
-            redis_override or config.WORKER_REMOTE_REDIS_URL or config.REDIS_URL or ""
-        ).strip(),
+        "worker_image": str(config.WORKER_REMOTE_IMAGE or "").strip(),
+        "redis_url": redis_url,
+        "redis_password": redis_password,
         "s3_endpoint": str(
             server.get("remote_s3_endpoint_override")
             or config.WORKER_REMOTE_S3_ENDPOINT
@@ -1012,10 +1344,63 @@ def remote_deployment_settings(server: Dict[str, object] | None = None) -> Dict[
     }
 
 
+def remote_effective_config(server: Dict[str, object]) -> Dict[str, object]:
+    """生成页面可查看的生效配置摘要，隐藏 Redis 认证信息和所有密钥。"""
+    deployment = remote_deployment_settings(server)
+    encrypted_redis_url = bool(str(server.get("remote_redis_url_encrypted", "") or ""))
+    if encrypted_redis_url:
+        redis_source = "server_override"
+    elif config.WORKER_REMOTE_REDIS_URL:
+        redis_source = "WORKER_REMOTE_REDIS_URL"
+    else:
+        redis_source = "REDIS_URL"
+    if server.get("remote_s3_endpoint_override"):
+        s3_source = "server_override"
+    elif config.WORKER_REMOTE_S3_ENDPOINT:
+        s3_source = "WORKER_REMOTE_S3_ENDPOINT"
+    else:
+        s3_source = "S3_ENDPOINT"
+    redis_url = deployment["redis_url"]
+    if "@" in redis_url:
+        redis_auth_source = "url"
+    elif config.WORKER_REMOTE_REDIS_PASSWORD:
+        redis_auth_source = "WORKER_REMOTE_REDIS_PASSWORD"
+    elif deployment.get("redis_password"):
+        redis_auth_source = "REDIS_PASSWORD"
+    else:
+        redis_auth_source = None
+    return {
+        "machine_id": str(server.get("machine_id", "")),
+        "host": str(server.get("host", "")),
+        "port": int(server.get("port", 22)),
+        "mode": str(server.get("mode", "cpu")),
+        "device_backend": str(server.get("device_backend", "auto")),
+        "cpu_slots": int(server.get("cpu_slots", 2)),
+        "distributed_host": str(server.get("distributed_host", "")),
+        "deployed": remote_server_is_deployed(server),
+        "status": str(server.get("status", "")),
+        "worker_image": deployment["worker_image"],
+        "worker_image_source": "WORKER_REMOTE_IMAGE",
+        "redis_endpoint": _safe_startup_endpoint(deployment["redis_url"]),
+        "redis_configured": bool(deployment["redis_url"]),
+        "redis_auth_configured": bool(redis_auth_source),
+        "redis_auth_source": redis_auth_source,
+        "redis_source": redis_source,
+        "s3_endpoint": _safe_startup_endpoint(deployment["s3_endpoint"]),
+        "s3_source": s3_source,
+        "s3_bucket": config.S3_BUCKET,
+        "s3_secure": config.S3_SECURE,
+    }
+
+
 def _open_local_docker_image_archive(
     image: str,
 ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
-    """通过宿主 Docker Engine API 打开指定本地镜像的 tar 流。"""
+    """通过宿主 Docker Engine API 打开指定本地镜像的 tar 流。
+
+    保留的备用路径（当前未接入操作流程）：仅被旧镜像传输链路
+    _stream_worker_image_to_remote 使用，见该函数说明。
+    """
     socket_path = config.WORKER_DOCKER_SOCKET_PATH
     if not socket_path or not Path(socket_path).exists():
         raise RemoteWorkerError(
@@ -1071,7 +1456,11 @@ def _stream_worker_image_to_remote(
     operation_id: str | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> Dict[str, str]:
-    """把 Docker Engine 镜像 tar 流经 SSH stdin 传给目标机 docker load。"""
+    """把 Docker Engine 镜像 tar 流经 SSH stdin 传给目标机 docker load。
+
+    保留的备用路径（当前未接入操作流程）：现网安装走目标机构建
+    （_build_worker_image_on_remote），本链路供回退与测试使用。
+    """
     docker_connection, image_response = _open_local_docker_image_archive(image)
     read_fd = -1
     write_fd = -1
@@ -1175,13 +1564,47 @@ def _stream_worker_image_to_remote(
             writer.join(timeout=5)
 
 
+def _remote_worker_generation_snapshot(machine_id: str) -> Dict[str, Dict[str, float | None]]:
+    """记录操作前的 worker 启动代次，避免把旧心跳误判为本次启动成功。"""
+    try:
+        workers = manager.lease.list_workers()
+    except Exception:
+        return {}
+    snapshot: Dict[str, Dict[str, float | None]] = {}
+    for item in workers:
+        if str(item.get("machine_id", "")) != machine_id:
+            continue
+        worker_id = str(item.get("worker_id", ""))
+        if not worker_id:
+            continue
+        try:
+            started_at = float(item["started_at"]) if item.get("started_at") is not None else None
+        except (TypeError, ValueError):
+            started_at = None
+        try:
+            last_seen = float(item["last_seen"]) if item.get("last_seen") is not None else None
+        except (TypeError, ValueError):
+            last_seen = None
+        # 旧 worker 记录可能没有启动代次；不把这种记录放入基线，避免阻断
+        # 兼容旧 worker 的首次部署心跳确认。
+        if started_at is not None:
+            snapshot[worker_id] = {"started_at": started_at, "last_seen": last_seen}
+    return snapshot
+
+
 def _wait_for_remote_worker_heartbeat(
     operation_id: str,
     machine_id: str,
     progress_callback: Callable[[str, str], None],
-) -> None:
-    """短暂等待远程 worker 注册，并记录有无心跳供安装诊断。"""
-    _emit_progress(progress_callback, "等待资源心跳", "等待远程 worker 注册资源槽（最多 15 秒）。")
+    baseline: Dict[str, Dict[str, float | None]] | None = None,
+) -> bool:
+    """等待新 worker 代次注册，避免把操作前的旧心跳误判为成功。"""
+    timeout_seconds = int(_WORKER_STARTUP_HEARTBEAT_TIMEOUT)
+    _emit_progress(
+        progress_callback,
+        "等待资源心跳",
+        f"等待远程 worker 注册资源槽（最多 {timeout_seconds} 秒）。",
+    )
     deadline = time.monotonic() + _WORKER_STARTUP_HEARTBEAT_TIMEOUT
     while True:
         if _remote_operation_cancel_requested(operation_id):
@@ -1194,11 +1617,35 @@ def _wait_for_remote_worker_heartbeat(
                 "等待资源心跳",
                 f"无法读取平台 worker 心跳：{exc}",
             )
-            return
+            return False
         matches = [
             item for item in workers
             if str(item.get("machine_id", "")) == machine_id and item.get("active")
         ]
+        if baseline:
+            fresh_matches = []
+            for item in matches:
+                worker_id = str(item.get("worker_id", ""))
+                previous = baseline.get(worker_id)
+                if previous is None:
+                    fresh_matches.append(item)
+                    continue
+                try:
+                    current_started_at = (
+                        float(item["started_at"])
+                        if item.get("started_at") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    current_started_at = None
+                previous_started_at = previous.get("started_at")
+                if (
+                    current_started_at is not None
+                    and previous_started_at is not None
+                    and current_started_at > previous_started_at
+                ):
+                    fresh_matches.append(item)
+            matches = fresh_matches
         if matches:
             worker_ids = ", ".join(str(item.get("worker_id", "未知槽位")) for item in matches)
             _emit_progress(
@@ -1206,15 +1653,16 @@ def _wait_for_remote_worker_heartbeat(
                 "等待资源心跳",
                 f"已收到 {len(matches)} 个资源槽心跳：{worker_ids}。",
             )
-            return
+            return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _emit_progress(
                 progress_callback,
                 "等待资源心跳",
-                "15 秒内未收到资源心跳。请查看下方容器启动日志，并检查目标机到 Redis、S3 的连通性。",
+                f"{timeout_seconds} 秒内未收到资源心跳。请查看下方容器启动日志，"
+                "并检查目标机到 Redis、S3 的连通性。",
             )
-            return
+            return False
         time.sleep(min(1.0, remaining))
 
 
@@ -1286,8 +1734,15 @@ def clear_platform_ssh_credentials() -> Dict[str, object]:
 def remote_configuration_errors(
     credentials: Dict[str, str] | None = None,
     server: Dict[str, object] | None = None,
+    *,
+    require_platform_config: bool = True,
 ) -> List[str]:
-    """列出远程执行缺少的配置，不读取或返回平台 SSH 凭证内容。"""
+    """列出远程执行缺少的配置，不读取或返回平台 SSH 凭证内容。
+
+    require_platform_config=False 仅用于 stop/status 纯容器生命周期操作：
+    只校验 SSH 可达性与凭证，不要求 Redis/S3/镜像等部署配置可用。
+    start/restart 会把最新配置下发到目标机，必须与部署类动作一样完整校验。
+    """
     errors: List[str] = []
     if credentials is None:
         try:
@@ -1301,9 +1756,9 @@ def remote_configuration_errors(
                 "passphrase": "",
                 "private_key": "",
             }
-    if not config.REDIS_URL:
+    if not config.REDIS_URL and require_platform_config:
         errors.append("平台必须配置共享 REDIS_URL，远程 worker 才能加入同一任务队列")
-    if config.STORAGE_BACKEND != "s3":
+    if config.STORAGE_BACKEND != "s3" and require_platform_config:
         errors.append("平台必须使用共享 S3 存储，远程 worker 才能读取数据集和写入产物")
     if not shutil.which("ssh"):
         errors.append("平台后端容器未安装 OpenSSH 客户端")
@@ -1315,14 +1770,16 @@ def remote_configuration_errors(
             errors.append("页面未配置 SSH 私钥")
     if auth_method in {"password", "key_password"} and not credentials.get("password"):
         errors.append("页面凭证缺少 SSH 登录密码")
+    if not require_platform_config:
+        return errors
     try:
         settings = remote_deployment_settings(server)
     except RemoteWorkerError as exc:
         errors.append(str(exc))
-        settings = {"worker_image": "", "redis_url": "", "s3_endpoint": ""}
+        settings = {"worker_image": "", "redis_url": "", "redis_password": "", "s3_endpoint": ""}
     image = settings["worker_image"]
     if not image or any(c.isspace() for c in image):
-        errors.append("WORKER_IMAGE 或服务器镜像覆盖值必须是有效的 worker 镜像标签")
+        errors.append("平台 WORKER_IMAGE 必须是有效的 worker 镜像标签")
     if not settings["redis_url"].startswith(("redis://", "rediss://")):
         errors.append("平台或服务器必须配置目标服务器可访问的 Redis URL")
     if not settings["s3_endpoint"] or any(
@@ -1332,6 +1789,7 @@ def remote_configuration_errors(
     values = (
         settings["worker_image"],
         settings["redis_url"],
+        settings["redis_password"],
         settings["s3_endpoint"],
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
@@ -1358,21 +1816,80 @@ def validate_server_record(server: Dict[str, object]) -> None:
         raise RemoteWorkerError("服务器标识格式无效")
     if not _HOST_RE.fullmatch(host):
         raise RemoteWorkerError("SSH 主机地址格式无效")
+    distributed_host = str(server.get("distributed_host") or "")
+    if distributed_host and not _HOST_RE.fullmatch(distributed_host):
+        raise RemoteWorkerError("联合训练互联地址格式无效")
     if not _USERNAME_RE.fullmatch(username):
         raise RemoteWorkerError("SSH 用户名格式无效")
     if not 1 <= port <= 65535:
         raise RemoteWorkerError("SSH 端口必须在 1 到 65535 之间")
+    backend = str(server.get("device_backend", "auto") or "auto").lower()
+    if backend not in {"auto", "cuda", "rocm", "xpu", "mps", "cpu"}:
+        raise RemoteWorkerError("计算后端配置无效")
+    mode = str(server.get("mode", "cpu"))
+    if mode == "cpu" and backend not in {"auto", "cpu"}:
+        raise RemoteWorkerError("CPU 资源类型不能选择 GPU 后端")
+    if mode == "gpu" and backend == "cpu":
+        raise RemoteWorkerError("GPU 资源类型不能选择 CPU 后端")
 
 
-def render_remote_script(server: Dict[str, object], action: str) -> str:
+# start/restart 会把最新配置下发到目标机并重建容器应用（见 remote_worker.sh），
+# 因此与部署类动作一样依赖 Redis/S3 配置可解析；只有 stop/status 是纯容器操作。
+_PURE_LIFECYCLE_ACTIONS = ("stop", "status")
+
+
+def _remote_worker_state_missing(message: object) -> bool:
+    """识别远端 worker 容器或外部配置已被清理的确定性错误。"""
+    text = str(message or "")
+    return any(
+        marker in text
+        for marker in (
+            "目标服务器上未找到 worker 容器",
+            "目标服务器未找到 worker 配置文件",
+        )
+    )
+
+
+def _mark_remote_worker_undeployed(server: Dict[str, object]) -> None:
+    """将持久化状态校准为远端不存在 worker，避免继续显示可重建旧容器。"""
+    server["deployed"] = False
+    server["status"] = "not_deployed"
+
+
+def _deployment_settings_for_action(
+    server: Dict[str, object], action: str
+) -> Dict[str, str]:
+    """按动作解析部署配置：仅 stop/status 不依赖 Redis/S3 配置可解密。"""
+    try:
+        return remote_deployment_settings(server)
+    except RemoteWorkerError:
+        if action in _PURE_LIFECYCLE_ACTIONS:
+            # stop/status 只操作容器，远端脚本不读取这些值；配置不可解密时置空继续。
+            return {
+                "worker_image": "",
+                "redis_url": "",
+                "redis_password": "",
+                "s3_endpoint": "",
+            }
+        raise
+
+
+def render_remote_script(
+    server: Dict[str, object], action: str, code_archive_base64: str | None = None
+) -> str:
     """把经过校验的配置作为 shell 字面量前缀，拼接随镜像打包的单文件脚本。"""
     validate_server_record(server)
-    allowed_actions = {"install", "start", "stop", "restart", "status"}
+    allowed_actions = {
+        "install", "config", "deploy", "update", "start", "stop", "restart", "status"
+    }
     if action not in allowed_actions:
         raise RemoteWorkerError("不支持的远程操作")
     mode = str(server.get("mode", "cpu"))
     if mode not in {"cpu", "gpu"}:
         raise RemoteWorkerError("计算类型必须是 cpu 或 gpu")
+    device_backend = str(server.get("device_backend", "auto") or "auto").lower()
+    if device_backend == "mps":
+        raise RemoteWorkerError("Apple MPS 需要 macOS 原生 worker；Linux Docker 远程部署不支持 MPS")
     try:
         cpu_slots = int(server.get("cpu_slots", 2))
     except (TypeError, ValueError) as exc:
@@ -1380,14 +1897,17 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
     if not 0 <= cpu_slots <= 256:
         raise RemoteWorkerError("CPU 执行槽数量必须在 0 到 256 之间")
 
-    deployment = remote_deployment_settings(server)
+    deployment = _deployment_settings_for_action(server, action)
     settings = {
         "MTP_ACTION": action,
         "MTP_MACHINE_ID": str(server["machine_id"]),
         "MTP_MODE": mode,
+        "MTP_DEVICE_BACKEND": device_backend,
         "MTP_CPU_SLOTS": str(cpu_slots),
+        "MTP_DISTRIBUTED_HOST": str(server.get("distributed_host", "")),
         "MTP_WORKER_IMAGE": deployment["worker_image"],
         "MTP_REDIS_URL": deployment["redis_url"],
+        "MTP_REDIS_PASSWORD": deployment["redis_password"],
         "MTP_S3_ENDPOINT": deployment["s3_endpoint"],
         "MTP_S3_ACCESS_KEY": config.S3_ACCESS_KEY,
         "MTP_S3_SECRET_KEY": config.S3_SECRET_KEY,
@@ -1404,6 +1924,11 @@ def render_remote_script(server: Dict[str, object], action: str) -> str:
     except OSError as exc:
         raise RemoteWorkerError("远程部署脚本未打包到后端镜像") from exc
     prelude = "\n".join(f"export {key}={shlex.quote(settings[key])}" for key in _ENVIRONMENT_KEYS)
+    if code_archive_base64:
+        prelude += (
+            "\nMTP_WORKER_APP_ARCHIVE_B64=$(cat <<'MTP_WORKER_APP_ARCHIVE'\n"
+            f"{code_archive_base64}\nMTP_WORKER_APP_ARCHIVE\n)"
+        )
     return f"{prelude}\n{script_body}"
 
 
@@ -1427,13 +1952,25 @@ def run_remote_action(
 
     progress_callback = report if operation_id else None
     _emit_progress(progress_callback, "检查部署配置", "检查 SSH、Redis、S3 和 worker 镜像配置。")
-    errors = remote_configuration_errors(credentials, server)
+    errors = remote_configuration_errors(
+        credentials,
+        server,
+        require_platform_config=action not in _PURE_LIFECYCLE_ACTIONS,
+    )
     if errors:
         raise RemoteWorkerError("；".join(errors))
     validate_server_record(resolved_server)
     ssh_path = shutil.which("ssh")
     if not ssh_path:
         raise RemoteWorkerError("平台后端容器未安装 OpenSSH 客户端")
+    heartbeat_baseline = None
+    if operation_id and action in {
+        "install", "deploy", "update", "start", "restart"
+    }:
+        # 必须在 SSH 操作前采样；否则重启已完成后再采样会把新代次当成旧基线。
+        heartbeat_baseline = _remote_worker_generation_snapshot(
+            str(server.get("machine_id", ""))
+        )
     try:
         Path(config.WORKER_SSH_KNOWN_HOSTS_PATH).parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1494,11 +2031,16 @@ def run_remote_action(
         ]
     )
     command.extend([target, "bash -s"])
-    timeout = 3600 if action == "install" else 120
+    timeout = 3600 if action == "install" else 180
     try:
         environment: Dict[str, str] | None = None
+        code_archive = (
+            base64.b64encode(_worker_code_archive()).decode("ascii")
+            if action in {"install", "deploy", "update"}
+            else None
+        )
         run_options = {
-            "input": render_remote_script(resolved_server, action),
+            "input": render_remote_script(resolved_server, action, code_archive),
             "text": True,
             "capture_output": True,
             "timeout": timeout,
@@ -1555,6 +2097,18 @@ def run_remote_action(
                 operation_id,
                 **progress_options,
             )
+        elif action in {"deploy", "update"}:
+            _emit_progress(
+                progress_callback,
+                "同步 worker 代码",
+                "同步最新 worker Python 代码并重建远端容器，不上传新配置。",
+            )
+        elif action == "config":
+            _emit_progress(
+                progress_callback,
+                "覆盖 worker 配置",
+                "覆盖目标机 worker 配置，下次启动/重启时生效，不上传代码。",
+            )
         _emit_progress(progress_callback, "执行远程部署脚本", f"开始执行远端 {action} 脚本。")
         progress_options = (
             {
@@ -1583,13 +2137,37 @@ def run_remote_action(
         detail = (output["stderr"] or output["stdout"] or "远程脚本返回错误").strip()
         raise RemoteWorkerError(detail[-2000:])
     _emit_progress(progress_callback, "执行远程部署脚本", "远端脚本已成功返回。")
-    if action == "install" and operation_id:
-        _wait_for_remote_worker_heartbeat(
-            operation_id,
-            str(server.get("machine_id", "")),
-            progress_callback or report,
-        )
+    # 重建/重启容器后等待资源心跳，确认 worker 真的注册成功（stop/config 无需等待；
+    # config 只写文件、不重启容器，worker 仍按旧配置心跳，等待无意义）。
+    heartbeat_ok: bool | None = None
+    if operation_id and action in {
+        "install", "deploy", "update", "start", "restart"
+    }:
+        machine_id = str(server.get("machine_id", ""))
+        wait_args = (operation_id, machine_id, progress_callback or report)
+        if heartbeat_baseline:
+            heartbeat_ok = _wait_for_remote_worker_heartbeat(
+                *wait_args, baseline=heartbeat_baseline
+            )
+        else:
+            heartbeat_ok = _wait_for_remote_worker_heartbeat(*wait_args)
+    output["heartbeat_ok"] = heartbeat_ok
     return output
+
+
+def _persist_remote_server_status(
+    operation_id: str, server: Dict[str, object], phase: str
+) -> None:
+    """保存服务器状态到 MySQL；失败只记入操作日志，不破坏操作终态。"""
+    try:
+        remote_config_repository.save_remote_server(server)
+    except remote_config_repository.RemoteConfigPersistenceError as exc:
+        _append_remote_operation_log(
+            operation_id,
+            phase,
+            f"服务器状态写入 MySQL 失败（不影响远端执行结果）：{exc}",
+            server=server,
+        )
 
 
 def execute_remote_operation(
@@ -1597,7 +2175,16 @@ def execute_remote_operation(
 ) -> None:
     """在后台执行 SSH 操作并将可轮询状态写入协调存储。"""
     cancellation_event = _register_remote_operation(operation_id)
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_executor_heartbeat_loop,
+        args=(operation_id, heartbeat_stop),
+        name="remote-operation-executor-heartbeat",
+        daemon=True,
+    )
     try:
+        manager.lease.set_remote_operation_executor(operation_id)
+        heartbeat_thread.start()
         operation = manager.lease.get_remote_operation(operation_id) or {
             "operation_id": operation_id,
             "machine_id": str(server.get("machine_id", "")),
@@ -1623,9 +2210,55 @@ def execute_remote_operation(
                 f"开始执行 {action} 操作。",
                 server=server,
             )
+            try:
+                startup_config = format_remote_startup_config(server, action)
+            except RemoteWorkerError as exc:
+                # 配置解密失败时仍保留可识别的启动日志，实际校验由远程动作继续负责。
+                startup_config = f"[远程服务器启动配置] 配置解析失败：{exc}"
+            _append_remote_operation_log(
+                operation_id,
+                "启动配置",
+                startup_config,
+                server=server,
+            )
             server.update({"status": "running", "operation_id": operation_id})
-            remote_config_repository.save_remote_server(server)
-            result = run_remote_action(server, action, operation_id)
+            _persist_remote_server_status(operation_id, server, "准备远程操作")
+            missing_worker_detected = False
+            recovered_with_install = False
+            try:
+                result = run_remote_action(server, action, operation_id)
+            except RemoteWorkerError as exc:
+                missing_worker_detected = _remote_worker_state_missing(exc)
+                if action not in {"deploy", "update"} or not missing_worker_detected:
+                    if missing_worker_detected:
+                        _mark_remote_worker_undeployed(server)
+                    raise
+                # 部署代码原本只复用现有镜像重建容器；容器被手动清理后，
+                # 自动退回完整安装，重新构建镜像并创建容器，修复持久化标记与远端事实脱钩。
+                _append_remote_operation_log(
+                    operation_id,
+                    "校准远程状态",
+                    "检测到远端 worker 容器或配置缺失，自动改为完整部署。"
+                    f"原始错误：{exc}",
+                    server=server,
+                )
+                try:
+                    result = run_remote_action(server, "install", operation_id)
+                    recovered_with_install = True
+                except RemoteWorkerError as recovery_exc:
+                    # 首次错误已经确认远端没有可复用容器；恢复失败后让页面显示“部署”。
+                    _mark_remote_worker_undeployed(server)
+                    raise recovery_exc
+            # 远端脚本的最终 stdout/stderr 也写入操作日志；日志窗口优先展示 log，避免配置摘要只停留在 output 字段而不可见。
+            for stream_name, phase in (("stdout", "远端脚本输出"), ("stderr", "远端脚本错误")):
+                stream_output = str(result.get(stream_name, "") or "").strip()
+                if stream_output:
+                    _append_remote_operation_log(
+                        operation_id,
+                        phase,
+                        stream_output,
+                        server=server,
+                    )
             if _remote_operation_cancel_requested(operation_id):
                 raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
             terminal_update = {
@@ -1635,8 +2268,30 @@ def execute_remote_operation(
                 "stderr": result.get("stderr", "")[-2000:],
                 "phase": "操作完成",
             }
-            server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"
+            if action in {"config", "deploy", "update"}:
+                previous_status = str(operation.get("previous_server_status", ""))
+                server["status"] = "online" if recovered_with_install else previous_status if previous_status in {
+                    "online", "stopped", "error", "not_deployed"
+                } else "online"
+            else:
+                server["status"] = "online" if action in {"install", "start", "restart"} else "stopped"
+            if action in {"install", "deploy", "update"}:
+                server["deployed"] = True
             terminal_log = ("操作完成", "远程操作已成功完成。")
+            heartbeat_ok = result.get("heartbeat_ok")
+            if heartbeat_ok is True:
+                terminal_update["heartbeat_ok"] = True
+            elif heartbeat_ok is False:
+                # 容器已重建但 worker 未在等待期内注册：如实标记状态，避免误导为在线。
+                terminal_update["heartbeat_ok"] = False
+                server["status"] = "error"
+                terminal_log = (
+                    "操作完成",
+                    "远端脚本已成功执行，但等待期内未收到资源心跳：worker 容器可能启动失败，"
+                    "请查看容器启动日志并检查目标机到 Redis、S3 的连通性。",
+                )
+            if _remote_operation_cancel_requested(operation_id):
+                raise RemoteWorkerCancelledError("操作已中断；远端可能已有部分变更")
         except RemoteWorkerCancelledError as exc:
             terminal_update = {
                 "status": "cancelled",
@@ -1654,7 +2309,10 @@ def execute_remote_operation(
                 "phase": "操作失败",
             }
             terminal_log = ("操作失败", str(exc))
-            server["status"] = "error"
+            if _remote_worker_state_missing(exc):
+                _mark_remote_worker_undeployed(server)
+            elif server.get("status") != "not_deployed":
+                server["status"] = "error"
         except Exception as exc:
             terminal_update = {
                 "status": "failed",
@@ -1676,8 +2334,13 @@ def execute_remote_operation(
         operation = manager.lease.get_remote_operation(operation_id) or operation
         operation.update(terminal_update)
         manager.lease.set_remote_operation(operation_id, operation)
-        remote_config_repository.save_remote_server(server)
+        _persist_remote_server_status(operation_id, server, terminal_log[0])
     finally:
+        heartbeat_stop.set()
+        try:
+            manager.lease.clear_remote_operation_executor(operation_id)
+        except Exception:
+            pass
         _unregister_remote_operation(operation_id, cancellation_event)
 
 
@@ -1697,6 +2360,8 @@ def _redact_output(
         redis_url,
         config.WORKER_REMOTE_REDIS_URL,
         config.REDIS_URL,
+        config.REDIS_PASSWORD,
+        config.WORKER_REMOTE_REDIS_PASSWORD,
         config.S3_ACCESS_KEY,
         config.S3_SECRET_KEY,
         credentials.get("password", ""),

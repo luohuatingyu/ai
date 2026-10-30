@@ -8,12 +8,13 @@
 设计约束：
 - 本地磁盘只是 scratch（缓存），所有训练语义状态都写状态平面（对象存储/本地存储抽象）；
 - 任何时刻同一任务只有一个租约持有者（单写者），心跳丢失即被 watchdog 重派，
-  本节点在下一个 epoch 边界优雅退出（先存档再停，绝不双写）；
+  本节点失租后停止发布状态与产物，由接手者恢复最近成功上传的 checkpoint；
 - checkpoint 全 CPU 化：A 服务器训练 1 小时后释放，B 服务器用不同型号显卡即可接手续训。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -33,6 +34,7 @@ from app import jobstore
 from app.coordination import JobQueue, LeaseStore, build_coordination
 from app.storage import (
     ArtifactStore,
+    ArtifactStoreUnavailableError,
     checkpoint_key,
     get_store,
     job_key,
@@ -40,7 +42,10 @@ from app.storage import (
     prune_checkpoints,
     resolve_dataset_for_worker,
 )
+from app.performance import ResourceSampler, configure_torch_threads, thread_environment
 from app.trainer import JobCancelled, JobPaused, load_trainer_state, run_training
+from app.parallel_worker import make_group, run_rank_process, select_members, slot_key
+from app.device import device_info, probe_device
 
 
 def detect_capabilities(
@@ -57,17 +62,15 @@ def detect_capabilities(
     machine_id / slot：一卡一进程模式下，Supervisor 传入机器与卡槽标识，
     使 /api/workers 可按「机器 -> 卡」两级聚合展示。
     """
-    gpu = {"available": False, "name": None, "count": 0, "vram_mb": 0}
+    gpu = {"available": False, "name": None, "count": 0, "vram_mb": 0,
+           "backend": "cpu", "vendor": "cpu", "device": "cpu", "healthy": True}
     try:
-        import torch
-
-        if torch.cuda.is_available():
-            gpu = {
-                "available": True,
-                "name": torch.cuda.get_device_name(0),
-                "count": int(torch.cuda.device_count()),
-                "vram_mb": int(torch.cuda.get_device_properties(0).total_memory // 2**20),
-            }
+        info = device_info()
+        if info["backend"] != "cpu":
+            gpu = {"available": True, "name": info["name"], "count": info["count"],
+                   "vram_mb": info["memory_mb"], "backend": info["backend"],
+                   "vendor": info["vendor"], "device": info["device"],
+                   "healthy": info["healthy"]}
     except Exception:
         pass
     try:
@@ -77,6 +80,16 @@ def detect_capabilities(
     except Exception:
         torch_version, cuda_version = "未知", None
     hostname = socket.gethostname()
+    parallel = {"protocol": 1, "host": os.environ.get("WORKER_DISTRIBUTED_HOST", "").strip(),
+                "gloo": False, "nccl": False, "vendor": gpu["vendor"],
+                "backend": gpu["backend"], "device": gpu["device"]}
+    slot_name = slot or "cpu0"
+    slot_number = int("".join(character for character in slot_name if character.isdigit()) or "0")
+    parallel["port"] = int(os.environ.get("WORKER_DISTRIBUTED_PORT", "29500")) + slot_number + (256 if slot_name.startswith("cpu") else 0)
+    try:
+        parallel.update({"gloo": _torch.distributed.is_gloo_available(), "nccl": _torch.distributed.is_nccl_available()})
+    except Exception:
+        pass
     return {
         "worker_id": worker_id or f"worker-{hostname}-{uuid.uuid4().hex[:6]}",
         "machine_id": machine_id or config.WORKER_MACHINE_ID or hostname,
@@ -85,10 +98,14 @@ def detect_capabilities(
         "managed": config.WORKER_MANAGED,
         "cpu": {"cores": _detect_cpu_cores(), "memory_mb": _detect_memory_mb()},
         "gpu": gpu,
+        "device": gpu["device"],
+        "device_backend": gpu["backend"],
+        "vendor": gpu["vendor"],
         "torch_version": torch_version,
         "cuda_version": cuda_version,
         "python_version": platform.python_version(),
         "started_at": time.time(),
+        "parallel": parallel,
     }
 
 
@@ -132,12 +149,8 @@ def probe_visible_gpu() -> bool:
     任何异常均视为不健康，绝不抛出——探测本身必须先于一切可靠。
     """
     try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return False
-        x = torch.tensor([2.0], device="cuda")
-        return float((x * 2).item()) == 4.0
+        info = device_info()
+        return info["backend"] != "cpu" and probe_device(info["device"])
     except Exception:
         return False
 
@@ -148,10 +161,63 @@ _RETRYABLE_PATTERNS = (
     "connection reset", "connection refused", "timed out", "timeout",
     "temporarily unavailable", "broken pipe", "no space left",
     "storage", "rpc error", "econnreset",
+    "联合训练通信", "联合训练进程连接中断", "gloo", "connection closed",
 )
 
 # 业务性错误类型（不可重试）：重试也无法改变结果，直接判 FAILED
 _FATAL_EXCEPTION_TYPES = (FileNotFoundError, ValueError, KeyError)
+
+_SENSITIVE_CONFIG_KEY_PARTS = (
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "access_key",
+    "private_key",
+    "credential",
+)
+
+
+def _redact_startup_config(value, key: str = ""):
+    """递归清理启动配置中的凭证字段，避免任务日志泄露敏感值。"""
+    normalized_key = key.lower().replace("-", "_")
+    if any(part in normalized_key for part in _SENSITIVE_CONFIG_KEY_PARTS):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _redact_startup_config(item_value, str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_startup_config(item, key) for item in value]
+    return value
+
+
+def format_training_startup_config(
+    job_id: str, record: dict, capabilities: dict
+) -> str:
+    """生成可读且脱敏的训练任务启动配置日志。"""
+    spec = record.get("spec") or {}
+    gpu = capabilities.get("gpu") or {}
+    device = f"cuda({gpu.get('name')})" if gpu.get("available") else "cpu"
+    summary = {
+        "job_id": job_id,
+        "dataset_id": spec.get("dataset_id"),
+        "dataset_name": spec.get("dataset_name"),
+        "task": spec.get("task"),
+        "target": spec.get("target"),
+        "params": _redact_startup_config(spec.get("params") or {}),
+        "resource_hint": _redact_startup_config(spec.get("resource_hint") or {}),
+        "worker_id": capabilities.get("worker_id"),
+        "machine_id": capabilities.get("machine_id"),
+        "slot": capabilities.get("slot"),
+        "device": device,
+        "torch_version": capabilities.get("torch_version"),
+        "cuda_version": capabilities.get("cuda_version"),
+    }
+    return "[训练任务启动配置] " + json.dumps(
+        summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    )
 
 
 def classify_retryable(exc: BaseException) -> bool:
@@ -160,13 +226,60 @@ def classify_retryable(exc: BaseException) -> bool:
     规则：
     - FileNotFoundError / ValueError / KeyError 视为业务性错误（数据集缺失、
       超参/格式非法、续训不兼容等），重试无意义；
+    - 对象存储不可用（网络/鉴权故障）属于环境性错误，一律可重试；
     - 其余异常（RuntimeError/OSError/ConnectionError 等）按错误文本匹配
       环境性特征词（CUDA/OOM/网络瞬断/存储故障）判定可重试。
     """
+    if isinstance(exc, ArtifactStoreUnavailableError):
+        return True
     if isinstance(exc, _FATAL_EXCEPTION_TYPES):
         return False
     text = f"{exc}".lower()
     return any(p in text for p in _RETRYABLE_PATTERNS)
+
+
+class JobLeaseLost(Exception):
+    """任务租约已失效或无法确认，旧执行者必须停止发布共享状态。"""
+
+
+class _LeaseGuardedStore(ArtifactStore):
+    """在每次共享写入前校验租约，覆盖正常、异常及 finally 的全部发布路径。"""
+
+    def __init__(self, inner: ArtifactStore, check_owner: Callable[[], None]) -> None:
+        """保留底层仓储实现，统一注入执行者所有权校验。"""
+        self._inner = inner
+        self._check_owner = check_owner
+
+    def read_bytes(self, key: str) -> Optional[bytes]:
+        """读取沿用底层仓储；后续写入独立校验，避免慢读取跨越租期。"""
+        return self._inner.read_bytes(key)
+
+    def read_file(self, key: str, local_path: Path) -> Path:
+        """下载到本次执行独占的临时目录。"""
+        return self._inner.read_file(key, local_path)
+
+    def write_bytes(self, key: str, data: bytes) -> None:
+        """发布任务状态或文本前确认当前 token 仍有效。"""
+        self._check_owner()
+        self._inner.write_bytes(key, data)
+
+    def write_file(self, key: str, local_path: Path) -> None:
+        """上传指标、日志、模型和断点前校验租约。"""
+        self._check_owner()
+        self._inner.write_file(key, local_path)
+
+    def exists(self, key: str) -> bool:
+        """查询共享产物是否存在。"""
+        return self._inner.exists(key)
+
+    def list_keys(self, prefix: str) -> List[str]:
+        """列举历史产物，后续删除仍需独立校验租约。"""
+        return self._inner.list_keys(prefix)
+
+    def delete(self, key: str) -> None:
+        """清理过期断点前校验租约，避免旧 worker 删除接手者的断点。"""
+        self._check_owner()
+        self._inner.delete(key)
 
 
 class JobController:
@@ -175,7 +288,7 @@ class JobController:
     - 分布式模式：后台线程每 heartbeat 周期做三件事——
       读取协调平面信号（cancel/pause -> 置本地事件）、续租（token 校验）、刷新 worker 心跳；
     - 租约续期失败（被 watchdog 重派/心跳丢失）：立即置 pause 事件，
-      训练器在下一个 epoch/批次边界存档并退出，天然杜绝双写者；
+      训练器在下一个回调/批次边界退出，失租后不再上传本地存档；
     - 嵌入式模式与分布式共用同一套逻辑（LeaseStore 接口一致）。
     """
 
@@ -195,26 +308,77 @@ class JobController:
         self._job_id = job_id
         self._token = token
         self._worker_id = worker_id
-        self._interval = max(float(interval), 0.2)
         self._ttl = float(ttl)
+        self._interval = max(min(float(interval), self._ttl / 3.0), 0.05)
         self._hb_ttl = max(float(ttl) * 2.0, self._interval * 3.0)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._err_since: Optional[float] = None
+        self._last_renewed_at = time.monotonic()
+        self._signals_ready = threading.Event()
         self._epoch = 0
         self._state = "starting"
+        self._progress_lock = threading.Lock()
+        self._publishing = False
+        self.resources: list[tuple[str, str]] = []
+        self.resource_sampler = None
 
     def set_progress(self, epoch: int, state: str = "training") -> None:
-        """训练循环回调：更新当前进度（心跳里上报给 /api/workers 展示）。"""
-        self._epoch = int(epoch)
-        self._state = state
+        """状态转换立即发布，持锁避免周期心跳把新进度覆盖为旧值。"""
+        self.ensure_owned()
+        with self._progress_lock:
+            self._epoch = int(epoch)
+            self._state = state
+            self._publishing = True
+            self._publish_progress()
 
-    def start(self) -> None:
-        """启动心跳/续租线程。"""
+    def _publish_progress(self) -> None:
+        """在进度锁内原子核对任务和计算槽租约，拒绝失租后的状态写入。"""
+        conditions = {self._job_id: self._token, **dict(self.resources)}
+        if not self._lease_store.heartbeat_worker(
+            self._worker_id,
+            {"current_job": self._job_id, "epoch": self._epoch, "state": self._state,
+             "resources": self.resource_sampler.snapshot() if self.resource_sampler else None},
+            self._hb_ttl, lease_conditions=conditions,
+        ):
+            self._mark_lease_lost()
+            raise JobLeaseLost("计算槽已被重新分配，拒绝覆盖新任务状态")
+
+    def start(self, publish: bool = True) -> None:
+        """领取后立即续租并启动线程，使慢准备和收尾阶段也受心跳保护。"""
+        self.ensure_owned()
+        if publish:
+            self.set_progress(self._epoch, self._state)
         self._thread = threading.Thread(
             target=self._loop, name=f"hb-{self._job_id}", daemon=True
         )
         self._thread.start()
+
+    def enable_signals(self) -> None:
+        """旧控制信号清理完成后才开始接收本次执行的暂停和取消请求。"""
+        self._signals_ready.set()
+
+    def _mark_lease_lost(self) -> None:
+        """永久标记本次执行失租，后续成功连接也不能恢复旧执行者写入权。"""
+        self.lease_lost.set()
+        self.pause_event.set()
+
+    def ensure_owned(self) -> None:
+        """写入前原子校验 token 并续租；无法确认所有权时拒绝继续写入。"""
+        if self.lease_lost.is_set():
+            raise JobLeaseLost("worker 任务租约已失效，停止写入并等待 watchdog 接续调度")
+        try:
+            owned = self._lease_store.renew(self._job_id, self._token, self._ttl)
+        except Exception as exc:
+            self._mark_lease_lost()
+            raise JobLeaseLost("无法确认 worker 任务租约，停止共享写入") from exc
+        if not owned:
+            self._mark_lease_lost()
+            raise JobLeaseLost("worker 任务租约已失效，停止写入并等待 watchdog 接续调度")
+        for key, token in list(self.resources):
+            if not self._lease_store.renew(key, token, self._ttl):
+                self._mark_lease_lost()
+                raise JobLeaseLost("联合训练计算槽租约已失效，停止本轮执行")
+        self._last_renewed_at = time.monotonic()
 
     def stop(self) -> None:
         """停止心跳线程（任务收尾时调用）。"""
@@ -227,34 +391,63 @@ class JobController:
         """心跳循环：信号同步 + 租约续期 + worker 存活性刷新。"""
         while not self._stop_event.wait(self._interval):
             try:
+                if self.lease_lost.is_set():
+                    return
+                # 先续租，再读取控制信号；信号读取慢不能吃掉本轮剩余租期。
+                if not self._lease_store.renew(self._job_id, self._token, self._ttl):
+                    self._mark_lease_lost()
+                    return
+                self._last_renewed_at = time.monotonic()
+                for key, token in list(self.resources):
+                    if not self._lease_store.renew(key, token, self._ttl):
+                        self._mark_lease_lost()
+                        return
+                signals = self._lease_store.get_signals(self._job_id) if self._signals_ready.is_set() else set()
+                if "cancel" in signals:
+                    self.cancel_event.set()
+                if "pause" in signals:
+                    self.pause_event.set()
+                with self._progress_lock:
+                    if self._publishing:
+                        self._publish_progress()
+            except Exception:
+                # 按最后一次成功续租计时，不能从首次错误再额外宽限一个租期。
+                if time.monotonic() - self._last_renewed_at >= self._ttl:
+                    self._mark_lease_lost()
+                    return
+
+
+class GroupMemberController(JobController):
+    """参与节点只维护自身心跳，不得续租主节点或发布任务状态。"""
+
+    def __init__(self, lease, group: dict, worker_id: str, assignment: str) -> None:
+        """保存执行轮次和槽位 token，使旧成员不能加入新一轮训练。"""
+        super().__init__(lease, group["job_id"], group["token"], worker_id,
+                         config.WORKER_HEARTBEAT_INTERVAL, config.WORKER_LEASE_TTL)
+        self._assignment = assignment
+        self.resources.append((slot_key(worker_id), assignment))
+
+    def ensure_owned(self) -> None:
+        """验证主节点仍拥有任务以及本槽仍属于同一执行轮次。"""
+        if self.lease_lost.is_set() or self._lease_store.peek_holder(self._job_id) != self._token or self._lease_store.peek_holder(slot_key(self._worker_id)) != self._assignment:
+            self._mark_lease_lost()
+            raise JobLeaseLost("联合训练主节点或成员租约已失效")
+
+    def _loop(self) -> None:
+        """独立维护成员存活与控制信号，覆盖数据下载和模型加载阶段。"""
+        while not self._stop_event.wait(self._interval):
+            try:
+                self.ensure_owned()
                 signals = self._lease_store.get_signals(self._job_id)
                 if "cancel" in signals:
                     self.cancel_event.set()
                 if "pause" in signals:
                     self.pause_event.set()
-                if not self._lease_store.renew(self._job_id, self._token, self._ttl):
-                    # token 不匹配/租约已被回收：本节点失去写入资格，优雅暂停
-                    self.lease_lost.set()
-                    self.pause_event.set()
-                else:
-                    self._lease_store.heartbeat_worker(
-                        self._worker_id,
-                        {
-                            "current_job": self._job_id,
-                            "epoch": self._epoch,
-                            "state": self._state,
-                        },
-                        self._hb_ttl,
-                    )
-                self._err_since = None
+                with self._progress_lock:
+                    self._publish_progress()
             except Exception:
-                # 协调平面瞬时不可达：先容忍网络抖动；持续失联超过租约期则让位
-                now = time.time()
-                if self._err_since is None:
-                    self._err_since = now
-                elif now - self._err_since > self._ttl:
-                    self.lease_lost.set()
-                    self.pause_event.set()
+                self._mark_lease_lost()
+                return
 
 
 class TrainingWorker:
@@ -281,9 +474,15 @@ class TrainingWorker:
         self._controller: Optional[JobController] = None
         self._last_skip: Tuple[Optional[str], float] = (None, 0.0)
         self._degraded = False  # 卡软探测失败标记：不再领取新任务，恢复后自动摘除
+        self._finished_group: Optional[str] = None
         self._gpu_probe_enabled = (
             config.WORKER_GPU_PROBE if gpu_probe_enabled is None else gpu_probe_enabled
         )
+        self._resource_sampler = ResourceSampler(str(self.caps.get("device") or "cpu"))
+        from app.inference import InferenceService
+
+        self.inference = InferenceService(self.store, self.queue, self.lease_store)
+        self._prefer_inference = True
 
     # ------------------------------------------------------------------
     # 对外
@@ -318,10 +517,12 @@ class TrainingWorker:
         """
         hb_ttl = max(config.WORKER_LEASE_TTL * 2.0, config.WORKER_HEARTBEAT_INTERVAL * 3.0)
         self.lease_store.register_worker(self.worker_id, self.caps, hb_ttl)
+        self._resource_sampler.start()
         gpu = self.caps.get("gpu") or {}
+        device_label = f"{gpu.get('backend', 'gpu')}({gpu.get('name')})" if gpu.get("available") else "cpu"
         self._log(
             f"worker {self.worker_id} 启动: 机器={self.caps.get('machine_id')} 槽位={self.caps.get('slot')} "
-            f"设备={'cuda(' + str(gpu.get('name')) + ')' if gpu.get('available') else 'cpu'}"
+            f"设备={device_label}"
             f" / torch={self.caps.get('torch_version')} / 存储={config.STORAGE_BACKEND}"
         )
         try:
@@ -334,8 +535,23 @@ class TrainingWorker:
                     self._log(f"worker {self.worker_id}: 协调面异常，稍后重试: {exc}")
                     self._shutdown.wait(self._idle_poll)
         finally:
+            self._resource_sampler.stop()
             self.lease_store.deregister_worker(self.worker_id)
             self._log(f"worker {self.worker_id} 已退出")
+
+    def _publish_available(self, hb_ttl: float) -> bool:
+        """仅在计算槽无租约时发布空闲并清理旧任务、轮次，防止误报可用。"""
+        enabled = self.lease_store.is_worker_enabled(
+            self.worker_id, default=not bool(self.caps.get("managed"))
+        )
+        return self.lease_store.heartbeat_worker(
+            self.worker_id,
+            {"state": "degraded" if self._degraded else ("idle" if enabled else "disabled"),
+             "current_job": None, "epoch": None, "machine_id": self.caps.get("machine_id"),
+             "slot": self.caps.get("slot"), "managed": bool(self.caps.get("managed")),
+             "resources": self._resource_sampler.snapshot()},
+            hb_ttl, lease_conditions={slot_key(self.worker_id): None},
+        )
 
     def _run_forever_iteration(self, hb_ttl: float) -> None:
         """单轮调度迭代：自探测并心跳；未启用的外部槽只保持在线、不领取任务。"""
@@ -349,23 +565,37 @@ class TrainingWorker:
         enabled = self.lease_store.is_worker_enabled(
             self.worker_id, default=not bool(self.caps.get("managed"))
         )
-        self.lease_store.heartbeat_worker(
-            self.worker_id,
-            {
-                "state": "degraded" if self._degraded else ("idle" if enabled else "disabled"),
-                "current_job": None,
-                "machine_id": self.caps.get("machine_id"),
-                "slot": self.caps.get("slot"),
-                "managed": bool(self.caps.get("managed")),
-            },
-            hb_ttl,
-        )
-        if self._degraded or not enabled:
-            # 掉卡或人工停用期间保持心跳，但不领取新任务。
+        assignment = self.lease_store.peek_holder(slot_key(self.worker_id))
+        if assignment:
+            try:
+                group = json.loads(assignment)
+            except (ValueError, TypeError):
+                group = {}
+            if isinstance(group, dict) and group.get("parallel") and group["members"][0]["worker_id"] != self.worker_id:
+                if group["group_id"] != self._finished_group:
+                    self._join_parallel_group(group, assignment)
+                    self._finished_group = group["group_id"]
+                else:
+                    self._shutdown.wait(self._idle_poll)
+            else:
+                self._shutdown.wait(self._idle_poll)
+            # 已被本任务或联合训练预留时，不领取任何竞争任务。
+            return
+        if not self._publish_available(hb_ttl) or self._degraded or not enabled:
             self._shutdown.wait(self._idle_poll)
             return
         try:
-            job_id = self.queue.pop(timeout=self._idle_poll)
+            # 两类任务交替优先，忙碌槽保留排队；计算槽租约仍是最终互斥条件。
+            job_id = None if self._prefer_inference else self.queue.pop(timeout=0)
+            if job_id is None:
+                inference_id = self.queue.inference_queue(self.worker_id).pop(timeout=0)
+                if inference_id is not None:
+                    self._prefer_inference = False
+                    self.inference.execute(self, inference_id)
+                    return
+            self._prefer_inference = True
+            if job_id is None:
+                job_id = self.queue.pop(timeout=self._idle_poll)
         except Exception as exc:  # noqa: BLE001
             # 队列领取异常：退避后由外层循环重试
             self._log(f"worker {self.worker_id}: 队列领取异常，稍后重试: {exc}")
@@ -386,6 +616,46 @@ class TrainingWorker:
     # 内部：领取与执行
     # ------------------------------------------------------------------
 
+    def _join_parallel_group(self, group: dict, assignment: str) -> None:
+        """跟随主节点清单运行独立 rank，绝不写入共享模型或任务终态。"""
+        controller = GroupMemberController(self.lease_store, group, self.worker_id, assignment)
+        controller.resource_sampler = self._resource_sampler
+        self._controller = controller
+        scratch = config.WORKER_SCRATCH_DIR / f"member-{group['group_id']}-{self.worker_id}" / group["job_id"]
+        try:
+            controller.start()
+            started = time.monotonic()
+            while not self.store.exists(group["manifest_key"]):
+                controller.ensure_owned()
+                if time.monotonic() - started > group["timeout"]:
+                    raise RuntimeError("联合训练准备清单等待 timeout")
+                time.sleep(0.1)
+            request = self.store.read_json(group["manifest_key"])
+            controller.ensure_owned()
+            rank = next(index for index, member in enumerate(group["members"]) if member["worker_id"] == self.worker_id)
+            scratch.mkdir(parents=True, exist_ok=True)
+            dataset_path = None
+            if request["params"].get("dataset_source", "local") != "hub":
+                dataset_path = resolve_dataset_for_worker(request["dataset_id"], scratch)
+            resume_path = None
+            if request.get("resume_key"):
+                resume_path = self.store.read_file(request["resume_key"], scratch / "resume-ckpt.pt")
+            controller.set_progress(0, "training")
+            run_rank_process({**request, "job_dir": str(scratch),
+                "dataset_path": str(dataset_path) if dataset_path else None,
+                "resume_path": str(resume_path) if resume_path else None,
+                "group": {**group, "rank": rank, "device": group["members"][rank]["device"]}},
+                controller, lambda message: self._log(f"[{group['job_id']}] {message}"))
+        except (JobPaused, JobCancelled, JobLeaseLost):
+            pass
+        except Exception as exc:
+            self._log(f"[{group['job_id']}] 联合训练成员退出：{exc}")
+        finally:
+            controller.stop()
+            self._controller = None
+            self._finished_group = group["group_id"]
+            shutil.rmtree(scratch.parent, ignore_errors=True)
+
     def _execute_job(self, job_id: str) -> None:
         """领取一个任务：校验 -> 抢租约 -> 执行（含全部异常兜底）。"""
         record = jobstore.read_job(self.store, job_id)
@@ -396,13 +666,15 @@ class TrainingWorker:
             # 已被取消/暂停的排队任务：直接丢弃（不再回队列）
             self._log(f"[{job_id}] 状态为 {record.get('status')}，跳过")
             return
-        requested_worker = record.get("retry_worker_id")
+        spec = record.get("spec") or {}
+        hint = spec.get("resource_hint") or {}
+        requested_worker = hint.get("worker_id") or record.get("retry_worker_id")
         if requested_worker and requested_worker != self.worker_id:
             self.queue.push(job_id)
             last_id, last_ts = self._last_skip
             if last_id != job_id or time.time() - last_ts > 30.0:
                 self._log(
-                    f"[{job_id}] 重试指定计算槽 {requested_worker}，"
+                    f"[{job_id}] 任务指定计算槽 {requested_worker}，"
                     f"本槽 {self.worker_id} 不匹配，已放回队列"
                 )
                 self._last_skip = (job_id, time.time())
@@ -410,8 +682,27 @@ class TrainingWorker:
             return
         spec = record.get("spec") or {}
         hint = spec.get("resource_hint") or {}
+        selected = hint.get("parallel_workers") or []
+        if selected and selected[0]["worker_id"] != self.worker_id:
+            self.queue.push(job_id)
+            self._shutdown.wait(self._idle_poll)
+            return
         gpu = self.caps.get("gpu") or {}
+        requested_backend = str(hint.get("device_backend") or "auto")
+        actual_backend = str(gpu.get("backend") or self.caps.get("device_backend") or ("cuda" if gpu.get("available") else "cpu"))
+        if requested_backend != "auto" and requested_backend != actual_backend:
+            self.queue.push(job_id)
+            last_id, last_ts = self._last_skip
+            if last_id != job_id or time.time() - last_ts > 30.0:
+                self._log(f"[{job_id}] 资源提示需要 {requested_backend} 后端，本槽为 {actual_backend}，已放回队列")
+                self._last_skip = (job_id, time.time())
+            time.sleep(min(2.0, self._idle_poll))
+            return
         min_vram = int(hint.get("min_vram_mb") or 0)
+        if hint.get("worker_id") and spec.get("task") == "clustering" and gpu.get("available"):
+            self.queue.push(job_id)
+            self._shutdown.wait(self._idle_poll)
+            return
         # 资源提示匹配（到卡级）：require_gpu 要求是 GPU 卡；min_vram_mb 要求显存下限。
         # 不匹配则放回队列等待合适的卡（提示日志防刷屏），不影响队列中其它任务。
         if (hint.get("require_gpu") or min_vram > 0) and not gpu.get("available"):
@@ -440,34 +731,113 @@ class TrainingWorker:
             time.sleep(min(1.0, self._idle_poll))
             self.queue.push(job_id)
             return
-        # 清除可能遗留的控制信号，保证本轮执行从干净状态开始
-        self.lease_store.clear_signals(job_id)
+        controller = JobController(
+            self.lease_store, job_id, token, self.worker_id,
+            config.WORKER_HEARTBEAT_INTERVAL, config.WORKER_LEASE_TTL,
+        )
+        controller.resource_sampler = self._resource_sampler
+        self._controller = controller
         try:
-            self._run_claimed(job_id, record, spec, token)
+            controller.start(publish=False)
+            self.lease_store.clear_signals(job_id)
+            controller.enable_signals()
+            # 抢租约前读到的 queued 可能已过时，取得所有权后重新确认。
+            record = jobstore.read_job(self.store, job_id)
+            if record is None or record.get("status") != jobstore.QUEUED:
+                return
+            # 租约获取期间可能发生重试改选或停用；执行前再次核对最新策略。
+            latest_hint = (record.get("spec") or {}).get("resource_hint") or {}
+            latest_worker = latest_hint.get("worker_id") or record.get("retry_worker_id")
+            if (latest_worker and latest_worker != self.worker_id) or self._degraded or not self.lease_store.is_worker_enabled(
+                self.worker_id, default=not bool(self.caps.get("managed"))
+            ):
+                self.queue.push(job_id)
+                return
+            group = None
+            if selected:
+                try:
+                    members = select_members(self.lease_store, selected, require_idle=False)
+                except RuntimeError as exc:
+                    self._log(f"[{job_id}] {exc}")
+                    self.queue.push(job_id)
+                    self._shutdown.wait(self._idle_poll)
+                    return
+                if hint.get("require_gpu") and any(member["device"] == "cpu" for member in members):
+                    raise ValueError("联合训练成员不满足仅 GPU 限制")
+                if requested_backend != "auto" and any(
+                    str(member.get("device_backend", "cpu")) != requested_backend for member in members
+                ):
+                    raise ValueError(f"联合训练成员必须全部使用 {requested_backend} 后端")
+                if min_vram and any(member["device"] == "cpu" or member["vram_mb"] < min_vram for member in members):
+                    raise ValueError("联合训练成员不满足最低显存限制")
+                group = make_group(job_id, token, members, int(hint.get("parallel_timeout", 300)), int((spec.get("params") or {}).get("seed", 42)))
+            resource_token = json.dumps(group, sort_keys=True) if group else token
+            identifiers = [item["worker_id"] for item in group["members"]] if group else [self.worker_id]
+            # 有序预留并在失败时整体释放；成员只在 manifest 发布后才启动 rank。
+            for identifier in sorted(identifiers):
+                key = slot_key(identifier)
+                if not self.lease_store.acquire(key, resource_token, config.WORKER_LEASE_TTL):
+                    self.queue.push(job_id)
+                    return
+                controller.resources.append((key, resource_token))
+            controller.set_progress(0, "starting")
+            self._run_claimed(job_id, record, record.get("spec") or {}, controller, group=group)
+        except JobLeaseLost as exc:
+            self._log(f"[{job_id}] {exc}")
+        except ValueError as exc:
+            controller.ensure_owned()
+            jobstore.update_job(_LeaseGuardedStore(self.store, controller.ensure_owned), job_id,
+                                status=jobstore.FAILED, error=str(exc), finished_at=time.time())
         except Exception:
             self._log(f"[{job_id}] worker 执行异常:\n{traceback.format_exc()}")
         finally:
+            controller.stop()
+            self._controller = None
+            for key, resource_token in controller.resources:
+                self.lease_store.release(key, resource_token)
             self.lease_store.release(job_id, token)
+            self._publish_available(controller._hb_ttl)
 
-    def _run_claimed(self, job_id: str, record: dict, spec: dict, token: str) -> None:
+    def _run_claimed(self, job_id: str, record: dict, spec: dict, controller: JobController, group=None) -> None:
         """执行已持有租约的任务：拉状态 -> 训练 -> 同步产物 -> 状态收尾。"""
-        store = self.store
-        scratch = config.WORKER_SCRATCH_DIR / job_id
-        controller: Optional[JobController] = None
+        store = _LeaseGuardedStore(self.store, controller.ensure_owned)
+        attempt_id = uuid.uuid4().hex
+        # 保持末级目录名为 job_id（训练器数据库日志依赖），父目录按执行批次隔离。
+        attempt_dir = config.WORKER_SCRATCH_DIR / attempt_id
+        scratch = attempt_dir / job_id
+        log_revision = int(record.get("log_revision", 0))
+
+        def reconcile_log_revision() -> None:
+            """清日志后丢弃本地旧快照；慢读取后再次检查租约，避免旧执行者继续发布。"""
+            nonlocal log_revision
+            controller.ensure_owned()
+            latest = jobstore.read_job(store, job_id) or {}
+            controller.ensure_owned()
+            latest_revision = int(latest.get("log_revision", 0))
+            if latest_revision != log_revision:
+                (scratch / "log.txt").write_text("", encoding="utf-8")
+                log_revision = latest_revision
+
         try:
             gpu = self.caps.get("gpu") or {}
             current_attempt = {
-                "id": uuid.uuid4().hex,
+                "id": attempt_id,
                 "worker_id": self.worker_id,
                 "machine_id": self.caps.get("machine_id"),
                 "slot": self.caps.get("slot"),
-                "device": "cuda" if gpu.get("available") else "cpu",
+                "device": gpu.get("device", "cpu") if gpu.get("available") else "cpu",
+                "device_backend": gpu.get("backend", "cpu"),
+                "vendor": gpu.get("vendor", "cpu"),
                 "gpu_name": gpu.get("name") if gpu.get("available") else None,
                 "vram_mb": int(gpu.get("vram_mb") or 0) if gpu.get("available") else None,
                 "from_epoch": 1,
                 "status": "running",
                 "started_at": time.time(),
             }
+            if group:
+                current_attempt["members"] = group["members"]
+                current_attempt["backend"] = group["backend"]
+                current_attempt["group_id"] = group["group_id"]
             jobstore.update_job(
                 store,
                 job_id,
@@ -480,7 +850,6 @@ class TrainingWorker:
                 retry_worker_id=None,
                 error=None,
             )
-            shutil.rmtree(scratch, ignore_errors=True)
             scratch.mkdir(parents=True, exist_ok=True)
             params = spec.get("params") or {}
 
@@ -490,6 +859,7 @@ class TrainingWorker:
                 不能直接 append 到状态平面：finally 的 _flush_final 会用
                 scratch 副本整文件覆盖状态平面日志，直接 append 的行会被冲掉。
                 """
+                reconcile_log_revision()
                 stamp = time.strftime("%H:%M:%S")
                 try:
                     with (scratch / "log.txt").open("a", encoding="utf-8") as f:
@@ -498,23 +868,30 @@ class TrainingWorker:
                     pass
                 try:
                     store.write_file(job_key(job_id, "log.txt"), scratch / "log.txt")
+                except JobLeaseLost:
+                    raise
                 except Exception:
                     pass
 
             # 拉取历史产物到 scratch：日志/指标延续既有内容，best.pt 供最终报告加载
-            for name in ("log.txt", "metrics.jsonl", "best.pt", "best_model.zip"):
+            for name in ("log.txt", "metrics.jsonl", "performance.jsonl", "best.pt", "best_model.zip"):
                 key = job_key(job_id, name)
                 if store.exists(key):
                     store.read_file(key, scratch / name)
 
+            # 任务日志先记录本次执行的脱敏启动配置，便于区分任务参数与运行节点。
+            joblog(format_training_startup_config(job_id, record, self.caps))
+
             # ---- 恢复训练上下文：优先最新 checkpoint，损坏则回退更早版本 ----
             resume_state = None
+            resume_key = None
             resumed_epoch = 0
             for epoch, key in _list_checkpoints(store, job_id):
                 try:
                     local_ckpt = store.read_file(key, scratch / "resume-ckpt.pt")
                     resume_state = load_trainer_state(local_ckpt)
                     resumed_epoch = epoch
+                    resume_key = key
                     break
                 except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
                     joblog(f"checkpoint e{epoch} 加载失败，回退更早版本: {exc}")
@@ -523,6 +900,13 @@ class TrainingWorker:
             # （resume_state 为空时回滚到 0——孤儿进度清空，重试曲线不会出现重复 epoch）
             truncated = jobstore.truncate_metrics_to_epoch(store, job_id, resumed_epoch)
             (scratch / "metrics.jsonl").write_text(truncated, encoding="utf-8")
+            # 性能曲线同样以已恢复断点为准，避免重试后出现重复轮次。
+            performance_path = scratch / "performance.jsonl"
+            if performance_path.exists():
+                rows = jobstore.parse_metrics_text(performance_path.read_text(encoding="utf-8"))
+                kept = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows if int(row.get("epoch", 0)) <= resumed_epoch)
+                performance_path.write_text(kept, encoding="utf-8")
+                store.write_file(job_key(job_id, "performance.jsonl"), performance_path)
             segment_start = (int(resume_state.get("epoch", 0)) + 1) if resume_state else 1
             current_attempt["from_epoch"] = segment_start
             jobstore.update_job(store, job_id, current_attempt=current_attempt)
@@ -536,13 +920,6 @@ class TrainingWorker:
             elif resumed_epoch == 0 and truncated == "":
                 joblog("未找到可用 checkpoint：从头开始训练（此前孤儿进度已回滚）")
 
-            controller = JobController(
-                self.lease_store, job_id, token, self.worker_id,
-                config.WORKER_HEARTBEAT_INTERVAL, config.WORKER_LEASE_TTL,
-            )
-            controller.start()
-            self._controller = controller
-
             dataset_path = None
             if str(params.get("dataset_source", "local")) != "hub":
                 dataset_path = resolve_dataset_for_worker(str(spec["dataset_id"]), scratch)
@@ -550,18 +927,25 @@ class TrainingWorker:
             training_params.setdefault("dataset_id", str(spec["dataset_id"]))
 
             def scratch_log(msg: str) -> None:
-                """训练器日志：写本地 scratch，随 on_epoch_end 整文件幂等同步到状态平面。"""
-                with (scratch / "log.txt").open("a", encoding="utf-8") as f:
-                    f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+                """训练器日志实时发布到权威文件，首个 epoch 前也能看到启动进度。"""
+                joblog(msg)
 
             def on_epoch_end(rec: dict) -> None:
                 """每 epoch 结束：同步 metrics/日志到状态平面（读方写后即可见）。"""
+                reconcile_log_revision()
                 store.write_file(job_key(job_id, "metrics.jsonl"), scratch / "metrics.jsonl")
                 store.write_file(job_key(job_id, "log.txt"), scratch / "log.txt")
+                if (scratch / "performance.jsonl").exists():
+                    store.write_file(job_key(job_id, "performance.jsonl"), scratch / "performance.jsonl")
                 controller.set_progress(int(rec.get("epoch", 0)), "training")
 
             def on_checkpoint(epoch_done: int) -> None:
-                """trainer-state 存档回调：上传版本化 checkpoint 并只保留最近 N 个。"""
+                """先同步指标与最佳模型再发布断点，保证接手者不会缺失已存档的进度。"""
+                reconcile_log_revision()
+                for name in ("metrics.jsonl", "log.txt", "best.pt", "last.pt", "preprocessor.json", "best_model.zip"):
+                    artifact = scratch / name
+                    if artifact.exists():
+                        store.write_file(job_key(job_id, name), artifact)
                 store.write_file(
                     checkpoint_key(job_id, epoch_done),
                     scratch / "checkpoints" / f"ckpt-e{epoch_done:04d}.pt",
@@ -570,36 +954,51 @@ class TrainingWorker:
                 controller.set_progress(epoch_done, "training")
 
             joblog(f"worker {self.worker_id} 开始执行训练任务")
+            controller.set_progress(resumed_epoch, "training")
 
             # 本段执行的起始 epoch（续训场景 = 最近 checkpoint 之后）
 
             try:
-                summary = run_training(
-                    dataset_path=dataset_path,
-                    target=str(spec["target"]),
-                    task=str(spec["task"]),
-                    params=training_params,
-                    cancel_event=controller.cancel_event,
-                    log_fn=scratch_log,
-                    job_dir=scratch,
-                    pause_event=controller.pause_event,
-                    resume_state=resume_state,
-                    on_epoch_end=on_epoch_end,
-                    on_checkpoint=on_checkpoint,
-                )
+                if group:
+                    request = {"target": str(spec["target"]), "task": str(spec["task"]),
+                               "params": training_params, "dataset_id": str(spec["dataset_id"]),
+                               "resume_key": resume_key}
+                    store.write_json(group["manifest_key"], request)
+                    joblog(f"联合训练启动：{len(group['members'])} 个计算槽，通信 {group['backend']}；全局批大小 {sum(item['batch_size'] for item in group['members'])}")
+                    summary = run_rank_process({**request, "job_dir": str(scratch),
+                        "dataset_path": str(dataset_path) if dataset_path else None,
+                        "resume_path": str(scratch / "resume-ckpt.pt") if resume_state else None,
+                        "group": {**group, "rank": 0, "device": group["members"][0]["device"]}},
+                        controller, scratch_log, on_epoch_end, on_checkpoint)
+                else:
+                    summary = run_training(
+                        dataset_path=dataset_path,
+                        target=str(spec["target"]),
+                        task=str(spec["task"]),
+                        params=training_params,
+                        cancel_event=controller.cancel_event,
+                        log_fn=scratch_log,
+                        job_dir=scratch,
+                        pause_event=controller.pause_event,
+                        resume_state=resume_state,
+                        on_epoch_end=on_epoch_end,
+                        on_checkpoint=on_checkpoint,
+                    )
             except JobPaused as exc:
+                controller.ensure_owned()
                 # 优雅暂停：训练器已在暂停点存档并上传（on_checkpoint），
                 # 任务进入 paused，可被任意其它服务器/显卡接手
-                reason = (
-                    "worker 心跳丢失（任务已被重派），本节点停止写入"
-                    if controller.lease_lost.is_set() else str(exc)
-                )
+                reason = str(exc)
                 # 断点产物同步：best/last/preprocessor 一并上传状态平面——
                 # 恢复后即使验证指标不再提升，接手 worker 也有 best.pt 可交付/预测
                 for name in ("best.pt", "last.pt", "preprocessor.json", "best_model.zip"):
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
+                joblog(
+                    f"训练暂停: {reason}；断点与产物已同步，可由任意节点接手"
+                    f"（POST /api/jobs/{job_id}/resume）",
+                )
                 jobstore.finish_current_attempt(
                     store,
                     job_id,
@@ -609,10 +1008,6 @@ class TrainingWorker:
                     machine_id=self.caps.get("machine_id"),
                     slot=self.caps.get("slot"),
                 )
-                joblog(
-                    f"训练暂停: {reason}；断点与产物已同步，可由任意节点接手"
-                    f"（POST /api/jobs/{job_id}/resume）",
-                )
                 return
             except JobCancelled:
                 # 取消（可在任意 eopch）：同步已完成部分的最佳产物供交付/预测
@@ -620,6 +1015,7 @@ class TrainingWorker:
                     artifact = scratch / name
                     if artifact.exists():
                         store.write_file(job_key(job_id, name), artifact)
+                joblog("任务已取消")
                 jobstore.finish_current_attempt(
                     store,
                     job_id,
@@ -627,7 +1023,6 @@ class TrainingWorker:
                     status=jobstore.CANCELLED,
                     finished_at=time.time(),
                 )
-                joblog("任务已取消")
                 return
 
             # ---- 成功：上传最终产物 + 记录训练分段（UI 分段设备标注数据源） ----
@@ -636,6 +1031,10 @@ class TrainingWorker:
                 artifact = scratch / name
                 if artifact.exists():
                     store.write_file(job_key(job_id, name), artifact)
+            joblog(
+                f"训练完成: 最佳 epoch {summary.get('best_epoch')}，"
+                f"用时 {summary.get('duration_sec')}s（worker {self.worker_id}）",
+            )
             jobstore.finish_current_attempt(
                 store, job_id,
                 attempt_status="completed",
@@ -644,26 +1043,44 @@ class TrainingWorker:
                 summary=summary,
                 finished_at=time.time(),
             )
-            joblog(
-                f"训练完成: 最佳 epoch {summary.get('best_epoch')}，"
-                f"用时 {summary.get('duration_sec')}s（worker {self.worker_id}）",
-            )
+        except JobLeaseLost:
+            raise
         except Exception as exc:  # noqa: BLE001
             # 失败分类：业务性错误直接 FAILED；环境性错误带 checkpoint 自动重试
-            self._handle_run_failure(job_id, exc, scratch)
+            controller.ensure_owned()
+            self._handle_run_failure(job_id, exc, scratch, store=store)
         finally:
-            if controller is not None:
-                controller.stop()
-            self._controller = None
-            self._flush_final(scratch, job_id)
-            shutil.rmtree(scratch, ignore_errors=True)
+            try:
+                # 心跳一直维持到收尾上传结束；失租者只能清理自己的本地缓存。
+                if scratch.exists():
+                    reconcile_log_revision()
+                    self._flush_final(scratch, job_id, store=store)
+            finally:
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+                if group and not controller.lease_lost.is_set():
+                    store.delete(group["manifest_key"])
 
-    def _set_failed(self, job_id: str, error: str, scratch: Optional[Path] = None) -> None:
+    def _set_failed(self, job_id: str, error: str, scratch: Optional[Path] = None,
+                    store: Optional[ArtifactStore] = None) -> None:
         """任务失败收尾：状态/错误信息落状态平面并写日志（日志统一走 joblog 防覆盖）。"""
+        store = store or self.store
         error = str(error).strip()
         try:
+            # 结束状态可见前先发布原因，避免查询端看到 failed 却读不到错误日志。
+            if scratch is not None and scratch.exists():
+                stamp = time.strftime("%H:%M:%S")
+                try:
+                    with (scratch / "log.txt").open("a", encoding="utf-8") as f:
+                        f.write(f"[{stamp}] 任务失败: {error[:2000]}\n")
+                    store.write_file(job_key(job_id, "log.txt"), scratch / "log.txt")
+                except JobLeaseLost:
+                    raise
+                except Exception:
+                    pass
+            else:
+                jobstore.append_job_log(store, job_id, f"任务失败: {error}".strip()[:2000])
             jobstore.finish_current_attempt(
-                self.store,
+                store,
                 job_id,
                 attempt_status="failed",
                 attempt_error=error,
@@ -671,19 +1088,13 @@ class TrainingWorker:
                 error=error,
                 finished_at=time.time(),
             )
-            if scratch is not None and scratch.exists():
-                stamp = time.strftime("%H:%M:%S")
-                try:
-                    with (scratch / "log.txt").open("a", encoding="utf-8") as f:
-                        f.write(f"[{stamp}] 任务失败: {error[:2000]}\n")
-                except Exception:
-                    pass
-            else:
-                jobstore.append_job_log(self.store, job_id, f"任务失败: {error}".strip()[:2000])
+        except JobLeaseLost:
+            raise
         except Exception:
             self._log(f"[{job_id}] 失败状态写入异常:\n{traceback.format_exc()}")
 
-    def _handle_run_failure(self, job_id: str, exc: BaseException, scratch: Optional[Path] = None) -> None:
+    def _handle_run_failure(self, job_id: str, exc: BaseException, scratch: Optional[Path] = None,
+                            store: Optional[ArtifactStore] = None) -> None:
         """失败分类收尾：这是"单卡故障不影响整体任务完成"的核心保障。
 
         - 环境性错误（CUDA/OOM/网络瞬断/存储故障等，classify_retryable 判定）：
@@ -694,6 +1105,8 @@ class TrainingWorker:
         日志写本地 scratch（若有）：finally 的 _flush_final 会整文件同步，
         避免状态平面直接 append 被 scratch 副本覆盖而丢失。
         """
+        store = store or self.store
+
         def local_log(msg: str) -> None:
             """失败消息写入本地 scratch 日志（随 finally 同步到状态平面）。"""
             if scratch is None or not scratch.exists():
@@ -705,8 +1118,9 @@ class TrainingWorker:
                 pass
 
         retry_count = 0
+        record = {}
         try:
-            record = jobstore.read_job(self.store, job_id) or {}
+            record = jobstore.read_job(store, job_id) or {}
             retry_count = int(record.get("retry_count") or 0)
         except Exception:
             pass
@@ -715,11 +1129,13 @@ class TrainingWorker:
             new_count = retry_count + 1
             local_log(
                 f"环境性错误，自动重试 {new_count}/{config.JOB_MAX_AUTO_RETRY}"
-                f"（断点已保留，任意可用卡可接续）: {exc}",
+                + ("（断点已保留，等待指定计算槽恢复）"
+                   if ((record.get("spec") or {}).get("resource_hint") or {}).get("worker_id")
+                   else "（断点已保留，任意可用卡可接续）") + f": {exc}",
             )
             try:
                 jobstore.finish_current_attempt(
-                    self.store,
+                    store,
                     job_id,
                     attempt_status="retrying",
                     attempt_error=str(exc),
@@ -731,6 +1147,8 @@ class TrainingWorker:
                     retry_worker_id=None,
                     retry_assignment_mode="auto",
                 )
+            except JobLeaseLost:
+                raise
             except Exception:
                 self._log(f"[{job_id}] 重试状态写入异常:\n{traceback.format_exc()}")
             self._log(
@@ -748,24 +1166,28 @@ class TrainingWorker:
                 f"{exc}\n[环境性错误自动重试已耗尽 {config.JOB_MAX_AUTO_RETRY} 次]"
                 f"\n{traceback.format_exc(limit=8)}",
                 scratch,
+                store=store,
             )
         else:
-            self._set_failed(job_id, f"{exc}\n{traceback.format_exc(limit=8)}", scratch)
+            self._set_failed(job_id, f"{exc}\n{traceback.format_exc(limit=8)}", scratch, store=store)
 
-    def _flush_final(self, scratch: Path, job_id: str) -> None:
+    def _flush_final(self, scratch: Path, job_id: str, store: Optional[ArtifactStore] = None) -> None:
         """收尾兜底：把本地最后的 metrics/日志/最佳产物同步到状态平面（幂等）。
 
         best.pt/last.pt/preprocessor.json 也纳入兜底：失败路径下本地训练进度
         产生的最佳权重不应丢失（重试/预测/交付都要能取到）。
         """
+        store = store or self.store
         try:
             for name in (
-                "metrics.jsonl", "log.txt", "best.pt", "last.pt",
+                "metrics.jsonl", "performance.jsonl", "log.txt", "best.pt", "last.pt",
                 "preprocessor.json", "best_model.zip",
             ):
                 artifact = scratch / name
                 if artifact.exists():
-                    self.store.write_file(job_key(job_id, name), artifact)
+                    store.write_file(job_key(job_id, name), artifact)
+        except JobLeaseLost:
+            raise
         except Exception:
             pass
 
@@ -817,20 +1239,50 @@ class WorkerSupervisor:
         self._shutdown = threading.Event()
         self._children: Dict[str, "subprocess.Popen"] = {}  # slot -> 子进程
         self._slots: List[Tuple[str, Optional[str]]] = []   # (slot 短名, GPU 索引或 None)
+        self._slot_backends: Dict[str, str] = {}
         gpu_count = _gpu_count()
-        for i in range(gpu_count):
+        try:
+            import torch
+            backend = str(os.environ.get("WORKER_DEVICE", "auto")).lower()
+            if backend == "auto":
+                backend = str(device_info().get("backend", "cpu"))
+                # 旧版测试/调用方可能只替换 GPU 数量；保持显式可见 GPU 的 CUDA 兼容行为。
+                if backend == "cpu" and gpu_count > 0:
+                    backend = "cuda"
+            if backend in {"cuda", "rocm"}:
+                accelerator_count = gpu_count
+            elif backend == "xpu":
+                accelerator_count = int(torch.xpu.device_count()) if hasattr(torch, "xpu") else 0
+            elif backend == "mps":
+                accelerator_count = 1
+            else:
+                accelerator_count = 0
+        except Exception:
+            backend, accelerator_count = "cpu", 0
+        for i in range(accelerator_count):
             self._slots.append((f"gpu{i}", str(i)))
+            self._slot_backends[f"gpu{i}"] = backend
         n_cpu = config.WORKER_CPU_SLOTS if cpu_slots is None else cpu_slots
-        for j in range(max(int(n_cpu), 1) if gpu_count == 0 else int(n_cpu)):
+        for j in range(max(int(n_cpu), 1) if accelerator_count == 0 else int(n_cpu)):
             self._slots.append((f"cpu{j}", None))
+            self._slot_backends[f"cpu{j}"] = "cpu"
 
     # ------------------------------------------------------------------
     def _spawn(self, slot: str, gpu_index: Optional[str]) -> "subprocess.Popen":
-        """启动一个卡槽子进程：CUDA_VISIBLE_DEVICES 隔离到单卡（必须在 CUDA 初始化前设置）。"""
-        env = dict(os.environ)
+        """启动一个卡槽子进程，并按后端隔离 CUDA/ROCm 或 XPU 设备。"""
+        env = thread_environment(os.environ, len(self._slots))
         env.pop("_", None)  # 防止个别环境变量干扰 torch 启动偏好
-        if gpu_index is not None:
-            env["CUDA_VISIBLE_DEVICES"] = gpu_index
+        backend = self._slot_backends.get(slot, "cpu")
+        if gpu_index is not None and backend == "cpu":
+            # 兼容旧测试/旧 supervisor：显式 GPU 索引默认沿用 CUDA。
+            backend = "cuda"
+        env["WORKER_DEVICE"] = backend
+        env["CUDA_VISIBLE_DEVICES"] = gpu_index if backend in {"cuda", "rocm"} and gpu_index is not None else ""
+        env["HIP_VISIBLE_DEVICES"] = gpu_index if backend == "rocm" and gpu_index is not None else ""
+        env["ROCR_VISIBLE_DEVICES"] = gpu_index if backend == "rocm" and gpu_index is not None else ""
+        env["ONEAPI_DEVICE_SELECTOR"] = (
+            f"level_zero:{gpu_index}" if backend == "xpu" and gpu_index is not None else ""
+        )
         env["WORKER_SLOT"] = slot
         env["PYTHONUNBUFFERED"] = "1"
         child = subprocess.Popen(
@@ -840,12 +1292,18 @@ class WorkerSupervisor:
         self._log(f"supervisor: 启动卡槽 {slot} 子进程 pid={child.pid}")
         return child
 
-    def _probe_gpu(self, gpu_index: Optional[str]) -> bool:
+    def _probe_gpu(self, gpu_index: Optional[str], backend: str = "cuda") -> bool:
         """探测指定卡是否恢复：一次性 --probe-gpu 子进程（退出码 0 = 健康）。"""
         if gpu_index is None:
             return True
         env = dict(os.environ)
-        env["CUDA_VISIBLE_DEVICES"] = gpu_index
+        env["WORKER_DEVICE"] = backend
+        env["CUDA_VISIBLE_DEVICES"] = gpu_index if backend in {"cuda", "rocm"} else ""
+        env["HIP_VISIBLE_DEVICES"] = gpu_index if backend == "rocm" else ""
+        env["ROCR_VISIBLE_DEVICES"] = gpu_index if backend == "rocm" else ""
+        env["ONEAPI_DEVICE_SELECTOR"] = (
+            f"level_zero:{gpu_index}" if backend == "xpu" else ""
+        )
         try:
             probe = subprocess.run(
                 [sys.executable, "-m", "app.worker", "--probe-gpu"],
@@ -861,7 +1319,7 @@ class WorkerSupervisor:
         for slot, gpu_index in self._slots:
             if slot in self._children and self._children[slot] is not None:
                 continue
-            if gpu_index is not None and not self._probe_gpu(gpu_index):
+            if gpu_index is not None and not self._probe_gpu(gpu_index, self._slot_backends.get(slot, "cuda")):
                 # 掉卡时先不启动子进程：等下轮探测恢复再启动（recovering）
                 self._log(f"supervisor: 卡 {slot}（GPU {gpu_index}）探测失败，暂不启动（recovering）")
                 continue
@@ -936,11 +1394,10 @@ class WorkerSupervisor:
 
 
 def _gpu_count() -> int:
-    """本机可见 GPU 数（Supervisor 决定拉起几个卡槽用）；失败按 0 处理。"""
+    """本机可见加速器数（Supervisor 决定拉起几个卡槽）；失败按 0 处理。"""
     try:
-        import torch
-
-        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+        info = device_info()
+        return int(info["count"]) if info["backend"] != "cpu" else 0
     except Exception:
         return 0
 
@@ -1002,6 +1459,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- 卡槽子进程模式：本进程绑定单卡，注册后进入领取循环 ----
     if args.slot is not None:
+        configure_torch_threads()
         machine_id = config.WORKER_MACHINE_ID or socket.gethostname()
         worker_prefix = config.WORKER_ID or machine_id
         slot_worker_id = f"{worker_prefix}-{args.slot}"

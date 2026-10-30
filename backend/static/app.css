@@ -1,3 +1,111 @@
+/* 管理页面与训练台共用的服务器、日志和表单基础布局。 */
+  .compute-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .compute-actions { display:flex; gap:7px; flex-wrap:wrap; }
+  .compute-summary { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .compute-summary .chip { font-size:12px; padding:3px 10px; }
+  .server-grid { display:grid; gap:12px; margin-top:12px; }
+  .server-card { overflow:hidden; border:1px solid var(--border); border-radius:8px;
+    background:linear-gradient(135deg, rgba(88,166,255,.055), transparent 42%), var(--panel2); }
+  .server-head { display:flex; align-items:center; justify-content:space-between; gap:14px;
+    padding:13px 15px; border-bottom:1px solid var(--border); }
+  .server-head-main { min-width:0; flex:1; }
+  .server-title { min-width:0; display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+  .server-title strong { font-size:14px; overflow-wrap:anywhere; }
+  .server-kind { padding:2px 8px; border:1px solid var(--border); border-radius:999px;
+    color:var(--muted); background:rgba(13,17,23,.35); font-size:11px; }
+  .server-presence { color:var(--ok); font-size:12px; white-space:nowrap; }
+  .server-presence.offline { color:var(--muted); }
+  .server-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:9px 15px 2px;
+    color:var(--muted); font-size:12px; }
+  .server-head-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+  .server-controls { display:flex; gap:6px; flex-wrap:wrap; }
+  .server-controls button { padding:5px 9px; font-size:11px; }
+  .server-controls .server-log-button { border-color:rgba(88,166,255,.5); color:#a5d6ff; }
+  .server-operation { padding:7px 15px 0; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+  .server-operation-log { margin:7px 15px 10px; color:var(--muted); font-size:11px; }
+  .server-operation-log summary { width:fit-content; cursor:pointer; }
+  .server-operation-log pre { max-height:240px; overflow:auto; margin:6px 0 0; padding:9px 11px; border:1px solid var(--border); border-radius:7px; background:rgba(13,17,23,.5); color:var(--text); font:11px/1.5 ui-monospace,SFMono-Regular,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .server-operation-log-hint { padding:5px 15px 0; color:var(--muted); font-size:11px; }
+  .server-slots { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:8px; padding:10px 12px 13px; }
+  .resource-slot { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px;
+    padding:10px 11px; border:1px solid var(--border); border-radius:8px; background:rgba(13,17,23,.42); }
+  .resource-slot.enabled { border-color:rgba(63,185,80,.35); }
+  .slot-main { min-width:0; }
+  .slot-title { display:flex; align-items:center; gap:7px; font-weight:650; }
+  .slot-title .dot { width:7px; height:7px; border-radius:50%; background:var(--muted); }
+  .resource-slot.enabled .slot-title .dot { background:var(--ok); box-shadow:0 0 9px rgba(63,185,80,.5); }
+  .slot-details { margin-top:3px; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+  .slot-action { min-width:96px; padding:6px 10px; }
+  .slot-action.enable { border-color:rgba(63,185,80,.4); color:#7ee787; }
+  .slot-action.disable { color:var(--muted); }
+  .slot-action:disabled { cursor:not-allowed; opacity:.5; }
+  .server-modal { position:fixed; inset:0; z-index:60; display:none; align-items:center; justify-content:center;
+    padding:18px; background:rgba(4,8,14,.78); backdrop-filter:blur(5px); }
+  .server-modal.open { display:flex; }
+  .server-modal-card { width:min(660px,100%); max-height:90vh; overflow:auto; padding:22px;
+    border:1px solid var(--border-strong); border-radius:8px; background:var(--panel); box-shadow:var(--shadow-md); }
+  .server-modal-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .server-modal-head h3 { margin:0; font-size:18px; }
+  .server-modal-card p { color:var(--muted); font-size:13px; line-height:1.6; }
+  .server-log-modal-card { width:min(1120px,100%); }
+  .server-log-status { margin:10px 0; color:var(--muted); font-size:12px; }
+  .server-log-actions { display:flex; justify-content:flex-end; margin:10px 0 8px; }
+  .server-log-output { max-height:65vh; min-height:220px; overflow:auto; margin:0; padding:10px 14px;
+    border:1px solid var(--border); border-radius:9px; background:rgba(13,17,23,.6); color:var(--text);
+    font:13px/1.65 ui-monospace,SFMono-Regular,monospace; white-space:pre; overflow-wrap:normal; }
+  .server-log-line { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:12px;
+    min-width:max-content; padding:5px 0; border-bottom:1px solid rgba(139,148,158,.12); }
+  .server-log-line:last-child { border-bottom:0; }
+  .server-log-line-text { user-select:text; -webkit-user-select:text; cursor:text; }
+  .server-log-line-copy { position:sticky; right:0; margin-left:8px; padding:3px 7px; font-size:11px; opacity:.68; }
+  .server-log-line-copy:hover,.server-log-line-copy:focus-visible { opacity:1; }
+  .server-effective-config-card { width:min(720px,100%); }
+  .server-effective-config-status { margin:10px 0 14px; color:var(--muted); font-size:12px; }
+  .server-effective-config { display:grid; gap:8px; margin:0; }
+  .server-effective-config-row { display:grid; grid-template-columns:minmax(125px, .4fr) minmax(0, 1fr); gap:14px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:rgba(13,17,23,.32); }
+  .server-effective-config-label { color:var(--muted); }
+  .server-effective-config-value { min-width:0; color:var(--text); font:12px/1.5 ui-monospace,SFMono-Regular,monospace; overflow-wrap:anywhere; }
+  .server-effective-config-source { display:block; margin-top:2px; color:var(--muted); font:11px/1.4 inherit; }
+  .server-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:15px; }
+  .server-form .field { min-width:0; }
+  .server-form .field.wide { grid-column:1/-1; }
+  .ssh-credential-settings { grid-column:1/-1; padding:12px; border:1px solid var(--border);
+    border-radius:10px; background:rgba(28,35,51,.45); }
+  .ssh-credential-settings summary { cursor:pointer; color:var(--text); font-weight:600; }
+  .ssh-credential-settings[open] summary { margin-bottom:10px; }
+  .ssh-credential-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+  .ssh-credential-grid .wide { grid-column:1/-1; }
+  .ssh-credential-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  @media (max-width:560px) { .ssh-credential-grid { grid-template-columns:1fr; }
+    .ssh-credential-grid .wide { grid-column:auto; } }
+  .server-mode { display:flex; gap:7px; flex-wrap:wrap; }
+  .server-mode label { display:flex; align-items:center; gap:7px; padding:8px 11px;
+    border:1px solid var(--border); border-radius:9px; cursor:pointer; color:var(--text); }
+  .server-mode label:has(input:checked) { border-color:var(--accent); color:#a5d6ff; background:rgba(88,166,255,.1); }
+  .server-form .hint { margin-top:4px; }
+  .server-form-actions { grid-column:1/-1; display:flex; justify-content:flex-end; gap:8px; margin-top:3px; }
+  .server-form-actions button { min-width:120px; }
+  .server-modal-note { margin-top:14px; padding:10px 12px; border-left:3px solid var(--warning,var(--warn));
+    border-radius:5px; color:#e3b341; background:rgba(210,153,34,.08); font-size:12px; }
+  @media (max-width:560px) {
+    .server-head { align-items:flex-start; flex-direction:column; gap:5px; }
+    .server-slots { grid-template-columns:1fr; padding:9px; }
+    .server-modal-card { padding:17px; }
+    .server-form { grid-template-columns:1fr; }
+    .server-form .field.wide,.server-form-actions { grid-column:auto; }
+  }
+
+  #toastWrap { position: fixed; top: 16px; right: 16px; z-index: 70; display: flex;
+    flex-direction: column; gap: 8px; }
+  .toast { background: var(--panel); border: 1px solid var(--border);
+           border-left: 3px solid var(--accent); border-radius: var(--radius);
+    padding: 10px 16px; font-size: 13px; box-shadow: var(--shadow-md); max-width: 340px;
+    animation: toastIn .22s ease; }
+  .toast.err { border-left-color: var(--danger); }
+  .toast.ok { border-left-color: var(--ok); }
+  @keyframes toastIn { from { opacity: 0; transform: translateX(12px); }
+                       to { opacity: 1; transform: none; } }
+
 :root {
   color-scheme: light;
   --bg: #f3f6fb;
@@ -854,6 +962,71 @@ html { min-width: 320px; background: var(--bg); }
 .training-page .server-modal-card p,
 .dataset-page .section-description { color: #718096; line-height: 1.65; }
 .training-page .server-modal-note { border-left-color: #d97706; color: #8a4b08; background: #fff8e9; }
+/* 添加服务器使用独立滚动区，标题与操作栏始终保留在视野内。 */
+body.server-dialog-open { overflow: hidden; }
+.training-page #addServerModal { padding: clamp(10px, 3vh, 28px); }
+.training-page #addServerModal .server-dialog-card {
+  display: flex;
+  flex-direction: column;
+  width: min(760px, 100%);
+  max-height: min(900px, calc(100dvh - 40px));
+  overflow: hidden;
+  padding: 0;
+}
+.training-page #addServerModal .server-modal-head {
+  flex: none;
+  align-items: flex-start;
+  padding: 22px 26px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.training-page #addServerModal .server-modal-head p { margin: 7px 0 0; }
+.training-page #addServerModal .close-btn { flex: none; }
+.training-page #addServerModal .server-modal-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 22px 26px;
+  scrollbar-gutter: stable;
+}
+.training-page #addServerModal .server-form { display: block; margin: 0; }
+.training-page #addServerModal .server-form-section { min-width: 0; margin: 0 0 22px; }
+.training-page #addServerModal h4 { margin: 0 0 14px; font-size: 14px; }
+.training-page #addServerModal h4 span { margin-left: 10px; color: var(--muted); font-size: 12px; font-weight: 400; }
+.training-page #addServerModal .server-section-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; }
+.training-page #addServerModal .field[hidden],
+.training-page #addServerModal [hidden] { display: none; }
+.training-page #addServerModal .server-field-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.training-page #addServerModal .server-text-button { min-height: 28px; padding: 2px 5px; border: 0; color: var(--accent); background: transparent; box-shadow: none; font-size: 12px; }
+.training-page #addServerModal .server-mode { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.training-page #addServerModal .server-mode label { min-height: 46px; padding: 10px 14px; }
+.training-page #addServerModal .server-advanced-settings,
+.training-page #addServerModal .ssh-credential-settings { padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-raised); }
+.training-page #addServerModal summary { cursor: pointer; color: var(--text); font-weight: 600; }
+.training-page #addServerModal summary small { display: block; margin: 5px 0 0 18px; color: var(--muted); font-size: 12px; font-weight: 400; }
+.training-page #addServerModal .server-advanced-settings[open] > summary { margin-bottom: 18px; }
+.training-page #addServerModal .server-form-section:last-child { margin-bottom: 18px; }
+.training-page #addServerModal .ssh-credential-settings { background: #fff; }
+.training-page #addServerModal .ssh-credential-row { flex-wrap: wrap; overflow-wrap: anywhere; }
+.training-page #addServerModal .server-dialog-footer { flex: none; padding: 16px 26px; border-top: 1px solid var(--border); background: var(--panel-raised); }
+.training-page #addServerModal .server-dialog-footer-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.training-page #addServerModal .server-dialog-footer-row > .hint { max-width: 340px; margin: 0; line-height: 1.5; }
+.training-page #addServerModal .server-form-actions { flex: none; flex-direction: row; margin: 0; }
+.training-page #addServerModal .server-form-actions button { width: auto; min-width: 76px; }
+.training-page #addServerModal .server-form-error { margin-bottom: 12px; color: var(--danger); font-size: 13px; overflow-wrap: anywhere; }
+.training-page #addServerModal [aria-invalid="true"] { border-color: var(--danger); }
+.training-page #addServerModal :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 560px) {
+  .training-page #addServerModal .server-dialog-card { max-height: calc(100dvh - 20px); border-radius: 15px; }
+  .training-page #addServerModal .server-modal-head,
+  .training-page #addServerModal .server-modal-body,
+  .training-page #addServerModal .server-dialog-footer { padding: 16px; }
+  .training-page #addServerModal .server-section-grid { grid-template-columns: minmax(0, 1fr); }
+  .training-page #addServerModal h4 span { display: block; margin: 5px 0 0; }
+  .training-page #addServerModal .server-mode { grid-template-columns: minmax(0, 1fr); }
+  .training-page #addServerModal .server-dialog-footer-row { flex-direction: column; align-items: stretch; gap: 12px; }
+  .training-page #addServerModal .server-dialog-footer-row > .hint { max-width: none; }
+  .training-page #addServerModal .server-form-actions button { flex: 1; }
+}
 .training-page .progress { height: 8px; border-radius: 999px; background: #eaf0f7; }
 .training-page .progress > div { border-radius: 999px; }
 .training-page .tabs { gap: 4px; margin: 18px 0 16px; border-bottom-color: #e5ebf3; }
@@ -924,6 +1097,20 @@ html { min-width: 320px; background: var(--bg); }
 .dataset-page .section-title { margin-bottom: 8px; color: #24344d; font-size: 16px; font-weight: 700; }
 .dataset-page .section-title::before { width: 4px; height: 17px; }
 .dataset-page .section-description { margin-bottom: 18px; font-size: 13px; }
+.dataset-page .hub-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+.dataset-page .hub-fields label { display: grid; gap: 8px; color: var(--muted); font-size: 13px; }
+.dataset-page .hub-fields input { width: 100%; min-height: 42px; }
+.dataset-page .hub-modes { display: flex; flex-wrap: wrap; gap: 14px; margin: 20px 0; padding: 14px; border: 1px solid var(--border); border-radius: 12px; }
+.dataset-page .hub-modes legend { padding: 0 6px; color: var(--muted); font-size: 13px; }
+.dataset-page .hub-modes label { display: flex; flex: 1 1 230px; gap: 10px; align-items: flex-start; padding: 12px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+.dataset-page .hub-modes label:has(input:checked) { border-color: var(--accent); background: #f1f6ff; }
+.dataset-page .hub-modes input { width: auto; margin-top: 4px; accent-color: var(--accent); }
+.dataset-page .hub-modes strong, .dataset-page .hub-modes small { display: block; }
+.dataset-page .hub-modes small { margin-top: 5px; color: var(--muted); line-height: 1.6; }
+.dataset-page .hub-submit { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+.dataset-page #hubStatus { color: var(--muted); font-size: 13px; }
+.dataset-page .hub-hint { margin: 14px 0 0; font-size: 12px; }
+
 .dataset-page .upload-area {
   gap: 10px;
   padding: clamp(30px, 4vw, 48px) 18px;
@@ -946,8 +1133,10 @@ html { min-width: 320px; background: var(--bg); }
 .dataset-page .dataset-grid { gap: 16px; }
 .dataset-page .dataset-card { padding: 18px; border-color: #e2e8f0; border-radius: 15px; background: #fff; box-shadow: 0 2px 8px rgba(25, 42, 70, .035); }
 .dataset-page .dataset-card:hover { transform: translateY(-2px); border-color: #c2d3ec; box-shadow: 0 9px 24px rgba(25, 42, 70, .08); }
+/* 标题独占卡片宽度，操作区另起一行并按可用宽度折行，避免远程数据集按钮挤压名称。 */
+.dataset-page .dataset-header { flex-direction: column; align-items: stretch; }
 .dataset-page .dataset-title { color: #24344d; font-size: 16px; font-weight: 700; }
-.dataset-page .dataset-actions { gap: 7px; }
+.dataset-page .dataset-actions { min-width: 0; justify-content: flex-start; gap: 7px; }
 .dataset-page .dataset-actions button { min-height: 33px; padding: 6px 10px; font-size: 12px; }
 .dataset-page .dataset-info { margin: 14px 0; color: #687991; font-size: 12px; line-height: 1.55; }
 .dataset-page .dataset-tags { gap: 6px; }
@@ -1023,4 +1212,900 @@ html { min-width: 320px; background: var(--bg); }
   .dataset-page .queued-operation { grid-template-columns: 1fr; }
   .dataset-page .modal { padding: 10px; }
   .dataset-page .modal-content { max-height: 90vh; }
+}
+
+/* 统一视觉收口：让训练工作台和数据集页面共享同一套层级、间距与交互反馈。 */
+:root {
+  --bg: #f4f7fb;
+  --panel: #ffffff;
+  --panel-raised: #fbfcff;
+  --border: #dfe7f1;
+  --border-strong: #c8d4e4;
+  --text: #14243b;
+  --muted: #687991;
+  --accent: #2f64dc;
+  --accent-strong: #1d47b8;
+  --accent-soft: #edf3ff;
+  --ok: #15855a;
+  --danger: #c23b43;
+  --warning: #a26708;
+  --chip: #f1f5fa;
+  --shadow-sm: 0 3px 10px rgba(29, 55, 94, .055);
+  --shadow-md: 0 18px 52px rgba(29, 55, 94, .16);
+  --ease: .2s ease;
+}
+
+html {
+  background: var(--bg);
+  color-scheme: light;
+}
+
+.dataset-page,
+.training-page {
+  background:
+    radial-gradient(circle at 8% -8%, rgba(74, 125, 230, .13), transparent 29rem),
+    radial-gradient(circle at 94% 6%, rgba(126, 173, 250, .1), transparent 24rem),
+    var(--bg);
+}
+
+.dataset-page .topbar,
+.training-page .topbar {
+  min-height: 72px;
+  padding: 14px clamp(18px, 4vw, 64px);
+  border-bottom-color: rgba(203, 215, 230, .82);
+  background: rgba(255, 255, 255, .84);
+  box-shadow: 0 4px 18px rgba(30, 57, 95, .045);
+}
+
+.dataset-page .brand,
+.training-page .brand {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  color: #162943;
+  font-size: 16px;
+  letter-spacing: -.025em;
+}
+
+.training-page .brand .sub {
+  margin-left: 2px;
+  color: #7a8aa0;
+  font-size: 11px;
+}
+
+.dataset-page .app-nav,
+.training-page .app-nav {
+  gap: 3px;
+  padding: 4px;
+  border-color: #e0e8f2;
+  border-radius: 13px;
+  background: rgba(247, 250, 255, .92);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .8);
+}
+
+.dataset-page .app-nav a,
+.training-page .app-nav a {
+  min-height: 34px;
+  padding: 8px 14px;
+  border-radius: 9px;
+  color: #6b7b92;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.dataset-page .app-nav a:hover,
+.dataset-page .app-nav a:focus-visible,
+.training-page .app-nav a:hover,
+.training-page .app-nav a:focus-visible {
+  color: var(--accent-strong);
+  background: #eef4ff;
+}
+
+.dataset-page .app-nav a[aria-current="page"],
+.training-page .app-nav a[aria-current="page"] {
+  color: var(--accent-strong);
+  background: #e8f0ff;
+  box-shadow: inset 0 0 0 1px #d4e2ff, 0 1px 2px rgba(37, 99, 235, .08);
+}
+
+.dataset-page button,
+.training-page button {
+  min-height: 40px;
+  border-color: #d4dfed;
+  border-radius: 10px;
+  color: #33445d;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(25, 42, 70, .035);
+  font-weight: 620;
+}
+
+.dataset-page button:hover,
+.training-page button:hover {
+  border-color: #9db9ee;
+  color: var(--accent-strong);
+  background: #f8faff;
+  box-shadow: 0 5px 14px rgba(47, 100, 220, .1);
+}
+
+.dataset-page .btn-primary,
+.training-page button.primary {
+  border-color: var(--accent);
+  background: linear-gradient(180deg, #3a76ed, var(--accent));
+  box-shadow: 0 5px 12px rgba(47, 100, 220, .22);
+}
+
+.dataset-page .btn-primary:hover,
+.training-page button.primary:hover {
+  border-color: var(--accent-strong);
+  background: linear-gradient(180deg, #2f64dc, var(--accent-strong));
+  box-shadow: 0 7px 16px rgba(47, 100, 220, .27);
+}
+
+.training-page .layout {
+  width: min(1480px, calc(100% - 48px));
+  grid-template-columns: minmax(360px, 410px) minmax(0, 1fr);
+  gap: 20px;
+  padding: 24px 0 48px;
+}
+
+.training-page .layout > aside.panel {
+  position: sticky;
+  top: 92px;
+  max-height: calc(100vh - 112px);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.training-page .panel,
+.dataset-page .section-card {
+  position: relative;
+  overflow: hidden;
+  border-color: #dfe7f1;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, .94);
+  box-shadow: 0 5px 20px rgba(30, 57, 95, .055), 0 1px 2px rgba(30, 57, 95, .025);
+}
+
+.training-page .panel::before,
+.dataset-page .section-card::before {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3px;
+  content: "";
+  background: linear-gradient(90deg, #4c7ff0, #a9c7ff 54%, rgba(169, 199, 255, 0));
+}
+
+.training-page h2 {
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid #edf1f6;
+  color: #263953;
+  font-size: 14px;
+  letter-spacing: .01em;
+}
+
+.training-page h2:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.training-page h2::before {
+  width: 5px;
+  height: 18px;
+  background: linear-gradient(180deg, #4f82ed, #2f64dc);
+}
+
+.training-page .field label {
+  color: #60718a;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.dataset-page input,
+.dataset-page textarea,
+.dataset-page select,
+.training-page input,
+.training-page textarea,
+.training-page select {
+  min-height: 42px;
+  border-color: #d6e0ec;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: inset 0 1px 2px rgba(25, 42, 70, .025);
+}
+
+.dataset-page input:hover,
+.dataset-page textarea:hover,
+.dataset-page select:hover,
+.training-page input:hover,
+.training-page textarea:hover,
+.training-page select:hover {
+  border-color: #b4c6df;
+}
+
+.dataset-page input:focus,
+.dataset-page textarea:focus,
+.dataset-page select:focus,
+.training-page input:focus,
+.training-page textarea:focus,
+.training-page select:focus {
+  border-color: #6f98e7;
+  background: #fff;
+  box-shadow: 0 0 0 4px rgba(47, 100, 220, .12);
+}
+
+.training-page #btnStart {
+  min-height: 48px;
+  margin-top: 4px;
+  border-radius: 12px;
+  font-size: 14px;
+  letter-spacing: .01em;
+}
+
+.training-page #jobList {
+  display: grid;
+  gap: 10px;
+}
+
+/* 训练工作台：渐进配置、固定操作区和稳定的任务阅读体验。 */
+.training-page [hidden] { display: none !important; }
+.training-page .training-advanced {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-raised);
+}
+.training-page .training-advanced summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 600;
+  list-style-position: inside;
+}
+.training-page .training-advanced summary span {
+  display: block;
+  margin: 3px 0 0 16px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+.training-page .training-advanced[open] > .formgrid { margin-top: 16px; }
+.training-page .training-advanced summary:focus-visible,
+.training-page .jobcard:focus-visible,
+.training-page [role="tabpanel"]:focus-visible,
+.training-page #logBox:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.training-page .training-submit {
+  position: sticky;
+  bottom: -1px;
+  z-index: 2;
+  display: grid;
+  gap: 9px;
+  margin: 6px -8px -8px;
+  padding: 14px 8px 8px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -8px 16px rgba(255, 255, 255, .85);
+}
+.training-page .training-submit #btnStart { margin-top: 0; min-height: 44px; }
+.training-page .text-action {
+  justify-self: start;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  box-shadow: none;
+}
+.training-page .feedback-error { color: var(--danger); overflow-wrap: anywhere; }
+.training-page #detailFeedback:empty { display: none; }
+.training-page #detailFeedback:not(:empty) { margin-top: 16px; }
+.training-page #trainForm [aria-invalid="true"] { border-color: var(--danger); }
+.training-page .job-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 8px; }
+.training-page .job-filters input { flex: 1 1 220px; min-width: 0; }
+.training-page .job-filters select { flex: 0 1 130px; width: auto; }
+.training-page .job-filters button { white-space: nowrap; }
+.training-page .job-list-feedback { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 12px; }
+.training-page #jobsFeedback { color: var(--warning); }
+.training-page .job-focus-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 20px 0 10px; }
+.training-page .job-focus-heading > div { min-width: 0; }
+.training-page .job-focus-heading h2 { display: inline; margin: 0 10px 0 0; }
+.training-page #btnOpenJobs { flex: none; }
+.training-page #allJobCount { margin-left: 5px; }
+.training-page .jobs-modal-card { width: min(900px, 100%); }
+.training-page .jobs-modal-body { min-height: 220px; }
+.training-page .jobs-modal-pagination { flex: none; padding-top: 12px; }
+.training-page .jobs-modal-pagination button { min-width: 92px; }
+.training-page .jobs-modal-pagination button:disabled { cursor: default; opacity: .45; }
+.training-page #allJobList { display: grid; gap: 8px; }
+.training-page .jobs-modal .jobcard { padding: 11px 13px; border-radius: 8px; box-shadow: none; }
+.training-page .jobs-modal .jobcard:hover { transform: none; }
+.training-page .training-record { display: grid; gap: 18px; }
+.training-page .training-record-section { min-width: 0; }
+.training-page .training-record-section h3 { margin: 0 0 10px; color: #2f4059; font-size: 14px; }
+.training-page .training-record-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; margin: 0; background: #fff; }
+.training-page .training-record-section:nth-of-type(2) .training-record-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.training-page .training-record-field { min-width: 0; padding: 9px 11px; background: #fff; box-shadow: inset -1px -1px 0 #e2e8f0, inset 1px 1px 0 #e2e8f0; }
+.training-page .training-record-field dt { margin-bottom: 4px; color: #718096; font-size: 11px; }
+.training-page .training-record-field dd { margin: 0; color: #29394f; font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.training-page .training-record-table-wrap { max-width: 100%; overflow: auto; border: 1px solid #e2e8f0; border-radius: 7px; }
+.training-page .training-record-table-wrap table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 12px; }
+.training-page .training-record-table-wrap th, .training-page .training-record-table-wrap td { padding: 8px 10px; border-bottom: 1px solid #e8edf4; text-align: left; white-space: nowrap; }
+.training-page .training-record-table-wrap th { position: sticky; top: 0; background: #f5f8fc; color: #26364d !important; font-weight: 700; }
+.training-page .training-record-error { padding: 10px 12px; border-left: 3px solid #dc4c48; background: #fff5f4; color: #9c302d; font-size: 12px; overflow-wrap: anywhere; }
+.training-page .training-record-json { margin-top: 10px; border-top: 1px solid #e8edf4; padding-top: 9px; }
+.training-page .training-record-json summary { cursor: pointer; color: #52647c; font-size: 12px; }
+.training-page .training-record-json pre { max-height: 320px; overflow: auto; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; color: #334155; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.training-page .log-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 10px 0; }
+.training-page .log-toolbar label { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; cursor: pointer; }
+.training-page .log-toolbar #logStatus { flex: 1 1 130px; }
+.training-page .log-toolbar input { width: auto; }
+.training-page #logBox { overflow-anchor: none; }
+@media (max-width: 560px) {
+  .training-page .job-filters input { flex-basis: 100%; }
+  .training-page .job-filters select { flex: 1; }
+  .training-page .training-submit { bottom: 0; }
+  .training-page .training-record-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .training-page .job-focus-heading { align-items: flex-start; }
+  .training-page .jobs-modal-pagination { gap: 7px; padding: 10px 12px 14px; }
+  .training-page .jobs-modal-pagination button { min-width: 0; padding: 7px 9px; }
+  .training-page .jobs-modal-pagination .preview-modal-page { font-size: 11px; }
+}
+
+.training-page .jobcard {
+  margin: 0;
+  padding: 14px 16px 13px;
+  border-color: #e1e8f2;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(30, 57, 95, .035);
+}
+
+.training-page .jobcard:hover {
+  border-color: #adc4ed;
+  background: #fcfdff;
+  box-shadow: 0 8px 18px rgba(47, 100, 220, .09);
+}
+
+.training-page .jobcard.active {
+  border-color: #80a7ed;
+  background: linear-gradient(110deg, #f1f6ff, #fff 72%);
+  box-shadow: inset 4px 0 0 var(--accent), 0 6px 16px rgba(47, 100, 220, .09);
+}
+
+.training-page #detail {
+  margin-top: 22px;
+  padding-top: 20px;
+  border-top: 1px solid #e7edf5;
+}
+
+.training-page #detailHead {
+  padding: 15px 16px;
+  border-color: #dfe7f1;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #f5f8ff, #fff 70%);
+}
+
+.training-page .progress {
+  height: 8px;
+  margin-top: 11px;
+  border-radius: 999px;
+  background: #e8eef7;
+}
+
+.training-page .progress > div {
+  border-radius: inherit;
+  background: linear-gradient(90deg, #3f78e9, #71a0f4);
+}
+
+.training-page .tabs {
+  gap: 5px;
+  margin: 20px 0 17px;
+  border-bottom-color: #e5ebf3;
+}
+
+.training-page .tabs button {
+  min-height: 42px;
+  padding: 9px 15px;
+  border-radius: 10px 10px 0 0;
+  color: #77879d;
+  font-size: 12px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.training-page .tabs button.active {
+  color: var(--accent-strong);
+  border-bottom-color: var(--accent);
+  background: #f5f8ff;
+}
+
+/* 曲线二级标签共用一块绘图区；窄屏允许横向滚动，保持单图高度。 */
+.training-page .chart-tabs {
+  display: flex;
+  gap: 4px;
+  max-width: 100%;
+  margin-bottom: 12px;
+  padding: 4px;
+  overflow-x: auto;
+  border: 1px solid #e0e8f2;
+  border-radius: 10px;
+  background: #f4f7fb;
+}
+.training-page .chart-tabs button {
+  flex: 1 0 auto;
+  min-height: 36px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #60718a;
+  box-shadow: none;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.training-page .chart-tabs button.active {
+  border-color: #dce6f5;
+  background: #fff;
+  color: var(--accent-strong);
+  font-weight: 650;
+  box-shadow: 0 1px 4px rgba(30, 57, 95, .06);
+}
+.training-page .chart-tabs button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.training-page .chartbox,
+.training-page .stat,
+.training-page #predictOut {
+  border-color: #e0e8f2;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 3px 10px rgba(30, 57, 95, .045);
+}
+
+.training-page .chartbox {
+  padding: 17px;
+}
+
+.training-page .chartbox h3 {
+  margin-bottom: 14px;
+  color: #60718a;
+  font-size: 13px;
+}
+
+.training-page .server-card {
+  border-color: #dce6f2;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #f5f8ff, #fff 55%);
+  box-shadow: 0 3px 10px rgba(30, 57, 95, .04);
+}
+
+.training-page .server-head {
+  padding: 16px 18px;
+  border-bottom-color: #e6edf5;
+}
+
+.training-page .server-title strong {
+  color: #213552;
+  font-size: 15px;
+}
+
+.training-page .resource-slot {
+  border-color: #e1e8f2;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.training-page .resource-slot.enabled {
+  border-color: #a9d7b8;
+  background: #f7fdf9;
+}
+
+.dataset-page .page-shell {
+  width: min(1400px, calc(100% - 48px));
+  padding: 36px 0 60px;
+}
+
+.dataset-page .page-heading {
+  margin-bottom: 24px;
+}
+
+.dataset-page .page-heading h1 {
+  color: #1b2e49;
+  font-size: clamp(28px, 3vw, 38px);
+  letter-spacing: -.045em;
+}
+
+.dataset-page .page-heading p {
+  color: #718198;
+  font-size: 14px;
+}
+
+.dataset-page .page-heading > .tag {
+  min-height: 36px;
+  padding: 7px 14px;
+  border-color: #d7e4fb;
+  color: var(--accent-strong);
+  background: #edf4ff;
+  font-weight: 700;
+}
+
+.dataset-page .section-title {
+  margin-bottom: 8px;
+  color: #263953;
+  font-size: 16px;
+  font-weight: 720;
+}
+
+.dataset-page .section-description {
+  color: #718198;
+  line-height: 1.65;
+}
+
+.dataset-page .upload-area {
+  min-height: 220px;
+  gap: 10px;
+  padding: 34px 18px;
+  border-color: #b9cbe3;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #fafcff, #f3f7ff);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9);
+}
+
+.dataset-page .upload-area:hover,
+.dataset-page .upload-area.drag-over {
+  border-color: #6f99e8;
+  background: linear-gradient(180deg, #f3f7ff, #edf4ff);
+  transform: translateY(-1px);
+}
+
+.dataset-page .upload-icon {
+  width: 54px;
+  height: 54px;
+  border-radius: 17px;
+  color: var(--accent);
+  background: #e6efff;
+  font-size: 25px;
+}
+
+.dataset-page .upload-text {
+  color: #2b3f5b;
+  font-size: 15px;
+  font-weight: 680;
+}
+
+.dataset-page .filter-bar {
+  gap: 14px;
+  margin: 20px 0;
+  padding: 13px;
+  border-color: #e2e9f2;
+  border-radius: 14px;
+  background: #f8faff;
+}
+
+.dataset-page .search-input {
+  min-height: 43px;
+  background: #fff;
+}
+
+.dataset-page .dataset-grid {
+  gap: 17px;
+}
+
+.dataset-page .dataset-card {
+  display: flex;
+  min-height: 220px;
+  flex-direction: column;
+  padding: 19px;
+  border-color: #e0e8f2;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 3px 10px rgba(30, 57, 95, .04);
+}
+
+.dataset-page .dataset-card:hover {
+  border-color: #bfd1ec;
+  box-shadow: 0 11px 26px rgba(30, 57, 95, .09);
+}
+
+.dataset-page .dataset-title {
+  color: #263953;
+  font-size: 16px;
+  font-weight: 720;
+}
+
+.dataset-page .dataset-info {
+  margin: 15px 0;
+  color: #6d7e95;
+  line-height: 1.6;
+}
+
+.dataset-page .dataset-tags {
+  margin-top: auto;
+  padding-top: 14px;
+  border-top: 1px solid #edf1f6;
+}
+
+.dataset-page .dataset-tags .tag {
+  min-height: 27px;
+  border-color: #e0e7f0;
+  color: #5f7189;
+  background: #f7f9fc;
+}
+
+.dataset-page .modal-content,
+.training-page .server-modal-card {
+  border-color: #dce6f1;
+  border-radius: 20px;
+  box-shadow: 0 26px 76px rgba(18, 39, 70, .2);
+}
+
+.dataset-page .modal-section-title {
+  margin-top: 20px;
+  color: #2e425f;
+  font-weight: 720;
+}
+
+.dataset-page .operation-item,
+.dataset-page .queued-operation {
+  border-color: #e0e8f2;
+  border-radius: 13px;
+  background: #f8faff;
+}
+
+.dataset-page .notification,
+.training-page .toast {
+  border-color: #d9e4f1;
+  border-radius: 12px;
+  box-shadow: 0 12px 30px rgba(30, 57, 95, .14);
+}
+
+@media (max-width: 1080px) {
+  .training-page .layout {
+    width: min(900px, calc(100% - 40px));
+    grid-template-columns: 1fr;
+  }
+
+  .training-page .layout > aside.panel {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+@media (max-width: 720px) {
+  .dataset-page .topbar,
+  .training-page .topbar {
+    min-height: 64px;
+    padding: 11px 16px;
+  }
+
+  .dataset-page .app-nav,
+  .training-page .app-nav {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .training-page .layout,
+  .dataset-page .page-shell {
+    width: calc(100% - 32px);
+    padding-top: 22px;
+  }
+
+  .dataset-page .page-heading {
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .dataset-page .page-heading > .tag {
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 560px) {
+  .training-page .layout,
+  .dataset-page .page-shell {
+    width: calc(100% - 24px);
+  }
+
+  .training-page .panel,
+  .dataset-page .section-card {
+    border-radius: 16px;
+    padding: 17px;
+  }
+
+  .training-page .formgrid,
+  .training-page .server-form {
+    grid-template-columns: 1fr;
+  }
+
+  .training-page .server-form .field.wide,
+  .training-page .server-form-actions {
+    grid-column: auto;
+  }
+
+  .training-page .server-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .training-page .server-head-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .training-page .server-controls button {
+    flex: 1 1 auto;
+  }
+
+  .training-page .tabs {
+    overflow-x: auto;
+  }
+
+  .training-page .tabs button {
+    flex: 0 0 auto;
+  }
+
+  .dataset-page .page-heading {
+    flex-direction: column;
+  }
+
+  .dataset-page .page-heading > .tag {
+    align-self: flex-start;
+  }
+
+  .dataset-page .filter-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .dataset-page .dataset-header {
+    flex-direction: column;
+  }
+
+  .dataset-page .dataset-actions {
+    justify-content: flex-start;
+  }
+}
+
+/* 数据集展示：来源、规模、字段和操作分区，样式仅作用于维护页。 */
+.dataset-page .dataset-results { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 40px; margin: -6px 0 16px; color: var(--muted); font-size: 12px; }
+.dataset-page .dataset-results button { min-height: 32px; padding: 4px 10px; font-size: 12px; }
+.dataset-page .dataset-results [hidden] { display: none; }
+.dataset-page .filter-bar { flex-wrap: wrap; }
+.dataset-page .search-input { min-width: 0; width: 100%; flex: 1 1 260px; }
+.dataset-page .tag-filter { min-width: 0; flex: 1 1 220px; }
+.dataset-page .tag-filter:empty { display: none; }
+.dataset-page .dataset-grid { grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); gap: 20px; align-items: stretch; }
+.dataset-page .dataset-card { display: flex; flex-direction: column; min-width: 0; padding: 22px; gap: 16px; border-radius: 16px; }
+.dataset-page .dataset-card:hover { transform: none; }
+.dataset-page .dataset-card:focus-within { border-color: #8eafea; box-shadow: 0 0 0 3px rgba(47, 100, 220, .09); }
+.dataset-page .dataset-badges { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.dataset-page .dataset-source, .dataset-page .dataset-status { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 6px; font-size: 11px; font-weight: 650; line-height: 1.5; }
+.dataset-page .dataset-source { color: #4f6586; background: #f0f4f9; }
+.dataset-page .dataset-status { color: #63728b; background: #f4f6f9; }
+.dataset-page .dataset-status > span { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
+.dataset-page .status-local, .dataset-page .status-ready { color: #16734e; background: #edf8f2; }
+.dataset-page .status-downloading { color: #2459bc; background: #edf3ff; }
+.dataset-page .status-error { color: #b0333c; background: #fff0f1; }
+.dataset-page .dataset-title { margin: 0; font-size: 17px; line-height: 1.5; overflow-wrap: anywhere; }
+.dataset-page .dataset-description { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; margin: -8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.dataset-page .dataset-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; padding: 14px 0; border-block: 1px solid #edf1f6; }
+.dataset-page .dataset-metrics > div { min-width: 0; padding: 0 10px; border-left: 1px solid #e7edf5; }
+.dataset-page .dataset-metrics > div:first-child { padding-left: 0; border-left: 0; }
+.dataset-page .dataset-metrics dt { margin-bottom: 5px; color: var(--muted); font-size: 11px; }
+.dataset-page .dataset-metrics dd { margin: 0; color: #253955; font-size: 18px; line-height: 1.5; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.dataset-page .dataset-metrics > div:last-child dd { font-size: 14px; white-space: nowrap; }
+.dataset-page .dataset-origin { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: -4px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.dataset-page .dataset-origin span { font-family: ui-monospace, SFMono-Regular, monospace; }
+.dataset-page .dataset-error { margin: 0; padding: 10px 12px; border-left: 3px solid #d5636b; border-radius: 6px; color: #a33139; background: #fff5f5; font-size: 12px; overflow-wrap: anywhere; }
+.dataset-page .dataset-section-label { display: block; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
+.dataset-page .dataset-field-list { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.dataset-page .dataset-field { max-width: 100%; padding: 3px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid #e6ecf4; border-radius: 5px; background: #f8fafd; color: #586b85; font-size: 11px; }
+.dataset-page .dataset-field-more, .dataset-page .dataset-note { color: var(--muted); font-size: 12px; }
+.dataset-page .dataset-tags { margin: 0; padding: 0; border: 0; }
+.dataset-page .dataset-tags .tag { max-width: 100%; min-height: 24px; padding: 2px 8px; overflow-wrap: anywhere; color: #3c619d; background: #f0f5ff; border-color: #e0eafb; font-size: 11px; }
+.dataset-page .dataset-card-bottom { margin-top: auto; padding-top: 14px; border-top: 1px solid #edf1f6; }
+.dataset-page .dataset-created { margin: 0 0 12px; color: #7c899c; font-size: 11px; }
+.dataset-page .dataset-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.dataset-page .dataset-actions button { min-height: 36px; padding: 7px 10px; font-size: 12px; }
+.dataset-page .dataset-actions .btn-primary { color: #fff; }
+.dataset-page .dataset-actions .btn-danger { margin-left: auto; border-color: transparent; background: transparent; box-shadow: none; color: #aa424a; }
+.dataset-page .dataset-actions .btn-danger:hover { border-color: #f2d1d5; background: #fff3f4; }
+.dataset-page .empty-state { padding: 48px 22px; }
+.dataset-page .empty-state strong { display: block; color: #405571; font-size: 15px; }
+.dataset-page .empty-state p { max-width: 420px; margin: 10px auto 0; font-size: 13px; }
+.dataset-page.has-dataset-modal { overflow: hidden; }
+.dataset-page #datasetModal .modal-content { display: flex; flex-direction: column; width: min(1080px, 100%); max-height: min(88dvh, 940px); padding: 0; overflow: hidden; }
+.dataset-page #datasetModal .modal-header { flex: none; margin: 0; padding: 20px 24px; border-bottom: 1px solid var(--border); background: #fff; }
+.dataset-page #datasetModal .modal-title { font-size: 18px; max-height: 100px; overflow-y: auto; }
+.dataset-page #datasetModal .close-btn { flex: none; }
+.dataset-page #modalBody { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 24px; }
+.dataset-page #modalBody > .dataset-metrics { margin-top: 18px; background: #f8fafd; padding: 16px; border: 1px solid #e9eef5; border-radius: 10px; }
+.dataset-page .dataset-preview-heading { display: flex; align-items: baseline; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin: 22px 0 10px; }
+.dataset-page .dataset-preview-heading .modal-section-title { margin: 0; }
+.dataset-page .dataset-preview-heading > span { color: var(--muted); font-size: 12px; }
+.dataset-page #datasetModal .dataset-preview { max-height: 400px; overflow: auto; overscroll-behavior: contain; }
+.dataset-page #datasetModal .preview-table { min-width: 100%; width: max-content; border-collapse: separate; border-spacing: 0; }
+.dataset-page #datasetModal .preview-table th { z-index: 1; position: sticky; top: 0; }
+.dataset-page #datasetModal .preview-table th, .dataset-page #datasetModal .preview-table td { max-width: none; padding: 11px 14px; vertical-align: top; overflow: visible; white-space: normal; }
+.dataset-page #datasetModal .preview-cell { width: clamp(140px, 18vw, 280px); overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.65; }
+.dataset-page #datasetModal .preview-table th { max-width: 300px; overflow-wrap: anywhere; }
+.dataset-page .dataset-detail-description { margin: 18px 0; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.dataset-page .dataset-details { margin-top: 20px; padding: 14px 16px; border: 1px solid #e2e9f2; border-radius: 10px; }
+.dataset-page .dataset-details summary { cursor: pointer; color: #405571; font-size: 13px; font-weight: 650; }
+.dataset-page #modalBody > .dataset-tags { margin-top: 18px; }
+.dataset-page .dataset-details .dataset-info { margin: 14px 0; }
+.dataset-page .dataset-details .preview-table td { max-width: 480px !important; overflow-wrap: anywhere; }
+.dataset-page :is(.dataset-preview, .dataset-details summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 560px) {
+  .dataset-page .dataset-card { padding: 16px; gap: 14px; }
+  .dataset-page .dataset-grid { grid-template-columns: minmax(0, 1fr); }
+  .dataset-page .filter-bar { padding: 10px; }
+  .dataset-page .search-input, .dataset-page .tag-filter { flex-basis: auto; }
+  .dataset-page .dataset-metrics > div { padding: 0 7px; }
+  .dataset-page .dataset-metrics dd { font-size: 14px; }
+  .dataset-page .dataset-actions button { min-height: 40px; }
+  .dataset-page #datasetModal .modal-header, .dataset-page #modalBody { padding: 16px; }
+  .dataset-page #datasetModal .modal-content { max-height: calc(100dvh - 20px); }
+  .dataset-page .dataset-details { padding: 12px; }
+}
+
+/* 独立维护页沿用工作台的视觉令牌，列表与编辑区域各自清晰分组。 */
+.management-page { margin: 0; font-size: 14px; line-height: 1.6; }
+.management-page .topbar { display: flex; align-items: center; justify-content: space-between; }
+.management-page button { cursor: pointer; }
+.management-page input, .management-page select, .management-page textarea { width: 100%; font: inherit; }
+.management-page input[type="checkbox"], .management-page input[type="radio"] { width: auto; accent-color: var(--accent); }
+.management-page textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, monospace; }
+.management-page [hidden] { display: none !important; }
+.management-page .hint { color: var(--muted); font-size: 13px; }
+.management-page .field { min-width: 0; }
+.management-page .field > label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+.management-page .chip { display: inline-block; border: 1px solid var(--border); border-radius: 99px; padding: 4px 10px; color: var(--muted); font-size: 12px; background: var(--chip); }
+.management-page .empty { padding: 40px 20px; text-align: center; color: var(--muted); }
+.management-shell { width: min(1440px, 100%); margin: auto; padding: 32px clamp(18px, 4vw, 56px) 60px; }
+.management-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 26px; }
+.management-heading h1 { font-size: 28px; margin: 0 0 8px; }
+.management-heading p { margin: 0; }
+.management-heading .management-eyebrow { font-size: 12px; color: var(--accent); margin-bottom: 8px; }
+.management-summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.management-summary .compute-summary { margin-top: 0; }
+.management-status { padding: 12px 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-raised); color: var(--muted); }
+.credential-workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 24px; }
+.management-panel { border-top: 1px solid var(--border); padding: 20px 0; background: transparent; min-width: 0; }
+.management-panel h2 { font-size: 18px; margin: 0 0 14px; }
+.management-panel-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; }
+.management-panel-heading h2 { margin: 0; }
+.credential-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--border); }
+.credential-row:last-child { border: 0; }
+.credential-description { min-width: 0; overflow-wrap: anywhere; }
+.credential-description strong { font-size: 15px; margin-right: 8px; }
+.credential-description p { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.management-page .server-form-error { color: var(--danger); margin-top: 12px; overflow-wrap: anywhere; }
+.management-page .server-log-output, .management-page .server-effective-config-row { background: #f8faff; }
+.management-page .server-controls .server-log-button { color: var(--accent); }
+.management-page .server-slots { grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); }
+.management-page .server-card { border-radius: 8px; }
+.management-page .resource-slot { border-radius: 8px; }
+.management-page #addServerModal .server-field-heading { flex-wrap: wrap; }
+.management-link { display: inline-flex; align-items: center; padding: 8px 14px; border: 1px solid var(--border); border-radius: 10px; color: var(--accent); background: #fff; text-decoration: none; font-size: 13px; }
+.management-page #addServerModal a.server-text-button { text-decoration: none; margin-left: auto; }
+.training-page .app-nav, .dataset-page .app-nav, .management-page .app-nav { max-width: 100%; overflow-x: auto; justify-content: flex-start; }
+@media (max-width: 860px) {
+  .credential-workspace { grid-template-columns: minmax(0, 1fr); }
+  .management-heading { align-items: flex-start; flex-direction: column; gap: 16px; }
+  .management-page .server-head { align-items: flex-start; flex-direction: column; }
+  .management-page .server-head-actions { justify-content: flex-start; }
+}
+@media (max-width: 560px) {
+  .management-shell { padding: 22px 12px 40px; }
+  .management-panel { padding: 18px 0; }
+  .management-summary, .credential-row { align-items: flex-start; flex-direction: column; }
+  .management-page .topbar { padding: 12px; }
+  .management-page .server-effective-config-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .management-page .resource-slot { grid-template-columns: minmax(0, 1fr); }
 }

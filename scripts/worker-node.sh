@@ -244,6 +244,11 @@ case "$ACTION" in
     printf '本机 worker 已停止。\n'
     ;;
   restart)
+    check_worker_settings
+    export WORKER_MANAGED=true
+    # 先 up 应用 .env.worker 的最新配置（Compose 检测到变化会重建容器），
+    # 再强制重启进程，保证 restart 语义（如 worker 卡死恢复）。
+    compose up --detach --no-deps worker
     compose restart --timeout 45 worker
     printf '本机 worker 已重启。\n'
     ;;

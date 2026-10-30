@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>服务器管理 · 可视化模型训练平台</title>
+<link rel="stylesheet" href="/app.css?v=20261029-management">
+<script src="/remote-management.js?v=20261029-management" defer></script>
+</head>
+<body class="training-page management-page" data-management-page="servers">
+<header class="topbar"><div class="brand">可视化模型训练平台</div><nav class="app-nav" aria-label="主导航">
+    <a href="/">训练工作台</a>
+    <a href="/dataset-manager.html">数据集管理</a>
+    <a href="/server-manager.html" aria-current="page">服务器管理</a>
+    <a href="/credential-manager.html">凭证管理</a>
+</nav></header>
+<main class="management-shell">
+
+<div class="management-heading"><div><p class="management-eyebrow">计算基础设施</p><h1>服务器管理</h1><p class="hint">维护服务器连接、部署状态与计算槽。SSH 认证信息在凭证管理中统一维护。</p></div><div class="compute-actions"><button id="btnRefreshWorkers">刷新状态</button><button id="btnAddServer" class="primary">＋ 添加服务器</button></div></div>
+<div class="management-summary"><div id="workerSummary" class="compute-summary" aria-live="polite"></div><span id="queueDepth" class="chip">队列 0</span></div>
+<div id="resourceStatus" class="hint" role="status"></div>
+<div id="workerGrid" class="server-grid"><div class="empty">正在读取服务器…</div></div>
+
+</main>
+<div id="addServerModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="addServerTitle" aria-describedby="addServerDescription" hidden>
+  <div class="server-modal-card server-dialog-card" tabindex="-1">
+    <div class="server-modal-head">
+      <div><h3 id="addServerTitle">添加服务器</h3><p id="addServerDescription">配置 SSH 连接与计算资源，保存后可在服务器卡片上部署。</p></div>
+      <button type="button" id="btnCloseAddServer" class="close-btn" aria-label="关闭添加服务器弹窗">×</button>
+    </div>
+    <div class="server-modal-body">
+    <form id="remoteServerForm" class="server-form" novalidate>
+      <section class="server-form-section" aria-labelledby="remoteConnectionTitle">
+        <h4 id="remoteConnectionTitle">连接信息 <span>通过 SSH 连接目标服务器</span></h4>
+        <div class="server-section-grid">
+      <div class="field">
+        <label for="remoteMachineId">服务器标识</label>
+        <input id="remoteMachineId" name="machine_id" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" placeholder="例如 gpu-node-01">
+      </div>
+      <div class="field">
+        <label for="remoteHost">SSH 主机</label>
+        <input id="remoteHost" name="host" required maxlength="253" pattern="[A-Za-z0-9][A-Za-z0-9.:-]*" placeholder="主机名或 IP 地址">
+      </div>
+      <div class="field wide">
+        <div class="server-field-heading"><label for="remoteCredentialSelect">SSH 凭证</label><button type="button" id="btnRefreshRemoteCredentials" class="server-text-button">刷新</button></div>
+        <select id="remoteCredentialSelect" name="ssh_credential_id" required>
+          <option value="">请先配置 SSH 凭证</option>
+        </select>
+        <div id="remoteCredentialStatus" class="hint" role="status" aria-live="polite">正在读取凭证…</div>
+      </div>
+      <div class="field">
+        <label for="remoteDeviceBackend">设备后端</label>
+        <select id="remoteDeviceBackend" name="device_backend">
+          <option value="auto">自动检测</option>
+          <option value="cuda">NVIDIA CUDA</option>
+          <option value="rocm">AMD ROCm</option>
+          <option value="xpu">Intel XPU</option>
+          <option value="mps">Apple MPS（macOS 原生）</option>
+          <option value="cpu">CPU</option>
+        </select>
+        <div class="hint">MPS 不使用 Linux Docker；请用 scripts/worker-native.sh。</div>
+      </div>
+      <div class="field">
+        <label for="remoteUsername">SSH 用户（可选覆盖）</label>
+        <input id="remoteUsername" name="username" maxlength="32" pattern="[A-Za-z_][A-Za-z0-9_-]*" placeholder="留空时使用所选凭证的用户名">
+        <div class="hint">填写后仅覆盖这台服务器的 SSH 用户名。</div>
+      </div>
+      <div class="field">
+        <label for="remotePort">SSH 端口</label>
+        <input id="remotePort" name="port" type="number" min="1" max="65535" value="22" required>
+      </div>
+        </div>
+      </section>
+      <section class="server-form-section" aria-labelledby="remoteResourceTitle">
+        <h4 id="remoteResourceTitle">计算资源 <span>选择服务器提供的算力</span></h4>
+        <div class="server-section-grid">
+      <div class="field wide">
+        <label id="remoteModeLabel">计算类型</label>
+        <div class="server-mode" role="group" aria-label="目标服务器计算类型">
+          <label><input type="radio" name="mode" value="gpu" checked> GPU（使用全部可见 GPU）</label>
+          <label><input type="radio" name="mode" value="cpu"> CPU</label>
+        </div>
+      </div>
+      <div class="field" id="remoteCpuSlotsField" hidden>
+        <label for="remoteCpuSlots">CPU 计算槽</label>
+        <input id="remoteCpuSlots" name="cpu_slots" type="number" min="0" max="256" value="2">
+        <div class="hint">设为 0 可只运行管理容器，不提供 CPU 槽。</div>
+      </div>
+        </div>
+      </section>
+      <details id="remoteServerAdvanced" class="server-form-section server-advanced-settings">
+        <summary><span>高级配置<small>Redis / S3 与软件源，通常无需修改</small></span></summary>
+        <div class="server-section-grid">
+      <div class="field wide">
+        <label for="remoteDistributedHost">联合训练互联地址（可选）</label>
+        <input id="remoteDistributedHost" name="distributed_host" maxlength="253" pattern="[A-Za-z0-9.:-]*" placeholder="例如 10.0.0.12；留空仅支持单节点任务">
+        <div class="hint">填写本机在可信局域网/VPN 中可被其他节点访问的地址。启用或关闭后需点击“部署”重建容器以切换 host 网络；各节点需允许双向通信。</div>
+      </div>
+      <div class="field wide">
+        <label for="remoteRedisUrl">远程 Redis URL（可选覆盖）</label>
+        <input id="remoteRedisUrl" name="remote_redis_url" type="password" maxlength="4096" autocomplete="new-password" placeholder="留空时使用平台 .env 的 Redis">
+        <div class="hint" id="remoteRedisUrlHint">可使用 redis:// 或 rediss://；URL 中的密码会加密保存。</div>
+      </div>
+      <label class="field wide" id="clearRemoteRedisOverrideField" hidden>
+        <span><input id="clearRemoteRedisOverride" type="checkbox"> 改回平台默认 Redis</span>
+      </label>
+      <div class="field wide">
+        <label for="remoteS3Endpoint">S3 地址（可选覆盖）</label>
+        <input id="remoteS3Endpoint" name="remote_s3_endpoint" maxlength="512" placeholder="留空时使用平台 .env 的 S3_ENDPOINT">
+      </div>
+      <div class="field wide">
+        <label for="remoteDockerRegistry">Docker 镜像加速（可选）</label>
+        <input id="remoteDockerRegistry" name="docker_registry" maxlength="253" placeholder="例如 docker.m.daocloud.io，加速基础镜像拉取">
+        <div class="hint">仅用于目标机构建 worker 镜像时拉取基础镜像；留空直连 Docker Hub。</div>
+      </div>
+      <div class="field wide">
+        <label for="remotePipIndexUrl">pip 源（可选）</label>
+        <input id="remotePipIndexUrl" name="pip_index_url" maxlength="2048" placeholder="例如 https://mirrors.aliyun.com/pypi/simple/（默认清华源）">
+      </div>
+      <div class="field wide">
+        <label for="remoteAptMirror">apt 源（可选）</label>
+        <input id="remoteAptMirror" name="apt_mirror" maxlength="253" placeholder="例如 mirrors.aliyun.com（默认 deb.debian.org）">
+      </div>
+        </div>
+      </details>
+    </form>
+    <div class="server-modal-note">目标机需安装 Docker，并能访问 Redis 和 S3；GPU 模式还需要 NVIDIA 驱动与 Container Toolkit。部署后请手动将计算槽加入资源池。镜像由平台统一配置，页面不单独配置镜像。</div>
+    </div>
+    <div class="server-dialog-footer">
+      <div id="remoteServerError" class="server-form-error" role="alert" hidden></div>
+      <div class="server-dialog-footer-row">
+        <div class="hint" id="remoteConfigApplyHint">登记配置后，可在服务器卡片上单独部署。</div>
+        <div class="server-form-actions">
+          <button type="button" id="btnCancelAddServer">取消</button>
+          <button type="submit" id="btnSubmitRemoteServer" form="remoteServerForm" class="primary">登记服务器配置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="remoteLogModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="remoteLogTitle" hidden>
+  <div class="server-modal-card server-log-modal-card">
+    <div class="server-modal-head">
+      <h3 id="remoteLogTitle">远程操作日志</h3>
+      <button id="btnCloseRemoteLog" class="close-btn" aria-label="关闭">×</button>
+    </div>
+    <div id="remoteLogStatus" class="server-log-status" role="status"></div>
+    <div class="server-log-actions">
+      <button id="btnClearRemoteLog" type="button">清除日志</button>
+      <button id="btnCopyRemoteLog" type="button">复制全部</button>
+    </div>
+    <div id="remoteLogOutput" class="server-log-output" aria-label="远程操作日志" aria-live="polite"></div>
+  </div>
+</div>
+
+<div id="remoteEffectiveConfigModal" class="server-modal" role="dialog" aria-modal="true" aria-labelledby="remoteEffectiveConfigTitle" hidden>
+  <div class="server-modal-card server-effective-config-card">
+    <div class="server-modal-head">
+      <h3 id="remoteEffectiveConfigTitle">生效配置</h3>
+      <button id="btnCloseRemoteEffectiveConfig" class="close-btn" aria-label="关闭">×</button>
+    </div>
+    <div id="remoteEffectiveConfigStatus" class="server-effective-config-status" role="status"></div>
+    <div id="remoteEffectiveConfigOutput" class="server-effective-config" aria-live="polite"></div>
+    <div class="server-modal-note">这里显示平台当前解析出的配置。更新配置会写入目标机配置文件，但运行中的容器需执行“启动”或“重启”后才会使用新值；密码和密钥不会显示。</div>
+  </div>
+</div>
+
+
+<div id="toastWrap" aria-live="polite"></div>
+</body>
+</html>

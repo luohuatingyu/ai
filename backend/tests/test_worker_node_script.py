@@ -98,19 +98,37 @@ def test_start_creates_worker_without_rebuilding(tmp_path: Path) -> None:
     ("action", "expected"),
     [
         ("stop", "stop --timeout 45 worker"),
-        ("restart", "restart --timeout 45 worker"),
         ("status", "ps worker"),
     ],
 )
 def test_worker_lifecycle_commands(
     tmp_path: Path, action: str, expected: str
 ) -> None:
-    """停止与重启保留足够的 SIGTERM 等待时间，状态查询只看本机 worker。"""
+    """停止保留足够的 SIGTERM 等待时间，状态查询只看本机 worker。"""
     result, docker_log = _invoke_script(tmp_path, action)
 
     assert result.returncode == 0, result.stderr
     commands = docker_log.read_text(encoding="utf-8").splitlines()
     assert commands[-1].endswith(expected)
+
+
+def test_restart_applies_worker_env_then_restarts(tmp_path: Path) -> None:
+    """restart 先 up 应用 .env.worker 的最新配置（变化时 Compose 会重建容器），
+    再强制重启进程，保证配置更新后重启也能生效。"""
+    result, docker_log = _invoke_script(tmp_path, "restart")
+
+    assert result.returncode == 0, result.stderr
+    commands = docker_log.read_text(encoding="utf-8").splitlines()
+    up_index = next(
+        i for i, line in enumerate(commands)
+        if line.endswith("up --detach --no-deps worker")
+    )
+    restart_index = next(
+        i for i, line in enumerate(commands)
+        if line.endswith("restart --timeout 45 worker")
+    )
+    assert up_index < restart_index
+    assert "本机 worker 已重启" in result.stdout
 
 
 @pytest.mark.parametrize(

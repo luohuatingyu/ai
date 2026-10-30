@@ -63,6 +63,290 @@ def test_health_and_system(client):
     assert "device" in sysinfo
 
 
+def test_performance_detail_and_resource_heartbeat(client):
+    """性能产物按详情加载，旧任务为空；采样数据经过真实心跳/API 保留未知值。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "performance-" + uuid4().hex
+    worker_id = "telemetry-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed", "spec": {"params": {"epochs": 1}}})
+    try:
+        assert client.get(f"/api/jobs/{job_id}").json()["performance"] == []
+        row = {"epoch": 1, "samples_per_second": 12.5, "checkpoint_publish_seconds": .2}
+        manager.store.write_bytes(job_key(job_id, "performance.jsonl"), (json.dumps(row) + "\nbad partial line\n").encode())
+        assert client.get(f"/api/jobs/{job_id}").json()["performance"] == [row]
+        manager.lease.register_worker(worker_id, {"worker_id": worker_id}, 30)
+        resources = {"latest": {"sampled_at": time.time(), "host_cpu_percent": 0, "gpu": {"utilization_percent": None}}, "history": []}
+        manager.lease.heartbeat_worker(worker_id, {"resources": resources}, 30)
+        item = next(item for item in client.get("/api/workers").json()["workers"] if item["worker_id"] == worker_id)
+        assert item["resources"] == resources
+    finally:
+        manager.lease.deregister_worker(worker_id)
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+@pytest.mark.parametrize("state,active,occupied,expected", [
+    ("idle", True, True, "reserved"),
+    ("disabled", True, True, "reserved"),
+    ("starting", True, True, "starting"),
+    ("training", True, True, "training"),
+    ("idle", True, False, "idle"),
+    ("training", False, True, "offline"),
+])
+def test_resource_api_reports_exclusive_reservations(client, monkeypatch, ls, state, active, occupied, expected):
+    """资源 API 以真实槽位租约补齐首次心跳窗口，离线仍优先显示离线。"""
+    from app.state import manager
+
+    monkeypatch.setattr(manager, "lease", ls)
+    ls.register_worker("api-sync-cpu", {"state": state}, 30)
+    if occupied:
+        assert ls.acquire("slot:api-sync-cpu", "owner", 30)
+    if not active:
+        ls._workers["api-sync-cpu"]["last_seen"] = time.time() - 1000
+    response = client.get("/api/workers")
+    assert response.status_code == 200
+    worker, = response.json()["workers"]
+    assert worker["state"] == expected and worker["occupied"] is occupied
+    assert worker["active"] is active
+
+
+def test_running_job_logs_are_immediately_visible_and_uncacheable(client):
+    """运行中的追加日志应立即可读，响应不得被浏览器或代理缓存。"""
+    from uuid import uuid4
+
+    from app.state import manager
+
+    job_id = "live-logs-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "running"})
+    log_key = job_key(job_id, "log.txt")
+    manager.store.write_bytes(log_key, "[12:00:00] 训练启动\n".encode("utf-8"))
+    try:
+        first = client.get(f"/api/jobs/{job_id}/logs?offset=0")
+        assert first.status_code == 200
+        assert first.json() == {
+            "lines": ["[12:00:00] 训练启动"], "next_offset": 1, "total": 1,
+        }
+        assert "no-store" in first.headers.get("cache-control", "").lower()
+
+        manager.store.append_text(log_key, "[12:00:01] [epoch 1/2] train_loss=0.5\n")
+        second = client.get(f"/api/jobs/{job_id}/logs?offset=1")
+        assert second.json() == {
+            "lines": ["[12:00:01] [epoch 1/2] train_loss=0.5"],
+            "next_offset": 2, "total": 2,
+        }
+        assert jobstore.read_job(manager.store, job_id)["status"] == "running"
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_reads_only_complete_lines_and_catches_appends(client):
+    """游标只增量返回完整行，活动尾行写完后可从原字节位置继续读取。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-live-" + uuid4().hex
+    log_key = job_key(job_id, "log.txt")
+    jobstore.write_job(manager.store, {"id": job_id, "status": "running"})
+    initial_payload = "第一行\n未完成尾行".encode()
+    manager.store.write_bytes(log_key, initial_payload)
+    try:
+        first = client.get(f"/api/jobs/{job_id}/logs?cursor=")
+        assert first.status_code == 200
+        assert first.json() == {
+            "lines": ["第一行"], "next_cursor": f"file:0:{len('第一行'.encode()) + 1}",
+            "has_more": True, "reset": False,
+        }
+
+        manager.store.append_text(log_key, "追加完成\n")
+        second = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": first.json()["next_cursor"]})
+        assert second.status_code == 200
+        completed_payload = initial_payload + "追加完成\n".encode()
+        assert second.json() == {
+            "lines": ["未完成尾行追加完成"],
+            "next_cursor": f"file:0:{len(completed_payload)}",
+            "has_more": False, "reset": False,
+        }
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_pages_large_file_in_bounded_batches(client):
+    """大日志以字节游标分批返回，不重复读取已消费的历史部分。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-pages-" + uuid4().hex
+    lines = [f"训练记录 {index}" for index in range(1003)]
+    payload = ("\n".join(lines) + "\n").encode()
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    manager.store.write_bytes(job_key(job_id, "log.txt"), payload)
+    try:
+        cursor = ""
+        collected = []
+        batches = []
+        while True:
+            response = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": cursor})
+            assert response.status_code == 200
+            result = response.json()
+            batches.append(result["lines"])
+            collected.extend(result["lines"])
+            cursor = result["next_cursor"]
+            if not result["has_more"]:
+                break
+        assert [len(batch) for batch in batches] == [500, 500, 3]
+        assert collected == lines
+        assert cursor == f"file:0:{len(payload)}"
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_rejects_malformed_values(client):
+    """无效游标返回客户端错误，不触发意外读取。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-invalid-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    try:
+        for cursor in ("not-a-cursor", "f" * 65, "file:0:99999999999999999999999"):
+            response = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": cursor})
+            assert response.status_code == 400
+            assert response.json()["detail"] == "日志游标格式无效"
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_handles_empty_file_and_terminal_unterminated_line(client):
+    """空文件返回稳定空游标，终态任务返回最后一条未换行日志。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-terminal-" + uuid4().hex
+    log_key = job_key(job_id, "log.txt")
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    manager.store.write_bytes(log_key, b"")
+    try:
+        empty = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": ""})
+        assert empty.status_code == 200
+        assert empty.json() == {
+            "lines": [], "next_cursor": "file:0:0", "has_more": False, "reset": False,
+        }
+
+        manager.store.write_bytes(log_key, "最后一行无换行".encode())
+        terminal = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": "file:0:0"})
+        assert terminal.status_code == 200
+        assert terminal.json() == {
+            "lines": ["最后一行无换行"],
+            "next_cursor": f"file:0:{len('最后一行无换行'.encode())}",
+            "has_more": False,
+            "reset": False,
+        }
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_resets_when_storage_source_changes(client):
+    """文件与数据库来源相互切换时重置游标，避免遗漏新来源日志。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-source-" + uuid4().hex
+    log_key = job_key(job_id, "log.txt")
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    manager.store.write_bytes(log_key, b"file line\n")
+    try:
+        file_result = client.get(
+            f"/api/jobs/{job_id}/logs", params={"cursor": ""}
+        ).json()
+        assert file_result["lines"] == ["file line"]
+
+        manager.store.delete(log_key)
+        database_result = client.get(
+            f"/api/jobs/{job_id}/logs",
+            params={"cursor": file_result["next_cursor"]},
+        )
+        assert database_result.status_code == 200
+        assert database_result.json() == {
+            "lines": [], "next_cursor": "database:0:0", "has_more": False, "reset": True,
+        }
+
+        manager.store.write_bytes(log_key, b"new file line\n")
+        resumed = client.get(
+            f"/api/jobs/{job_id}/logs",
+            params={"cursor": database_result.json()["next_cursor"]},
+        )
+        assert resumed.status_code == 200
+        assert resumed.json() == {
+            "lines": ["new file line"], "next_cursor": "file:0:14",
+            "has_more": False, "reset": True,
+        }
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_clearing_job_logs_resets_previous_cursor(client):
+    """日志清空使旧游标重置，从新日志开头继续读取。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-clear-" + uuid4().hex
+    log_key = job_key(job_id, "log.txt")
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed", "log_revision": 0})
+    manager.store.write_bytes(log_key, "清空前\n".encode())
+    try:
+        first = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": ""}).json()
+        assert first["lines"] == ["清空前"]
+        assert client.delete(f"/api/jobs/{job_id}/logs").status_code == 200
+        manager.store.write_bytes(log_key, "清空后\n".encode())
+        resumed = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": first["next_cursor"]})
+        assert resumed.status_code == 200
+        assert resumed.json() == {
+            "lines": ["清空后"], "next_cursor": "file:1:10",
+            "has_more": False, "reset": True,
+        }
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_cursor_falls_back_to_database_and_keeps_legacy_offset(client, monkeypatch):
+    """缺少权威文件时数据库游标按主键续读，旧版 offset 响应保持兼容。"""
+    from app import database
+    from app.models import Dataset, JobLog, TrainingJob
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-cursor-db-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    with database.SessionLocal() as db:
+        db.add(Dataset(id=job_id, name=job_id, rows=0, columns=[]))
+        db.add(TrainingJob(id=job_id, dataset_id=job_id, dataset_name=job_id,
+                           target="", task="classification", params={}))
+        db.add_all([JobLog(job_id=job_id, message=f"数据库日志 {index}") for index in range(503)])
+        db.commit()
+    monkeypatch.setattr(config, "DB_AVAILABLE", True)
+    try:
+        first = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": ""})
+        assert first.status_code == 200
+        first_result = first.json()
+        assert len(first_result["lines"]) == 500
+        assert first_result["lines"][0].endswith("数据库日志 0")
+        assert first_result["lines"][-1].endswith("数据库日志 499")
+        assert first_result["has_more"] is True
+
+        second = client.get(f"/api/jobs/{job_id}/logs", params={"cursor": first_result["next_cursor"]})
+        assert second.status_code == 200
+        assert [line.rsplit(" ", 1)[-1] for line in second.json()["lines"]] == ["500", "501", "502"]
+        assert second.json()["has_more"] is False
+
+        legacy = client.get(f"/api/jobs/{job_id}/logs?offset=500")
+        assert legacy.status_code == 200
+        assert legacy.json()["total"] == 503
+        assert [line.rsplit(" ", 1)[-1] for line in legacy.json()["lines"]] == ["500", "501", "502"]
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
 def test_static_paths_not_shadowed_by_param_route(client):
     """回归：/api/datasets/tags 与 import-history 不得被 /datasets/{ds_id} 遮蔽。"""
     r = client.get("/api/datasets/tags")
@@ -96,6 +380,95 @@ def test_train_e2e_classification(client, make_dataset):
     # 模型可下载（经状态平面取出）
     dl = client.get(f"/api/jobs/{job}/model")
     assert dl.status_code == 200 and len(dl.content) > 0
+
+
+def test_clear_job_logs_removes_file_and_database_logs(client, monkeypatch):
+    """清除任务日志后，文件存储、数据库镜像和读取接口都应为空。"""
+    from app import database
+    from app.models import Dataset, JobLog, TrainingJob
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "clear-logs-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed", "log_revision": 0})
+    jobstore.append_job_log(manager.store, job_id, "需要清除")
+    with database.SessionLocal() as db:
+        db.add(Dataset(id=job_id, name="clear logs", rows=0, columns=[]))
+        db.add(TrainingJob(
+            id=job_id, dataset_id=job_id, dataset_name="clear logs", target="",
+            task="classification", params={},
+        ))
+        db.add(JobLog(job_id=job_id, message="数据库中的旧日志"))
+        db.commit()
+    monkeypatch.setattr(config, "DB_AVAILABLE", True)
+    try:
+        response = client.delete(f"/api/jobs/{job_id}/logs")
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+        assert client.get(f"/api/jobs/{job_id}/logs").json() == {
+            "lines": [], "next_offset": 0, "total": 0,
+        }
+        assert jobstore.read_job_log(manager.store, job_id) == ""
+        assert jobstore.read_job(manager.store, job_id)["log_revision"] == 1
+        with database.SessionLocal() as db:
+            assert db.query(JobLog).filter(JobLog.job_id == job_id).count() == 0
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_clear_job_logs_returns_404_for_missing_job(client):
+    """不存在的任务不得创建日志文件或返回成功。"""
+    response = client.delete("/api/jobs/missing-clear-logs-test/logs")
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("file_log", [None, "", "[08:42:38] worker 心跳丢失，任务重新排队\n"])
+def test_job_logs_prefer_authoritative_file_with_legacy_fallback(client, monkeypatch, file_log):
+    """完整文件日志优先；已清空文件不复活数据库旧日志，旧任务无文件时可回退。"""
+    from app import database
+    from app.models import Dataset, JobLog, TrainingJob
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-source-" + uuid4().hex
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    if file_log is not None:
+        manager.store.write_bytes(job_key(job_id, "log.txt"), file_log.encode())
+    with database.SessionLocal() as db:
+        db.add(Dataset(id=job_id, name=job_id, rows=0, columns=[]))
+        db.add(TrainingJob(id=job_id, dataset_id=job_id, dataset_name=job_id,
+                           target="", task="classification", params={}))
+        db.add(JobLog(job_id=job_id, message="仅数据库保留的旧训练日志"))
+        db.commit()
+    monkeypatch.setattr(config, "DB_AVAILABLE", True)
+    try:
+        result = client.get(f"/api/jobs/{job_id}/logs").json()
+        if file_log is None:
+            assert result["total"] == 1
+            assert "仅数据库保留的旧训练日志" in result["lines"][0]
+        else:
+            assert result == {"lines": file_log.splitlines(),
+                              "next_offset": len(file_log.splitlines()),
+                              "total": len(file_log.splitlines())}
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
+
+
+def test_job_logs_paginate_authoritative_file(client):
+    """日志分页保持内容顺序，负偏移和超出末尾的偏移均有确定结果。"""
+    from app.state import manager
+    from uuid import uuid4
+
+    job_id = "log-pages-" + uuid4().hex
+    lines = [f"训练记录 {index}" for index in range(505)]
+    jobstore.write_job(manager.store, {"id": job_id, "status": "completed"})
+    manager.store.write_bytes(job_key(job_id, "log.txt"), "\n".join(lines).encode())
+    try:
+        for offset, start, end in [(-1, 0, 500), (500, 500, 505), (999, 505, 505)]:
+            result = client.get(f"/api/jobs/{job_id}/logs?offset={offset}").json()
+            assert result == {"lines": lines[start:end], "next_offset": end, "total": 505}
+    finally:
+        jobstore.delete_job_artifacts(manager.store, job_id)
 
 
 def test_train_e2e_regression(client, make_dataset):
@@ -334,6 +707,53 @@ def test_remote_operation_cancel_cancels_queued_operation(
     assert server["status"] == "error"
 
 
+def test_remote_operation_logs_can_be_cleared_without_changing_state(client):
+    """清除远程执行日志后保留操作状态和阶段元数据。"""
+    from app import remote_workers
+    from app.state import manager
+
+    operation_id = "a" * 32
+    manager.lease.set_remote_operation(
+        operation_id,
+        {
+            "operation_id": operation_id,
+            "machine_id": "remote-clear-logs-api",
+            "action": "restart",
+            "status": "running",
+            "phase": "执行远程部署脚本",
+            "log": "旧阶段输出",
+            "output": "旧标准输出",
+            "stderr": "旧错误输出",
+            "error": "旧错误",
+        },
+    )
+
+    response = client.delete(f"/api/remote-operations/{operation_id}/logs")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "operation_id": operation_id}
+    cleared = manager.lease.get_remote_operation(operation_id)
+    assert cleared["status"] == "running"
+    assert cleared["phase"] == "执行远程部署脚本"
+    assert cleared["log"] == ""
+    assert cleared["output"] == ""
+    assert cleared["stderr"] == ""
+    assert cleared["error"] is None
+
+    remote_workers._append_remote_operation_log(operation_id, "新阶段", "清除后新产生的日志")
+    updated = manager.lease.get_remote_operation(operation_id)
+    assert updated["status"] == "running"
+    assert "清除后新产生的日志" in updated["log"]
+
+
+def test_remote_operation_log_clear_returns_404_for_missing_operation(client):
+    """不存在的远程操作不得创建记录或返回清除成功。"""
+    # 使用与其它操作用例不同的 ID，避免跨模块共享协调存储时误命中已取消操作。
+    response = client.delete(f"/api/remote-operations/{'9' * 32}/logs")
+
+    assert response.status_code == 404
+
+
 def test_remote_operation_cancel_marks_active_operation_as_cancelling(client, monkeypatch):
     """执行中的操作收到取消请求后保留忙碌状态，直到 SSH 执行器确认退出。"""
     from app import remote_workers
@@ -399,8 +819,8 @@ def test_remote_operation_cancel_clears_stale_running_state(client, monkeypatch)
     manager.lease.clear_remote_operation_cancel(operation_id)
 
 
-def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, monkeypatch, request):
-    """无需令牌的远程添加与生命周期 API 仅保存 SSH 目标元数据并记录异步操作。"""
+def test_remote_server_api_separates_registration_deployment_and_config_update(client, monkeypatch, request):
+    """新增只登记配置；已部署修改配置和部署代码分别触发独立远程动作。"""
     from app.routers import jobs as jobs_router
     from app import remote_workers
     from app import remote_config_repository
@@ -412,6 +832,12 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     _enable_remote_mysql(monkeypatch)
     monkeypatch.setattr(config, "WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setattr(config, "REDIS_URL", "redis://redis.example.net:6379/0")
+    monkeypatch.setattr(config, "WORKER_REMOTE_REDIS_URL", "")
+    monkeypatch.setattr(config, "WORKER_REMOTE_S3_ENDPOINT", "")
+    monkeypatch.setattr(config, "WORKER_REMOTE_IMAGE", "registry.example.net/platform/worker:unit")
+    monkeypatch.setattr(config, "S3_ENDPOINT", "platform-s3.example.net:9000")
+    monkeypatch.setattr(config, "S3_BUCKET", "platform-artifacts")
+    monkeypatch.setattr(config, "S3_SECURE", True)
     monkeypatch.setattr(manager, "distributed", True)
     manager.lease.delete_remote_ssh_credentials()
     request.addfinalizer(manager.lease.delete_remote_ssh_credentials)
@@ -426,7 +852,7 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     )
     assert credential.status_code == 200, credential.text
     credential_id = credential.json()["credentials"][0]["id"]
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         remote_workers,
         "run_remote_action",
@@ -440,17 +866,17 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
         "port": 2222,
         "mode": "gpu",
         "cpu_slots": 0,
-        "worker_image": "registry.example.net/remote/worker:v2",
         "remote_redis_url": "rediss://worker:synthetic-redis-password@redis.example.net:6380/4",
         "remote_s3_endpoint": "remote-storage.example.net:9000",
+        "docker_registry": "docker.m.daocloud.io",
+        "pip_index_url": "https://mirrors.aliyun.com/pypi/simple/",
+        "apt_mirror": "mirrors.aliyun.com",
     }
     added = client.post("/api/remote-servers", json=payload)
-    assert added.status_code == 202
-    operation_id = added.json()["operation_id"]
-    operation = client.get(f"/api/remote-operations/{operation_id}").json()
-    assert operation["status"] == "completed"
-    assert operation["output"] == "done"
-    assert calls == [(machine_id, "install", "worker")]
+    assert added.status_code == 201
+    assert "operation_id" not in added.json()
+    assert calls == []
+    assert added.json()["server"]["deployed"] is False
 
     stored_server = remote_config_repository.get_remote_server(machine_id)
     assert stored_server["remote_redis_url_encrypted"] != payload["remote_redis_url"]
@@ -461,45 +887,104 @@ def test_remote_server_api_installs_and_manages_with_nonsecret_records(client, m
     assert server["host"] == payload["host"]
     assert server["username_override"] == "worker"
     assert server["ssh_credential_id"] == credential_id
-    assert server["worker_image_override"] == payload["worker_image"]
     assert server["remote_s3_endpoint_override"] == payload["remote_s3_endpoint"]
+    assert server["docker_registry"] == "docker.m.daocloud.io"
+    assert server["pip_index_url"] == "https://mirrors.aliyun.com/pypi/simple/"
+    assert server["apt_mirror"] == "mirrors.aliyun.com"
+    assert "worker_image_override" not in server
     assert server["has_remote_redis_url_override"] is True
+    assert server["deployed"] is False
     assert "remote_redis_url_encrypted" not in server
     assert payload["remote_redis_url"] not in repr(server)
     assert "private_key" not in server and "token" not in server
 
+    effective = client.get(f"/api/remote-servers/{machine_id}/effective-config")
+    assert effective.status_code == 200, effective.text
+    effective_config = effective.json()["config"]
+    assert effective_config["worker_image"] == "registry.example.net/platform/worker:unit"
+    assert effective_config["worker_image_source"] == "WORKER_REMOTE_IMAGE"
+    assert effective_config["redis_endpoint"] == "rediss://redis.example.net:6380/4"
+    assert effective_config["redis_source"] == "server_override"
+    assert effective_config["redis_auth_configured"] is True
+    assert effective_config["s3_endpoint"] == "remote-storage.example.net:9000"
+    assert effective_config["s3_source"] == "server_override"
+    assert "synthetic-redis-password" not in repr(effective_config)
+
     edited = client.patch(
         f"/api/remote-servers/{machine_id}",
         json={
-            "worker_image": "registry.example.net/remote/worker:v3",
             "remote_redis_url": "",
-            "remote_s3_endpoint": "storage-v2.example.net:9000",
+            "remote_s3_endpoint": "",
         },
     )
     assert edited.status_code == 200, edited.text
     edited_server = remote_config_repository.get_remote_server(machine_id)
-    assert edited_server["worker_image_override"] == "registry.example.net/remote/worker:v3"
-    assert edited_server["remote_s3_endpoint_override"] == "storage-v2.example.net:9000"
-    assert edited_server["remote_redis_url_encrypted"] == stored_server["remote_redis_url_encrypted"]
-    assert edited.json()["server"]["has_remote_redis_url_override"] is True
+    assert "worker_image_override" not in edited_server
+    assert edited_server["remote_s3_endpoint_override"] is None
+    assert "remote_redis_url_encrypted" not in edited_server
+    assert edited.json()["server"]["has_remote_redis_url_override"] is False
+    assert calls == []
 
-    cleared = client.patch(
-        f"/api/remote-servers/{machine_id}",
-        json={"clear_remote_redis_url_override": True},
-    )
-    assert cleared.status_code == 200, cleared.text
-    assert "remote_redis_url_encrypted" not in remote_config_repository.get_remote_server(machine_id)
-    assert cleared.json()["server"]["has_remote_redis_url_override"] is False
+    fallback_config = client.get(
+        f"/api/remote-servers/{machine_id}/effective-config"
+    ).json()["config"]
+    assert fallback_config["redis_endpoint"] == "redis://redis.example.net:6379/0"
+    assert fallback_config["redis_source"] == "REDIS_URL"
+    assert fallback_config["s3_endpoint"] == "platform-s3.example.net:9000"
+    assert fallback_config["s3_source"] == "S3_ENDPOINT"
+    assert client.get("/api/remote-servers/missing-effective-config/effective-config").status_code == 404
+
     assert client.post("/api/remote-servers", json=payload).status_code == 409
 
-    for action in ("install", "start", "stop", "restart"):
+    deployed = client.post(f"/api/remote-servers/{machine_id}/install")
+    assert deployed.status_code == 202
+    operation_id = deployed.json()["operation_id"]
+    operation = client.get(f"/api/remote-operations/{operation_id}").json()
+    assert operation["status"] == "completed"
+    assert operation["output"] == "done"
+    assert calls == [(machine_id, "install", "worker")]
+    servers = client.get("/api/remote-servers").json()["servers"]
+    server = next(item for item in servers if item["machine_id"] == machine_id)
+    assert server["deployed"] is True
+    assert "remote_redis_url_encrypted" not in server
+    assert payload["remote_redis_url"] not in repr(server)
+    assert "private_key" not in server and "token" not in server
+
+    updated = client.patch(
+        f"/api/remote-servers/{machine_id}",
+        json={
+            "remote_s3_endpoint": "storage-v3.example.net:9000",
+            "docker_registry": "docker.m.daocloud.io",
+            "apt_mirror": "",
+        },
+    )
+    assert updated.status_code == 202, updated.text
+    update_operation = client.get(
+        f"/api/remote-operations/{updated.json()['operation_id']}"
+    ).json()
+    assert update_operation["status"] == "completed"
+    assert update_operation["action"] == "config"
+    assert calls[-1] == (machine_id, "config", "worker")
+    edited_record = remote_config_repository.get_remote_server(machine_id)
+    assert edited_record["remote_s3_endpoint_override"] == "storage-v3.example.net:9000"
+    assert edited_record["docker_registry"] == "docker.m.daocloud.io"
+    assert edited_record["apt_mirror"] is None
+    assert edited_record["pip_index_url"] == "https://mirrors.aliyun.com/pypi/simple/"
+
+    for action in ("install", "deploy", "start", "stop", "restart"):
         result = client.post(f"/api/remote-servers/{machine_id}/{action}")
         assert result.status_code == 202
         current = client.get(
             f"/api/remote-operations/{result.json()['operation_id']}"
         ).json()
         assert current["status"] == "completed"
-        assert calls[-1] == (machine_id, action, "worker")
+        expected_remote_action = "deploy" if action == "install" else action
+        assert calls[-1] == (machine_id, expected_remote_action, "worker")
+        current_server = next(
+            item for item in client.get("/api/remote-servers").json()["servers"]
+            if item["machine_id"] == machine_id
+        )
+        assert current_server["deployed"] is True
 
     assert client.post(
         f"/api/remote-servers/missing-{machine_id}/start"
@@ -511,7 +996,7 @@ def test_remote_server_api_rejects_shell_injection_before_ssh(client, monkeypatc
     """非法主机字段由请求模型拒绝，不进入 SSH 执行器。"""
     from app.routers import jobs as jobs_router
 
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda *_args, **_kwargs: [])
     response = client.post(
         "/api/remote-servers",
         json={
@@ -551,7 +1036,7 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
     )
     assert credential_response.status_code == 200, credential_response.text
     credential_id = credential_response.json()["credentials"][0]["id"]
-    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda _credentials=None, _server=None: [])
+    monkeypatch.setattr(jobs_router, "remote_configuration_errors", lambda *_args, **_kwargs: [])
     run_calls = []
     monkeypatch.setattr(
         remote_workers,
@@ -572,8 +1057,9 @@ def test_remote_server_uses_credential_username_when_server_username_is_blank(cl
         },
     )
 
-    assert response.status_code == 202, response.text
-    assert run_calls == [("credential-user", "install")]
+    assert response.status_code == 201, response.text
+    assert run_calls == []
+    assert response.json()["server"]["deployed"] is False
     server = remote_config_repository.get_remote_server(machine_id)
     assert server["username"] == "credential-user"
     assert server["username_override"] is None
@@ -1266,7 +1752,7 @@ def test_training_page_resource_retry_and_chart_style_contract():
     assert "grid-column: 1 / -1" in css
     assert ".training-page #llmFields > .formgrid" in css
     assert "repeat(auto-fit, minmax(min(100%, 210px), 1fr))" in css
-    assert 'href="/app.css?v=20261025-2"' in html
+    assert 'href="/app.css?v=20261030-training-record-2"' in html
 
 
 def test_remote_server_feedback_toasts_render_above_add_modal():
@@ -1275,7 +1761,7 @@ def test_remote_server_feedback_toasts_render_above_add_modal():
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
     modal_css = html.split(".server-modal {", 1)[1].split("}", 1)[0]
     toast_css = html.split("#toastWrap {", 1)[1].split("}", 1)[0]
     modal_z_index = int(modal_css.split("z-index:", 1)[1].split(";", 1)[0])
@@ -1284,27 +1770,65 @@ def test_remote_server_feedback_toasts_render_above_add_modal():
     assert toast_z_index > modal_z_index
 
 
+def test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_area():
+    """添加与编辑共用分组表单，折叠高级项时仍可从固定操作栏提交。"""
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
+    css = (static_dir / "app.css").read_text(encoding="utf-8")
+    modal = html.split('id="addServerModal"', 1)[1].split('id="remoteLogModal"', 1)[0]
+
+    assert 'aria-describedby="addServerDescription"' in modal
+    assert 'id="remoteServerAdvanced"' in modal
+    advanced_tag = modal.split('id="remoteServerAdvanced"', 1)[1].split(">", 1)[0]
+    assert "open" not in advanced_tag
+    assert modal.index('id="remoteServerAdvanced"') < modal.index('id="remoteRedisUrl"')
+    assert modal.index('id="remoteServerAdvanced"') < modal.index('id="remoteS3Endpoint"')
+    assert 'id="remoteServerForm" class="server-form" novalidate' in modal
+    assert 'form="remoteServerForm"' in modal.split('id="btnSubmitRemoteServer"', 1)[1].split(">", 1)[0]
+    assert 'id="remoteServerError"' in modal
+    assert 'id="btnManageRemoteCredentials"' not in modal
+    assert 'id="btnRefreshRemoteCredentials"' in modal
+    assert 'id="remoteCredentialStatus"' in modal
+    assert "#addServerModal .server-modal-body" in css
+    assert "overscroll-behavior: contain" in css
+    assert "body.server-dialog-open" in css
+
+
+def test_remote_server_dialog_protects_input_and_keyboard_navigation():
+    """关闭前检查未保存内容，遮罩不清空表单，键盘仅在弹窗内移动。"""
+    html = (Path(__file__).resolve().parents[1] / "static" / "remote-management.js").read_text(encoding="utf-8")
+    backdrop_handler = html.split('$("addServerModal").addEventListener("click",', 1)[1].split("});", 1)[0]
+
+    assert "closeAddServerModal" not in backdrop_handler
+    assert "function handleRemoteServerDialogKeydown(event)" in html
+    assert "function remoteServerDialogIsDirty()" in html
+    assert "function validateRemoteServerForm()" in html
+    assert "addEventListener('keydown', handleRemoteServerDialogKeydown)" in html
+    assert "closeAddServerModal(true)" in html
+
+
 def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads():
     """保存按钮保持可用，页面不再要求远程管理令牌。"""
     backend_dir = Path(__file__).resolve().parents[1]
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
+    html += (static_dir / "credential-manager.html").read_text(encoding="utf-8")
     button = html.split('id="btnSaveRemoteSshSettings"', 1)[1].split(">", 1)[0]
     credential_form = html.split('id="remoteSshCredentialForm"', 1)[1].split(">", 1)[0]
-    catalog_loader = html.split("async function loadRemoteSshSettings()", 1)[1].split(
-        "// 清空凭证编辑表单", 1
+    catalog_loader = html.split("async function loadRemoteSshSettings(", 1)[1].split(
+        "// 绘制公开凭证元数据", 1
     )[0]
     save_handler = html.split("async function saveRemoteSshSettings()", 1)[1].split(
-        "// 把凭证元数据载入编辑表单", 1
+        "// 编辑公开元数据", 1
     )[0]
 
     assert "disabled" not in button
     assert "novalidate" in credential_form
     assert '先填写远程管理令牌，再查看或管理 SSH 凭证。' not in catalog_loader
     assert "共享 Redis" not in catalog_loader
-    assert "MySQL" in catalog_loader
+    assert "MySQL" in html
     assert 'remoteAdminToken' not in html
     assert 'X-Worker-Admin-Token' not in html
     assert "if (!token)" not in save_handler
@@ -1312,27 +1836,89 @@ def test_remote_ssh_credential_save_button_stays_clickable_while_catalog_loads()
     assert "button.disabled = false" in save_handler
 
 
-def test_remote_server_form_exposes_host_overrides_and_edit_action():
-    """远程服务器页面提供镜像、Redis、S3 单机覆盖入口和现有服务器编辑动作。"""
+def test_remote_server_form_exposes_network_overrides_and_effective_config_action():
+    """远程服务器页面提供 Redis/S3 覆盖、生效配置查看和编辑动作。"""
     backend_dir = Path(__file__).resolve().parents[1]
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
 
     for marker in (
-        'id="remoteWorkerImage"',
-        "Worker 镜像（可选本地标签覆盖）",
-        "平台会通过 SSH 发送镜像，目标机无需访问镜像仓库",
+        "页面不单独配置镜像",
+        "生效配置",
+        "data-remote-effective-config",
+        "remoteEffectiveConfigModal",
         'id="remoteRedisUrl"',
         'id="remoteS3Endpoint"',
+        'id="remoteDockerRegistry"',
+        'id="remotePipIndexUrl"',
+        'id="remoteAptMirror"',
         'id="clearRemoteRedisOverride"',
         "data-edit-remote-machine-id",
-        'data-remote-action="install"',
-        "重新部署并应用配置",
+        'data-remote-action="deploy"',
+        'deployed ? "部署代码" : "部署"',
+        "更新配置",
+        "部署代码",
+        "同步最新 worker 代码并重建容器",
+        "保存后覆盖远端配置文件，下次启动/重启时生效",
         "openEditRemoteServer",
     ):
         assert marker in html
+    assert 'id="remoteWorkerImage"' not in html
+    assert 'name="worker_image"' not in html
+
+
+def test_remote_server_rejects_invalid_repository_sources():
+    """镜像加速/pip/apt 源格式非法时拒绝，合法时接受。"""
+    from pydantic import ValidationError
+
+    from app.routers.schemas import RemoteServerRequest
+
+    with pytest.raises(ValidationError):
+        RemoteServerRequest(machine_id="m1", host="h.example.net", ssh_credential_id="c1", docker_registry="https://bad.example")
+    with pytest.raises(ValidationError):
+        RemoteServerRequest(machine_id="m1", host="h.example.net", ssh_credential_id="c1", pip_index_url="not-a-url")
+    with pytest.raises(ValidationError):
+        RemoteServerRequest(machine_id="m1", host="h.example.net", ssh_credential_id="c1", apt_mirror="mirrors.aliyun.com/debian")
+
+    ok = RemoteServerRequest(
+        machine_id="m1",
+        host="h.example.net",
+        ssh_credential_id="c1",
+        docker_registry="docker.m.daocloud.io",
+        pip_index_url="https://mirrors.aliyun.com/pypi/simple/",
+        apt_mirror="mirrors.aliyun.com",
+    )
+    assert ok.docker_registry == "docker.m.daocloud.io"
+    assert ok.pip_index_url == "https://mirrors.aliyun.com/pypi/simple/"
+    assert ok.apt_mirror == "mirrors.aliyun.com"
+
+
+def test_remote_server_card_filters_lifecycle_actions_by_presence():
+    """在线卡片提供停止/重启，离线卡片提供启动/重启；未部署时不显示生命周期操作。"""
+    backend_dir = Path(__file__).resolve().parents[1]
+    static_dir = backend_dir / "static"
+    if not static_dir.is_dir():
+        static_dir = backend_dir.parent / "static"
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
+    card_renderer = html.split("function workerServerCard(", 1)[1].split(
+        "// 读取仅在当前会话授权的远程服务器状态", 1
+    )[0]
+
+    assert 'const deployed = Boolean(remoteServer && remoteServer.deployed);' in card_renderer
+    assert 'const lifecycleControls = !deployed ? "" : online' in card_renderer
+    lifecycle_controls = card_renderer.split("const lifecycleControls", 1)[1].split(
+        "const serverControls", 1
+    )[0]
+    assert '? `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="stop"' in lifecycle_controls
+    online_controls, offline_controls = lifecycle_controls.split(': `<button', 1)
+    assert 'data-remote-action="restart"' in online_controls
+    assert 'data-remote-action="restart"' in offline_controls
+    assert ': `<button data-remote-machine-id="${esc(machineId)}" data-remote-action="start"' in lifecycle_controls
+    assert '配置已保存，正在写入远端；操作成功后请点击“重启”使其生效' in html
+    assert '正在写入远端配置，重启后生效…' in card_renderer
+    assert '配置已写入，请重启后生效' in html
 
 
 def test_remote_server_cards_expose_interrupt_action_for_active_operations():
@@ -1341,7 +1927,7 @@ def test_remote_server_cards_expose_interrupt_action_for_active_operations():
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
     card_renderer = html.split("function workerServerCard(", 1)[1].split(
         "// 读取仅在当前会话授权的远程服务器状态", 1
     )[0]
@@ -1363,7 +1949,7 @@ def test_remote_server_card_exposes_live_operation_logs():
     static_dir = backend_dir / "static"
     if not static_dir.is_dir():
         static_dir = backend_dir.parent / "static"
-    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html = (static_dir / "server-manager.html").read_text(encoding="utf-8") + (static_dir / "remote-management.js").read_text(encoding="utf-8") + (static_dir / "app.css").read_text(encoding="utf-8")
     card_renderer = html.split("function workerServerCard(", 1)[1].split(
         "// 读取仅在当前会话授权的远程服务器状态", 1
     )[0]
@@ -1386,8 +1972,154 @@ def test_remote_server_card_exposes_live_operation_logs():
     assert "text.textContent = line || \" \"" in html
     assert 'id="remoteLogModal"' in html
     assert 'id="btnCopyRemoteLog" type="button">复制全部</button>' in html
+    assert 'id="btnClearRemoteLog" type="button">清除日志</button>' in html
+    assert "async function clearRemoteOperationLogs()" in html
+    assert "/logs" in logs_handler or "/logs" in html
+    assert "清除执行日志失败" in html
     assert "user-select:text" in html
     assert "data-copy-remote-log-line" in html
     assert "copyRemoteLogText(line.textContent" in html
     assert 'remoteLogOutput").dataset.rawLog' in html
     assert "navigator.clipboard.writeText" in html
+
+
+@pytest.fixture()
+def selection_api(client, store, monkeypatch, tmp_path):
+    """资源选择使用独立队列和管理器，不改变其他 API 测试的 worker 生命周期。"""
+    from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore
+    from app.jobs import JobManager
+    from app.storage import LocalArtifactStore
+    from app.routers import jobs as routes
+
+    store = LocalArtifactStore(tmp_path / "selection-state")
+    lease = EmbeddedLeaseStore()
+    manager = JobManager(store=store, queue=EmbeddedJobQueue(), lease=lease,
+                         start_workers=False, start_watchdog=False)
+    monkeypatch.setattr(routes, "manager", manager)
+    for name, gpu, state, enabled in [
+        ("cpu", False, "idle", True), ("busy", False, "running", True),
+        ("gpu", True, "idle", True), ("disabled", False, "idle", False),
+        ("degraded", True, "degraded", True), ("offline", False, "idle", True),
+    ]:
+        lease.register_worker(name, {"worker_id": name, "state": state, "managed": True,
+            "gpu": {"available": gpu, "vram_mb": 8192 if gpu else 0},
+            "current_job": "another-job" if state == "running" else None},
+            ttl=-1 if name == "offline" else 60)
+        lease.set_worker_enabled(name, enabled)
+    yield client, manager, lease
+    manager.stop()
+
+
+@pytest.mark.parametrize("worker_id", [None, "cpu", "busy", "gpu"])
+def test_training_resource_selection_persists_hint(selection_api, make_dataset, worker_id):
+    """自动、CPU、GPU 和忙碌资源均可提交，选择只进入调度参数。"""
+    client, manager, _ = selection_api
+    response = client.post("/api/train", json=_train_payload(make_dataset(n=40), worker_id=worker_id))
+    assert response.status_code == 200, response.text
+    record = manager.get(response.json()["job_id"])
+    assert record["spec"]["resource_hint"].get("worker_id") == worker_id
+    assert "worker_id" not in record["spec"]["params"]
+    assert record["status"] == "queued"
+    assert manager.queue.snapshot() == [record["id"]]
+    assert client.get(f"/api/jobs/{record['id']}").json()["resource_hint"] == record["spec"]["resource_hint"]
+
+
+@pytest.mark.parametrize("worker_id,extra,status", [
+    ("unknown", {}, 409), ("offline", {}, 409), ("disabled", {}, 409), ("degraded", {}, 409),
+    ("cpu", {"require_gpu": True}, 409), ("cpu", {"min_vram_mb": 1}, 409),
+    ("gpu", {"min_vram_mb": 8193}, 409),
+    ("gpu", {"task": "clustering", "target": None}, 409),
+    ("cpu", {"task": "llm_pretraining"}, 409),
+    ("", {}, 422), ("x" * 161, {}, 422), ("../../;echo secret", {}, 422),
+    ("cpu", {"parallel_workers": [{"worker_id": "cpu"}, {"worker_id": "gpu"}]}, 422),
+])
+def test_training_resource_selection_rejects_invalid_without_job(selection_api, worker_id, extra, status):
+    """资源错误先于数据拉取被拒绝，非法输入不创建任务或队列项。"""
+    client, manager, _ = selection_api
+    response = client.post("/api/train", json=_train_payload("unmaterialized-dataset", worker_id=worker_id, **extra))
+    assert response.status_code == status, response.text
+    assert manager.list() == []
+    assert manager.queue.snapshot() == []
+
+
+@pytest.mark.parametrize("minimum", [0, 8192])
+def test_training_resource_selection_gpu_vram_boundary(selection_api, make_dataset, minimum):
+    """显存下限为零或恰好等于卡容量时允许选择 GPU。"""
+    client, manager, _ = selection_api
+    response = client.post("/api/train", json=_train_payload(make_dataset(n=40), worker_id="gpu", min_vram_mb=minimum))
+    assert response.status_code == 200, response.text
+    assert manager.get(response.json()["job_id"])["spec"]["resource_hint"]["min_vram_mb"] == minimum
+
+
+def test_training_resource_selection_dependency_failure_is_redacted(selection_api, monkeypatch):
+    """协调服务读取失败返回可重试错误，不暴露连接凭证或创建任务。"""
+    client, manager, lease = selection_api
+
+    def unavailable():
+        """模拟外部协调服务不可用，保留 API 校验与错误处理真实执行。"""
+        raise ConnectionError("redis://secret-password@private-host")
+
+    monkeypatch.setattr(lease, "list_workers", unavailable)
+    response = client.post("/api/train", json=_train_payload("unmaterialized", worker_id="cpu"))
+    assert response.status_code == 503
+    assert "secret-password" not in response.text
+    assert manager.list() == [] and manager.queue.size() == 0
+
+
+def test_management_tabs_have_independent_pages_and_forms():
+    """服务器和凭证分别维护，导航可直接访问，训练台仅展示资源状态。"""
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    for name in ("index.html", "dataset-manager.html", "server-manager.html", "credential-manager.html"):
+        html = (static_dir / name).read_text(encoding="utf-8")
+        assert 'href="/server-manager.html"' in html
+        assert 'href="/credential-manager.html"' in html
+        assert html.count('aria-current="page"') == 1
+    server = (static_dir / "server-manager.html").read_text(encoding="utf-8")
+    credentials = (static_dir / "credential-manager.html").read_text(encoding="utf-8")
+    workbench = (static_dir / "index.html").read_text(encoding="utf-8")
+    assert 'id="remoteServerForm"' in server
+    assert 'id="remoteSshCredentialForm"' not in server
+    assert 'id="remoteSshCredentialForm"' in credentials
+    assert 'id="remoteServerForm"' not in credentials
+    assert 'id="addServerModal"' not in workbench
+    assert 'id="workerGrid"' in workbench
+    assert 'data-remote-action=' not in workbench
+
+
+def test_training_storage_write_failure_returns_retryable_service_error(selection_api, make_dataset, monkeypatch):
+    """任务权威记录无法写入时返回可重试错误且不入队或泄露连接细节。"""
+    from app.storage import ArtifactStoreUnavailableError
+
+    client, manager, _ = selection_api
+    ds_id = make_dataset(n=40)
+
+    def fail_write(*args, **kwargs):
+        """模拟对象存储连接故障，保持路由和任务创建流程真实运行。"""
+        raise ArtifactStoreUnavailableError("TLS secret endpoint connection reset")
+
+    monkeypatch.setattr(manager.store, "write_json", fail_write)
+    response = client.post("/api/train", json=_train_payload(ds_id))
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "对象存储暂不可用，任务未创建，请稍后重试"
+    assert "secret" not in response.text and "endpoint" not in response.text
+    assert manager.list() == []
+    assert manager.queue.snapshot() == []
+
+
+def test_job_list_storage_failure_returns_retryable_service_error(selection_api, monkeypatch):
+    """任务列表无法读取权威状态时返回可重试错误，不伪装成空列表。"""
+    from app.storage import ArtifactStoreUnavailableError
+
+    client, manager, _ = selection_api
+
+    def fail_list(*args, **kwargs):
+        """模拟对象存储列表请求失败。"""
+        raise ArtifactStoreUnavailableError("TLS secret endpoint connection reset")
+
+    monkeypatch.setattr(manager.store, "list_keys", fail_list)
+    response = client.get("/api/jobs")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "对象存储暂不可用，无法读取任务列表，请稍后重试"
+    assert "secret" not in response.text and "endpoint" not in response.text

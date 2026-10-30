@@ -12,6 +12,7 @@ REDIS_URL 为空时自动切换 Embedded 实现（进程内队列/锁，单机�
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import threading
 import time
@@ -32,7 +33,9 @@ _REMOTE_SERVERS = "mtp:remote:servers"
 _REMOTE_SSH_CREDENTIALS = "mtp:remote:ssh_credentials"
 _REMOTE_OPERATION = "mtp:remote:operation:{operation_id}"
 _REMOTE_OPERATION_CANCEL = "mtp:remote:operation:cancel:{operation_id}"
+_REMOTE_OPERATION_EXECUTOR = "mtp:remote:operation:executor:{operation_id}"
 _REMOTE_OPERATION_TTL = 7 * 24 * 3600
+_REMOTE_EXECUTOR_TTL = 90
 
 # 信号 TTL：控制信号 1 小时后自动清理，避免遗留脏信号影响后续轮次
 _SIGNAL_TTL = 3600
@@ -52,6 +55,27 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
+"""
+
+# 状态与租约在同一事务内校验，禁止旧执行者或空闲轮询覆盖新占用者。
+_GUARDED_HEARTBEAT_LUA = """
+local expected = cjson.decode(ARGV[4])
+for i = 4, #KEYS do
+  local actual = redis.call('GET', KEYS[i])
+  local token = expected[i - 3]
+  if token == cjson.null then
+    if actual then return 0 end
+  elseif actual ~= token then
+    return 0
+  end
+end
+local fields = cjson.decode(ARGV[3])
+redis.call('SADD', KEYS[1], ARGV[1])
+for key, value in pairs(fields) do
+  redis.call('HSET', KEYS[2], key, value)
+end
+redis.call('SET', KEYS[3], '1', 'EX', ARGV[2])
+return 1
 """
 
 
@@ -81,6 +105,11 @@ class JobQueue:
     def snapshot(self) -> List[str]:
         """当前在队的任务 id 列表（watchdog 防丢失重派用，尽力而为）。"""
         raise NotImplementedError
+
+    def inference_queue(self, worker_id: str) -> JobQueue:
+        """在同一协调实例中共享各计算槽的独立预测队列。"""
+        queues = self.__dict__.setdefault("_inference_queues", {})
+        return queues.setdefault(worker_id, EmbeddedJobQueue())
 
 
 class EmbeddedJobQueue(JobQueue):
@@ -129,19 +158,28 @@ class EmbeddedJobQueue(JobQueue):
 class RedisJobQueue(JobQueue):
     """Redis List 实现的任务队列（多机模式）。"""
 
-    def __init__(self, redis_client) -> None:
+    def __init__(self, redis_client, queue_key: str = _QUEUE_KEY) -> None:
+        """允许独立业务队列复用协调连接，默认保持训练队列不变。"""
         self._redis = redis_client
+        self._queue_key = queue_key
+
+    def inference_queue(self, worker_id: str) -> JobQueue:
+        """按计算槽分队列，避免其它 Worker 领取指定资源的预测。"""
+        suffix = hashlib.sha256(worker_id.encode()).hexdigest()
+        return RedisJobQueue(self._redis, f"mtp:queue:inference:{suffix}")
 
     def push(self, job_id: str) -> None:
         # RPUSH 尾插：列表顺序 = 入队顺序（snapshot 与 pop 方向一致）
-        self._redis.rpush(_QUEUE_KEY, job_id)
+        self._redis.rpush(self._queue_key, job_id)
 
     def pop(self, timeout: float = 1.0) -> Optional[str]:
         # BLPOP 是单命令原子出队（队首）：两个 worker 同时领取不会拿到同一个任务。
         # 阻塞窗口与 socket 超时相等的边界竞态下 redis-py 会抛 TimeoutError，
         # 语义上等价于"窗口内无任务"——捕获并返回 None（worker 退避后重试）。
         try:
-            result = self._redis.blpop(_QUEUE_KEY, timeout=max(int(timeout), 1))
+            if timeout <= 0:
+                return self._redis.lpop(self._queue_key)
+            result = self._redis.blpop(self._queue_key, timeout=max(int(timeout), 1))
         except Exception:
             return None
         if result is None:
@@ -151,20 +189,20 @@ class RedisJobQueue(JobQueue):
 
     def remove(self, job_id: str) -> bool:
         # LREM 尽力移除；任务可能已被 worker 领走，返回 False 属正常
-        return bool(self._redis.lrem(_QUEUE_KEY, 0, job_id))
+        return bool(self._redis.lrem(self._queue_key, 0, job_id))
 
     def rebuild(self, job_ids: List[str]) -> None:
         pipe = self._redis.pipeline()
-        pipe.delete(_QUEUE_KEY)
+        pipe.delete(self._queue_key)
         if job_ids:
-            pipe.rpush(_QUEUE_KEY, *job_ids)  # 尾插保持原顺序（队首=第一个任务）
+            pipe.rpush(self._queue_key, *job_ids)  # 尾插保持原顺序（队首=第一个任务）
         pipe.execute()
 
     def size(self) -> int:
-        return int(self._redis.llen(_QUEUE_KEY))
+        return int(self._redis.llen(self._queue_key))
 
     def snapshot(self) -> List[str]:
-        return [str(item) for item in self._redis.lrange(_QUEUE_KEY, 0, -1)]
+        return [str(item) for item in self._redis.lrange(self._queue_key, 0, -1)]
 
 
 class LeaseStore:
@@ -218,8 +256,9 @@ class LeaseStore:
         """worker 启动注册：写入能力信息（显卡/显存/版本）并开启心跳。"""
         raise NotImplementedError
 
-    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float) -> None:
-        """worker 心跳：刷新在线 TTL 并更新动态字段（当前任务/epoch 等）。"""
+    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float,
+                         *, lease_conditions: Optional[Dict[str, Optional[str]]] = None) -> bool:
+        """原子校验可选租约条件后发布心跳；条件值 None 表示该租约必须空闲。"""
         raise NotImplementedError
 
     def deregister_worker(self, worker_id: str) -> None:
@@ -284,6 +323,18 @@ class LeaseStore:
 
     def clear_remote_operation_cancel(self, operation_id: str) -> None:
         """清除远程 SSH 操作的中断请求。"""
+        raise NotImplementedError
+
+    def set_remote_operation_executor(self, operation_id: str) -> None:
+        """写入远程操作执行者的存活标记（带 TTL，执行进程周期性续写）。"""
+        raise NotImplementedError
+
+    def is_remote_operation_executor_active(self, operation_id: str) -> bool:
+        """检查远程操作执行者是否仍在存活周期内。"""
+        raise NotImplementedError
+
+    def clear_remote_operation_executor(self, operation_id: str) -> None:
+        """清除远程操作执行者存活标记（操作正常结束时调用）。"""
         raise NotImplementedError
 
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
@@ -367,12 +418,21 @@ class EmbeddedLeaseStore(LeaseStore):
             merged["ttl"] = ttl
             self._workers[worker_id] = merged
 
-    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float) -> None:
+    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float,
+                         *, lease_conditions: Optional[Dict[str, Optional[str]]] = None) -> bool:
+        """持锁核对所有权再更新状态，空闲发布不能越过并发资源预留。"""
         with self._lock:
+            now = time.time()
+            for key, expected in (lease_conditions or {}).items():
+                holder = self._leases.get(key)
+                actual = holder[0] if holder is not None and holder[1] > now else None
+                if actual != expected:
+                    return False
             info = self._workers.setdefault(worker_id, {})
             info.update(fields)
-            info["last_seen"] = time.time()
+            info["last_seen"] = now
             info["ttl"] = ttl
+            return True
 
     def deregister_worker(self, worker_id: str) -> None:
         with self._lock:
@@ -461,6 +521,16 @@ class EmbeddedLeaseStore(LeaseStore):
         with self._lock:
             self._remote_operation_cancellations.discard(operation_id)
 
+    def set_remote_operation_executor(self, operation_id: str) -> None:
+        """嵌入式实现无跨进程存活信息，执行者活性由调用方进程内注册表判断。"""
+        return
+
+    def is_remote_operation_executor_active(self, operation_id: str) -> bool:
+        return False
+
+    def clear_remote_operation_executor(self, operation_id: str) -> None:
+        return
+
     def cleanup_stale_workers(self, grace_seconds: float) -> int:
         """清理心跳长期未更新的注册条目（存活 worker 心跳远短于宽限期）。"""
         now = time.time()
@@ -482,7 +552,9 @@ class RedisLeaseStore(LeaseStore):
     """
 
     def __init__(self, redis_client) -> None:
+        """保留本进程注册的能力快照，供 Redis 注册信息丢失后恢复。"""
         self._redis = redis_client
+        self._worker_capabilities: Dict[str, Dict[str, str]] = {}
 
     def healthy(self) -> bool:
         try:
@@ -531,23 +603,35 @@ class RedisLeaseStore(LeaseStore):
     # ---------------- Worker 注册与心跳 ----------------
 
     def register_worker(self, worker_id: str, info: Dict[str, object], ttl: float) -> None:
-        payload = {str(k): (jsonable(v)) for k, v in info.items()}
+        """缓存序列化后的启动能力，并用同一心跳事务发布完整注册信息。"""
+        self._worker_capabilities[worker_id] = {str(k): jsonable(v) for k, v in info.items()}
+        self.heartbeat_worker(worker_id, {}, ttl)
+
+    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float,
+                         *, lease_conditions: Optional[Dict[str, Optional[str]]] = None) -> bool:
+        """原子校验租约并补齐索引、能力与状态，兼容未传条件的旧调用方。"""
+        # 能力快照按槽隔离；动态进度最后合并，不能被启动时的旧状态覆盖。
+        payload = dict(self._worker_capabilities.get(worker_id, {}))
+        payload.update({str(k): jsonable(v) for k, v in fields.items()})
+        payload["last_seen"] = time.time()
+        if lease_conditions:
+            keys = [_WORKERS_SET, _WORKER_INFO.format(worker_id=worker_id),
+                    _WORKER_HB.format(worker_id=worker_id)]
+            keys.extend(_LEASE_KEY.format(job_id=key) for key in lease_conditions)
+            return bool(self._redis.eval(
+                _GUARDED_HEARTBEAT_LUA, len(keys), *keys, worker_id, str(int(ttl)),
+                json.dumps(payload), json.dumps(list(lease_conditions.values())),
+            ))
         pipe = self._redis.pipeline()
         pipe.sadd(_WORKERS_SET, worker_id)
         pipe.hset(_WORKER_INFO.format(worker_id=worker_id), mapping=payload)
         pipe.set(_WORKER_HB.format(worker_id=worker_id), "1", ex=int(ttl))
         pipe.execute()
-
-    def heartbeat_worker(self, worker_id: str, fields: Dict[str, object], ttl: float) -> None:
-        payload = {str(k): jsonable(v) for k, v in fields.items()}
-        payload["last_seen"] = time.time()
-        pipe = self._redis.pipeline()
-        if payload:
-            pipe.hset(_WORKER_INFO.format(worker_id=worker_id), mapping=payload)
-        pipe.set(_WORKER_HB.format(worker_id=worker_id), "1", ex=int(ttl))
-        pipe.execute()
+        return True
 
     def deregister_worker(self, worker_id: str) -> None:
+        """显式注销时丢弃能力缓存，避免复用槽 ID 时恢复旧硬件信息。"""
+        self._worker_capabilities.pop(worker_id, None)
         pipe = self._redis.pipeline()
         pipe.srem(_WORKERS_SET, worker_id)
         pipe.delete(_WORKER_INFO.format(worker_id=worker_id))
@@ -632,6 +716,24 @@ class RedisLeaseStore(LeaseStore):
     def clear_remote_operation_cancel(self, operation_id: str) -> None:
         """清除 Redis 中远程操作的中断请求。"""
         self._redis.delete(_REMOTE_OPERATION_CANCEL.format(operation_id=operation_id))
+
+    def set_remote_operation_executor(self, operation_id: str) -> None:
+        """写入远程操作执行者存活标记；TTL 到期即判定执行进程已消失。"""
+        self._redis.set(
+            _REMOTE_OPERATION_EXECUTOR.format(operation_id=operation_id),
+            "1",
+            ex=_REMOTE_EXECUTOR_TTL,
+        )
+
+    def is_remote_operation_executor_active(self, operation_id: str) -> bool:
+        """执行者存活标记存在即视为仍在执行。"""
+        return bool(
+            self._redis.get(_REMOTE_OPERATION_EXECUTOR.format(operation_id=operation_id))
+        )
+
+    def clear_remote_operation_executor(self, operation_id: str) -> None:
+        """操作正常结束后移除执行者存活标记。"""
+        self._redis.delete(_REMOTE_OPERATION_EXECUTOR.format(operation_id=operation_id))
 
     def delete_remote_server(self, machine_id: str) -> None:
         """从 Redis 删除远程服务器元数据，不访问目标服务器。"""

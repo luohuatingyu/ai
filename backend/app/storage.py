@@ -16,11 +16,29 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import app.config as config
 
 # 合法 key：仅允许字母/数字/下划线/点/横线/斜杠，禁止 ".." 段（防路径穿越）
 _KEY_RE = re.compile(r"^[A-Za-z0-9._\-/]+$")
+
+
+class ArtifactStoreUnavailableError(OSError):
+    """对象存储无法完成请求。
+
+    ``None`` 只表示产物确实不存在。网络、鉴权和服务端故障必须保留为
+    可识别异常，调用方才能将训练任务按环境性故障重试，而不是误报文件缺失。
+    """
+
+
+def _is_s3_object_missing(exc: BaseException) -> bool:
+    """仅把 S3 的对象不存在响应归类为缺失，避免吞掉基础设施故障。"""
+    return str(getattr(exc, "code", "")) in {
+        "NoSuchKey",
+        "NoSuchObject",
+        "NoSuchVersion",
+    }
 
 
 def validate_key(key: str) -> str:
@@ -30,6 +48,28 @@ def validate_key(key: str) -> str:
     if ".." in key.split("/"):
         raise ValueError(f"产物 key 不允许包含 '..': {key!r}")
     return key
+
+
+def _oss_region_from_endpoint(endpoint: str) -> Optional[str]:
+    """从阿里云 OSS/S3 endpoint 提取 region，避免 SDK 使用路径式区域探测。"""
+    endpoint_url = endpoint if "://" in endpoint else f"//{endpoint}"
+    hostname = (urlsplit(endpoint_url).hostname or "").lower()
+    suffix = ".aliyuncs.com"
+    if not hostname.endswith(suffix):
+        return None
+
+    domain = hostname[:-len(suffix)]
+    if domain.startswith("s3.oss-"):
+        region = domain[len("s3.oss-"):]
+    elif domain.startswith("oss-"):
+        region = domain[len("oss-"):]
+    else:
+        return None
+    if region.endswith("-internal"):
+        region = region[:-len("-internal")]
+    if not re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+)+", region):
+        return None
+    return region
 
 
 class ArtifactStore:
@@ -53,6 +93,19 @@ class ArtifactStore:
         """读取文本内容；不存在返回 None。"""
         data = self.read_bytes(key)
         return None if data is None else data.decode(encoding, errors="replace")
+
+    def get_size(self, key: str) -> Optional[int]:
+        """返回产物字节数；默认实现兼容未实现元数据读取的存储。"""
+        data = self.read_bytes(key)
+        return None if data is None else len(data)
+
+    def read_bytes_range(self, key: str, start: int, length: int) -> Optional[bytes]:
+        """读取指定字节范围；默认实现兼容不支持范围请求的存储。"""
+        data = self.read_bytes(key)
+        if data is None:
+            return None
+        begin = min(max(int(start), 0), len(data))
+        return data[begin:begin + max(int(length), 0)]
 
     def append_text(self, key: str, text: str, encoding: str = "utf-8") -> None:
         """追加文本（日志/metrics 使用）；key 不存在时等同写入。"""
@@ -135,6 +188,23 @@ class LocalArtifactStore(ArtifactStore):
             return None
         return path.read_bytes()
 
+    def get_size(self, key: str) -> Optional[int]:
+        """用文件元数据获取日志大小，不读取文件内容。"""
+        path = self._path(key)
+        try:
+            return path.stat().st_size if path.is_file() else None
+        except FileNotFoundError:
+            return None
+
+    def read_bytes_range(self, key: str, start: int, length: int) -> Optional[bytes]:
+        """通过 seek 读取本地日志的指定字节区间。"""
+        path = self._path(key)
+        if not path.is_file():
+            return None
+        with path.open("rb") as source:
+            source.seek(max(int(start), 0))
+            return source.read(max(int(length), 0))
+
     def write_bytes(self, key: str, data: bytes) -> None:
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,11 +267,13 @@ class S3ArtifactStore(ArtifactStore):
         # 惰性导入：保持 local 模式零依赖
         from minio import Minio  # noqa: WPS433
 
+        resolved_endpoint = endpoint or config.S3_ENDPOINT
         self._client = Minio(
-            endpoint or config.S3_ENDPOINT,
+            resolved_endpoint,
             access_key=access_key or config.S3_ACCESS_KEY,
             secret_key=secret_key or config.S3_SECRET_KEY,
             secure=config.S3_SECURE if secure is None else secure,
+            region=_oss_region_from_endpoint(resolved_endpoint),
         )
         self.bucket = bucket or config.S3_BUCKET
         self._ensure_bucket()
@@ -220,29 +292,82 @@ class S3ArtifactStore(ArtifactStore):
             finally:
                 response.close()
                 response.release_conn()
-        except Exception:
-            return None
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return None
+            raise ArtifactStoreUnavailableError(
+                f"读取对象存储产物失败: {key}: {exc}"
+            ) from exc
+
+    def get_size(self, key: str) -> Optional[int]:
+        """使用 S3 对象元数据取大小，避免下载整个日志对象。"""
+        validate_key(key)
+        try:
+            return int(self._client.stat_object(self.bucket, key).size)
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return None
+            raise ArtifactStoreUnavailableError(
+                f"读取对象存储产物元数据失败: {key}: {exc}"
+            ) from exc
+
+    def read_bytes_range(self, key: str, start: int, length: int) -> Optional[bytes]:
+        """用 S3 Range GET 读取日志增量，响应关闭后及时归还连接。"""
+        validate_key(key)
+        begin = max(int(start), 0)
+        count = max(int(length), 0)
+        if count == 0:
+            return b""
+        try:
+            response = self._client.get_object(
+                self.bucket, key, offset=begin, length=count
+            )
+            try:
+                return response.read()
+            finally:
+                response.close()
+                response.release_conn()
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return None
+            raise ArtifactStoreUnavailableError(
+                f"读取对象存储产物失败: {key}: {exc}"
+            ) from exc
 
     def write_bytes(self, key: str, data: bytes) -> None:
+        """写入对象存储；网络、鉴权和服务端故障统一包装。"""
         validate_key(key)
         from io import BytesIO
 
-        self._client.put_object(self.bucket, key, BytesIO(data), length=len(data))
+        try:
+            self._client.put_object(self.bucket, key, BytesIO(data), length=len(data))
+        except Exception as exc:
+            raise ArtifactStoreUnavailableError(
+                f"写入对象存储产物失败: {key}: {exc}"
+            ) from exc
 
     def exists(self, key: str) -> bool:
         validate_key(key)
         try:
             self._client.stat_object(self.bucket, key)
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return False
+            raise ArtifactStoreUnavailableError(
+                f"检查对象存储产物失败: {key}: {exc}"
+            ) from exc
 
     def delete(self, key: str) -> None:
         validate_key(key)
         try:
             self._client.remove_object(self.bucket, key)
-        except Exception:
-            pass  # 不存在时静默
+        except Exception as exc:
+            if _is_s3_object_missing(exc):
+                return
+            raise ArtifactStoreUnavailableError(
+                f"删除对象存储产物失败: {key}: {exc}"
+            ) from exc
 
     def list_keys(self, prefix: str) -> List[str]:
         validate_key(prefix)
@@ -336,16 +461,14 @@ def sync_dataset_to_store(ds_id: str, local_csv: Path) -> bool:
     """数据集入库时同步一份到对象存储（多机 worker 需要自行拉取数据）。
 
     local 后端本身就在共享文件系统上，无需同步，直接返回 False。
-    同步失败不阻塞主流程（上传接口不受影响），返回 False 并由调用方记录。
+    S3 同步失败向调用方抛出异常：若只保存本地副本，远端 worker 会在
+    领取任务后必然失败，导入接口应在成功响应前回滚本地数据集。
     """
     store = get_store()
     if isinstance(store, LocalArtifactStore):
         return False
-    try:
-        store.write_file(f"datasets/{ds_id}.csv", local_csv)
-        return True
-    except Exception:
-        return False
+    store.write_file(f"datasets/{ds_id}.csv", local_csv)
+    return True
 
 
 def resolve_dataset_csv_local(ds_id: str) -> Path:
@@ -366,17 +489,35 @@ def resolve_dataset_csv_local(ds_id: str) -> Path:
     for path in candidates:
         if path.exists():
             return path
+    # 本机执行槽直接使用远程引用时同样按需缓存；远端执行槽由提交 API 先同步 S3。
+    from app.dataset_manager import DatasetManager
+
+    dataset_manager = DatasetManager(config.DATASETS_DIR)
+    metadata = dataset_manager.get_dataset(ds_id)
+    if metadata and metadata.get("source") == "huggingface":
+        dataset_manager.ensure_local(ds_id)
+        return config.DATASETS_DIR / "processed" / f"{ds_id}.csv"
     return candidates[0]
 
 
 def resolve_dataset_for_worker(ds_id: str, scratch_dir: Path) -> Path:
-    """worker 视角解析数据集：本地布局直接用，对象存储则下载到 scratch。"""
+    """worker 视角解析数据集：本地布局直接用，对象存储则下载到 scratch。
+
+    对象存储中缺少历史数据时，若当前节点仍保留本地副本，先自动补同步，
+    这样升级到 S3 状态平面后无需为每个任务手工执行迁移脚本。远程节点没有
+    本地副本时仍保留明确的迁移提示。
+    """
     store = get_store()
     if isinstance(store, LocalArtifactStore):
         return resolve_dataset_csv_local(ds_id)
     key = f"datasets/{ds_id}.csv"
     if not store.exists(key):
-        raise FileNotFoundError(
-            f"数据集 {ds_id} 未同步到对象存储（请先运行迁移脚本 scripts/migrate_to_object_storage.py）"
-        )
+        # 旧数据可能只存在当前节点的挂载目录，首次使用时自动补到状态平面。
+        local_csv = resolve_dataset_csv_local(ds_id)
+        if local_csv.is_file():
+            sync_dataset_to_store(ds_id, local_csv)
+        else:
+            raise FileNotFoundError(
+                f"数据集 {ds_id} 未同步到对象存储（请先运行迁移脚本 scripts/migrate_to_object_storage.py）"
+            )
     return store.read_file(key, Path(scratch_dir) / f"{ds_id}.csv")

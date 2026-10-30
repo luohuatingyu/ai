@@ -6,17 +6,17 @@ import time
 import uuid
 from typing import Literal, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
 import app.config as config
 from app import jobstore
 from app import remote_config_repository
 from app.database import db_session
-from app.db_utils import get_job_logs
+from app.db_utils import count_job_logs, delete_job_logs, get_job_logs, get_job_logs_after
 from app.jobs import api_view
 from app.state import manager
-from app.storage import job_key
+from app.storage import ArtifactStoreUnavailableError, job_key
 from app.trainer import predict_row
 from app.routers.common import _check_id, _load_meta_or_404
 from app.routers.schemas import (
@@ -31,9 +31,13 @@ from app.routers.schemas import (
 from app.remote_workers import (
     RemoteWorkerError,
     apply_remote_server_overrides,
+    clear_remote_operation_log,
     execute_remote_operation,
+    recover_stale_remote_operation,
     request_remote_operation_cancel,
     remote_configuration_errors,
+    remote_effective_config,
+    remote_server_is_deployed,
     remote_server_public_view,
     resolve_remote_server_credentials,
     validate_server_record,
@@ -42,10 +46,45 @@ from app.remote_workers import (
 router = APIRouter(prefix="/api", tags=["jobs"])
 
 
+def _validate_training_worker(worker_id: str, task: str, hint: dict) -> None:
+    """读取实时资源状态；忙碌槽可排队，失效或不兼容槽不得创建任务。"""
+    try:
+        worker = next((item for item in manager.lease.list_workers()
+                       if item.get("worker_id") == worker_id), None)
+        enabled = worker is not None and manager.lease.is_worker_enabled(
+            worker_id, default=not bool(worker.get("managed", False))
+        )
+    except Exception as exc:
+        raise HTTPException(503, "计算资源状态读取失败，请稍后重试") from exc
+    if worker is None or not worker.get("active"):
+        raise HTTPException(409, "所选计算槽不在线或已失效，请刷新资源列表")
+    if not enabled or worker.get("state") in {"disabled", "degraded", "offline", "stopping"}:
+        raise HTTPException(409, "所选计算槽已停用或暂不可用，请选择其他资源")
+    gpu = worker.get("gpu") or {}
+    requested_backend = str(hint.get("device_backend") or "auto")
+    actual_backend = str(gpu.get("backend") or worker.get("device_backend") or ("cuda" if gpu.get("available") else "cpu"))
+    if requested_backend != "auto" and actual_backend != requested_backend:
+        raise HTTPException(409, f"所选计算槽后端为 {actual_backend}，不满足任务要求的 {requested_backend}")
+    minimum = int(hint.get("min_vram_mb") or 0)
+    if task == "clustering" and gpu.get("available"):
+        raise HTTPException(409, "KMeans 聚类仅使用 CPU，请选择 CPU 计算槽")
+    if (hint.get("require_gpu") or minimum > 0) and not gpu.get("available"):
+        raise HTTPException(409, "任务要求 GPU，所选计算槽不含可用 GPU")
+    if minimum > int(gpu.get("vram_mb") or 0):
+        raise HTTPException(409, "所选 GPU 显存不足以满足任务要求")
+
+
 @router.post("/train")
 def start_training(req: TrainRequest) -> dict:
+    """校验数据与计算资源后创建单节点或异构联合训练任务。"""
+    # 在数据下载和任务写入前验证资源，防止无效选择产生副作用。
     llm_task = req.task.startswith("llm_")
-    meta = _load_meta_or_404(req.dataset_id) if req.dataset_source == "local" else None
+    if req.worker_id:
+        _validate_training_worker(req.worker_id, req.task, {
+            "require_gpu": llm_task or req.require_gpu, "min_vram_mb": req.min_vram_mb,
+            "device_backend": req.device_backend,
+        })
+    meta = _load_meta_or_404(req.dataset_id, materialize=True) if req.dataset_source == "local" else None
     target = "" if req.task == "clustering" or llm_task else (req.target or "")
     columns = (meta or {}).get("columns", [])
     if req.task in {"classification", "regression", "time_series_forecasting"}:
@@ -80,30 +119,61 @@ def start_training(req: TrainRequest) -> dict:
             "model_heads", "ppo_updates", "generation_tokens", "llm_lr",
         ):
             params.pop(name, None)
+    selected_worker = params.pop("worker_id")
     requested_gpu = bool(params.pop("require_gpu"))
+    requested_backend = str(params.pop("device_backend") or "auto")
+    parallel_workers = params.pop("parallel_workers")
+    parallel_timeout = params.pop("parallel_timeout")
     resource_hint = {
-        "require_gpu": llm_task or requested_gpu,
+        "require_gpu": (llm_task and not parallel_workers) or requested_gpu,
         "min_vram_mb": int(params.pop("min_vram_mb") or 0),
     }
+    if requested_backend != "auto":
+        resource_hint["device_backend"] = requested_backend
+    if parallel_workers:
+        from app.parallel_worker import select_members
+        try:
+            members = select_members(manager.lease, parallel_workers, require_idle=False)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if resource_hint["require_gpu"] and any(member["device"] == "cpu" for member in members):
+            raise HTTPException(400, "已选择 CPU 节点，请关闭仅 GPU 资源限制")
+        if requested_backend != "auto" and any(
+            str(member.get("device_backend", "cpu")) != requested_backend for member in members
+        ):
+            raise HTTPException(400, f"联合训练节点必须全部使用 {requested_backend} 后端")
+        if resource_hint["min_vram_mb"] and any(member["device"] == "cpu" or member["vram_mb"] < resource_hint["min_vram_mb"] for member in members):
+            raise HTTPException(400, "所选联合训练节点不满足最低显存限制")
+        resource_hint.update({"parallel_workers": parallel_workers, "parallel_timeout": parallel_timeout})
 
-    job = manager.submit(
-        {
-            "dataset_id": dataset_id,
-            "dataset_name": (meta or {}).get("name", dataset_id),
-            "target": target,
-            "task": task,
-            "params": params,
-            "resource_hint": resource_hint,
-        }
-    )
+    if selected_worker:
+        resource_hint["worker_id"] = selected_worker
+
+    try:
+        job = manager.submit(
+            {
+                "dataset_id": dataset_id,
+                "dataset_name": (meta or {}).get("name", dataset_id),
+                "target": target,
+                "task": task,
+                "params": params,
+                "resource_hint": resource_hint,
+            }
+        )
+    except ArtifactStoreUnavailableError as exc:
+        raise HTTPException(503, "对象存储暂不可用，任务未创建，请稍后重试") from exc
     return {"job_id": job["id"]}
 
 
 @router.get("/jobs")
 def list_jobs() -> list[dict]:
+    try:
+        records = manager.list()
+    except ArtifactStoreUnavailableError as exc:
+        raise HTTPException(503, "对象存储暂不可用，无法读取任务列表，请稍后重试") from exc
     return [
         api_view(record, include_metrics=True, store=manager.store)
-        for record in manager.list()
+        for record in records
     ]
 
 
@@ -115,6 +185,9 @@ def job_detail(job_id: str) -> dict:
         raise HTTPException(404, "任务不存在")
 
     data = api_view(record, include_metrics=True, include_summary=True, store=manager.store)
+    data["performance"] = jobstore.parse_metrics_text(
+        manager.store.read_text(job_key(job_id, "performance.jsonl")) or ""
+    )
     metrics = data.get("metrics") or []
     epochs_total = (record.get("spec") or {}).get("params", {}).get("epochs", 0)
     current_epoch = metrics[-1]["epoch"] if metrics else 0
@@ -129,34 +202,168 @@ def job_detail(job_id: str) -> dict:
 
 
 @router.get("/jobs/{job_id}/logs")
-def job_logs(job_id: str, offset: int = 0) -> dict:
+def job_logs(
+    job_id: str,
+    offset: int = 0,
+    cursor: Optional[str] = None,
+    response: Response = None,
+) -> dict:
+    """增量读取权威文件日志，保留旧版行偏移分页和数据库日志回退。"""
+    # 训练日志是持续变化的状态，禁止浏览器和反向代理复用旧响应。
+    if response is not None:
+        response.headers.update({
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        })
     _check_id(job_id, "任务")
     if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")
 
-    total = 0
-    lines: list[str] = []
-    # 状态平面日志文件为权威源（续训时各登录点自然衔接）
-    text = jobstore.read_job_log(manager.store, job_id)
-    if text:
-        lines = text.splitlines()
-        total = len(lines)
+    key = job_key(job_id, "log.txt")
+    record = jobstore.read_job(manager.store, job_id) or {}
+    revision = max(int(record.get("log_revision", 0)), 0)
+    file_size = manager.store.get_size(key)
+    if cursor is not None:
+        source = "file" if file_size is not None else "database"
+        position, reset = _decode_log_cursor(cursor, source, revision)
+        if source == "file":
+            if position > file_size:
+                position, reset = 0, True
+            lines, next_position = _read_log_file_batch(
+                manager.store,
+                key,
+                position,
+                file_size,
+                allow_partial=record.get("status") in {"completed", "failed", "cancelled"},
+            )
+            return {
+                "lines": lines,
+                "next_cursor": f"file:{revision}:{next_position}",
+                "has_more": next_position < file_size,
+                "reset": reset,
+            }
 
-    # 数据库可用且已有日志时，与文件日志合并优先取数据库（训练线程镜像）
-    if config.DB_AVAILABLE:
+        if not config.DB_AVAILABLE:
+            return {"lines": [], "next_cursor": f"database:{revision}:0", "has_more": False, "reset": reset}
         try:
             with db_session() as db:
-                db_logs = get_job_logs(db, job_id, 0, 1000000)
-                if db_logs:
-                    db_lines = [f"[{log.timestamp.strftime('%H:%M:%S')}] {log.message}" for log in db_logs]
-                    lines = db_lines
-                    total = len(db_lines)
+                db_logs = get_job_logs_after(db, job_id, position, 501)
+            has_more = len(db_logs) > 500
+            batch = db_logs[:500]
+            next_id = batch[-1].id if batch else position
+            lines = [f"[{log.timestamp.strftime('%H:%M:%S')}] {log.message}" for log in batch]
+            return {
+                "lines": lines,
+                "next_cursor": f"database:{revision}:{next_id}",
+                "has_more": has_more,
+                "reset": reset,
+            }
         except Exception:
-            pass
+            return {
+                "lines": [], "next_cursor": f"database:{revision}:{position}",
+                "has_more": False, "reset": reset,
+            }
+
+    # 旧客户端仍按行偏移读取；文件读取保持原有 total/next_offset 响应形状。
+    text = manager.store.read_text(key)
+    if text is not None:
+        lines = text.splitlines()
+        total = len(lines)
+    elif config.DB_AVAILABLE:
+        try:
+            with db_session() as db:
+                total = count_job_logs(db, job_id)
+                db_logs = get_job_logs(db, job_id, max(offset, 0), 500)
+            lines = [f"[{log.timestamp.strftime('%H:%M:%S')}] {log.message}" for log in db_logs]
+            safe_offset = max(0, min(offset, total))
+            return {"lines": lines, "next_offset": safe_offset + len(lines), "total": total}
+        except Exception:
+            lines, total = [], 0
+    else:
+        lines, total = [], 0
 
     offset = max(0, min(offset, total))
     batch = lines[offset : offset + 500]
     return {"lines": batch, "next_offset": offset + len(batch), "total": total}
+
+
+def _decode_log_cursor(cursor: str, source: str, revision: int) -> tuple[int, bool]:
+    """校验带来源和清空版本的日志游标，来源变化时从头读取。"""
+    # 限定长度与整数位数，避免异常长游标消耗不必要的解析资源。
+    if len(cursor) > 64:
+        raise HTTPException(400, "日志游标格式无效")
+    match = re.fullmatch(r"(file|database):(\d{1,10}):(\d{1,20})", cursor)
+    if not match:
+        if cursor == "":
+            return 0, False
+        raise HTTPException(400, "日志游标格式无效")
+    cursor_source, cursor_revision, position = match.groups()
+    if cursor_source != source or int(cursor_revision) != revision:
+        return 0, True
+    return int(position), False
+
+
+def _read_log_file_batch(
+    store, key: str, offset: int, file_size: int, allow_partial: bool = False
+) -> tuple[list[str], int]:
+    """从日志字节游标增量读取最多 500 行，并等待活动日志的尾行写完整。"""
+    chunk_size = 64 * 1024
+    chunks: list[bytes] = []
+    read_position = offset
+    newline_count = 0
+    while read_position < file_size:
+        chunk = store.read_bytes_range(key, read_position, min(chunk_size, file_size - read_position)) or b""
+        if not chunk:
+            break
+        chunks.append(chunk)
+        read_position += len(chunk)
+        newline_count += chunk.count(b"\n")
+        # 在达到 500 条后立即停止范围读取，避免将下一批内容一并下载。
+        if newline_count >= 500:
+            break
+
+    data = b"".join(chunks)
+    newline_positions = [match.start() for match in re.finditer(b"\n", data)]
+    complete_lines = min(len(newline_positions), 500)
+    if complete_lines:
+        consumed = newline_positions[complete_lines - 1] + 1
+    else:
+        consumed = 0
+    if complete_lines == 500:
+        data = data[:consumed]
+    elif allow_partial and consumed < len(data):
+        consumed = len(data)
+    else:
+        data = data[:consumed]
+    next_position = offset + consumed
+    decoded = data.decode("utf-8", errors="replace")
+    # 日志生产方以 LF 分隔；只移除 CRLF 的 CR，不把其他 Unicode 分隔符
+    # 解释成额外日志行，保持字节游标与返回行数严格一致。
+    lines = decoded.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    lines = [line[:-1] if line.endswith("\r") else line for line in lines]
+    return lines[:500], next_position
+
+
+@router.delete("/jobs/{job_id}/logs")
+def clear_job_logs(job_id: str) -> dict:
+    """清空任务文件日志和数据库镜像日志。"""
+    _check_id(job_id, "任务")
+    if not manager.get(job_id):
+        raise HTTPException(404, "任务不存在")
+
+    if config.DB_AVAILABLE:
+        try:
+            with db_session() as db:
+                delete_job_logs(db, job_id)
+        except Exception:
+            raise HTTPException(503, "数据库日志清除失败，请稍后重试")
+    record = jobstore.read_job(manager.store, job_id) or {}
+    jobstore.update_job(manager.store, job_id, log_revision=int(record.get("log_revision", 0)) + 1)
+    jobstore.clear_job_log(manager.store, job_id)
+    return {"ok": True}
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -201,31 +408,15 @@ def resume_job(job_id: str) -> dict:
 def retry_job(job_id: str, request: RetryJobRequest) -> dict:
     """失败任务重新排队；指定槽位时先验证在线、启用及资源要求。"""
     _check_id(job_id, "任务")
+    existing = manager.get(job_id)
+    if request.worker_id and existing and ((existing.get("spec") or {}).get("resource_hint") or {}).get("parallel_workers"):
+        raise HTTPException(400, "联合训练按原成员整组重试，不能改为单个计算槽")
     if request.worker_id:
-        worker = next(
-            (
-                item for item in manager.lease.list_workers()
-                if str(item.get("worker_id", "")) == request.worker_id
-            ),
-            None,
-        )
-        if worker is None or not worker.get("active"):
-            raise HTTPException(409, "所选计算槽不在线或已失效，请刷新资源列表")
-        if not manager.lease.is_worker_enabled(
-            request.worker_id, default=not bool(worker.get("managed", False))
-        ):
-            raise HTTPException(409, "所选计算槽已停用，不能接收重试任务")
-        record = manager.get(job_id)
-        if record is None:
+        if existing is None:
             raise HTTPException(404, "任务不存在")
-        hint = (record.get("spec") or {}).get("resource_hint") or {}
-        gpu = worker.get("gpu") or {}
-        min_vram = int(hint.get("min_vram_mb") or 0)
-        if (hint.get("require_gpu") or min_vram > 0) and not gpu.get("available"):
-            raise HTTPException(409, "任务要求 GPU，所选计算槽不含可用 GPU")
-        if min_vram > 0 and int(gpu.get("vram_mb") or 0) < min_vram:
-            raise HTTPException(409, "所选 GPU 显存不足以满足任务要求")
-
+        _validate_training_worker(
+            request.worker_id, existing["spec"]["task"], existing["spec"].get("resource_hint") or {}
+        )
     try:
         record = manager.retry(job_id, worker_id=request.worker_id)
     except KeyError as exc:
@@ -280,6 +471,10 @@ def list_workers() -> dict:
         info["state"] = state
         info["current_job"] = current_job
         info["epoch"] = epoch
+        # 槽位锁是独占依据，即使首次执行心跳尚未到达也不得显示空闲。
+        info["occupied"] = manager.lease.peek_holder("slot:" + str(info.get("worker_id", ""))) is not None
+        if info.get("active") and info["occupied"] and state in {"idle", "disabled"}:
+            info["state"] = "reserved"
         info["managed"] = bool(info.get("managed", False))
         info["enabled"] = manager.lease.is_worker_enabled(
             str(info.get("worker_id", "")), default=not info["managed"]
@@ -344,6 +539,7 @@ def _start_remote_operation(
         "operation_id": operation_id,
         "machine_id": str(server["machine_id"]),
         "action": action,
+        "previous_server_status": server.get("status"),
         "status": "queued",
         "created_at": now,
         "updated_at": now,
@@ -351,8 +547,12 @@ def _start_remote_operation(
         "error": None,
     }
     server = dict(server)
+    server["deployed"] = remote_server_is_deployed(server)
     server["status"] = {
         "install": "provisioning",
+        "config": "configuring",
+        "deploy": "deploying",
+        "update": "deploying",
         "start": "starting",
         "stop": "stopping",
         "restart": "restarting",
@@ -369,6 +569,19 @@ def list_remote_servers() -> dict:
     """列出经 SSH 接入的远程服务器管理元数据。"""
     servers = _remote_config_db_call(remote_config_repository.list_remote_servers)
     return {"servers": [remote_server_public_view(server) for server in servers]}
+
+
+@router.get("/remote-servers/{machine_id}/effective-config")
+def get_remote_server_effective_config(machine_id: str) -> dict:
+    """返回平台解析出的远程配置摘要，不读取或返回任何配置密钥。"""
+    _check_id(machine_id, "服务器")
+    server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
+    if server is None:
+        raise HTTPException(404, "远程服务器不存在")
+    try:
+        return {"config": remote_effective_config(server)}
+    except RemoteWorkerError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @router.get("/remote-ssh-settings")
@@ -532,12 +745,11 @@ def delete_remote_ssh_settings() -> dict:
         raise HTTPException(503, "平台 SSH 凭证清除失败；请检查 MySQL 连接") from exc
 
 
-@router.post("/remote-servers", status_code=202)
+@router.post("/remote-servers", status_code=201)
 def add_remote_server(
     request: RemoteServerRequest,
-    background_tasks: BackgroundTasks,
 ) -> dict:
-    """经平台 SSH 远程安装 worker；目标主机只接收单文件脚本和容器镜像。"""
+    """登记远程服务器配置；部署由服务器卡片上的单独操作触发。"""
     from app.remote_workers import RemoteWorkerError
 
     server = request.model_dump()
@@ -557,29 +769,37 @@ def add_remote_server(
         raise HTTPException(409, "服务器标识已登记")
     server["username"] = credentials["username"]
     server["ssh_credential_id"] = credentials["id"]
-    server.update({"status": "provisioning", "created_at": time.time()})
-    return _start_remote_operation(server, "install", background_tasks)
+    server.update({"status": "not_deployed", "deployed": False, "created_at": time.time()})
+    _remote_config_db_call(remote_config_repository.save_remote_server, server)
+    return {"server": remote_server_public_view(server)}
 
 
 @router.patch("/remote-servers/{machine_id}")
 def update_remote_server(
     machine_id: str,
     request: RemoteServerUpdateRequest,
+    background_tasks: BackgroundTasks,
+    response: Response,
 ) -> dict:
-    """更新一台远程服务器的连接参数和部署覆盖值，不自动重启目标 worker。"""
+    """保存服务器配置；已部署服务器异步覆盖目标机配置文件。"""
     _check_id(machine_id, "服务器")
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
         raise HTTPException(404, "远程服务器不存在")
-    previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
+    previous_operation_id = str(server.get("operation_id", ""))
+    previous = manager.lease.get_remote_operation(previous_operation_id)
+    if previous:
+        previous = recover_stale_remote_operation(previous_operation_id, previous)
     if previous and previous.get("status") in {"queued", "running"}:
         raise HTTPException(409, "该服务器已有远程操作正在执行，暂时不能编辑")
 
     updates = request.model_dump(exclude_unset=True)
-    if any(updates.get(key) is None for key in ("host", "port", "mode", "cpu_slots") if key in updates):
+    if any(updates.get(key) is None for key in ("host", "port", "mode", "cpu_slots", "device_backend") if key in updates):
         raise HTTPException(422, "SSH 主机、端口、计算类型和 CPU 槽不能设为空")
     candidate = dict(server)
-    for key in ("host", "port", "mode", "cpu_slots"):
+    if "distributed_host" in updates:
+        candidate["distributed_host"] = updates.pop("distributed_host") or ""
+    for key in ("host", "port", "mode", "cpu_slots", "device_backend"):
         if key in updates:
             candidate[key] = updates.pop(key)
     if "username" in updates:
@@ -588,9 +808,14 @@ def update_remote_server(
         if not updates["ssh_credential_id"]:
             raise HTTPException(422, "必须选择 SSH 凭证")
         candidate["ssh_credential_id"] = updates.pop("ssh_credential_id")
+    # 远程构建仓库源（镜像加速 / pip 源 / apt 源）：空值表示清除，回退平台默认。
+    for key in ("docker_registry", "pip_index_url", "apt_mirror"):
+        if key in updates:
+            raw = updates.pop(key)
+            candidate[key] = (str(raw).strip() or None) if raw is not None else None
 
     try:
-        candidate = apply_remote_server_overrides(candidate, updates, is_update=True)
+        candidate = apply_remote_server_overrides(candidate, updates)
     except RemoteWorkerError as exc:
         raise HTTPException(503, str(exc)) from exc
     try:
@@ -598,6 +823,7 @@ def update_remote_server(
     except RemoteWorkerError as exc:
         raise HTTPException(422, str(exc)) from exc
     candidate["username"] = credentials["username"]
+    candidate["deployed"] = remote_server_is_deployed(server)
     try:
         validate_server_record(candidate)
     except RemoteWorkerError as exc:
@@ -608,16 +834,19 @@ def update_remote_server(
 
     candidate["updated_at"] = time.time()
     _remote_config_db_call(remote_config_repository.save_remote_server, candidate)
+    if candidate["deployed"]:
+        response.status_code = 202
+        return _start_remote_operation(candidate, "config", background_tasks)
     return {"server": remote_server_public_view(candidate)}
 
 
 @router.post("/remote-servers/{machine_id}/{action}", status_code=202)
 def manage_remote_server(
     machine_id: str,
-    action: Literal["install", "start", "stop", "restart"],
+    action: Literal["install", "deploy", "config", "start", "stop", "restart"],
     background_tasks: BackgroundTasks,
 ) -> dict:
-    """经 SSH 重装、启动、优雅停止或重启目标服务器上的 worker 容器。"""
+    """经 SSH 首次部署、同步代码、覆盖配置或控制 worker 容器。"""
     _check_id(machine_id, "服务器")
     server = _remote_config_db_call(remote_config_repository.get_remote_server, machine_id)
     if server is None:
@@ -628,13 +857,36 @@ def manage_remote_server(
         credentials = resolve_remote_server_credentials(server)
     except RemoteWorkerError as exc:
         raise HTTPException(409, str(exc)) from exc
-    errors = remote_configuration_errors(credentials, server)
+    if action == "install" and remote_server_is_deployed(server):
+        operation_action = "deploy"
+    elif action == "deploy" and not remote_server_is_deployed(server):
+        operation_action = "install"
+    else:
+        operation_action = action
+    candidate = dict(server)
+    candidate["username"] = credentials["username"]
+    try:
+        validate_server_record(candidate)
+    except RemoteWorkerError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    # start/restart 会把最新配置下发并重建容器应用，需要 Redis/S3/镜像配置可用；
+    # 只有 stop/status 是纯容器操作，不依赖部署配置。
+    errors = remote_configuration_errors(
+        credentials,
+        server,
+        require_platform_config=operation_action in {
+            "install", "deploy", "config", "start", "restart"
+        },
+    )
     if errors:
         raise HTTPException(503, "远程管理配置不完整：" + "；".join(errors))
-    previous = manager.lease.get_remote_operation(str(server.get("operation_id", "")))
+    previous_operation_id = str(server.get("operation_id", ""))
+    previous = manager.lease.get_remote_operation(previous_operation_id)
+    if previous:
+        previous = recover_stale_remote_operation(previous_operation_id, previous)
     if previous and previous.get("status") in {"queued", "running"}:
         raise HTTPException(409, "该服务器已有远程操作正在执行")
-    return _start_remote_operation(server, action, background_tasks)
+    return _start_remote_operation(server, operation_action, background_tasks)
 
 
 @router.get("/remote-operations/{operation_id}")
@@ -647,10 +899,21 @@ def get_remote_operation(
     operation = manager.lease.get_remote_operation(operation_id)
     if operation is None:
         raise HTTPException(404, "远程操作不存在")
+    operation = recover_stale_remote_operation(operation_id, operation)
     operation["cancel_requested"] = manager.lease.is_remote_operation_cancel_requested(
         operation_id
     )
     return operation
+
+
+@router.delete("/remote-operations/{operation_id}/logs")
+def clear_remote_operation_logs(operation_id: str) -> dict:
+    """清除远程操作日志输出，但保留操作状态和阶段信息。"""
+    if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+        raise HTTPException(404, "远程操作不存在")
+    if not clear_remote_operation_log(operation_id):
+        raise HTTPException(404, "远程操作不存在")
+    return {"ok": True, "operation_id": operation_id}
 
 
 @router.post("/remote-operations/{operation_id}/cancel", status_code=202)
@@ -663,6 +926,7 @@ def cancel_remote_operation(
     operation = manager.lease.get_remote_operation(operation_id)
     if operation is None:
         raise HTTPException(404, "远程操作不存在")
+    operation = recover_stale_remote_operation(operation_id, operation)
     if operation.get("status") == "cancelled":
         return {"ok": True, "operation_id": operation_id, "status": "cancelled"}
     if operation.get("status") not in {"queued", "running"}:
@@ -716,7 +980,8 @@ def download_model(job_id: str) -> FileResponse:
 
 
 @router.post("/jobs/{job_id}/predict")
-def predict(job_id: str, body: PredictRequest) -> dict:
+def predict(job_id: str, body: PredictRequest, response: Response = None) -> dict:
+    """保留同步预测，指定 Worker 时提交独立异步预测任务。"""
     _check_id(job_id, "任务")
     if not manager.get(job_id):
         raise HTTPException(404, "任务不存在")
@@ -726,6 +991,8 @@ def predict(job_id: str, body: PredictRequest) -> dict:
     key = job_key(job_id, "best.pt")
     if not manager.store.exists(key):
         raise HTTPException(400, "模型文件尚未生成（任务可能仍在训练）")
+    if body.worker_id:
+        return _submit_inference(job_id, task, body, response)
     local_ckpt = manager.store.read_file(
         key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best.pt"
     )
@@ -736,7 +1003,7 @@ def predict(job_id: str, body: PredictRequest) -> dict:
 
 
 @router.post("/jobs/{job_id}/generate")
-def generate(job_id: str, body: GenerateRequest) -> dict:
+def generate(job_id: str, body: GenerateRequest, response: Response = None) -> dict:
     """从已训练的 LLM 模型包生成文本，不执行任何远程代码。"""
     _check_id(job_id, "任务")
     record = manager.get(job_id)
@@ -748,6 +1015,8 @@ def generate(job_id: str, body: GenerateRequest) -> dict:
     key = job_key(job_id, "best_model.zip")
     if not manager.store.exists(key):
         raise HTTPException(400, "LLM 模型文件尚未生成（任务可能仍在训练）")
+    if body.worker_id:
+        return _submit_inference(job_id, task, body, response)
     local_bundle = manager.store.read_file(
         key, config.WORKER_SCRATCH_DIR / "serve" / job_id / "best_model.zip"
     )
@@ -764,3 +1033,28 @@ def generate(job_id: str, body: GenerateRequest) -> dict:
         return {"prompt": body.prompt, "generated_text": generated}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"文本生成失败: {exc}") from exc
+
+
+def _submit_inference(job_id: str, task: str, body, response: Response) -> dict:
+    """拒绝不可用资源；请求体只保存预测参数，状态接口隐藏输入。"""
+    try:
+        result = manager.inference.submit(job_id, task, body.worker_id,
+                                          body.model_dump(exclude={"worker_id"}, exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if response is not None:
+        response.status_code = 202
+    return result
+
+
+@router.get("/jobs/{job_id}/inferences/{inference_id}")
+def inference_status(job_id: str, inference_id: str) -> dict:
+    """按所属模型查询预测，拒绝跨任务读取及非法路径编号。"""
+    _check_id(job_id, "任务")
+    try:
+        result = manager.inference.get(inference_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not result or result["job_id"] != job_id or not manager.get(job_id):
+        raise HTTPException(404, "预测任务不存在")
+    return result

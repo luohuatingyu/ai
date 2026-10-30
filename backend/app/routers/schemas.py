@@ -7,6 +7,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, StrictBool, model_validator
 
 
+class ParallelMember(BaseModel):
+    """联合训练的固定成员和本地批大小，允许不同算力节点承担不同数据量。"""
+
+    worker_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.-]+$")
+    batch_size: int = Field(default=32, ge=1, le=4096)
+
+
 class TrainRequest(BaseModel):
     dataset_id: str
     target: str | None = None
@@ -45,13 +52,33 @@ class TrainRequest(BaseModel):
     test_split: float = Field(0.2, ge=0.05, le=0.5)
     seed: int = 42
     # 资源提示（任务分发匹配到卡级）：要求在 GPU 卡上训练 / 显存下限
+    worker_id: str | None = Field(default=None, min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.-]+$")
     require_gpu: bool = False
     min_vram_mb: int = Field(0, ge=0, le=1024 * 1024)
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] = "auto"
+    parallel_workers: list[ParallelMember] = Field(default_factory=list, max_length=32)
+    parallel_timeout: int = Field(default=300, ge=10, le=3600)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_resource_selection(cls, data: Any) -> Any:
+        """单槽定向与多节点联合选择互斥，避免调度策略相互覆盖。"""
+        if isinstance(data, dict) and data.get("worker_id") and data.get("parallel_workers"):
+            raise ValueError("指定单个计算槽与多节点联合训练不能同时选择")
+        return data
 
     @model_validator(mode="after")
     def validate_task_fields(self) -> "TrainRequest":
         """按任务类型校验数据源、模型标识、目标列和资源参数。"""
         llm_tasks = {"llm_pretraining", "llm_sft", "llm_dpo", "llm_ppo"}
+        if self.parallel_workers:
+            identifiers = [item.worker_id for item in self.parallel_workers]
+            if len(identifiers) < 2 or len(set(identifiers)) != len(identifiers):
+                raise ValueError("联合训练必须选择 2～32 个不同的计算槽")
+            if self.task == "clustering":
+                raise ValueError("KMeans 暂不支持梯度同步，请使用单节点模式")
+            if self.task in llm_tasks and any(item.batch_size > 64 for item in self.parallel_workers):
+                raise ValueError("LLM 联合训练的各节点批大小不得超过 64")
         repo_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?$")
 
         def validate_repo_id(value: str | None, label: str, required: bool = False) -> None:
@@ -83,10 +110,39 @@ class TrainRequest(BaseModel):
                 raise ValueError("时间列不能与目标列相同")
         if self.task == "clustering" and self.require_gpu:
             raise ValueError("KMeans 聚类当前仅支持 CPU 计算")
+        if self.device_backend == "cpu" and self.require_gpu:
+            raise ValueError("CPU 后端不能同时设置 require_gpu=true")
+        if self.task == "clustering" and self.device_backend not in {"auto", "cpu"}:
+            raise ValueError("KMeans 聚类当前仅支持 CPU 后端")
+        return self
+
+
+class HubDatasetRequest(BaseModel):
+    """维护页的 Hub 来源，仅允许公开仓库引用，不接收任意下载地址或令牌。"""
+
+    repo_id: str = Field(min_length=1, max_length=193)
+    revision: str = Field(default="main", min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_./-]+$")
+    subset: str | None = Field(default=None, min_length=1, max_length=128)
+    split: str = Field(default="train", min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
+    storage_mode: Literal["local", "remote"] = "remote"
+    description: str = Field(default="", max_length=2000)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def validate_hub_source(self) -> "HubDatasetRequest":
+        """拒绝 URL、本地路径和非法仓库标识，下载器只能访问 Hub 仓库。"""
+        from huggingface_hub.utils import validate_repo_id
+
+        validate_repo_id(self.repo_id)
+        if self.subset and (not self.subset.strip() or any(ord(char) < 32 for char in self.subset)):
+            raise ValueError("子集名称不能为空或包含控制字符")
+        if any(not tag.strip() or len(tag) > 100 for tag in self.tags):
+            raise ValueError("标签须为 1～100 个字符")
         return self
 
 
 class PredictRequest(BaseModel):
+    worker_id: str | None = Field(default=None, min_length=1, max_length=160)
     row: dict[str, Any] | None = None
     history: list[Any] | None = None
 
@@ -101,6 +157,7 @@ class PredictRequest(BaseModel):
 class GenerateRequest(BaseModel):
     """LLM 文本生成请求，并限制单次推理的资源消耗。"""
 
+    worker_id: str | None = Field(default=None, min_length=1, max_length=160)
     prompt: str = Field(min_length=1, max_length=32768)
     max_new_tokens: int = Field(default=32, ge=1, le=512)
     temperature: float = Field(default=0.0, ge=0, le=2.0)
@@ -134,22 +191,33 @@ class RemoteServerRequest(BaseModel):
     )
     port: int = Field(default=22, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] = "gpu"
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] = "auto"
     cpu_slots: int = Field(default=2, ge=0, le=256)
-    worker_image: str | None = Field(default=None, max_length=512)
+    distributed_host: str = Field(default="", max_length=253, pattern=r"^[A-Za-z0-9.:-]*$")
     remote_redis_url: str | None = Field(default=None, max_length=4096)
     remote_s3_endpoint: str | None = Field(default=None, max_length=512)
+    # 远程构建仓库源（可选，目标机构建 worker 镜像时注入加速源）
+    docker_registry: str | None = Field(default=None, max_length=253)
+    pip_index_url: str | None = Field(default=None, max_length=2048)
+    apt_mirror: str | None = Field(default=None, max_length=253)
 
     @model_validator(mode="after")
     def validate_deployment_overrides(self) -> "RemoteServerRequest":
         """拒绝远程部署配置中的换行和格式错误值。"""
-        if self.worker_image and any(char.isspace() or ord(char) < 32 for char in self.worker_image):
-            raise ValueError("WORKER_IMAGE 不能包含空白字符")
         if self.remote_redis_url and not self.remote_redis_url.startswith(("redis://", "rediss://")):
             raise ValueError("Redis 地址必须以 redis:// 或 rediss:// 开头")
         if self.remote_redis_url and any(char.isspace() or ord(char) < 32 for char in self.remote_redis_url):
             raise ValueError("Redis 地址不能包含空白或控制字符")
         if self.remote_s3_endpoint and any(char.isspace() or ord(char) < 32 for char in self.remote_s3_endpoint):
             raise ValueError("S3 地址不能包含空白字符")
+        if self.docker_registry and not re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", self.docker_registry):
+            raise ValueError("镜像加速源必须是主机[:端口]格式，例如 docker.m.daocloud.io")
+        if self.pip_index_url and not self.pip_index_url.startswith(("http://", "https://")):
+            raise ValueError("pip 源必须以 http:// 或 https:// 开头")
+        if self.pip_index_url and any(char.isspace() or ord(char) < 32 for char in self.pip_index_url):
+            raise ValueError("pip 源不能包含空白或控制字符")
+        if self.apt_mirror and not re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", self.apt_mirror):
+            raise ValueError("apt 源必须是主机[:端口]格式，例如 mirrors.aliyun.com")
         return self
 
 
@@ -161,23 +229,34 @@ class RemoteServerUpdateRequest(BaseModel):
     ssh_credential_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     port: int | None = Field(default=None, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] | None = None
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] | None = None
     cpu_slots: int | None = Field(default=None, ge=0, le=256)
-    worker_image: str | None = Field(default=None, max_length=512)
+    distributed_host: str | None = Field(default=None, max_length=253, pattern=r"^[A-Za-z0-9.:-]*$")
     remote_redis_url: str | None = Field(default=None, max_length=4096)
     remote_s3_endpoint: str | None = Field(default=None, max_length=512)
     clear_remote_redis_url_override: bool = False
+    # 远程构建仓库源（可选，目标机构建 worker 镜像时注入加速源）
+    docker_registry: str | None = Field(default=None, max_length=253)
+    pip_index_url: str | None = Field(default=None, max_length=2048)
+    apt_mirror: str | None = Field(default=None, max_length=253)
 
     @model_validator(mode="after")
     def validate_deployment_overrides(self) -> "RemoteServerUpdateRequest":
         """拒绝编辑请求中的换行和格式错误值。"""
-        if self.worker_image and any(char.isspace() or ord(char) < 32 for char in self.worker_image):
-            raise ValueError("WORKER_IMAGE 不能包含空白字符")
         if self.remote_redis_url and not self.remote_redis_url.startswith(("redis://", "rediss://")):
             raise ValueError("Redis 地址必须以 redis:// 或 rediss:// 开头")
         if self.remote_redis_url and any(char.isspace() or ord(char) < 32 for char in self.remote_redis_url):
             raise ValueError("Redis 地址不能包含空白或控制字符")
         if self.remote_s3_endpoint and any(char.isspace() or ord(char) < 32 for char in self.remote_s3_endpoint):
             raise ValueError("S3 地址不能包含空白字符")
+        if self.docker_registry and not re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", self.docker_registry):
+            raise ValueError("镜像加速源必须是主机[:端口]格式，例如 docker.m.daocloud.io")
+        if self.pip_index_url and not self.pip_index_url.startswith(("http://", "https://")):
+            raise ValueError("pip 源必须以 http:// 或 https:// 开头")
+        if self.pip_index_url and any(char.isspace() or ord(char) < 32 for char in self.pip_index_url):
+            raise ValueError("pip 源不能包含空白或控制字符")
+        if self.apt_mirror and not re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", self.apt_mirror):
+            raise ValueError("apt 源必须是主机[:端口]格式，例如 mirrors.aliyun.com")
         return self
 
 

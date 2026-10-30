@@ -21,6 +21,7 @@
 x-backend-env: &backend-env
   # ---- 协调平面 (外部Redis容器，地址来自.env) ----
   REDIS_URL: ${REDIS_URL:-redis://localhost:6379/0}
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
   # ---- 状态平面（S3 兼容：SeaweedFS / OSS / COS / S3 均可）----
   STORAGE_BACKEND: s3
   S3_ENDPOINT: ${S3_ENDPOINT:-seaweedfs:8333}
@@ -79,7 +80,11 @@ services:
     restart: unless-stopped
 
   trainer:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: mtp-trainer
     # 仅内网：对外入口统一走 frontend 容器（同源代理 /api）
     # 本地单进程开发仍可直接 uvicorn app.main:app（后端自带静态兜底）
@@ -97,6 +102,7 @@ services:
       USE_DATABASE: ${USE_DATABASE:-false}
       EMBEDDED_WORKERS: ${EMBEDDED_WORKERS:-0}   # 多机模式下训练交给 worker 服务
       WORKER_REMOTE_REDIS_URL: ${WORKER_REMOTE_REDIS_URL:-}
+      WORKER_REMOTE_REDIS_PASSWORD: ${WORKER_REMOTE_REDIS_PASSWORD:-}
       WORKER_REMOTE_S3_ENDPOINT: ${WORKER_REMOTE_S3_ENDPOINT:-}
       WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY: ${WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY:-}
     depends_on:
@@ -128,7 +134,11 @@ services:
 
   worker:
     image: ${WORKER_IMAGE:-mtp-worker:local}
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: mtp-worker
     # 计算平面：supervisor 按 WORKER_CPU_SLOTS 拉起 CPU 执行槽（一卡一进程的 CPU 版）
     command: ["python", "-m", "app.worker"]
@@ -143,6 +153,8 @@ services:
       USE_DATABASE: ${USE_DATABASE:-false}
       WORKER_MACHINE_ID: ${WORKER_MACHINE_ID:-}
       WORKER_MANAGED: ${WORKER_MANAGED:-false}
+      # 同一 Compose 网络内的 CPU/GPU 槽使用服务名互联；跨机器部署请显式配置训练网地址并使用受管 worker。
+      WORKER_DISTRIBUTED_HOST: ${WORKER_DISTRIBUTED_HOST:-worker}
     depends_on:
       seaweedfs:
         condition: service_healthy

@@ -127,6 +127,11 @@ def read_job_log(store: ArtifactStore, job_id: str) -> str:
     return store.read_text(job_key(job_id, "log.txt")) or ""
 
 
+def clear_job_log(store: ArtifactStore, job_id: str) -> None:
+    """清空任务状态存储中的日志文件。"""
+    store.write_bytes(job_key(job_id, "log.txt"), b"")
+
+
 def list_job_ids(store: ArtifactStore) -> List[str]:
     """列出状态平面上的全部任务 ID（按 key 解析，本地/对象存储两后端通用）。"""
     ids: List[str] = []
