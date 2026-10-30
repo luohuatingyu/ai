@@ -1,3 +1,53 @@
+## 本次变更测试结果：选择预测计算资源并展示执行位置（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：01e84769c55ab7f05aa3a3316e79ae1a3e4e3dc1。
+- **提交信息**：Add selectable prediction compute resources。
+- **测试日期 / 分支**：2026-10-30 / emdash/hot-boxes-clean-y9u6p。
+- **范围**：预测和文本生成保留原有同步 API 默认行为，也可指定在线 Worker 异步执行；忙碌槽排队，不可用时明确失败，不自动回退。前端显示实际机器、Worker、设备和预测编号。预测记录与训练状态隔离，并通过共享租约避免同槽训练和预测并发。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| 默认 API 兼容；指定资源生成独立预测记录 | API；分类/LLM 模型，省略或指定 Worker | `backend/tests/test_inference.py` 断言默认预测/生成响应不变，指定 Worker 返回 202、预测编号和最终结果，训练任务记录不变 | 正常、兼容、回归 |
+| 仅运行在用户指定的有效 Worker | 队列/API；有效、离线、停用、设备异常、忙碌及不支持设备 | 同文件参数化拒绝失效资源、忙碌时排队；不同 Worker 队列隔离，服务恢复后可恢复记录 | 边界、异常、状态冲突 |
+| 报告实际执行位置和设备 | Worker 子进程；真实 checkpoint 的分类、回归、聚类、时序和 LLM 预测 | 同文件运行真实训练产物并断言 worker_id、machine_id/hostname、slot、device/backend/name 与结果；容器 CPU 预测核对所选 Worker 的实际记录 | 端到端、正常、回归 |
+| 同槽训练互斥且异常可清理 | 队列/租约/子进程；训练占用、租约丢失、超时、取消、停机 | 同文件断言共享槽锁、队列顺序、子进程终止和迟到结果保护 | 并发、异常、超时、安全 |
+| 预测预处理与训练产物一致 | 模型；缺失/非法字段和重复输入 | 同文件从训练链路生成模型，验证缺失值填补、编码/标准化、特征顺序与重复预测稳定性 | 边界、兼容、回归 |
+| 前端异步交互与隐私安全正确 | Node；排队/完成/失败、状态轮询、模型切换、不可信主机名 | `frontend/workbench-interactions.test.cjs` 断言不重复提交、状态请求 no-store、显示机器/Worker/设备/编号、用文本安全呈现，旧响应不覆盖新模型；三次查询失败提示后台可能仍在执行 | 并发、异常、XSS、竞态 |
+| 失效资源不静默改选 | Node；资源缺失、离线、停用、过期、不健康、聚类选 GPU | 同文件参数化断言保留原选择、解释原因且不提交；`frontend/training-resources.test.cjs` 覆盖 predicting 占用显示 | 边界、异常、回归 |
+| 历史训练、数据格式和 API 不回归 | Python 3.12 完整后端 | 全量 `backend/tests/` 覆盖既有训练、日志、指标、checkpoint、预测一致性、权限与双布局数据集行为 | 兼容、安全、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 隔离功能快照：完整前端 | 179 | 179 | 0 | 0 | 0 |
+| 隔离功能快照：Python 3.12 完整后端 | 677 | 646 | 0 | 0 | 31 |
+| 预测后端专项（前序执行） | 29 | 29 | 0 | 0 | 0 |
+| 并行共享工作区：完整后端（非隔离） | 690 | 658 | 1 | 0 | 31 |
+
+- 隔离后端使用 Python 3.12.15，耗时 157.15 秒。31 项因未配置真实 Redis/S3、NVIDIA GPU/NCCL 或 Supervisor 多进程环境而跳过；两条既有弃用警告来自 SQLAlchemy `declarative_base` 和 pandas `xlrd`，跳过项不计为通过。
+- 并行共享工作区另有 1 项失败：`tests/test_api.py::test_training_page_resource_retry_and_chart_style_contract` 断言旧 CSS 版本 `20261030-curve-tabs-1`，共享首页已并行改为 `20261030-training-record-2`。该测试及样式不在本次隔离提交；本次隔离功能快照的全量套件通过，未删除或弱化测试。
+- `docker compose up --build -d` 成功；`docker compose ps` 显示 frontend、SeaweedFS healthy，trainer、worker running；`curl --fail --silent --show-error http://localhost:8000/api/health` 返回 `{"ok":true}`，首页包含“预测计算资源”选择器。
+- 真实容器 CPU Worker 预测完成：`infer-bc3761957c5b46ecb625b217e8e32cce`，所属任务 `job-20261030-105504-b5670a`，实际 `worker_id=a9d5ae3dd6c4-cpu0`、机器/主机 `a9d5ae3dd6c4`、槽 `cpu0`、设备 `cpu`（`CPU`）。另验证默认同步 200、指定 Worker 异步 202 和相同预测结果。只删除本次预测编号目录下 3 个对象，未触碰既有任务、数据集或模型。
+- 预测记录和临时验证文件位于 `/tmp/mtp-inference-work/` 与 pytest 临时目录；提交前清理，无运行时产物纳入版本控制。
+
+实际执行命令：`node --test frontend/*.test.cjs`；`docker run --rm --pull=never --network none --mount type=bind,src=/tmp/mtp-inference-work/feature-source,dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -rs -p no:cacheprovider --basetemp=/tmp/mtp-inference-isolated-backend-tests --tb=short`；`docker compose up --build -d`；`docker compose ps`；`curl --fail --silent --show-error http://localhost:8000/api/health`。
+
+### 已知限制、重测建议与回滚
+
+- 本环境没有物理 GPU；CUDA/ROCm/XPU/MPS、多 GPU/NCCL、Redis/S3 和 Supervisor 集成需在相应环境补验。未执行真实浏览器截图/点击，已运行完整 Node 交互测试及首页 HTTP 检查。
+- 修改预测队列、设备选择、训练/预测共享租约、预测 API 或预处理时，重跑预测专项、完整前端、Python 3.12 后端并重建 Compose 服务；有 GPU 的环境补跑设备集成测试。
+- 可撤销功能提交 `01e84769c55ab7f05aa3a3316e79ae1a3e4e3dc1` 并执行 `docker compose up --build -d` 回滚；无需数据迁移。
+
+## 本次测试报告更新提交
+
+- **报告提交**：Update test report for selectable prediction resources。
+- 报告基准点指向功能提交 `01e84769c55ab7f05aa3a3316e79ae1a3e4e3dc1`；报告自身提交不改变该测试代码版本。
+
 ## 本次变更测试结果：合并慢任务列表轮询，恢复资源终态核对（2026-10-30）
 
 ### Git 基准点与范围
