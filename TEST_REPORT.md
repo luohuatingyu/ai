@@ -1,3 +1,47 @@
+## 本次变更测试结果：日志游标分页、S3 故障可重试与训练记录展示修正（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：576daa4e4da97952bf882fe0f3dcf7da11caba93。
+- **提交信息**：Fix training record layout and credential selector focus（本报告基准点；功能为前两个提交）。
+- **测试日期 / 分支**：2026-10-30 / emdash/hot-boxes-clean-y9u6p。
+- **范围**：任务日志改为来源+清空版本+字节位置的游标增量分页（文件与数据库双源、旧偏移分页保持兼容），日志存储新增字节范围读取并复用连接；S3 任务记录写入/列表故障统一映射为 503 可重试错误，不泄露连接细节；训练记录栅格空槽边框、表头对比度、进度回退计算修正，SSH 凭证下拉焦点修复并移除跨页管理入口。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| 日志按游标增量续读且不清空、不重复 | API/存储；有后续批次、空批次、清空版本、跨来源、越界游标 | `tests/test_api.py` 游标分页/格式校验用例与 `app/storage.py` 字节范围读测试：500 行分批、空批次不忙循环、来源或清空版本变化从头读取、S3 缺失返回空值且服务故障保留异常 | 正常、边界、异常、兼容 |
+| 数据库镜像日志支持主键游标 | 数据层；job_logs 复合索引 `ix_job_logs_job_id_id` | `tests/test_db_layer.py` 断言 `get_job_logs_after` 只返回 `id` 大于游标的行，`count_job_logs` 不加载实体；`db_init.create_tables` 补齐索引 | 正常、回归 |
+| 存储故障返回可重试错误且不静默 | API；训练提交与任务列表期间连接故障 | `tests/test_api.py::test_training_storage_write_failure_returns_retryable_service_error`、`test_job_list_storage_failure_returns_retryable_service_error` 断言 503 中文提示、任务不入队、不泄露 endpoint/secret；`tests/test_storage.py::test_s3_write_failure_is_reported_as_storage_unavailable` | 异常、安全、权限 |
+| 训练记录展示与凭证交互 | 前端；栅格实际字段数、表头高对比度、进度缺省回退、凭证焦点 | `frontend/training-record-display.test.cjs`、`frontend/server-modal.test.cjs`、`frontend/workbench-interactions.test.cjs`：栅格无空块边框、表头 700 加粗、进度取 epoch/epochs 或终态 100%、空凭证时焦点留在下拉框且无跨页入口 | 正常、边界、兼容、回归 |
+| 历史功能不回归 | Python 3.12 完整后端 | 全量 `backend/tests/`：训练、轮询、指标、checkpoint、预测一致性、权限与双布局数据集 | 兼容、安全、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 完整后端（容器 /repo 完整仓库布局） | 690 | 658 | 1 | 0 | 31 |
+| 完整前端 `node --test frontend/` | 184 | 184 | 0 | 0 | 0 |
+
+- 首轮曾将 `backend/tests` 拷入容器 `/app/tests` 执行，因测试以 `Path(__file__).parents[2]` 定位仓库根，容器布局差异产生 23 个路径类失败；改为 `/repo` 完整仓库布局（与本地 checkout 等价，Python 3.12.15）后复跑，除 1 项既有失败外全部通过。
+- `tests/test_api.py::test_training_page_resource_retry_and_chart_style_contract` 首轮失败源于旧断言写死 CSS 版本 `20261030-curve-tabs-1`；本次变更后更新为 `20261030-training-record-2` 并通过，未删除或弱化其他断言。
+- `tests/test_remote_workers.py::test_worker_entrypoint_clears_removed_values_and_rejects_missing_file` 在基准点 `01e8476` 的干净签出中同样失败（`REDIS_PASSWORD=` 子串误匹配 `WORKER_REMOTE_REDIS_PASSWORD=`），属既有问题，不在本次变更范围；后续建议将断言改为按行匹配避免子串误报。
+- 本环境无物理 GPU；31 项跳过与既有记录一致（真实 Redis/S3、NCCL/Supervisor 多进程、GPU 相关集成）。
+- `docker compose up --build -d` 成功（trainer/worker/frontend running、SeaweedFS healthy）；`curl http://localhost:8000/api/health` 返回 `{"ok":true}`；首页已引用 `app.css?v=20261030-training-record-2`。
+
+实际执行命令：`docker compose up --build -d`；`docker exec -w /repo/backend mtp-trainer python -m pytest tests/`（多次，最终 658 通过/1 既有失败/31 跳过）；`git archive 01e8476 | docker exec -i mtp-trainer tar x -C /baseline` 后对基准点复跑疑点用例；`node --test frontend/`；`curl --fail --silent --show-error http://localhost:8000/api/health`。
+
+### 已知限制、重测建议与回滚
+
+- 修改日志分页、存储读写、任务 API 或训练记录样式时重跑全量前后端测试并重建 Compose；`test_worker_entrypoint` 既有失败修复后应补跑 `tests/test_remote_workers.py`。
+- 可逐一撤销 `b1f1cd5`（日志分页）、`d12714e`（S3 故障映射）、`576daa4`（前端修正）并 `docker compose up --build -d` 回滚；无数据迁移。
+
+## 本次测试报告更新提交
+
+- **报告提交**：Update test report for log cursor pagination and storage error mapping。
+- 报告基准点指向功能提交 `576daa4e4da97952bf882fe0f3dcf7da11caba93`；报告自身提交不改变该测试代码版本。
+
 ## 本次变更测试结果：选择预测计算资源并展示执行位置（2026-10-30）
 
 ### Git 基准点与范围
