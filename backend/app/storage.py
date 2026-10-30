@@ -335,10 +335,16 @@ class S3ArtifactStore(ArtifactStore):
             ) from exc
 
     def write_bytes(self, key: str, data: bytes) -> None:
+        """写入对象存储；网络、鉴权和服务端故障统一包装。"""
         validate_key(key)
         from io import BytesIO
 
-        self._client.put_object(self.bucket, key, BytesIO(data), length=len(data))
+        try:
+            self._client.put_object(self.bucket, key, BytesIO(data), length=len(data))
+        except Exception as exc:
+            raise ArtifactStoreUnavailableError(
+                f"写入对象存储产物失败: {key}: {exc}"
+            ) from exc
 
     def exists(self, key: str) -> bool:
         validate_key(key)

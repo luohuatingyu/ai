@@ -16,7 +16,7 @@ from app.database import db_session
 from app.db_utils import count_job_logs, delete_job_logs, get_job_logs, get_job_logs_after
 from app.jobs import api_view
 from app.state import manager
-from app.storage import job_key
+from app.storage import ArtifactStoreUnavailableError, job_key
 from app.trainer import predict_row
 from app.routers.common import _check_id, _load_meta_or_404
 from app.routers.schemas import (
@@ -149,24 +149,31 @@ def start_training(req: TrainRequest) -> dict:
     if selected_worker:
         resource_hint["worker_id"] = selected_worker
 
-    job = manager.submit(
-        {
-            "dataset_id": dataset_id,
-            "dataset_name": (meta or {}).get("name", dataset_id),
-            "target": target,
-            "task": task,
-            "params": params,
-            "resource_hint": resource_hint,
-        }
-    )
+    try:
+        job = manager.submit(
+            {
+                "dataset_id": dataset_id,
+                "dataset_name": (meta or {}).get("name", dataset_id),
+                "target": target,
+                "task": task,
+                "params": params,
+                "resource_hint": resource_hint,
+            }
+        )
+    except ArtifactStoreUnavailableError as exc:
+        raise HTTPException(503, "对象存储暂不可用，任务未创建，请稍后重试") from exc
     return {"job_id": job["id"]}
 
 
 @router.get("/jobs")
 def list_jobs() -> list[dict]:
+    try:
+        records = manager.list()
+    except ArtifactStoreUnavailableError as exc:
+        raise HTTPException(503, "对象存储暂不可用，无法读取任务列表，请稍后重试") from exc
     return [
         api_view(record, include_metrics=True, store=manager.store)
-        for record in manager.list()
+        for record in records
     ]
 
 

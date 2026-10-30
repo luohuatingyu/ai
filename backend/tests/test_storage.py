@@ -545,3 +545,17 @@ def test_s3_backend_roundtrip():
     finally:
         for k in st.list_keys("jobs/it-s3/"):
             st.delete(k)  # 清理测试遗留对象
+
+
+def test_s3_write_failure_is_reported_as_storage_unavailable():
+    """S3 上传连接故障包装成可识别的存储异常供 API 安全映射。"""
+    class FailingClient:
+        def put_object(self, *args, **kwargs):
+            raise ConnectionError("TLS connection reset")
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = FailingClient()
+    st.bucket = "test-bucket"
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="写入对象存储产物失败"):
+        st.write_bytes("jobs/test/job.json", b"{}")

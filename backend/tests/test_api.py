@@ -2083,3 +2083,42 @@ def test_management_tabs_have_independent_pages_and_forms():
     assert 'id="addServerModal"' not in workbench
     assert 'id="workerGrid"' in workbench
     assert 'data-remote-action=' not in workbench
+
+
+def test_training_storage_write_failure_returns_retryable_service_error(selection_api, make_dataset, monkeypatch):
+    """任务权威记录无法写入时返回可重试错误且不入队或泄露连接细节。"""
+    from app.storage import ArtifactStoreUnavailableError
+
+    client, manager, _ = selection_api
+    ds_id = make_dataset(n=40)
+
+    def fail_write(*args, **kwargs):
+        """模拟对象存储连接故障，保持路由和任务创建流程真实运行。"""
+        raise ArtifactStoreUnavailableError("TLS secret endpoint connection reset")
+
+    monkeypatch.setattr(manager.store, "write_json", fail_write)
+    response = client.post("/api/train", json=_train_payload(ds_id))
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "对象存储暂不可用，任务未创建，请稍后重试"
+    assert "secret" not in response.text and "endpoint" not in response.text
+    assert manager.list() == []
+    assert manager.queue.snapshot() == []
+
+
+def test_job_list_storage_failure_returns_retryable_service_error(selection_api, monkeypatch):
+    """任务列表无法读取权威状态时返回可重试错误，不伪装成空列表。"""
+    from app.storage import ArtifactStoreUnavailableError
+
+    client, manager, _ = selection_api
+
+    def fail_list(*args, **kwargs):
+        """模拟对象存储列表请求失败。"""
+        raise ArtifactStoreUnavailableError("TLS secret endpoint connection reset")
+
+    monkeypatch.setattr(manager.store, "list_keys", fail_list)
+    response = client.get("/api/jobs")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "对象存储暂不可用，无法读取任务列表，请稍后重试"
+    assert "secret" not in response.text and "endpoint" not in response.text
