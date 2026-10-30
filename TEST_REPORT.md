@@ -3423,3 +3423,84 @@ docker compose up --build -d
 - 在真实 Redis 多 worker 环境执行跨进程槽位抢占、worker 崩溃接管和网络抖动测试。
 - 在真实 GPU 节点验证 GPU 槽独占、显存限制和训练吞吐。
 - 修改槽位租约、心跳状态或资源选择逻辑时，重跑本节专项、完整后端套件和前端套件。
+
+## 本次变更测试结果：移除训练页管理快捷入口（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：`2ca97d3`（Remove management shortcuts from training views）。
+- **测试日期 / 分支**：2026-10-30 / `emdash/hot-boxes-clean-y9u6p`。
+- **变更范围**：训练台计算资源栏移除“管理服务器”入口；添加服务器弹窗移除“管理凭证”入口。保留服务器/凭证独立管理页导航、凭证选择和刷新；无后端接口、依赖或数据格式变更。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 可执行验证 | 结果与场景 |
+|---|---|---|
+| 训练台和服务器弹窗不再出现这两个快捷入口 | `frontend/server-modal.test.cjs` 的“工作台和服务器弹窗不再提供跨页管理入口”；`test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_area` | 通过；页面结构、正常、兼容 |
+| 凭证为空时校验焦点可用，刷新和已有凭证流程保留 | Node `server-modal.test.cjs`；`test_remote_server_dialog_groups_fields_and_keeps_actions_outside_scroll_area` | 通过；空状态、焦点、刷新、回归 |
+| 容器提供已更新的静态页面 | `docker compose up --build -d`、`/api/health`、训练台和服务器页 HTTP 内容核对 | 通过；4 个服务运行，健康检查成功 |
+
+### 测试执行结果
+
+| 阶段 / 实际命令 | 通过 | 失败 | 跳过 | 说明 |
+|---|---:|---:|---:|---|
+| 前端专项 `node --test frontend/server-modal.test.cjs` | 33 | 0 | 0 | 覆盖服务器/凭证弹窗和页面入口 |
+| JS 语法 `node --check backend/static/remote-management.js` | 1 | 0 | 0 | 通过 |
+| 后端相关 `python3 -m pytest backend/tests/test_api.py -q -k 'remote_server_dialog or management_tabs' --tb=short` | 3 | 0 | 85 | 宿主 Python 3.9.6；1 条既有 SQLAlchemy 弃用警告 |
+| 前端完整 `node --test frontend/*.test.cjs` | 98 | 22 | 0 | 22 项失败均在工作台测试 fixture 初始化时报 `document.addEventListener is not a function`；该工作区同时有未提交的训练工作台交互改动 |
+| Python 3.12 后端完整 `python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-remove-management-links --tb=short -rs` | 615 | 2 | 31 | 1 项静态契约断言期待旧 CSS 缓存版本（工作区并行修改已更新版本）；1 项 Gloo 多进程异常退出，单独重试该测试后 3 个参数用例通过 |
+| 容器重建及健康检查 | 4 服务 | 0 | 0 | trainer、worker、frontend、SeaweedFS 均运行；`/api/health` 返回 `{"ok":true}` |
+
+Python 3.12 完整套件实际运行于已构建的 trainer 镜像：
+
+```bash
+docker run --rm --pull=never --network none \
+  --mount type=bind,src="$PWD",dst=/workspace,readonly \
+  --workdir /workspace/backend \
+  --env PYTHONDONTWRITEBYTECODE=1 \
+  --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 \
+  emdash-hot-boxes-clean-y9u6p-trainer:latest \
+  python -m pytest tests/ -q -p no:cacheprovider \
+    --basetemp=/tmp/mtp-remove-management-links --tb=short -rs
+```
+
+完整前端套件的失败属于并行工作区测试夹具与训练台交互改动不匹配；完整后端套件的 CSS 版本失败也由同一并行工作区的静态资源版本更新触发。该环境下完整套件仍有未通过项，不能据此判定全套回归通过；本次相关前后端专项均通过。
+
+### 已知限制与下次测试建议
+
+- 全量测试需在训练工作台并行改动及其测试夹具、CSS 缓存版本契约同步后重跑。
+- 本次仅移除入口，不影响经独立页面顶部导航访问服务器管理和凭证管理。
+
+## 本次变更测试结果：聚焦本次训练并保留完整训练记录（2026-10-30）
+
+### Git 基准点与范围
+
+- **Commit Hash**：052b3f6（Focus training workbench on current run）。
+- **测试日期 / 分支**：2026-10-30 / emdash/hot-boxes-clean-y9u6p。
+- **变更范围**：训练台主区默认聚焦运行中/排队中/暂停中的任务，仅显示当前任务；“全部训练”弹窗保留全部历史搜索、状态筛选和切换；详情新增完整训练记录页，展示参数、生命周期、执行资源与分段、逐轮指标、性能及错误。未修改 API、数据格式或依赖。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 可执行验证 | 结果与覆盖场景 |
+|---|---|---|
+| 当前/活跃训练优先呈现，主区不随历史任务增长 | frontend/workbench-interactions.test.cjs：“首次聚焦活跃任务，历史弹窗保留完整卡片并复用焦点” | 通过；活跃优先、已选任务保持、无活跃时回退、单卡主区、轮询保焦 |
+| 全部训练仍可检索、筛选和切换 | 同文件：“搜索和状态筛选组合在完整训练弹窗中工作…”、“历史选择关闭弹窗并切换当前训练…”、“Escape 关闭历史弹窗并恢复入口焦点” | 通过；组合筛选、空集合、恶意名称转义、历史选择、键盘关闭与焦点恢复 |
+| 训练过程详细且兼容旧任务 | 同文件：“训练记录展示配置、完整指标、性能和跨节点执行段…”、“旧任务缺少时间、性能和执行段时记录页提供明确空状态” | 通过；配置/摘要/指标/吞吐、执行分段、失败原因、恶意文本转义、缺字段兼容 |
+| 页面行为与已有日志/预测/标签兼容 | node --test frontend/*.test.cjs | 124 项通过；包括日志轮询、任务切换、预测响应隔离及键盘标签导航回归 |
+| 服务提供最新页面 | docker compose up --build -d、训练页内容核对、/api/health | 4 个服务运行；页面含“本次训练”“全部训练”“训练记录”，健康接口返回 {"ok":true} |
+
+### 测试执行结果
+
+| 阶段 / 实际命令 | 通过 | 失败 | 跳过 | 说明 |
+|---|---:|---:|---:|---|
+| 训练台专项 node --test frontend/workbench-interactions.test.cjs | 27 | 0 | 0 | 覆盖本次聚焦、历史弹窗和完整记录 |
+| 前端完整 node --test frontend/*.test.cjs | 124 | 0 | 0 | Node 内置测试 |
+| 后端完整 docker run --rm --pull=never --network none --mount type=bind,src="$PWD",dst=/workspace,readonly --workdir /workspace/backend --env PYTHONDONTWRITEBYTECODE=1 --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 emdash-hot-boxes-clean-y9u6p-trainer:latest python -m pytest tests/ -q -p no:cacheprovider --basetemp=/tmp/mtp-training-focus-full --tb=short -rs | 617 | 0 | 31 | Python 3.12；跳过项依赖 Redis、S3、真实 GPU/NCCL；2 条既有弃用警告 |
+| 页面脚本语法与差异检查 | 2 | 0 | 0 | Node vm.Script 校验内联脚本，git diff --check 通过 |
+| 容器重建和 HTTP 核对 | 4 服务 | 0 | 0 | docker compose up --build -d 成功；健康接口和静态页面均可访问 |
+
+### 已知限制与下次测试建议
+
+- 当前没有可用的浏览器自动化会话，因此未完成人工桌面/移动端截图检查；已完成响应内容、交互测试和服务健康核对。
+- Redis/S3/GPU/NCCL 条件测试未在本环境配置，相关分布式和硬件路径仍需在对应环境验证。
+- 若未来更改训练详情 API 或记录格式，应补充 API 兼容测试；本次使用的现有详情字段已由完整后端回归覆盖。
