@@ -234,6 +234,74 @@ test('历史轮询保留有效页和卡片焦点，记录减少时回退且请�
   assert.match(f.$('jobsFeedback').textContent, /离线.*保留列表/);
 });
 
+test('慢任务列表轮询共用一个请求，完成响应仍更新任务并触发资源释放核对', async () => {
+  const f = fixture(), pending = deferred();
+  f.state.jobs = [{ ...job('a'), worker_id: 'cpu' }]; f.state.jobId = 'a';
+  f.state.workerRequestVersion = 0;
+  f.context.fillPredictTemplate = () => {}; f.context.loadDetail = () => {};
+  const resourceRequests = [];
+  f.context.refreshWorkers = options => resourceRequests.push(options);
+  f.context.apiJson = (url, options) => { f.requests.push({ url, options }); return pending.promise; };
+  const first = f.context.refreshJobs();
+  const polls = Array.from({ length: 30 }, () => f.context.refreshJobs());
+  assert.equal(f.requests.length, 1, '列表慢于轮询间隔时不得继续占用浏览器连接');
+  assert.ok(polls.every(poll => poll === first), '后续刷新应等待同一个结果');
+  assert.equal(f.requests[0].options.cache, 'no-store');
+  assert.ok(f.requests[0].options.signal instanceof AbortSignal);
+  pending.resolve([{ ...completedJob('a'), worker_id: 'cpu' }]);
+  await Promise.all([first, ...polls]);
+  assert.equal(f.state.jobs[0].status, 'completed');
+  assert.match(f.$('jobList').children[0].innerHTML, /已完成/);
+  assert.equal(f.state.resourceRefreshJobs.get('a').phase, 'terminal');
+  assert.deepEqual([...f.state.resourceRefreshJobs.get('a').workerIds], ['cpu']);
+  assert.equal(resourceRequests.length, 1);
+  assert.equal(resourceRequests[0].resourcesOnly, true);
+  assert.equal(f.state.jobsLoading, null);
+});
+
+// 网络、超时及服务端拒绝均保留业务状态，恢复后应接受新的空列表。
+for (const failure of ['network', 'timeout', 'forbidden']) test(`任务列表 ${failure} 后保留选择并释放请求，后续成功可更新`, async () => {
+  const f = fixture(), pending = deferred(), controller = new AbortController();
+  f.state.jobs = [job('a')]; f.state.jobId = 'a'; f.state.detailRecord = job('a');
+  f.context.fillPredictTemplate = () => {}; f.context.loadDetail = () => {};
+  f.context.renderJobList(); const card = f.$('jobList').children[0];
+  let timeout;
+  f.context.AbortSignal = { timeout(ms) { timeout = ms; return controller.signal; } };
+  f.context.apiJson = (url, options) => {
+    f.requests.push({ url, options });
+    options?.signal.addEventListener('abort', () => pending.reject(new Error('请求超时')), { once: true });
+    return pending.promise;
+  };
+  const first = f.context.refreshJobs(), second = f.context.refreshJobs();
+  assert.equal(f.requests.length, 1);
+  assert.equal(timeout, 120000, '慢列表有明确上限，同时容纳已观察到的分钟级响应');
+  if (failure === 'timeout') controller.abort();
+  else pending.reject(new Error(failure === 'forbidden' ? 'HTTP 403 <img src=x>' : '网络断开'));
+  await Promise.all([first, second]);
+  assert.equal(f.state.jobsLoading, null);
+  assert.equal(f.state.jobId, 'a'); assert.equal(f.state.detailRecord.id, 'a');
+  assert.equal(f.state.jobs[0].id, 'a'); assert.equal(f.$('jobList').children[0], card);
+  assert.match(f.$('jobsFeedback').textContent, /保留列表.*自动重试/);
+  assert.equal(f.$('jobsFeedback').innerHTML, '');
+  f.context.apiJson = async () => []; await f.context.refreshJobs();
+  assert.equal(f.state.jobs.length, 0); assert.equal(f.state.jobId, null);
+  assert.equal(f.$('detail').hidden, true); assert.equal(f.$('jobsFeedback').textContent, '');
+  assert.equal(f.state.jobsLoading, null);
+});
+
+test('列表慢响应期间切换任务，不清空响应中尚未包含的新选择', async () => {
+  const f = fixture(), pending = deferred();
+  f.state.jobs = [job('a')]; f.state.jobId = 'a';
+  f.context.fillPredictTemplate = () => {}; f.context.loadDetail = () => {};
+  f.context.apiJson = () => pending.promise;
+  const first = f.context.refreshJobs();
+  f.context.selectJob('new'); f.state.detailRecord = job('new'); f.$('detail').hidden = false;
+  const second = f.context.refreshJobs();
+  pending.resolve([job('a')]); await Promise.all([first, second]);
+  assert.equal(f.state.jobId, 'new'); assert.equal(f.state.detailRecord.id, 'new');
+  assert.equal(f.$('detail').hidden, false); assert.equal(f.state.jobsLoading, null);
+});
+
 test('选择第二页训练关闭弹窗并更新当前详情，重新打开保留历史页码', async () => {
   const f = fixture();
   f.state.jobs = Array.from({ length: 23 }, (_, i) => job('job-' + i, 'completed'));

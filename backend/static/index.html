@@ -662,7 +662,7 @@ const state = {
   workerRequestVersion: 0, workerSnapshot: null, remoteResourceResult: null,
   editingRemoteMachineId: null,
   trainSubmitting: false, trainError: "", trainingIssue: null,
-  jobsRequest: 0, detailRequest: 0, detailLoading: null, selectionVersion: 0,
+  jobsRequest: 0, jobsLoading: null, detailRequest: 0, detailLoading: null, selectionVersion: 0,
   logVersion: 0, logUnread: 0, logLoading: null, predictTemplateRequest: 0,
   remoteCredentials: [], remoteCredentialDefaultId: null, remoteCredentialsCanConfigure: false,
 };
@@ -1628,11 +1628,22 @@ function observeResourceJobTransitions(jobs) {
 }
 
 // 只采纳最近一次任务列表响应；短暂离线保留已有任务及当前选择。
-async function refreshJobs() {
+function refreshJobs() {
+  // 慢列表共用请求，避免定时轮询堆积连接并持续作废尚未返回的完成状态。
+  if (state.jobsLoading) return state.jobsLoading;
+  const pending = fetchJobs().finally(() => {
+    if (state.jobsLoading === pending) state.jobsLoading = null;
+  });
+  state.jobsLoading = pending;
+  return pending;
+}
+
+// 超时释放列表请求；保留选择版本，防止迟到列表清除刚创建或切换的任务。
+async function fetchJobs() {
   const request = ++state.jobsRequest;
   const selection = state.selectionVersion;
   try {
-    const jobs = await apiJson("/api/jobs");
+    const jobs = await apiJson("/api/jobs", { cache: "no-store", signal: AbortSignal.timeout(120000) });
     if (request !== state.jobsRequest) return;
     observeResourceJobTransitions(jobs);
     state.jobs = jobs;
