@@ -1,3 +1,46 @@
+## 本次变更测试结果：XGBoost 模型选项（GPU 可用时加速）与远程 Worker 启动崩溃修复（2026-10-31）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：功能提交 `e26fba4`（XGBoost 后端）、`b54bd74`（前端选项）、测试修复 `573513d`；故障修复 `6d900f2`（远程 worker 白名单）；报告更新为独立提交。
+- **测试日期 / 分支**：2026-10-31 / emdash/hot-boxes-clean-y9u6p。
+- **范围（功能增强 + 故障修复）**：
+  1. **XGBoost 模型选项**：`model_type=xgboost` 加入分类/回归；`requirements.txt`/`requirements-worker.txt` 新增 `xgboost>=2.0,<3`（镜像实测 2.1.4）。训练时按 `torch.cuda.is_available()` 自动选择 `device="cuda"/"cpu"`；分阶段重训（与随机森林/梯度提升同语义，固定步长 10、预算封顶 200）；checkpoint 框架标记扩展为 `sklearn`/`xgboost` 双值，`predict_row`/`load_trainer_state` 双兼容；Schema 允许 xgboost 携带 `require_gpu`/`device_backend=cuda`（区别于纯 sklearn 仅 CPU），仍禁联合训练。前端分类/回归模型下拉新增"XGBoost（GPU 可用时加速）"选项与说明。
+  2. **远程 Worker 启动崩溃修复（Linux 槽位失联）**：提交 `c46ff12` 在 `worker.py` 初始化新增 `from app.inference import InferenceService`，但 `remote_workers.py::_worker_runtime_files` 部署白名单未同步加入 `inference.py`，导致远程部署的镜像内 worker 进程启动即 `ModuleNotFoundError`（supervisor 反复拉起、计算槽失联、服务器状态 error）。修复：白名单补入 `inference.py`，并新增防回归测试（扫描运行文件的 `app.*` 导入并断言白名单覆盖）。已重新部署远程 `Linux` 服务器，`Linux-cpu0` 恢复注册（active、心跳正常、正常接单预测）。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| B1 XGBoost 完成分类/回归训练并产出标准产物 | 训练器层（容器，xgboost 已装） | `test_model_options.py` 分类/回归参数化新增 `xgboost`：summary `framework=xgboost`、best.pt/last.pt/指标齐全 | 正常 |
+| B2 GPU 可用时用 CUDA、否则 CPU | 训练器层；monkeypatch `torch.cuda.is_available` 两种取值 | `test_xgboost_device_selection_and_staged`：构造的估计器 `device` 分别为 cpu/cuda；真实训练 summary.device 与真实探测一致；分阶段 metrics [1..4]；预测一致 | 边界 |
+| B3 XGBoost 任务/资源约束 | Schema 层 | `test_model_schema.py::test_xgboost_accepted_and_allows_gpu`：分类/回归接受、`require_gpu`/`cuda` 合法、联合训练拒绝；`clustering+xgboost`/`time_series+xgboost` 422 | 异常、权限 |
+| B4 前端选项与载荷 | 前端（node --test） | `workbench-interactions.test.cjs` 新增：xgboost 选项按任务出现、说明含"CUDA 加速"、保留轮数字段、载荷 `model_type=xgboost` | 正常 |
+| B5 既有模型与 MLP 行为不变 | 训练器层 + 容器全量 | 既有 sklearn/MLP/聚类/时序/LLM 全部用例通过（见下表）；默认参数用例（AdamW/Dropout 0.15/weight_decay 0.01）保持 | 兼容、回归 |
+| C1 远程 worker 白名单覆盖运行文件引用 | 单元（容器） | `test_worker_runtime_files_cover_referenced_app_modules`：扫描白名单文件的 `app.*` 导入，断言无缺失模块；当前覆盖 inference.py | 异常、回归 |
+| C2 修复后远程可部署且 worker 存活 | 线上实测 | 重新部署 `Linux` → 操作 completed → `Linux-cpu0` 注册（active/心跳 2s/正常接单预测）；容器日志无 ModuleNotFoundError | 正常、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 容器全量后端（`docker run -v "$(pwd):/repo" -w /repo/backend`，与历史基准同口径；镜像含 xgboost 2.1.4 与白名单修复） | 758 | 727 | 0 | 0 | 31 |
+| 完整前端 `node --test frontend/` | 197 | 197 | 0 | 0 | 0 |
+| 宿主机 3.9 训练器层定向（test_trainer + test_model_options） | 43 | 40 | 0 | 0 | 3（xgboost 用例容器执行） |
+
+- 较上一轮净增 8 个用例（xgboost 训练×2、设备选择、Schema×3、前端×1、白名单防回归×1）。
+- **端到端冒烟（重建后线上，6/6 通过）**：示例房价数据集（260 行）→ 梯度提升树（4 轮指标、framework=scikit-learn、R²=0.489）→ 同行预测一致（163.34 万）→ **XGBoost 训练（device=cpu，本机无 GPU 自动回退；预测 151.86 万）** → MLP 新超参（sgd+cosine+早停+gelu）完整 30 轮 → 非法组合 422 拒绝；任务与数据集全部清理。
+- `docker compose up --build -d` 重建成功（trainer/worker 镜像含 xgboost 2.1.4 + 白名单修复），4 容器全部 Up/healthy。
+
+### 已知限制、环境说明与回滚
+
+- **真实 GPU 训练未验证**：本机与容器均无 NVIDIA GPU，`device="cuda"` 路径仅通过 monkeypatch 验证设备选择逻辑与 CUDA 构造参数；建议在含 GPU 的计算槽上提交一次 `model_type=xgboost` 任务确认（日志会打印"模型: XGBoost（xgboost 2.1.4，CUDA）"）。
+- **远程 Linux 槽暂无 xgboost 依赖**：故障修复部署打包自修复中的 trainer 容器，其 requirements-worker.txt 尚不含 xgboost；该槽执行 xgboost 任务会明确报错（不静默）。下次对该服务器"同步代码/更新"（本地镜像已含依赖）后即恢复完整能力。
+- **pip 加速源建议**：远程服务器（阿里云）未配置 pip 源，重建安装 torch+全依赖较慢；如需加速可在服务器管理中配置 `https://mirrors.aliyun.com/pypi/simple/`。
+- **部署白名单与运行代码的时序约束**：远程部署由运行中的 trainer 容器打包自身代码，平台代码更新后需先重建本地容器再触发部署，否则远程拿到旧代码（本次故障的放大因素之一）。
+- 宿主机 3.9 无法运行 API/Schema 层测试（pydantic 注解求值，既有环境限制），以容器 3.12 为权威口径。
+- 回滚方式：XGBoost 特性 `git revert e26fba4 b54bd74 573513d`；白名单修复独立提交 `6d900f2` 可单独保留（建议保留，属崩溃修复）；无持久化格式变更。
+
 ## 本次变更测试结果：训练模型选择（sklearn 传统 ML）与 MLP 训练超参扩充（2026-10-31）
 
 ### Git 基准点与范围
