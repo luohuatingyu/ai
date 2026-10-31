@@ -2356,6 +2356,7 @@ async function fillPredictTemplate() {
 function predictionWorkerIssue(worker, task) {
   if (!worker || !worker.active) return "已离线";
   if (!worker.enabled) return "未启用";
+  if (!worker.inference) return "Worker 镜像过旧，请重新部署服务器";
   const gpu = worker.gpu || {}, backend = worker.device_backend || gpu.backend || "cpu";
   if (["degraded", "recovering"].includes(worker.state) || gpu.healthy === false) return "设备异常";
   if (!["cpu", "cuda", "rocm", "xpu"].includes(backend)) return "不支持的计算后端";

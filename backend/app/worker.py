@@ -106,6 +106,9 @@ def detect_capabilities(
         "python_version": platform.python_version(),
         "started_at": time.time(),
         "parallel": parallel,
+        # 能力协商标志：仅内置预测队列消费/执行逻辑的代码版本才上报，
+        # 服务端据此拒绝旧镜像 Worker 的预测指派，避免静默排队直至超时。
+        "inference": True,
     }
 
 

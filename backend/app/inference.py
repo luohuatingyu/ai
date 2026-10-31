@@ -40,6 +40,10 @@ class InferenceService:
             raise ValueError("所选预测 Worker 不存在或已离线")
         if not self.lease.is_worker_enabled(worker_id, default=not bool(worker.get("managed"))):
             raise ValueError("所选预测 Worker 已停用")
+        if not bool(worker.get("inference")):
+            # 旧镜像 Worker 不消费预测队列，指派只会静默排队直至超时；
+            # 提交阶段立即拒绝并给出可操作的修复指引。
+            raise ValueError("所选预测 Worker 镜像过旧，不具备预测执行能力；请重新部署该服务器（同步代码）后再试")
         gpu = worker.get("gpu") or {}
         backend = worker.get("device_backend") or gpu.get("backend") or "cpu"
         if worker.get("state") in {"degraded", "recovering"} or gpu.get("healthy") is False:
