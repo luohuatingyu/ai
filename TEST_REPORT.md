@@ -1,3 +1,52 @@
+## 本次变更测试结果：训练模型选择（sklearn 传统 ML）与 MLP 训练超参扩充（2026-10-31）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：功能提交 `9ba592e`（后端 trainer/schema）、`03d0180`（前端表单）、测试提交 `ab406cc`（schema 校验测试）；报告更新为独立提交，当前 HEAD 为 `43cc332`。
+- **测试日期 / 分支**：2026-10-31 / emdash/hot-boxes-clean-y9u6p。
+- **范围（功能增强）**：
+  1. **模型选择**：分类/回归任务新增 `model_type` 下拉（mlp / 逻辑回归·线性回归 / 决策树 / 随机森林 / 梯度提升树(HistGB) / SVM / KNN），全部基于既有 scikit-learn 依赖，无新增依赖；sklearn 模型仅单节点 CPU、不支持联合训练；随机森林/梯度提升按 epoch 固定步长（10，预算封顶 200）从零重训，保证任意分段续训与不中断完全等价；sklearn 产物仍写入 `best.pt`（新增 `framework=sklearn` 标记），`predict_row` 双格式兼容，下载/同步/异步预测链路零改动。
+  2. **MLP 训练超参**：新增优化器（AdamW/Adam/SGD/RMSprop）、学习率调度（无/Step/Cosine）、早停（开关+耐心值）、Dropout、权重衰减、激活函数（ReLU/GELU/Tanh/SiLU）；默认值与历史行为完全一致（AdamW + 无调度 + Dropout 0.15 + weight_decay 0.01 = PyTorch AdamW 原默认），调度器不落盘、续训按已完成 epoch 快进。
+  3. **描述文案**：任务类型/模型选择/全部主要参数补充中文说明（作用+推荐范围+适用场景），模型选项附说明行。
+  - 涉及文件：`backend/app/trainer.py`、`backend/app/routers/schemas.py`、`backend/static/index.html`、新增 `backend/tests/test_model_options.py`、`backend/tests/test_model_schema.py`、`frontend/workbench-interactions.test.cjs`；无配置/数据迁移/新依赖。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| A1 每种 sklearn 模型完成分类/回归训练并产出标准产物 | 训练器层；300 行示例数据、epochs=3 | `test_model_options.py::test_sklearn_classification_models`（6 模型参数化）：summary 含 `model_type/framework=scikit-learn/device=cpu`，best.pt/last.pt/preprocessor.json/summary.json/metrics.jsonl 齐全；回归版断言 R²/RMSE | 正常 |
+| A2 预测一致性与格式 | 训练器层；同一 best.pt 重复调用 | `test_sklearn_prediction_consistency`：两次预测完全相等；分类概率和为 1 且键=类别全集；回归返回原量纲有限数值 | 预测一致性 |
+| A3 分阶段模型按轮产出指标且续训等价 | 训练器层；梯度提升 3+3 续训 vs 一口气 6 epoch | `test_sklearn_staged_models_span_epochs`：metrics 逐轮 [1..4]；`test_sklearn_resume_equals_full_run`：轨迹逐项差 <1e-6、最终 R² 相等 | 可复现性 |
+| A4 一次性模型轮次语义 | 训练器层；决策树 epochs=5 | `test_sklearn_oneshot_single_epoch`：实际 1 轮、summary 如实上报 `epochs_total=1` | 边界 |
+| A5 sklearn 仅限分类/回归、仅 CPU、不联合训练 | Schema 层（容器 3.12） | `test_model_schema.py`：任务-模型不匹配（含聚类+SVM、时序+RF、LLM+RF）422；`require_gpu`/`cuda`/`parallel_workers` 组合全部拒绝；MLP 联合训练不受影响 | 异常、权限 |
+| A6 MLP 新超参生效且 checkpoint 往返可用 | 训练器层；sgd+cosine+gelu+dropout0.3 | `test_mlp_new_hyperparams_roundtrip`：summary 记录全部超参；predict_row 按 arch（含 dropout/activation）重建预测成功 | 正常 |
+| A7 早停按耐心值提前结束 | 训练器层；monkeypatch `_evaluate` 恒定指标隔离数据随机性 | `test_early_stopping_triggers_on_stale_metric`：patience=1 时停在第 2 轮（epochs_done=2<10）；真实数据冒烟用例回归 | 边界、正常 |
+| A8 续训 arch 兼容校验 | 训练器层；篡改 checkpoint arch.dropout | `test_resume_rejects_changed_arch`：ValueError"网络结构"；线上实测旧部署 Worker（arch 无新字段）接手被正确拒绝 | 异常 |
+| A9 历史行为完全不变 | 训练器层 + Schema 层 | `test_default_params_preserve_legacy_behavior`：无新参数请求得到旧版等效默认值（weight_decay=0.01 即原 AdamW 默认）；`test_trainer.py` 既有续训等价/可复现性用例全绿；`test_api.py` 既有用例全绿 | 兼容、回归 |
+| A10 前端联动与载荷 | 前端（node --test，真实页面函数） | `workbench-interactions.test.cjs` 新增 6 用例：按任务生成选项/说明、非法选项回退 MLP、非 MLP 隐藏网络与 GPU 资源字段并自动退出联合模式、一次性模型免轮数校验、早停耐心值联动校验、载荷含 `model_type`+7 项超参且聚类任务固定 mlp | 正常、边界 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 容器全量后端（`docker run -v "$(pwd):/repo" -w /repo/backend`，与历史基准同口径） | 750 | 750 | 0 | 0 | 31 |
+| 完整前端 `node --test frontend/` | 196 | 196 | 0 | 0 | 0 |
+| 本地 3.9 训练器层定向（test_trainer + test_model_options） | 40 | 40 | 0 | 0 | 0 |
+
+- 相对上一轮净增 40 个用例（test_model_options 22 + test_model_schema 12 + 前端 6），其中 `test_model_schema.py` 依赖 pydantic 运行期注解求值，需容器 3.12（与既有 `test_api.py`/`test_parallel.py` 同口径，宿主机 3.9 无法收集，非回归）。
+- **端到端冒烟（重建后线上，5/5 通过）**：导入示例数据集（房价回归 260 行）→ 提交梯度提升树训练（4 轮指标、summary 标记 `framework=scikit-learn`、best R²=0.489）→ 同一行两次预测一致（163.34 万元）→ MLP 新超参（sgd+cosine+早停+gelu+dropout0.2）完整训练 30 轮 → 非法组合 clustering+svm 被 422 拒绝（"任务 clustering 不支持模型 svm"）→ 任务与数据集全部清理，无残留产物。
+- `docker compose up --build -d` 重建成功，4 容器全部 Up/healthy。
+- 初次容器口径差异说明：以镜像内 `/app`（未拷贝 `scripts/` 与仓库根 compose 文件）跑全量会出现 22 个环境性失败（`test_platform_launcher`/`test_worker_node_script` 找不到脚本、`test_remote_workers` 找不到 `/docker-compose.yml`）；改用完整仓库挂载的历史同口径后全部通过，非代码回归。
+- 观察到并行提交 `e8bddf3`（MPS 移除）曾被 `git add -A` 卷入本功能未提交改动（`trainer.py`/`schemas.py` 已随该提交入库，随后 `9ba592e` 按功能重新独立提交）；`test_worker_entrypoint_clears_removed_values_and_rejects_missing_file` 在该提交后一度失败、当前 HEAD 已通过，最终以本报告全绿结果为准。
+
+### 已知限制、环境说明与回滚
+
+- **外部旧部署节点**：远程服务器 `Linux`（外部计算槽 `Linux-cpu0`）的 worker 镜像早于本特性，接手训练会因 arch 新增 `dropout/activation` 字段被续训校验正确拒绝（报"checkpoint 网络结构与当前超参不一致"）。这是校验的预期保护行为；需通过"服务器管理 → 同步代码/更新"重新部署后即可正常接单。重新部署前该机只影响含新超参任务的自动接单，可通过指定本地计算槽规避。
+- **sklearn 分阶段模型语义**：随机森林/梯度提升每轮以累计基学习器预算从零重训（固定步长 10、封顶 200），轮数很大时后段轮次重复重训、耗时线性增加但指标稳定，属预期行为。
+- **早停语义**：以"当前轮次 - best_epoch ≥ patience"判定，跨续训天然一致；调度器状态不落盘、按 epoch 快进（Step/Cosine 轨迹与不中断一致）。
+- **宿主机 3.9 限制**：pydantic 无法求值 `str | None` 注解（既有问题），API/Schema 层测试以容器 3.12 为权威口径。
+- 回滚方式：`git revert 9ba592e 03d0180 ab406cc` 即可整体还原；`model_type` 等新字段均带默认值，无持久化格式变更，旧 checkpoint（arch 无 dropout/activation）与新代码的续训会被明确拒绝并提示，不会静默出错。
+
 ## 本次变更测试结果：预测计算槽能力协商（旧镜像 Worker 提交即拒）（2026-10-31）
 
 ### Git 基准点与范围
