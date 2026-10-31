@@ -1,3 +1,40 @@
+## 本次变更测试结果：训练记录页头中文统一与秒数精度收敛（2026-10-31）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：`6a4c7f3`（Update test report for storage outage hardening）；本次业务变更为其后的新提交（见提交记录），报告更新为独立提交。
+- **测试日期 / 分支**：2026-10-31 / emdash/hot-boxes-clean-y9u6p。
+- **范围**：仅前端静态代码 `backend/static/index.html`（`renderTrainingRecord` 渲染层）与对应纯前端契约测试，未改任何后端业务代码、CSS 与 CSS 版本参数。三处改动：① 两张数据表（逐轮训练指标 9 键、吞吐与阶段耗时 13 键）与训练参数栅格（通用/聚类/时序/LLM 约 37 键）的键名统一映射为中文（`ZH_KEY_LABELS` + `zhKey`，未知键回退原键原文不阻断渲染）；② `formatNumber4` 将性能表数值单元格（`*_seconds`/`step_ms`/吞吐率）与任务概览"训练用时"浮点最多保留 4 位小数；③ 旧运行时 DOM 契约中断言英文表头 `val_r2`/`samples_per_second` 的条目按新行为更新（明确不改数据显示语义：metrics 表已为 ≤6 位，`*_seconds` 原始值不动，仅显示层截断）。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| 两张数据表表头统一中文 | 前端静态契约；渲染代码结构 | `training-record-display.test.cjs::训练记录表头键名统一显示中文`：两个 `<th>` 构建经 `esc(zhKey(key))`，参数栅格 dt 经 `row(zhKey(key),…)` | 正常 |
+| 键映射完整无遗漏（回退保底） | 前端静态契约；56 个已知键逐键检查 | `training-record-display.test.cjs::指标、性能与参数键全部登记中文映射`：传统/聚类/LLM 指标键、性能 13 键、通用+LLM 参数键全部存在于映射区，`zhKey` 回退语义存在 | 边界 |
+| 浮点最多 4 位小数 | 前端契约 + 运行时 DOM 行为 | `training-record-display.test.cjs::浮点小数性能表与训练用时最多保留 4 位`：提取并 eval `formatNumber4` 验证 0.5344615600042744→0.5345、1/3→0.3333、整数/字符串/空值原样；`workbench-interactions.test.cjs::训练记录展示配置…`：真实渲染 0.5344615600042744 与 120.987654321 显示为 0.5345/120.9877 且全精度值不出现 | 边界、兼容 |
+| 英文键不再出现在表头 <th> | 运行时 DOM | 同上用例：`doesNotMatch /<th>(val_r2\|samples_per_second\|train_seconds)<\/th>/`，未知参数键（nested）仍回退显示 | 兼容、回归 |
+| 历史功能不回归 | Python 3.12 容器全量后端 + 全量前端 | 两次全量后端稳定；`test_job_logs_cursor…` 单独复测通过（并行时序偶发） | 回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| 完整前端 `node --test frontend/` | 188 | 188 | 0 | 0 | 0 |
+| Python 3.12 完整后端（两次运行） | 693 | 661 | 1 | 0 | 31 |
+
+- 全量后端首跑中 `test_job_logs_cursor_reads_only_complete_lines_and_catches_appends` 并行时序偶发失败，单独复测通过，随后整包复跑稳定（661 通过 / 1 既有失败）；`test_remote_workers.py::test_worker_entrypoint…` 为既有问题，不在本次范围。
+- 容器重建（`docker compose up --build -d`）后线上验证：`/` 页面含 `zhKey`/`ZH_KEY_LABELS`/`formatNumber4` 及"训练耗时（秒）""样本吞吐（样本/秒）"，`/api/health` 200。
+- 未执行与未受影响的验证：浏览器人工目测表头中文与秒数显示（页面为客户端渲染，静态代码 + 运行时 DOM 测试已覆盖；建议用户刷新页面确认）。
+
+实际执行命令：`node --test frontend/`；`docker compose up --build -d`；`docker exec -w /repo/backend mtp-trainer python -m pytest tests/ -q`（全量两次）；`docker exec … pytest tests/test_api.py::test_job_logs_cursor_reads_only_complete_lines_and_catches_appends`（定向复测）；`curl /`、`curl /api/health`。
+
+### 已知限制、重测建议与回滚
+
+- 映射未覆盖的未预期键名按原键显示（回退设计）；后续新增指标/参数键时需在 `ZH_KEY_LABELS`/`PARAM_LABELS` 补登记（前端测试逐键校验会拦截遗漏）。
+- 性能表吞吐率列同样应用 4 位小数（用户仅明确"秒"，同表浮点统一收敛，如需更高精度反馈可调）。
+- 回滚：撤销本次前端提交即可，无数据、后端与配置影响；无需数据库迁移。
+
 ## 本次变更测试结果：存储故障分级 503 与启动降级（2026-10-31）
 
 ### Git 基准点与范围
