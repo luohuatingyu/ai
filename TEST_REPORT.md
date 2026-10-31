@@ -1,3 +1,45 @@
+## 本次变更测试结果：Apple MPS（M3）种子可复现与显存监控兼容（2026-10-31）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：`6519af5`（Add MPS seed support and Apple memory metrics for M3 compatibility）；报告更新为独立提交。
+- **测试日期 / 分支**：2026-10-31 / emdash/hot-boxes-clean-y9u6p。
+- **范围**：仅两处后端兼容缺口修复——① `device.py::seed_device` 增加 MPS 分支（`torch.mps.manual_seed`，带 `getattr(torch,"mps",None)` 防护），修复 M3 上 GPU 侧随机初始化不受 seed 控制、违反"固定 seed 重复训练指标一致"的问题；② `performance.py::_gpu_snapshot` 为 MPS 映射 Apple 内存接口（`current_allocated_memory`/`driver_allocated_memory`，均不接收设备参数），修复 MPS 训练显存监控恒为未知。不改动 CUDA/ROCm/XPU/CPU 任何既有路径；**Linux 兼容性零影响**（Linux 的 PyTorch 无 `torch.mps` 模块，探测返回 False 后自动模式仍按 CUDA→ROCm→XPU→CPU 选择；`remote_workers.py` 原有保护继续拒绝 Linux Docker 部署 MPS，仅 macOS 原生 worker 可用）。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| MPS 上固定 seed 随机序列可复现 | 设备层；真实 M3 MPS 可用 | `test_device.py::test_seed_device_mps_makes_random_sequence_reproducible`：两次 `seed_device(42,"mps")` 后 `torch.rand(8, device="mps")` 完全相等（无硬件环境 skip） | 正常 |
+| 设备入参双形态兼容 | 设备层；字符串与 torch.device | `test_device.py::test_seed_device_mps_accepts_string_and_device`（参数化 2 例）不抛异常 | 兼容、边界 |
+| 旧版 PyTorch 无 torch.mps 不阻塞训练 | 设备层；删除 torch.mps 属性模拟 Linux | `test_seed_device_mps_missing_module_is_noop`：静默跳过不抛异常 | 异常、兼容 |
+| 种子接口故障不阻塞训练启动 | 设备层；mock manual_seed 抛 RuntimeError | `test_seed_device_mps_failure_is_swallowed`：异常被吞掉，训练可继续 | 异常 |
+| CPU/无 CUDA 既有行为不回归 | 设备层；cpu/cuda/None 入参 | `test_seed_device_cpu_and_unavailable_cuda_paths_do_not_raise` | 回归 |
+| MPS 显存采集映射正确且不伪造未知字段 | 性能层；mock torch.mps 接口（无硬件环境可跑） | `test_performance.py::test_mps_memory_metrics_use_apple_api`：allocated=256MB、reserved=512MB，peak/utilization 保持 None；调用序列仅 Apple API | 正常、边界 |
+| MPS 内存接口缺失/异常不崩溃 | 性能层；接口抛 AttributeError | `test_mps_memory_api_failure_stays_unknown`：字段保持 None，采样不中断 | 异常 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 容器全量后端（挂载完整仓库，与历史基准同口径） | 701 | 667 | 0 | 0 | 34 |
+| 新增 MPS 用例（含于上表） | 8 | 8 | 0 | 0 | 0 |
+| macOS 宿主机 3.9 定向（test_device + test_performance） | 46 | 45 | 1 | 0 | 0 |
+
+- 新增 8 个用例全部通过；`test_device.py::test_seed_device_mps_makes_random_sequence_reproducible` 在本机 M3 上真实执行（非 skip）。
+- 容器口径说明：镜像内 `/app` 仅含 `./backend` 构建上下文，直接 exec 跑全量会因缺仓库根 `scripts/`、`docker-compose*.yml` 出现 22 个 FileNotFoundError/127（`test_worker_node_script`/`test_platform_launcher`/`test_remote_workers`），为容器文件布局限制而非代码缺陷；按历史基准改用 `docker run --rm -v <repo>:/repo -w /repo/backend` 挂载后 0 失败。此前报告的既有问题 `test_remote_workers.py::test_worker_entrypoint…` 本轮已通过。
+- 宿主机 1 个失败 `test_cpu_quota_respected` 为既有 macOS 限制（`os.sched_getaffinity` 为 Linux-only API），经 `git stash` 在基线复测确认与本次改动无关；宿主机 3.9 缺 `cryptography` 等依赖无法跑全量，以容器 3.12 为准。
+- `docker compose up --build -d` 重建成功，验证均在重建后环境执行。
+
+实际执行命令：`docker compose up --build -d`；`docker run --rm -v "$(pwd):/repo" -w /repo/backend <trainer镜像> python -m pytest tests/ -q --tb=no`（全量）；`python3 -m pytest tests/test_device.py tests/test_performance.py -v`（宿主定向）；`docker compose exec -T trainer python -m pytest tests/ -q --lf`（失败集定位）；API 层面 `python3 -c "from app.device import device_info…"` 验证 M3 返回 `backend=mps, healthy=true`。
+
+### 已知限制、重测建议与回滚
+
+- MPS 无 `get_rng_state_all` API（PyTorch 平台限制），checkpoint 的设备 RNG 状态恢复对 MPS 维持既有"尽力而为、静默跳过"语义；单机可复现性由 `manual_seed` 保证。
+- MPS 显存利用率（utilization/total）无系统级查询接口，仍为未知；allocated/reserved 已可显示。
+- 未验证：真实 NVIDIA/AMD/Intel 硬件回归（环境无该硬件，协议映射由既有 monkeypatch 用例覆盖）；M3 长时间训练稳定性（建议跑一次小型训练任务确认 GPU 监控曲线）。
+- 回滚：`git revert 6519af5` 即可，纯代码分支新增，无数据、配置与数据库迁移影响。
+
 ## 本次变更测试结果：训练记录页头中文统一与秒数精度收敛（2026-10-31）
 
 ### Git 基准点与范围
