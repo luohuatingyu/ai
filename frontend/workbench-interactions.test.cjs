@@ -359,14 +359,18 @@ test('训练记录展示配置、完整指标、性能和跨节点执行段，�
     created_at: 10, started_at: 11, finished_at: 15, error: '<img src=x>',
     segments: [{ status: 'completed', from_epoch: 1, to_epoch: 2, worker_id: 'worker-a', started_at: 11, finished_at: 15 }],
     metrics: [{ epoch: 1, train_loss: 0.7, val_r2: 0.2 }, { epoch: 2, train_loss: 0.3, val_r2: 0.8 }],
-    performance: [{ epoch: 1, samples_per_second: 120, train_seconds: 0.2 }],
+    performance: [{ epoch: 1, samples_per_second: 120.987654321, train_seconds: 0.5344615600042744 }],
     summary: { duration_sec: 4, final: { val_r2: 0.8 } },
   });
   const record = f.$('trainingRecord').innerHTML;
-  for (const value of ['任务 ID', '开始时间', '嵌套', 'worker-a', 'val_r2', 'samples_per_second', '训练结果摘要']) {
+  // 表头映射为中文；未知参数键回退原键（nested）；性能秒/吞吐最多 4 位小数
+  for (const value of ['任务 ID', '开始时间', '嵌套', 'worker-a', '验证 R²', '样本吞吐（样本/秒）', '训练结果摘要',
+    '120.9877', '0.5345']) {
     if (value === '嵌套') assert.match(record, /nested/);
     else assert.match(record, new RegExp(value));
   }
+  assert.doesNotMatch(record, /<th>(val_r2|samples_per_second|train_seconds)<\/th>/);
+  assert.doesNotMatch(record, /0\.5344615/);
   assert.match(record, /&lt;script&gt;/); assert.match(record, /&lt;img src=x&gt;/);
   assert.doesNotMatch(record, /<script>x/); assert.doesNotMatch(record, /<img src=x>/);
 });

@@ -1803,11 +1803,43 @@ function renderTrainingRecord(job) {
   const metrics = job.metrics || [];
   const performance = job.performance || [];
   const formatValue = value => value === null || value === undefined || value === "" ? "-" : esc(String(value));
+  /* 数据键中文映射：训练记录页所有键名统一显示为中文（未知键名回退原键原文） */
+  const ZH_KEY_LABELS = {
+    // 逐轮训练指标（传统监督 / 聚类 / LLM）
+    epoch: "轮次", train_loss: "训练损失", val_loss: "验证损失", val_accuracy: "验证准确率",
+    val_mse: "验证均方误差", val_rmse: "验证 RMSE", val_r2: "验证 R²",
+    perplexity: "困惑度", preference_accuracy: "偏好准确率",
+    // 吞吐与阶段耗时
+    scope: "范围", train_seconds: "训练耗时（秒）", validation_seconds: "验证耗时（秒）",
+    checkpoint_save_seconds: "检查点保存耗时（秒）", checkpoint_publish_seconds: "检查点发布耗时（秒）",
+    epoch_seconds: "单轮耗时（秒）", samples: "样本数", steps: "步数",
+    effective_tokens: "有效 token 数", samples_per_second: "样本吞吐（样本/秒）",
+    tokens_per_second: "token 吞吐（token/秒）", step_ms: "单步耗时（毫秒）",
+  };
+  const zhKey = key => ZH_KEY_LABELS[key] || key;
+  /* 浮点数值最多保留 4 位小数（秒/毫秒/吞吐率），整数与非数值原样返回 */
+  const formatNumber4 = value => typeof value === "number" && Number.isFinite(value) ? Math.round(value * 10000) / 10000 : value;
+  /* 训练参数（通用 + 聚类/时序/LLM 任务） */
+  const PARAM_LABELS = {
+    dataset_id: "数据集 ID", target: "目标列", task: "任务类型",
+    epochs: "轮数", batch_size: "批大小", lr: "学习率", llm_lr: "LLM 学习率",
+    hidden_layers: "隐藏层数", hidden_size: "每层神经元", test_split: "验证集比例",
+    seed: "随机种子", require_gpu: "需要 GPU", min_vram_mb: "最小显存（MB）",
+    device_backend: "设备后端", n_clusters: "聚类簇数", time_column: "时间列",
+    lookback: "回看窗口", forecast_horizon: "预测步长", parallel_workers: "并行 Worker",
+    dataset_source: "数据集来源", dataset_config: "Hub 配置", dataset_split: "Hub 数据分割",
+    base_model: "基座模型", reward_model: "奖励模型", text_column: "文本列",
+    prompt_column: "Prompt 列", completion_column: "回复列", chosen_column: "偏好答案列",
+    rejected_column: "拒绝答案列", max_samples: "最大样本数", max_seq_len: "最大序列长度",
+    vocab_size: "词表大小", model_hidden_size: "模型隐藏维度", model_layers: "模型层数",
+    model_heads: "注意力头数", ppo_updates: "PPO 更新轮数",
+  };
+  Object.assign(ZH_KEY_LABELS, PARAM_LABELS);
   const row = (label, value) => '<div class="training-record-field"><dt>' + esc(label) + '</dt><dd>' + formatValue(value) + '</dd></div>';
   const duration = summary.duration_sec ?? (
     job.started_at && job.finished_at ? Math.max(0, Math.round(job.finished_at - job.started_at)) : null
   );
-  const configRows = Object.entries(params).map(([key, value]) => row(key, typeof value === "object" && value !== null ? JSON.stringify(value) : value)).join("");
+  const configRows = Object.entries(params).map(([key, value]) => row(zhKey(key), typeof value === "object" && value !== null ? JSON.stringify(value) : value)).join("");
   const segmentRows = segments.length ? segments.map((segment, index) => {
     const from = segment.from_epoch ?? "-";
     const to = segment.to_epoch ?? (job.progress && job.progress.epoch) ?? "-";
@@ -1819,14 +1851,14 @@ function renderTrainingRecord(job) {
   }).join("") : '<tr><td colspan="6">暂无执行记录</td></tr>';
   const metricKeys = [...new Set(metrics.flatMap(item => Object.keys(item)))];
   const metricTable = metrics.length
-    ? '<div class="training-record-table-wrap"><table><thead><tr>' + metricKeys.map(key => '<th>' + esc(key) + '</th>').join("")
+    ? '<div class="training-record-table-wrap"><table><thead><tr>' + metricKeys.map(key => '<th>' + esc(zhKey(key)) + '</th>').join("")
       + '</tr></thead><tbody>' + metrics.map(item => '<tr>' + metricKeys.map(key => '<td>' + formatValue(item[key]) + '</td>').join("") + '</tr>').join("")
       + '</tbody></table></div>'
     : '<div class="empty">暂无逐轮指标</div>';
   const performanceKeys = [...new Set(performance.flatMap(item => Object.keys(item)))];
   const performanceTable = performance.length
-    ? '<div class="training-record-table-wrap"><table><thead><tr>' + performanceKeys.map(key => '<th>' + esc(key) + '</th>').join("")
-      + '</tr></thead><tbody>' + performance.map(item => '<tr>' + performanceKeys.map(key => '<td>' + formatValue(item[key]) + '</td>').join("") + '</tr>').join("")
+    ? '<div class="training-record-table-wrap"><table><thead><tr>' + performanceKeys.map(key => '<th>' + esc(zhKey(key)) + '</th>').join("")
+      + '</tr></thead><tbody>' + performance.map(item => '<tr>' + performanceKeys.map(key => '<td>' + formatValue(formatNumber4(item[key])) + '</td>').join("") + '</tr>').join("")
       + '</tbody></table></div>'
     : '<div class="hint">该任务没有性能采集记录。</div>';
   const summaryJson = summary && Object.keys(summary).length
@@ -1842,7 +1874,7 @@ function renderTrainingRecord(job) {
     + row("任务 ID", job.id) + row("状态", statusText[job.status] || job.status) + row("任务类型", taskName(spec.task))
     + row("数据集", spec.dataset_name || spec.dataset_id) + row("目标列", spec.target || "无目标列")
     + row("创建时间", fmtTime(job.created_at)) + row("开始时间", fmtTime(job.started_at))
-    + row("结束时间", fmtTime(job.finished_at)) + row("训练用时", duration == null ? null : duration + " 秒")
+    + row("结束时间", fmtTime(job.finished_at)) + row("训练用时", duration == null ? null : formatNumber4(duration) + " 秒")
     + row("设备", job.device || (job.current_attempt && resourceText(job.current_attempt)))
     + row("自动重试", job.retry_count || 0) + row("手动重试", job.manual_retry_count || 0)
     + '</dl>' + (error ? '<p class="training-record-error"><strong>错误信息</strong><br>' + esc(error) + '</p>' : "")
