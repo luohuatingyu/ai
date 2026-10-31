@@ -1,3 +1,41 @@
+## 本次变更测试结果：剔除 Apple MPS 后端支持（Linux 隔离部署收敛）（2026-10-31）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：`17cef44`（Remove Apple MPS backend support for Linux-only isolated deployment）；报告更新为独立提交。
+- **测试日期 / 分支**：2026-10-31 / emdash/hot-boxes-clean-y9u6p。
+- **范围**：按用户决策（任务必须在隔离容器执行、只考虑 Linux 兼容、剔除多余逻辑）彻底移除 Apple MPS（Mac GPU）支持，共 16 个文件：`device.py`（探测/映射/别名/seed 等约 14 处）、`performance.py`（mps 内存分支）、`parallel_worker.py`（校验集合与解析分支）、`remote_workers.py`（2 处校验集合 + 2 处 MPS Docker 拒绝）、`llm_trainer.py`/`trainer.py`（loss 精度分支统一为 float64）、`worker.py`、`inference.py`、`routers/schemas.py`（3 处 Literal）、前端 `index.html`/`server-manager.html`（Apple MPS 选项与提示）、删除 `scripts/worker-native.sh`（macOS 原生 worker 启动器，仅因 MPS 存在）、同步清理 4 个测试文件中的 MPS 用例。**保留** CUDA/ROCm/XPU/CPU 全部路径（Linux 真实场景）；`-apple-system` CSS 字体栈无关保留。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| MPS 从设备选择中消失 | 设备层；`available_backends()`/`device_info("mps")` | 本机 M3 实测 `available_backends()==['cpu']`（原 `['mps','cpu']`）；显式请求 mps 抛 `ValueError("不支持的计算后端：mps")` | 正常、异常 |
+| 后端协议映射不再含 MPS | 设备层；参数化映射表 | `test_device.py::test_backend_mapping_is_cross_platform` 仅剩 cuda/rocm/xpu/cpu 四组 | 兼容 |
+| 远程部署拒绝未知后端 | 远程部署；device_backend=mps | `test_remote_workers.py::test_remote_build_rejects_unknown_backend`：抛 `RemoteWorkerError("计算后端必须是 auto、cuda、rocm、xpu 或 cpu")` | 异常、安全 |
+| 混合加速器联合训练仅含合法后端 | 并行层；rocm+xpu+cpu 组队 | `test_parallel.py::test_mixed_accelerators_use_gloo`：成员断言 `["rocm","xpu","cpu"]`，统一 Gloo | 兼容、回归 |
+| 训练/推理 loss 精度路径不变 | 训练层；非 CUDA 设备统一 float64 | `llm_trainer.py`/`trainer.py` 3 处分支删除后全量回归通过 | 回归 |
+| Linux 容器行为与剔除前一致 | 容器层；Python 3.12 全量 | 全量 `backend/tests/` 0 失败（详见下表）；容器内 `device_info()` 实测 `backend=cpu` | 兼容、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 容器全量后端（挂载完整仓库，与历史基准同口径） | 688 | 657 | 0 | 0 | 31 |
+
+- 相对上一轮（701 用例）净减少 13 个，均为随功能剔除的 MPS 用例；原 22 个容器文件布局性失败此前已通过挂载方式消除。
+- 过程中发现并修复 1 处测试断言错误（MPS 拒绝提示文案已随实现变更，负向用例改为匹配新文案"计算后端必须是…"），修复后全量一次通过；修正已并入业务提交 `17cef44`。
+- `docker compose up --build -d` 重建成功；线上冒烟：`/api/health` 200、`/api/system` 设备选择 `cpu`、前端镜像 `index.html` 已无 "Apple MPS"。
+- 未执行：真实 NVIDIA/AMD/Intel 硬件回归（环境无该硬件，协议映射由既有参数化用例覆盖）。
+
+实际执行命令：`docker compose up --build -d`；`docker run --rm -v "$(pwd):/repo" -w /repo/backend <trainer镜像> python -m pytest tests/ -q --tb=short`（全量，含修复后复跑）；`python3 -c "from app.device import …"`（本机 M3 行为验证）；`curl /api/health`；`docker compose exec -T … device_info()`。
+
+### 已知限制、重测建议与回滚
+
+- Mac 原生（非容器）运行平台时不再有任何 GPU 加速能力，仅 CPU；如未来需要恢复，`git revert 17cef44` 即可整体回滚。
+- MPS 拒绝语义从"明确提示 macOS 原生 worker"收敛为通用的"不支持的计算后端"，错误文案更简洁但不再区分 Apple 场景。
+- 工作区存在未跟踪文件 `backend/tests/test_model_options.py`（2026-10-31 14:59 出现，无任何代码引用，疑似并行的"模型选择"功能开发产物），未纳入本次任何提交，请确认归属后处置。
+
 ## 本次变更测试结果：Apple MPS（M3）种子可复现与显存监控兼容（2026-10-31）
 
 ### Git 基准点与范围
