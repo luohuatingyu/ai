@@ -273,6 +273,35 @@ def test_prediction_subprocess_is_reaped(setup_inference, monkeypatch, tmp_path,
     assert list(scratch.iterdir()) == []
 
 
+def test_prediction_failure_includes_subprocess_stderr(setup_inference, monkeypatch, tmp_path):
+    """子进程被信号杀死（如 OOM）时，失败原因必须带上它的 stderr 与返回码。"""
+    from app.inference import run_prediction_process
+
+    service, caps = setup_inference
+    original_popen = subprocess.Popen
+
+    def killed_process(*args, **kwargs):
+        """用真实子进程输出 stderr 后自杀，模拟被外部 OOM killer 杀死。"""
+        script = (
+            "import os, signal, sys; "
+            "sys.stderr.write('MemoryError: unable to allocate 665.0 MiB'); "
+            "sys.stderr.flush(); "
+            "os.kill(os.getpid(), signal.SIGKILL)"
+        )
+        return original_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr("app.inference.subprocess.Popen", killed_process)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(config, "WORKER_SCRATCH_DIR", scratch)
+    controller = SimpleNamespace(ensure_owned=lambda: None, pause_event=threading.Event())
+    with pytest.raises(RuntimeError) as excinfo:
+        run_prediction_process({"timeout": 5}, caps, service.store, controller, threading.Event())
+    message = str(excinfo.value)
+    assert "MemoryError" in message and "665.0 MiB" in message
+    assert "-9" in message
+    assert list(scratch.iterdir()) == []
+
+
 def test_prediction_api_compatibility_privacy_and_ownership(setup_inference, monkeypatch):
     """旧接口保持同步结果，新接口返回任务且拒绝跨模型读取和非法输入。"""
     service, _ = setup_inference

@@ -177,41 +177,72 @@ class InferenceService:
             lease.release(inference_id, token)
 
 
+_STDOUT_TAIL_LIMIT = 1500
+
+
+def _stderr_tail(path: Path, limit: int = _STDOUT_TAIL_LIMIT) -> str:
+    """读取子进程错误输出尾部，供失败原因展示；读取失败不影响原始异常。"""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(size - limit, 0))
+            return handle.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
 def run_prediction_process(record: dict, caps: dict, store, controller, shutdown) -> dict:
-    """将下载、模型加载和计算全部纳入超时，关闭子进程后清理私有临时目录。"""
+    """将下载、模型加载和计算全部纳入超时，关闭子进程后清理私有临时目录。
+
+    子进程的 stderr 写入私有临时文件并在失败时附到异常信息上：预测进程常常
+    在导入阶段就被 OOM 杀掉（返回码 -9），此时结果文件不会生成，错误输出是
+    唯一能说明真实原因的线索；直接丢弃 stderr 会让用户只看到笼统的失败。
+    """
     config.WORKER_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="inference-", dir=config.WORKER_SCRATCH_DIR) as directory:
         root = Path(directory)
         request = {**record, "caps": caps,
                    "local_store": str(store.root) if isinstance(store, LocalArtifactStore) else None}
         request_path, output_path = root / "request.json", root / "result.json"
+        stderr_path = root / "stderr.log"
         request_path.write_text(json.dumps(request), encoding="utf-8")
-        process = subprocess.Popen([sys.executable, "-m", "app.inference", str(request_path), str(output_path)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.monotonic() + record["timeout"]
         try:
-            while process.poll() is None:
-                controller.ensure_owned()
-                if shutdown.is_set() or controller.pause_event.is_set():
-                    raise RuntimeError("预测 Worker 已停止")
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("预测执行超时（包含模型下载和加载）")
-                time.sleep(0.05)
-            controller.ensure_owned()
-            if not output_path.exists():
-                raise RuntimeError(f"预测子进程异常退出（{process.returncode}）")
-            result = json.loads(output_path.read_text(encoding="utf-8"))
-            if process.returncode or result.get("error"):
-                raise RuntimeError(result.get("error") or "预测子进程失败")
-            return result
-        finally:
-            if process.poll() is None:
-                process.terminate()
+            with stderr_path.open("wb") as stderr_log:
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "app.inference", str(request_path), str(output_path)],
+                    stdout=subprocess.DEVNULL, stderr=stderr_log,
+                )
+                deadline = time.monotonic() + record["timeout"]
                 try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                    while process.poll() is None:
+                        controller.ensure_owned()
+                        if shutdown.is_set() or controller.pause_event.is_set():
+                            raise RuntimeError("预测 Worker 已停止")
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("预测执行超时（包含模型下载和加载）")
+                        time.sleep(0.05)
+                    controller.ensure_owned()
+                    if not output_path.exists():
+                        raise RuntimeError(f"预测子进程异常退出（返回码 {process.returncode}）")
+                    result = json.loads(output_path.read_text(encoding="utf-8"))
+                    if process.returncode or result.get("error"):
+                        raise RuntimeError(result.get("error") or "预测子进程失败")
+                    return result
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+        except (RuntimeError, TimeoutError) as exc:
+            # 只补充可读上下文；JobLeaseLost 等控制流异常保持原样向上传播。
+            detail = _stderr_tail(stderr_path)
+            if detail and detail not in str(exc):
+                raise type(exc)(f"{exc}；子进程错误输出：{detail}") from exc
+            raise
 
 
 def predict_request(request: dict, root: Path) -> dict:
