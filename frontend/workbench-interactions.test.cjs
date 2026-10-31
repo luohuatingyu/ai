@@ -734,3 +734,126 @@ for (const issue of ['missing', 'offline', 'disabled', 'stale', 'unhealthy', 'cl
     assert.match(f.$('predictOut').textContent, /不会自动回退/);
   });
 }
+
+/* ---------- 模型选择与训练超参（模块 A/B/C） ---------- */
+
+test('分类任务展示模型选择并按任务切换，默认 MLP 保持历史行为', () => {
+  const f = fixture();
+  f.$('p_parallel').value = 'single';
+  f.context.updateTaskFields();
+  assert.equal(f.$('modelTypeField').hidden, false);
+  assert.equal(f.$('p_model_type').value, 'mlp');
+  assert.match(f.$('modelTypeHint').textContent, /多层感知机/);
+  // 切到聚类隐藏模型选择，切回分类恢复并保留默认
+  f.$('taskSelect').value = 'clustering';
+  f.context.updateTaskFields();
+  assert.equal(f.$('modelTypeField').hidden, true);
+  f.$('taskSelect').value = 'classification';
+  f.context.updateTaskFields();
+  assert.equal(f.$('modelTypeField').hidden, false);
+  assert.equal(f.$('p_model_type').value, 'mlp');
+});
+
+test('回归任务提供线性回归选项，分类独有选项切到回归时回退 MLP', () => {
+  const f = fixture();
+  f.$('p_parallel').value = 'single';
+  f.$('p_model_type').value = 'logistic_regression';
+  f.$('taskSelect').value = 'regression';
+  f.context.updateTaskFields();
+  assert.equal(f.$('p_model_type').value, 'mlp', '逻辑回归不属于回归任务，应回退默认');
+  f.$('p_model_type').value = 'linear_regression';
+  f.context.updateTaskFields();
+  assert.equal(f.$('p_model_type').value, 'linear_regression');
+  assert.match(f.$('modelTypeHint').textContent, /线性拟合基线/);
+});
+
+test('非 MLP 模型隐藏网络/优化器/资源提示，联合训练自动退出', () => {
+  const f = fixture();
+  f.$('p_parallel').value = 'parallel';
+  f.$('p_model_type').value = 'svm';
+  f.context.updateTaskFields();
+  assert.equal(f.$('p_parallel').value, 'single', 'sklearn 模型不支持联合训练');
+  assert.equal(f.$('learningRateField').hidden, true);
+  assert.equal(f.$('hiddenLayersField').hidden, true);
+  assert.equal(f.$('hiddenSizeField').hidden, true);
+  assert.equal(f.$('batchSizeField').hidden, true);
+  assert.equal(f.$('mlpHyperFields').hidden, true);
+  assert.equal(f.$('resourceHintField').hidden, true);
+  assert.equal(f.$('p_require_gpu').checked, false);
+  assert.equal(f.$('epochField').hidden, true, '一次性模型不按轮训练');
+  // 切回 MLP 恢复可见性
+  f.$('p_model_type').value = 'mlp';
+  f.context.updateTaskFields();
+  assert.equal(f.$('learningRateField').hidden, false);
+  assert.equal(f.$('mlpHyperFields').hidden, false);
+  assert.equal(f.$('epochField').hidden, false);
+});
+
+test('分阶段模型保留轮数字段，早停开关控制耐心值显隐', () => {
+  const f = fixture();
+  f.$('p_parallel').value = 'single';
+  f.$('p_model_type').value = 'gradient_boosting';
+  f.context.updateTaskFields();
+  assert.equal(f.$('epochField').hidden, false, '梯度提升按轮增长迭代数，需要轮数');
+  assert.equal(f.$('mlpHyperFields').hidden, true);
+  f.$('p_model_type').value = 'mlp';
+  f.$('p_early_stopping').checked = false;
+  f.context.updateTaskFields();
+  assert.equal(f.$('patienceField').hidden, true);
+  f.$('p_early_stopping').checked = true;
+  f.context.updateTaskFields();
+  assert.equal(f.$('patienceField').hidden, false);
+});
+
+test('校验随模型适配：一次性模型免轮数校验，早停校验耐心值', () => {
+  const f = fixture();
+  f.$('p_parallel').value = 'single';
+  f.$('p_model_type').value = 'knn';
+  f.$('p_epochs').value = '';
+  f.context.updateTaskFields();
+  assert.equal(f.context.getTrainingIssue(), null, '一次性模型不使用轮数，不应阻塞提交');
+  f.$('p_model_type').value = 'mlp';
+  f.context.updateTaskFields();
+  assert.equal(f.context.getTrainingIssue()?.id, 'p_epochs', 'MLP 必须填写轮数');
+  f.$('p_epochs').value = '30';
+  f.$('p_early_stopping').checked = true;
+  f.$('p_patience').value = '';
+  assert.equal(f.context.getTrainingIssue()?.id, 'p_patience');
+  f.$('p_patience').value = '5';
+  assert.equal(f.context.getTrainingIssue(), null);
+  f.$('p_dropout').value = '0.95';
+  assert.equal(f.context.getTrainingIssue()?.id, 'p_dropout', 'Dropout 超出 0～0.9 应阻塞');
+});
+
+test('提交载荷携带模型选择与训练超参，非分类回归任务固定 mlp', async () => {
+  const f = fixture();
+  f.$('p_parallel').value = 'single';
+  f.$('p_model_type').value = 'random_forest';
+  f.$('p_optimizer').value = 'sgd';
+  f.$('p_lr_scheduler').value = 'cosine';
+  f.$('p_early_stopping').checked = true;
+  f.$('p_patience').value = '7';
+  f.$('p_dropout').value = '0.25';
+  f.$('p_weight_decay').value = '0.002';
+  f.$('p_activation').value = 'gelu';
+  f.context.updateTaskFields();
+  f.context.updateStart();
+  await f.$('btnStart').onclick();
+  const body = JSON.parse(f.requests[0].options.body);
+  assert.equal(body.model_type, 'random_forest');
+  assert.equal(body.optimizer, 'sgd');
+  assert.equal(body.lr_scheduler, 'cosine');
+  assert.equal(body.early_stopping, true);
+  assert.equal(body.patience, 7);
+  assert.equal(body.dropout, 0.25);
+  assert.equal(body.weight_decay, 0.002);
+  assert.equal(body.activation, 'gelu');
+  // 聚类任务固定提交 mlp，避免残留模型选择被后端拒绝
+  const g = fixture();
+  g.$('p_model_type').value = 'knn';
+  g.$('taskSelect').value = 'clustering';
+  g.context.updateTaskFields();
+  g.context.updateStart();
+  await g.$('btnStart').onclick();
+  assert.equal(JSON.parse(g.requests[0].options.body).model_type, 'mlp');
+});
