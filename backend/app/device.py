@@ -242,6 +242,11 @@ def seed_device(seed: int, device: torch.device | str | None = None) -> None:
             xpu = _xpu_module()
             if xpu is not None and hasattr(xpu, "manual_seed_all"):
                 xpu.manual_seed_all(seed)
+        elif value.type == "mps":
+            # Apple MPS 使用单设备 manual_seed 接口，保证 GPU 侧随机初始化可复现。
+            mps = getattr(torch, "mps", None)
+            if mps is not None and hasattr(mps, "manual_seed"):
+                mps.manual_seed(seed)
     except Exception:
         # 随机种子增强不能阻塞训练启动，CPU seed 仍由调用方设置。
         return

@@ -125,11 +125,19 @@ def _gpu_snapshot(device: str, own_process: bool) -> dict:
         return result
     api = getattr(torch, parsed.type, None)
     if own_process and api is not None and (parsed.type != "cuda" or torch.cuda.is_initialized()):
-        for key, method in (("allocated_mb", "memory_allocated"), ("reserved_mb", "memory_reserved"), ("peak_allocated_mb", "max_memory_allocated")):
-            try:
-                result[key] = float(getattr(api, method)(parsed)) / 2**20
-            except (AttributeError, RuntimeError, TypeError, AssertionError):
-                pass
+        if parsed.type == "mps":
+            # MPS 的内存统计 API 名称不同且不接受设备参数，也没有峰值分配接口。
+            for key, method in (("allocated_mb", "current_allocated_memory"), ("reserved_mb", "driver_allocated_memory")):
+                try:
+                    result[key] = float(getattr(api, method)()) / 2**20
+                except (AttributeError, RuntimeError, TypeError, AssertionError):
+                    pass
+        else:
+            for key, method in (("allocated_mb", "memory_allocated"), ("reserved_mb", "memory_reserved"), ("peak_allocated_mb", "max_memory_allocated")):
+                try:
+                    result[key] = float(getattr(api, method)(parsed)) / 2**20
+                except (AttributeError, RuntimeError, TypeError, AssertionError):
+                    pass
     if parsed.type == "cuda" and not getattr(torch.version, "hip", None):
         try:
             properties = torch.cuda.get_device_properties(parsed)

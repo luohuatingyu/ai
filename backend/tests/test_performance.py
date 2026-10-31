@@ -89,6 +89,45 @@ def test_gpu_metrics_match_uuid(monkeypatch):
     assert row["allocated_mb"] is None
 
 
+def test_mps_memory_metrics_use_apple_api(monkeypatch):
+    """MPS 后端改用 Apple 内存接口采集，无峰值接口时保持未知而非伪造。"""
+    calls = []
+
+    class FakeMps:
+        @staticmethod
+        def current_allocated_memory():
+            """模拟 PyTorch MPS 已分配内存接口（返回字节）。"""
+            calls.append("allocated")
+            return 256 * 2**20
+
+        @staticmethod
+        def driver_allocated_memory():
+            """模拟 Metal 驱动保留内存接口（返回字节）。"""
+            calls.append("driver")
+            return 512 * 2**20
+
+    monkeypatch.setattr(performance.torch, "mps", FakeMps, raising=False)
+    row = performance._gpu_snapshot("mps", True)
+    assert row["allocated_mb"] == pytest.approx(256)
+    assert row["reserved_mb"] == pytest.approx(512)
+    assert row["peak_allocated_mb"] is None
+    assert row["utilization_percent"] is None
+    assert calls == ["allocated", "driver"]
+
+
+def test_mps_memory_api_failure_stays_unknown(monkeypatch):
+    """MPS 内存接口缺失或异常时采样不崩溃，字段保持未知。"""
+    class FakeMps:
+        @staticmethod
+        def current_allocated_memory():
+            """模拟旧版 PyTorch 缺少该内存接口。"""
+            raise AttributeError("current_allocated_memory")
+
+    monkeypatch.setattr(performance.torch, "mps", FakeMps, raising=False)
+    row = performance._gpu_snapshot("mps", True)
+    assert row["allocated_mb"] is None and row["reserved_mb"] is None
+
+
 def test_checkpoint_timing_and_errors(tmp_path):
     """阶段计时包含实际保存开销，失败原样传播，成功记录可序列化。"""
     meter = performance.EpochPerformance(1)
