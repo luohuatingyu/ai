@@ -38,11 +38,31 @@ def test_regression_accepts_all_models(model_type):
     assert request.model_type == model_type
 
 
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_xgboost_accepted_and_allows_gpu(task):
+    """正常场景：xgboost 支持分类/回归，且允许 GPU 资源要求（区别于纯 sklearn）。"""
+    payload = {"task": task, "model_type": "xgboost",
+               "target": "label" if task == "classification" else "value"}
+    request = TrainRequest(**_valid(**payload))
+    assert request.model_type == "xgboost"
+    gpu_request = TrainRequest(**_valid(**{**payload, "require_gpu": True}))
+    assert gpu_request.require_gpu is True
+    backend_request = TrainRequest(**_valid(**{**payload, "device_backend": "cuda"}))
+    assert backend_request.device_backend == "cuda"
+    with pytest.raises(ValueError, match="联合训练"):
+        TrainRequest(**_valid(**{**payload, "parallel_workers": [
+            {"worker_id": "slot-a", "batch_size": 32},
+            {"worker_id": "slot-b", "batch_size": 32},
+        ]}))
+
+
 @pytest.mark.parametrize("task,model_type", [
     ("classification", "linear_regression"),   # 线性回归仅回归
     ("regression", "logistic_regression"),     # 逻辑回归仅分类
     ("clustering", "svm"),                     # 聚类仅 mlp
+    ("clustering", "xgboost"),
     ("time_series_forecasting", "random_forest"),
+    ("time_series_forecasting", "xgboost"),
     ("llm_sft", "random_forest"),
 ])
 def test_invalid_task_model_combinations_rejected(task, model_type):
@@ -115,7 +135,7 @@ def test_hyperparameter_bounds_accepted(field, value):
 
 @pytest.mark.parametrize("field,value", [
     ("optimizer", "momentum"), ("lr_scheduler", "linear"),
-    ("activation", "selu"), ("model_type", "xgboost"),
+    ("activation", "selu"), ("model_type", "lightgbm"),
 ])
 def test_invalid_literal_choices_rejected(field, value):
     """异常场景：非法枚举值被 Literal 拒绝。"""

@@ -44,10 +44,11 @@ class TrainRequest(BaseModel):
     n_clusters: int = Field(4, ge=2, le=64)
     lookback: int = Field(12, ge=2, le=512)
     forecast_horizon: int = Field(1, ge=1, le=64)
-    # 分类/回归的模型选择：mlp 为 PyTorch 神经网络，其余为 sklearn 传统机器学习模型
+    # 分类/回归的模型选择：mlp 为 PyTorch 神经网络，xgboost 支持 GPU 加速，
+    # 其余为 sklearn 传统机器学习模型（仅 CPU）
     model_type: Literal[
         "mlp", "logistic_regression", "linear_regression", "decision_tree",
-        "random_forest", "gradient_boosting", "svm", "knn",
+        "random_forest", "gradient_boosting", "svm", "knn", "xgboost",
     ] = "mlp"
     epochs: int = Field(20, ge=1, le=500)
     batch_size: int = Field(32, ge=1, le=4096)
@@ -92,9 +93,9 @@ class TrainRequest(BaseModel):
         }
         sklearn_regression = sklearn_classification - {"logistic_regression"} | {"linear_regression"}
         if self.task == "classification":
-            allowed_models = {"mlp"} | sklearn_classification
+            allowed_models = {"mlp", "xgboost"} | sklearn_classification
         elif self.task == "regression":
-            allowed_models = {"mlp"} | sklearn_regression
+            allowed_models = {"mlp", "xgboost"} | sklearn_regression
         else:
             allowed_models = {"mlp"}
         if self.model_type not in allowed_models:
@@ -102,7 +103,10 @@ class TrainRequest(BaseModel):
         if self.model_type != "mlp":
             if self.parallel_workers:
                 raise ValueError("传统机器学习模型不支持联合训练，请使用单节点模式")
-            if self.require_gpu or self.device_backend not in {"auto", "cpu"}:
+            # xgboost 在 GPU 可用时使用 CUDA 加速，允许 GPU 资源要求；纯 sklearn 仅 CPU
+            if self.model_type != "xgboost" and (
+                self.require_gpu or self.device_backend not in {"auto", "cpu"}
+            ):
                 raise ValueError("传统机器学习模型基于 scikit-learn，仅支持 CPU 计算")
         if self.parallel_workers:
             identifiers = [item.worker_id for item in self.parallel_workers]

@@ -47,13 +47,28 @@ def _metrics(tmp_dir):
 # 模块 A：sklearn 模型训练链路
 # ---------------------------------------------------------------------------
 
+def _xgboost_available() -> bool:
+    """宿主机未安装 xgboost 时跳过对应用例（容器镜像包含该依赖）。"""
+    try:
+        import xgboost  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+XGBOOST_MARK = pytest.mark.skipif(
+    not _xgboost_available(), reason="宿主机未安装 xgboost（容器环境执行）"
+)
+
 CLASSIFICATION_MODELS = [
     "logistic_regression", "decision_tree", "random_forest",
     "gradient_boosting", "svm", "knn",
+    pytest.param("xgboost", marks=XGBOOST_MARK),
 ]
 REGRESSION_MODELS = [
     "linear_regression", "decision_tree", "random_forest",
     "gradient_boosting", "svm", "knn",
+    pytest.param("xgboost", marks=XGBOOST_MARK),
 ]
 
 
@@ -116,6 +131,28 @@ def test_sklearn_staged_models_span_epochs(store, make_dataset, tmp_path):
     gb_dir.mkdir()
     _run(ds, "classification", 4, gb_dir, model_type="gradient_boosting")
     assert [m["epoch"] for m in _metrics(gb_dir)] == [1, 2, 3, 4]
+
+
+@XGBOOST_MARK
+def test_xgboost_device_selection_and_staged(store, make_dataset, tmp_path, monkeypatch):
+    """XGBoost：无 GPU 时选 cpu；GPU 可用时选 cuda；分阶段按轮增长 n_estimators。"""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    estimator = trainer._build_sklearn_estimator("xgboost", "regression", 42)
+    assert str(getattr(estimator, "device", "cpu")) == "cpu"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    gpu_estimator = trainer._build_sklearn_estimator("xgboost", "classification", 42)
+    assert str(getattr(gpu_estimator, "device", "cpu")) == "cuda"
+
+    ds = make_dataset(kind="regression")
+    summary = _run(ds, "regression", 4, tmp_path, model_type="xgboost")
+    assert summary["framework"] == "xgboost"
+    assert summary["device"] == "cpu", "本机无 GPU 时 summary.device 应为 cpu"
+    assert [m["epoch"] for m in _metrics(tmp_path)] == [1, 2, 3, 4]
+    # 预测一致：同一行两次预测稳定
+    row = {"f1": 0.5, "f2": -0.3, "f3": 0.2}
+    assert predict_row(tmp_path / "best.pt", row=row) == predict_row(tmp_path / "best.pt", row=row)
 
 
 def test_sklearn_oneshot_single_epoch(store, make_dataset, tmp_path):

@@ -8,10 +8,11 @@
     模型权重 + 优化器状态 + 随机数状态 + epoch 进度 + best 追踪 + 预处理器；
   * 保存时全部 CPU 化（设备无关），任意服务器/任意显卡（甚至 CPU）可接手续训；
   * run_training 支持 resume_state 断点续训与 pause_event 优雅暂停。
-- **模型选择（分类/回归）**：model_type=mlp 为 PyTorch 多层感知机；其余为
-  scikit-learn 传统模型（线性/逻辑回归、决策树、随机森林、梯度提升树、SVM、KNN），
-  仅支持单节点 CPU；随机森林/梯度提升树按 epoch 累计预算从零重训并支持续训。
-  sklearn 产物仍写入 best.pt（framework=sklearn 标记），predict_row 双格式兼容。
+- **模型选择（分类/回归）**：model_type=mlp 为 PyTorch 多层感知机；xgboost 为
+  XGBoost 梯度提升（GPU/CUDA 可用时自动加速，否则 CPU）；其余为 scikit-learn
+  传统模型（线性/逻辑回归、决策树、随机森林、梯度提升树、SVM、KNN，仅单节点 CPU）。
+  分阶段模型按 epoch 累计预算从零重训并支持续训。非 torch 产物仍写入 best.pt
+  （framework=sklearn/xgboost 标记），predict_row 双格式兼容。
 - **MLP 可配置训练超参**：优化器（AdamW/Adam/SGD/RMSprop）、学习率调度
   （step/cosine）、早停（patience）、Dropout、权重衰减、激活函数；
   默认值与历史行为完全一致（AdamW + 无调度 + Dropout 0.15 + weight_decay 0.01）。
@@ -472,13 +473,13 @@ def load_trainer_state(path: Path) -> dict:
     try:
         state = torch.load(path, map_location="cpu", weights_only=True)
     except Exception:
-        # sklearn 训练状态包含估计器对象，无法进入 weights_only 白名单；
-        # 仅当加载结果声明 framework=sklearn 时接受，其余仍按损坏文件报错。
+        # sklearn/XGBoost 训练状态包含估计器对象，无法进入 weights_only 白名单；
+        # 仅当加载结果声明受支持的框架标记时接受，其余仍按损坏文件报错。
         try:
             state = torch.load(path, map_location="cpu", weights_only=False)
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {exc}") from exc
-        if state.get("framework") != "sklearn":
+        if state.get("framework") not in ("sklearn", "xgboost"):
             raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {path}")
     if not isinstance(state, dict) or state.get("kind") not in {"trainer_state", "llm_trainer_state"}:
         raise ValueError(f"不是有效的训练状态文件（kind 不匹配）: {path}")
@@ -815,7 +816,7 @@ def _run_kmeans_training(
 # 传统机器学习模型（scikit-learn）：分类/回归的可选模型
 # ---------------------------------------------------------------------------
 
-# 允许的 sklearn 模型及展示名；linear_regression 仅回归，logistic_regression 仅分类
+# 允许的 sklearn/XGBoost 模型及展示名；linear_regression 仅回归，logistic_regression 仅分类
 _SKLEARN_MODEL_LABELS = {
     "logistic_regression": "逻辑回归",
     "linear_regression": "线性回归",
@@ -824,12 +825,22 @@ _SKLEARN_MODEL_LABELS = {
     "gradient_boosting": "梯度提升树",
     "svm": "支持向量机",
     "knn": "K 近邻",
+    "xgboost": "XGBoost",
 }
-# 随机森林 / 梯度提升树：每轮以累计基学习器预算从零重训，支持按 epoch 分阶段与续训
-_SKLEARN_STAGED_MODELS = {"random_forest", "gradient_boosting"}
+# 随机森林 / 梯度提升树 / XGBoost：每轮以累计基学习器预算从零重训，支持按 epoch 分阶段与续训
+_SKLEARN_STAGED_MODELS = {"random_forest", "gradient_boosting", "xgboost"}
 # 分阶段模型的总量预算：每轮固定增量增长，达到预算后不再增长
 _SKLEARN_STAGED_STEP = 10
 _SKLEARN_ESTIMATOR_BUDGET = 200
+
+
+def _estimator_framework(model_type: str) -> str:
+    """非 torch 估计器的框架标记：XGBoost 单列，其余归入 sklearn。
+
+    该标记写入 checkpoint/trainer-state，读取方据此允许完整反序列化
+    （estimator 对象无法进入 torch.load(weights_only=True) 白名单）。
+    """
+    return "xgboost" if model_type == "xgboost" else "sklearn"
 
 
 def _build_sklearn_estimator(model_type: str, task: str, seed: int):
@@ -866,6 +877,19 @@ def _build_sklearn_estimator(model_type: str, task: str, seed: int):
     if model_type == "knn":
         cls = KNeighborsClassifier if task == "classification" else KNeighborsRegressor
         return cls(n_neighbors=5)
+    if model_type == "xgboost":
+        from xgboost import XGBClassifier, XGBRegressor
+
+        cls = XGBClassifier if task == "classification" else XGBRegressor
+        # GPU（NVIDIA CUDA）可用时自动加速；否则回退 CPU，行为与平台设备探测一致
+        use_cuda = bool(torch.cuda.is_available())
+        kwargs = {
+            "n_estimators": 10, "random_state": seed, "tree_method": "hist",
+            "device": "cuda" if use_cuda else "cpu",
+        }
+        if task == "classification":
+            kwargs["eval_metric"] = "logloss"
+        return cls(**kwargs)
     raise ValueError(f"未知模型类型: {model_type}")
 
 
@@ -989,14 +1013,14 @@ def _save_sklearn_checkpoint(
     path: Path, estimator, preprocessor: dict, task: str, kind: str,
     record: dict | None, model_type: str,
 ) -> None:
-    """保存 sklearn 模型到 best.pt/last.pt，字段结构与 torch checkpoint 对齐。
+    """保存 sklearn/XGBoost 模型到 best.pt/last.pt，字段结构与 torch checkpoint 对齐。
 
-    sklearn 估计器无法进入 torch.load(weights_only=True) 白名单，
+    估计器对象无法进入 torch.load(weights_only=True) 白名单，
     读取方（predict_row / load_trainer_state）依据 framework 标记切换加载方式。
     """
     torch.save(
         {
-            "framework": "sklearn",
+            "framework": _estimator_framework(model_type),
             "model_type": model_type,
             "estimator": estimator,
             "task": task,
@@ -1016,7 +1040,7 @@ def _persist_sklearn_state(
     """保存 sklearn 训练上下文（分阶段模型的断点续训依据）。"""
     state = {
         "kind": "trainer_state",
-        "framework": "sklearn",
+        "framework": _estimator_framework(model_type),
         "task": task,
         "model_type": model_type,
         "params": params,
@@ -1050,7 +1074,7 @@ def _run_sklearn_training(
     on_checkpoint: Callable[[int], None] | None = None,
     started_at: float | None = None,
 ) -> dict:
-    """训练 sklearn 传统机器学习模型（分类/回归），产物与 torch 路径一致。
+    """训练 sklearn/XGBoost 传统机器学习模型（分类/回归），产物与 torch 路径一致。
 
     - 随机森林 / 梯度提升树：每轮以累计基学习器预算从零重训（确定性），
       支持 epoch 分阶段与断点续训，续训轮次与不中断训练完全等价；
@@ -1077,7 +1101,13 @@ def _run_sklearn_training(
     )
 
     estimator = _build_sklearn_estimator(model_type, task, seed)
-    db_log_fn(f"模型: {label}（scikit-learn {__import__('sklearn').__version__}，CPU）")
+    if model_type == "xgboost":
+        import xgboost as xgb
+
+        device_note = "CUDA" if str(getattr(estimator, "device", "cpu")) == "cuda" else "CPU"
+        db_log_fn(f"模型: {label}（xgboost {xgb.__version__}，{device_note}）")
+    else:
+        db_log_fn(f"模型: {label}（scikit-learn {__import__('sklearn').__version__}，CPU）")
     if not staged:
         db_log_fn("该模型一次性拟合，epochs 参数不适用（按 1 轮完成）")
 
@@ -1087,7 +1117,8 @@ def _run_sklearn_training(
     best_epoch = 0
     best_record: dict | None = None
     if resume_state is not None:
-        if resume_state.get("framework") != "sklearn" or resume_state.get("task") != task \
+        if resume_state.get("framework") != _estimator_framework(model_type) \
+                or resume_state.get("task") != task \
                 or resume_state.get("model_type") != model_type:
             raise ValueError("checkpoint 与当前任务/模型类型不匹配，无法续训")
         estimator = resume_state["estimator"]
@@ -1132,7 +1163,7 @@ def _run_sklearn_training(
             # 轮次序号决定模型规模（固定步长 + 预算封顶），固定 seed 下确定性强，
             # 任意分段续训的轮次与不中断训练完全一致。
             target_count = min(epoch * _SKLEARN_STAGED_STEP, _SKLEARN_ESTIMATOR_BUDGET)
-            if model_type == "random_forest":
+            if model_type in ("random_forest", "xgboost"):
                 estimator.n_estimators = target_count
             else:
                 estimator.max_iter = target_count
@@ -1210,8 +1241,9 @@ def _run_sklearn_training(
         "target": target,
         "model_type": model_type,
         "model_label": label,
-        "device": "cpu",
-        "framework": "scikit-learn",
+        "device": "cuda" if model_type == "xgboost" and torch.cuda.is_available() else "cpu",
+        # 面向用户的框架名；checkpoint 内部标记见 _estimator_framework
+        "framework": "xgboost" if model_type == "xgboost" else "scikit-learn",
         "epochs_total": effective_epochs,
         "epochs_done": last_epoch,
         "resumed_from": start_epoch,
@@ -1774,16 +1806,17 @@ def predict_row(
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     except Exception:
-        # sklearn 估计器不在 weights_only 白名单内；仅当文件声明 framework=sklearn
-        # （由本平台训练器写入）时才允许完整反序列化，其余文件维持严格模式报错。
+        # sklearn/XGBoost 估计器不在 weights_only 白名单内；仅当文件声明
+        # framework ∈ {sklearn, xgboost}（由本平台训练器写入）时才允许完整
+        # 反序列化，其余文件维持严格模式报错。
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        if ckpt.get("framework") != "sklearn":
+        if ckpt.get("framework") not in ("sklearn", "xgboost"):
             raise
     pre: dict = ckpt["preprocessor"]
     task = ckpt["task"]
     target_device = torch.device(device)
 
-    if ckpt.get("framework") == "sklearn":
+    if ckpt.get("framework") in ("sklearn", "xgboost"):
         if target_device.type != "cpu":
             raise ValueError("传统机器学习模型预测仅支持 CPU")
         if row is None:
