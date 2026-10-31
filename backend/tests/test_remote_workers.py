@@ -1057,6 +1057,37 @@ def test_worker_code_archive_contains_only_runtime_app_files():
     assert not any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in names)
 
 
+def test_worker_runtime_files_cover_referenced_app_modules():
+    """白名单必须覆盖运行文件引用的 app 模块，否则远程 worker 启动即 ModuleNotFoundError。
+
+    历史缺陷：worker.py 在构造执行槽时无条件导入 app.inference，但白名单漏发
+    inference.py，导致远程镜像内 worker 进程启动失败、计算槽失联。
+    """
+    import re
+
+    app_root = Path(remote_workers.__file__).parent
+    files = remote_workers._worker_runtime_files(app_root)
+    whitelist = {path.name for path in files}
+    # 有意不发往计算节点的控制面/数据库模块（与打包排除用例保持一致）。
+    intentionally_excluded = {"database", "db_utils", "dataset_manager"}
+    referenced = set()
+    for path in files:
+        if path.suffix != ".py":
+            continue
+        source = path.read_text(encoding="utf-8")
+        referenced.update(re.findall(r"(?m)^\s*(?:from|import)\s+app\.([a-z_]+)", source))
+        for clause in re.findall(r"(?m)^\s*from\s+app\s+import\s+([a-z_,\s]+)", source):
+            referenced.update(name.strip() for name in clause.split(","))
+
+    missing = sorted(
+        name for name in referenced
+        if (app_root / f"{name}.py").is_file()
+        and f"{name}.py" not in whitelist
+        and name not in intentionally_excluded
+    )
+    assert missing == [], f"白名单缺少运行文件引用的 app 模块：{missing}"
+
+
 @pytest.mark.parametrize("build_context", [False, True])
 def test_worker_packages_exclude_control_plane_and_keep_training(build_context):
     """训练包保留执行入口与训练模块，排除管理代码、页面、样例及测试依赖。"""
@@ -1069,7 +1100,7 @@ def test_worker_packages_exclude_control_plane_and_keep_training(build_context):
         names = set(archive.getnames())
         assert {"app/worker.py", "app/trainer.py", "app/llm_trainer.py",
                 "app/storage.py", "app/coordination.py", "app/jobstore.py",
-                "app/worker-entrypoint.sh"} <= names
+                "app/inference.py", "app/worker-entrypoint.sh"} <= names
         assert not {"app/main.py", "app/remote_workers.py", "app/remote_worker.sh",
                     "app/database.py", "app/db_utils.py", "app/dataset_importer.py"} & names
         assert not any(name.startswith(("static/", "sample_data/", "tests/", "data/", "app/routers/"))
