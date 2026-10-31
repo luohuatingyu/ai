@@ -78,7 +78,8 @@ def test_sklearn_classification_models(store, make_dataset, tmp_path, model_type
     ds = make_dataset(kind="classification")
     summary = _run(ds, "classification", 3, tmp_path, model_type=model_type)
     assert summary["model_type"] == model_type
-    assert summary["framework"] == "scikit-learn"
+    expected_framework = "xgboost" if model_type == "xgboost" else "scikit-learn"
+    assert summary["framework"] == expected_framework
     assert summary["device"] == "cpu"
     assert "val_accuracy" in summary["final"]
     assert (tmp_path / "best.pt").exists()
@@ -138,17 +139,20 @@ def test_xgboost_device_selection_and_staged(store, make_dataset, tmp_path, monk
     """XGBoost：无 GPU 时选 cpu；GPU 可用时选 cuda；分阶段按轮增长 n_estimators。"""
     import torch
 
+    # 设备选择为纯构造逻辑：用 monkeypatch 验证两种探测结果，随后还原再跑真实训练
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     estimator = trainer._build_sklearn_estimator("xgboost", "regression", 42)
     assert str(getattr(estimator, "device", "cpu")) == "cpu"
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     gpu_estimator = trainer._build_sklearn_estimator("xgboost", "classification", 42)
     assert str(getattr(gpu_estimator, "device", "cpu")) == "cuda"
+    monkeypatch.undo()  # 真实训练必须使用真实设备探测，避免 mock 泄漏
 
     ds = make_dataset(kind="regression")
     summary = _run(ds, "regression", 4, tmp_path, model_type="xgboost")
     assert summary["framework"] == "xgboost"
-    assert summary["device"] == "cpu", "本机无 GPU 时 summary.device 应为 cpu"
+    expected_device = "cuda" if torch.cuda.is_available() else "cpu"
+    assert summary["device"] == expected_device
     assert [m["epoch"] for m in _metrics(tmp_path)] == [1, 2, 3, 4]
     # 预测一致：同一行两次预测稳定
     row = {"f1": 0.5, "f2": -0.3, "f3": 0.2}
