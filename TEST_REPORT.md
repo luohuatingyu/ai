@@ -38,6 +38,32 @@
 - `test_worker_entrypoint` 既有失败建议将 `REDIS_PASSWORD=` 子串断言改为按行匹配。
 - 回滚：撤销本次功能提交并 `docker compose up --build -d`；无数据迁移。
 
+## 本次变更测试结果：存储故障修复合并至 master（2026-10-31）
+
+### Git 基准点与范围
+
+- **Commit Hash**：0b53dd9（Merge branch 'emdash/hot-boxes-clean-y9u6p'，含 `5d40cf7` 存储修复 + `5d2085f` 表头 sticky 移除）。
+- **测试日期 / 分支**：2026-10-31 / master。
+- **范围**：纯合并提交。合并前分支侧已按 `5d40cf7` 基准完成全量测试（见下节）；合并后 master 与 6a4c7f3 的完整代码差异仅 TEST_REPORT.md（+70 行），业务代码与已测版本完全一致，测试结论直接适用。`TEST_REPORT.md` 顶部双方新章节按时间新到旧 union（存储修复章节在上、master 合并章节随后）。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 验证方式与输入 | 预期结果 | 场景 |
+|---|---|---|---|
+| 合并后业务代码与已测版本一致 | `git diff 6a4c7f3 0b53dd9 --stat` | 仅 TEST_REPORT.md 差异；实际输出为空即通过（实际仅报告） | 兼容、回归 |
+| 合并冲突无遗漏标记 | `grep -c "^<<<<<<<\|^=======$\|^>>>>>>>" TEST_REPORT.md` | 0（实际 0） | 边界 |
+
+### 测试执行结果
+
+- 使用分支侧 5d40cf7 基准的既有全量结果：后端 693 收集（661 通过、1 既有失败、31 跳过）、前端 185/185。
+
+实际执行命令：`git -C /Users/xyzc/github/ai diff 6a4c7f3 HEAD --stat`；冲突标记计数检查。
+
+### 已知限制、重测建议与回滚
+
+- 本合并未引入新代码差异，无需回滚；撤销整个合并 `git revert -m 1 0b53dd9`。
+- 后续 master 侧 `backend/app/` 变更时按常规触发重测并重建 Compose。
+
 ## 本次变更测试结果：emdash/hot-boxes-clean-y9u6p 合并至 master（2026-10-30）
 
 ### Git 基准点与范围
