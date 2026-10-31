@@ -46,7 +46,7 @@ def select_members(lease, requested: list[dict], require_idle: bool = True) -> l
             backend = {"nvidia": "cuda"}.get(vendor, "cuda")
         if gpu.get("available") and vendor == "amd" and backend == "cuda":
             raise ValueError("当前节点不是 NVIDIA CUDA 后端；请使用 NVIDIA GPU 或重新登记后端能力")
-        if backend not in {"cuda", "rocm", "xpu", "mps", "cpu"}:
+        if backend not in {"cuda", "rocm", "xpu", "cpu"}:
             raise ValueError(f"节点 {worker_id} 的计算后端 {backend} 不受支持")
         if gpu.get("available") and capability.get("capability_supported") is False:
             raise ValueError(f"节点 {worker_id} 的显卡架构不受当前 PyTorch 构建支持")
@@ -57,8 +57,6 @@ def select_members(lease, requested: list[dict], require_idle: bool = True) -> l
             device = "cuda:0"
         elif backend == "xpu" and (not device or device == "cpu"):
             device = "xpu:0"
-        elif backend == "mps" and (not device or device == "cpu"):
-            device = "mps"
         elif not device:
             device = "cpu"
         members.append({

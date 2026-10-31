@@ -1253,8 +1253,6 @@ class WorkerSupervisor:
                 accelerator_count = gpu_count
             elif backend == "xpu":
                 accelerator_count = int(torch.xpu.device_count()) if hasattr(torch, "xpu") else 0
-            elif backend == "mps":
-                accelerator_count = 1
             else:
                 accelerator_count = 0
         except Exception:

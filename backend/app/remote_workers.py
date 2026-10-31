@@ -666,14 +666,12 @@ def _remote_build_args(server: Dict[str, object]) -> str:
     if mode not in {"cpu", "gpu"}:
         raise RemoteWorkerError("资源类型必须是 cpu 或 gpu")
     backend = str(server.get("device_backend", "auto") or "auto").lower()
-    if backend not in {"auto", "cuda", "rocm", "xpu", "mps", "cpu"}:
-        raise RemoteWorkerError("计算后端必须是 auto、cuda、rocm、xpu、mps 或 cpu")
+    if backend not in {"auto", "cuda", "rocm", "xpu", "cpu"}:
+        raise RemoteWorkerError("计算后端必须是 auto、cuda、rocm、xpu 或 cpu")
     if mode == "cpu" and backend not in {"auto", "cpu"}:
         raise RemoteWorkerError("CPU 资源类型不能选择 GPU 后端")
     if mode == "gpu" and backend == "cpu":
         raise RemoteWorkerError("GPU 资源类型不能选择 CPU 后端")
-    if backend == "mps":
-        raise RemoteWorkerError("Apple MPS 需要 macOS 原生 worker，不能通过 Linux Docker 部署")
     args: List[str] = [f"--build-arg WORKER_MODE={mode}"]
     if backend != "auto":
         args.append(f"--build-arg WORKER_BACKEND={backend}")
@@ -1824,7 +1822,7 @@ def validate_server_record(server: Dict[str, object]) -> None:
     if not 1 <= port <= 65535:
         raise RemoteWorkerError("SSH 端口必须在 1 到 65535 之间")
     backend = str(server.get("device_backend", "auto") or "auto").lower()
-    if backend not in {"auto", "cuda", "rocm", "xpu", "mps", "cpu"}:
+    if backend not in {"auto", "cuda", "rocm", "xpu", "cpu"}:
         raise RemoteWorkerError("计算后端配置无效")
     mode = str(server.get("mode", "cpu"))
     if mode == "cpu" and backend not in {"auto", "cpu"}:
@@ -1888,8 +1886,6 @@ def render_remote_script(
     if mode not in {"cpu", "gpu"}:
         raise RemoteWorkerError("计算类型必须是 cpu 或 gpu")
     device_backend = str(server.get("device_backend", "auto") or "auto").lower()
-    if device_backend == "mps":
-        raise RemoteWorkerError("Apple MPS 需要 macOS 原生 worker；Linux Docker 远程部署不支持 MPS")
     try:
         cpu_slots = int(server.get("cpu_slots", 2))
     except (TypeError, ValueError) as exc:

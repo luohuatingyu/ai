@@ -55,10 +55,9 @@
           <option value="cuda">NVIDIA CUDA</option>
           <option value="rocm">AMD ROCm</option>
           <option value="xpu">Intel XPU</option>
-          <option value="mps">Apple MPS（macOS 原生）</option>
           <option value="cpu">CPU</option>
         </select>
-        <div class="hint">MPS 不使用 Linux Docker；请用 scripts/worker-native.sh。</div>
+        <div class="hint">远程部署统一使用 Linux Docker；macOS 不支持远程 worker 部署。</div>
       </div>
       <div class="field">
         <label for="remoteUsername">SSH 用户（可选覆盖）</label>

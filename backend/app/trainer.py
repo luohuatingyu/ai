@@ -8,6 +8,13 @@
     模型权重 + 优化器状态 + 随机数状态 + epoch 进度 + best 追踪 + 预处理器；
   * 保存时全部 CPU 化（设备无关），任意服务器/任意显卡（甚至 CPU）可接手续训；
   * run_training 支持 resume_state 断点续训与 pause_event 优雅暂停。
+- **模型选择（分类/回归）**：model_type=mlp 为 PyTorch 多层感知机；其余为
+  scikit-learn 传统模型（线性/逻辑回归、决策树、随机森林、梯度提升树、SVM、KNN），
+  仅支持单节点 CPU；随机森林/梯度提升树按 epoch 分阶段增量拟合并支持续训。
+  sklearn 产物仍写入 best.pt（framework=sklearn 标记），predict_row 双格式兼容。
+- **MLP 可配置训练超参**：优化器（AdamW/Adam/SGD/RMSprop）、学习率调度
+  （step/cosine）、早停（patience）、Dropout、权重衰减、激活函数；
+  默认值与历史行为完全一致（AdamW + 无调度 + Dropout 0.15 + weight_decay 0.01）。
 - 新增训练类型时：在本文件增加 run_* 函数，并在 app/main.py 的 /api/train 中路由。
 """
 from __future__ import annotations
@@ -156,15 +163,47 @@ def _version_tuple(version: str) -> tuple:
 
 
 def _build_model(
-    in_dim: int, out_dim: int, hidden_size: int, hidden_layers: int, device: torch.device
+    in_dim: int, out_dim: int, hidden_size: int, hidden_layers: int, device: torch.device,
+    dropout: float = 0.15, activation: str = "relu",
 ) -> nn.Module:
+    """构建 MLP；dropout/activation 可配置，默认值与历史任务保持完全一致。"""
+    activations = {
+        "relu": nn.ReLU, "gelu": nn.GELU, "tanh": nn.Tanh, "silu": nn.SiLU,
+    }
+    act_cls = activations.get(str(activation or "relu"), nn.ReLU)
+    drop = float(dropout if dropout is not None else 0.15)
     dims = [in_dim] + [hidden_size] * hidden_layers + [out_dim]
     layers: list[nn.Module] = []
     for i, (a, b) in enumerate(zip(dims, dims[1:])):
         layers.append(nn.Linear(a, b))
         if i < len(dims) - 2:  # 非最后一层
-            layers += [nn.ReLU(), nn.Dropout(0.15)]
+            layers += [act_cls(), nn.Dropout(drop)]
     return nn.Sequential(*layers).to(device)
+
+
+def _build_optimizer(name: str, model: nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
+    """按名称构建优化器；未知名回退 AdamW（平台历史默认）。"""
+    key = str(name or "adamw").lower()
+    params = model.parameters()
+    if key == "adam":
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if key == "sgd":
+        return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay)
+    if key == "rmsprop":
+        return torch.optim.RMSprop(params, lr=lr, weight_decay=weight_decay)
+    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+
+def _build_scheduler(
+    name: str, optimizer: torch.optim.Optimizer, epochs: int,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    """按名称构建逐 epoch 学习率调度器；none 或未知名返回 None。"""
+    key = str(name or "none").lower()
+    if key == "step":
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    if key == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(int(epochs), 1))
+    return None
 
 
 class _KMeansCenters(nn.Module):
@@ -179,7 +218,7 @@ class _KMeansCenters(nn.Module):
 
 
 def _pick_device(log_fn: LogFn) -> torch.device:
-    """选择 NVIDIA/ROCm/XPU/MPS/CPU，并保留自动回退 CPU 的旧行为。"""
+    """选择 NVIDIA/ROCm/XPU/CPU，并保留自动回退 CPU 的旧行为。"""
     return select_device(log_fn=log_fn)
 
 
@@ -432,8 +471,15 @@ def load_trainer_state(path: Path) -> dict:
         raise FileNotFoundError(f"训练状态文件不存在: {path}")
     try:
         state = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {exc}") from exc
+    except Exception:
+        # sklearn 训练状态包含估计器对象，无法进入 weights_only 白名单；
+        # 仅当加载结果声明 framework=sklearn 时接受，其余仍按损坏文件报错。
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {exc}") from exc
+        if state.get("framework") != "sklearn":
+            raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {path}")
     if not isinstance(state, dict) or state.get("kind") not in {"trainer_state", "llm_trainer_state"}:
         raise ValueError(f"不是有效的训练状态文件（kind 不匹配）: {path}")
     return state
@@ -766,6 +812,423 @@ def _run_kmeans_training(
 
 
 # ---------------------------------------------------------------------------
+# 传统机器学习模型（scikit-learn）：分类/回归的可选模型
+# ---------------------------------------------------------------------------
+
+# 允许的 sklearn 模型及展示名；linear_regression 仅回归，logistic_regression 仅分类
+_SKLEARN_MODEL_LABELS = {
+    "logistic_regression": "逻辑回归",
+    "linear_regression": "线性回归",
+    "decision_tree": "决策树",
+    "random_forest": "随机森林",
+    "gradient_boosting": "梯度提升树",
+    "svm": "支持向量机",
+    "knn": "K 近邻",
+}
+# 随机森林 / 梯度提升树支持 warm_start 增量训练，可按 epoch 分阶段拟合并续训
+_SKLEARN_STAGED_MODELS = {"random_forest", "gradient_boosting"}
+# 分阶段模型的总量预算：per-epoch 增量 = ceil(budget / epochs)，保证跑满 epochs 时约达预算
+_SKLEARN_ESTIMATOR_BUDGET = 100
+
+
+def _build_sklearn_estimator(model_type: str, task: str, seed: int):
+    """按 model_type/task 构建未拟合的 sklearn 估计器。"""
+    from sklearn.ensemble import (
+        HistGradientBoostingClassifier,
+        HistGradientBoostingRegressor,
+        RandomForestClassifier,
+        RandomForestRegressor,
+    )
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+    from sklearn.svm import SVC, SVR
+    from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+
+    if model_type == "logistic_regression":
+        return LogisticRegression(max_iter=500, random_state=seed)
+    if model_type == "linear_regression":
+        from sklearn.linear_model import LinearRegression
+
+        return LinearRegression()
+    if model_type == "decision_tree":
+        cls = DecisionTreeClassifier if task == "classification" else DecisionTreeRegressor
+        return cls(random_state=seed)
+    if model_type == "random_forest":
+        cls = RandomForestClassifier if task == "classification" else RandomForestRegressor
+        return cls(n_estimators=10, warm_start=True, random_state=seed, n_jobs=-1)
+    if model_type == "gradient_boosting":
+        cls = HistGradientBoostingClassifier if task == "classification" else HistGradientBoostingRegressor
+        return cls(max_iter=10, warm_start=True, random_state=seed)
+    if model_type == "svm":
+        # probability=True 才能输出分类概率（内部 5 折交叉验证，小数据集开销可接受）
+        return SVC(probability=True, random_state=seed) if task == "classification" else SVR()
+    if model_type == "knn":
+        cls = KNeighborsClassifier if task == "classification" else KNeighborsRegressor
+        return cls(n_neighbors=5)
+    raise ValueError(f"未知模型类型: {model_type}")
+
+
+def _prepare_supervised_data(
+    dataset_path: Path, target: str, task: str, test_split: float, seed: int, log_fn: LogFn,
+):
+    """sklearn 路径的数据准备：特征预处理 → 标签编码 → 划分 → 标准化。
+
+    仅支持分类/回归；与 MLP 路径的 preprocessor 结构保持一致，
+    使 _featurize_row / predict_row 的预测预处理完全复用。
+    返回 (X_train, X_val, y_train, y_val, preprocessor, classes, y_scale)。
+    """
+    if not dataset_path.exists():
+        raise ValueError("数据集文件不存在（可能已被删除）")
+    df = pd.read_csv(dataset_path)
+    if not target or target not in df.columns:
+        raise ValueError(f"目标列 '{target}' 不在数据集中")
+    df = df.dropna(subset=[target]).reset_index(drop=True)
+    if len(df) < 10:
+        raise ValueError(f"有效样本过少（{len(df)} 行，需要 >= 10 行）")
+    X_df, feat_meta = _prepare_features(df, target)
+    y_all, classes = _encode_target(df[target], task)
+    X_all = X_df.to_numpy(dtype=np.float32)
+    feature_names = [str(c) for c in X_df.columns]
+    del X_df, df
+
+    log_fn(f"样本 {len(X_all)} 条；特征 {len(feature_names)} 个")
+    if classes:
+        log_fn(f"分类类别: {classes}")
+
+    stratify = None
+    if task == "classification":
+        min_count = int(np.bincount(y_all).min())
+        if min_count >= 2:
+            stratify = y_all
+        else:
+            log_fn("存在仅 1 个样本的类别，改为普通随机划分")
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_all, y_all, test_size=test_split, random_state=seed, stratify=stratify
+    )
+    log_fn(f"划分: 训练 {X_train.shape[0]} 条 / 验证 {X_val.shape[0]} 条")
+    del X_all, y_all, stratify
+
+    mean = np.asarray(X_train.mean(axis=0), dtype=np.float32)
+    std = np.asarray(X_train.std(axis=0), dtype=np.float32)
+    std[std < 1e-8] = 1.0
+    np.subtract(X_train, mean, out=X_train)
+    np.divide(X_train, std, out=X_train)
+    np.subtract(X_val, mean, out=X_val)
+    np.divide(X_val, std, out=X_val)
+
+    # 回归目标标准化：与 MLP 路径一致，预测时按 target_scale 反归一化
+    y_scale: tuple[float, float] | None = None
+    if task == "regression":
+        y_mean = float(np.asarray(y_train, dtype=np.float64).mean())
+        y_std = float(np.asarray(y_train, dtype=np.float64).std())
+        if y_std < 1e-8:
+            y_std = 1.0
+        y_scale = (y_mean, y_std)
+        np.subtract(y_train, y_mean, out=y_train)
+        np.divide(y_train, y_std, out=y_train)
+        np.subtract(y_val, y_mean, out=y_val)
+        np.divide(y_val, y_std, out=y_val)
+
+    preprocessor = {
+        "feature_names": feature_names,
+        "num_cols": feat_meta["num_cols"],
+        "cat_cols": feat_meta["cat_cols"],
+        "num_medians": feat_meta["num_medians"],
+        "cat_modes": feat_meta["cat_modes"],
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "classes": classes,
+        "target": target,
+        "task": task,
+        "target_scale": y_scale,
+    }
+    return X_train, X_val, y_train, y_val, preprocessor, classes, y_scale
+
+
+def _sklearn_metrics(
+    estimator, task: str, X_train, y_train, X_val, y_val, y_scale,
+) -> tuple[dict, float]:
+    """计算 sklearn 模型的 train/val 指标，记录结构与 MLP 路径保持一致。
+
+    返回 (record, score)；分类 score=val_accuracy，回归 score=-val_loss（越大越好）。
+    """
+    from sklearn.metrics import log_loss
+
+    train_pred = estimator.predict(X_train)
+    val_pred = estimator.predict(X_val)
+    if task == "classification":
+        classes = list(range(estimator.classes_.shape[0]))
+        train_proba = estimator.predict_proba(X_train)
+        val_proba = estimator.predict_proba(X_val)
+        train_loss = float(log_loss(y_train, train_proba, labels=classes))
+        val_loss = float(log_loss(y_val, val_proba, labels=classes))
+        val_accuracy = float(accuracy_score(y_val, val_pred))
+        record = {
+            "train_loss": round(train_loss, 6),
+            "val_loss": round(val_loss, 6),
+            "val_accuracy": round(val_accuracy, 6),
+        }
+        score = record["val_accuracy"]
+    else:
+        # 训练在标准化目标空间进行；val 指标反归一化到原始量纲（与 MLP 一致）
+        k = (y_scale[1] ** 2) if y_scale else 1.0
+        train_loss = float(mean_squared_error(y_train, train_pred))
+        val_loss = float(mean_squared_error(y_val, val_pred)) * k
+        record = {
+            "train_loss": round(train_loss, 6),
+            "val_loss": round(val_loss, 6),
+            "val_mse": round(val_loss, 6),
+            "val_r2": round(float(r2_score(y_val, val_pred)), 6),
+        }
+        score = -record["val_loss"]
+    return record, score
+
+
+def _save_sklearn_checkpoint(
+    path: Path, estimator, preprocessor: dict, task: str, kind: str,
+    record: dict | None, model_type: str,
+) -> None:
+    """保存 sklearn 模型到 best.pt/last.pt，字段结构与 torch checkpoint 对齐。
+
+    sklearn 估计器无法进入 torch.load(weights_only=True) 白名单，
+    读取方（predict_row / load_trainer_state）依据 framework 标记切换加载方式。
+    """
+    torch.save(
+        {
+            "framework": "sklearn",
+            "model_type": model_type,
+            "estimator": estimator,
+            "task": task,
+            "kind": kind,
+            "best_record": record or {},
+            "preprocessor": preprocessor,
+        },
+        path,
+    )
+
+
+def _persist_sklearn_state(
+    path: Path, *, estimator, task: str, model_type: str, params: dict,
+    epoch: int, best_score, best_epoch: int, best_record: dict | None,
+    preprocessor: dict,
+) -> dict:
+    """保存 sklearn 训练上下文（分阶段模型的断点续训依据）。"""
+    state = {
+        "kind": "trainer_state",
+        "framework": "sklearn",
+        "task": task,
+        "model_type": model_type,
+        "params": params,
+        "epoch": int(epoch),
+        "best_score": best_score,
+        "best_epoch": int(best_epoch),
+        "best_record": best_record or {},
+        "estimator": estimator,
+        "rng": _rng_snapshot(),
+        "preprocessor": preprocessor,
+        "meta": {"torch_version": str(torch.__version__), "saved_at": time.time()},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    torch.save(state, tmp)
+    tmp.replace(path)
+    return state
+
+
+def _run_sklearn_training(
+    dataset_path: Path,
+    target: str,
+    task: str,
+    params: dict,
+    cancel_event: threading.Event,
+    db_log_fn: LogFn,
+    job_dir: Path,
+    pause_event: threading.Event | None = None,
+    resume_state: dict | None = None,
+    on_epoch_end: Callable[[dict], None] | None = None,
+    on_checkpoint: Callable[[int], None] | None = None,
+    started_at: float | None = None,
+) -> dict:
+    """训练 sklearn 传统机器学习模型（分类/回归），产物与 torch 路径一致。
+
+    - 随机森林 / 梯度提升树：warm_start 按 epoch 分阶段增量拟合，支持断点续训；
+    - 一次性模型（线性/逻辑回归、决策树、SVM、KNN）：第 1 个 epoch 拟合完成，
+      后续 epoch 参数不适用（summary 中 epochs_total=1）。
+    """
+    from sklearn.metrics import classification_report
+
+    t0 = started_at if started_at is not None else time.time()
+    if pause_event is None:
+        pause_event = threading.Event()
+    model_type = str(params.get("model_type", "mlp"))
+    epochs = int(params.get("epochs", 20))
+    seed = int(params.get("seed", 42))
+    test_split = float(params.get("test_split", 0.2))
+    label = _SKLEARN_MODEL_LABELS.get(model_type, model_type)
+    staged = model_type in _SKLEARN_STAGED_MODELS
+
+    X_train, X_val, y_train, y_val, preprocessor, classes, y_scale = _prepare_supervised_data(
+        dataset_path, target, task, test_split, seed, db_log_fn
+    )
+    (job_dir / "preprocessor.json").write_text(
+        json.dumps(_py(preprocessor), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    estimator = _build_sklearn_estimator(model_type, task, seed)
+    db_log_fn(f"模型: {label}（scikit-learn {__import__('sklearn').__version__}，CPU）")
+    if not staged:
+        db_log_fn("该模型一次性拟合，epochs 参数不适用（按 1 轮完成）")
+
+    # ---- 续训恢复（仅分阶段模型会跨 epoch 存活）----
+    start_epoch = 0
+    best_score: float | None = None
+    best_epoch = 0
+    best_record: dict | None = None
+    if resume_state is not None:
+        if resume_state.get("framework") != "sklearn" or resume_state.get("task") != task \
+                or resume_state.get("model_type") != model_type:
+            raise ValueError("checkpoint 与当前任务/模型类型不匹配，无法续训")
+        estimator = resume_state["estimator"]
+        start_epoch = int(resume_state.get("epoch", 0))
+        best_score = resume_state.get("best_score")
+        best_epoch = int(resume_state.get("best_epoch", 0))
+        best_record = resume_state.get("best_record") or None
+        _rng_restore(resume_state.get("rng") or {}, db_log_fn)
+        db_log_fn(f"续训恢复: 从第 {start_epoch + 1} 个 epoch 继续（scikit-learn 模型）")
+
+    metrics_path = job_dir / "metrics.jsonl"
+    effective_epochs = epochs if staged else min(epochs, 1)
+    performance = EpochPerformance(start_epoch)
+    last_epoch = start_epoch
+
+    def _persist(finished_epoch: int) -> None:
+        """保存完整训练上下文并回调 worker 上传（与 MLP 路径语义一致）。"""
+        saved_at = time.perf_counter()
+        _persist_sklearn_state(
+            job_dir / "checkpoints" / f"ckpt-e{finished_epoch:04d}.pt",
+            estimator=estimator, task=task, model_type=model_type,
+            params={"epochs": epochs, "test_split": test_split, "seed": seed,
+                    "model_type": model_type},
+            epoch=finished_epoch, best_score=best_score, best_epoch=best_epoch,
+            best_record=best_record, preprocessor=preprocessor,
+        )
+        performance.record["checkpoint_save_seconds"] += time.perf_counter() - saved_at
+        if on_checkpoint is not None:
+            on_checkpoint(finished_epoch)
+
+    for epoch in range(start_epoch + 1, effective_epochs + 1):
+        performance = EpochPerformance(epoch, "single")
+        if cancel_event.is_set():
+            raise JobCancelled()
+        if pause_event.is_set():
+            _persist(epoch - 1)
+            raise JobPaused(f"训练已在第 {epoch - 1} 个 epoch 后暂停")
+
+        fit_started = time.perf_counter()
+        if staged:
+            # warm_start 增量：每轮追加固定数量的基学习器，直至达到预算
+            per_epoch = max(1, -(-_SKLEARN_ESTIMATOR_BUDGET // max(effective_epochs, 1)))
+            if model_type == "random_forest":
+                estimator.n_estimators = getattr(estimator, "n_estimators", 0) + per_epoch
+            else:
+                estimator.max_iter = getattr(estimator, "max_iter", 0) + per_epoch
+        estimator.fit(X_train, y_train)
+        performance.record["train_seconds"] = time.perf_counter() - fit_started
+
+        record, score = _sklearn_metrics(
+            estimator, task, X_train, y_train, X_val, y_val, y_scale
+        )
+        record = {"epoch": epoch, **record}
+        _append_jsonl(metrics_path, record)
+        if task == "classification":
+            db_log_fn(
+                f"[epoch {epoch}/{effective_epochs}] train_loss={record['train_loss']:.4f} "
+                f"val_loss={record['val_loss']:.4f} val_acc={record['val_accuracy']:.4f}"
+            )
+        else:
+            db_log_fn(
+                f"[epoch {epoch}/{effective_epochs}] train_loss={record['train_loss']:.4f} "
+                f"val_loss={record['val_loss']:.4f} val_r2={record['val_r2']:.4f}"
+            )
+
+        if best_record is None or score > best_score:
+            best_score, best_epoch, best_record = score, epoch, dict(record)
+            _save_sklearn_checkpoint(
+                job_dir / "best.pt", estimator, preprocessor, task, "best", record, model_type
+            )
+        if epoch == effective_epochs:
+            _save_sklearn_checkpoint(
+                job_dir / "last.pt", estimator, preprocessor, task, "last", record, model_type
+            )
+        _persist(epoch)
+        performance.write(job_dir, int(X_train.shape[0]), 1)
+        if on_epoch_end is not None:
+            on_epoch_end(record)
+        last_epoch = epoch
+
+    # ---- 最终报告（用最佳模型）----
+    best_path = job_dir / "best.pt"
+    if not best_path.exists():
+        raise ValueError("缺少 best.pt 权重产物，无法生成最终报告")
+    ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+    estimator = ckpt["estimator"]
+    val_pred = estimator.predict(X_val)
+    if y_scale:
+        val_pred = np.asarray(val_pred, dtype=np.float64) * y_scale[1] + y_scale[0]
+    y_true_raw = np.asarray(y_val, dtype=np.float64)
+    if y_scale:
+        y_true_raw = y_true_raw * y_scale[1] + y_scale[0]
+    if task == "classification":
+        val_accuracy = float(accuracy_score(y_val, val_pred))
+        final_result = {"val_accuracy": val_accuracy, "val_loss": best_record["val_loss"]}
+        report = classification_report(
+            y_val, val_pred,
+            labels=list(range(len(classes))),
+            target_names=[str(c) for c in classes],
+            output_dict=True,
+            zero_division=0,
+        )
+        db_log_fn(f"最终验证准确率 {val_accuracy:.4f}")
+    else:
+        mse = float(mean_squared_error(y_true_raw, val_pred))
+        final_result = {
+            "val_mse": mse,
+            "val_rmse": float(np.sqrt(mse)),
+            "val_r2": float(r2_score(y_true_raw, val_pred)),
+        }
+        db_log_fn(
+            f"最终验证 MSE={final_result['val_mse']:.4f} RMSE={final_result['val_rmse']:.4f} "
+            f"R²={final_result['val_r2']:.4f}"
+        )
+
+    summary: dict[str, Any] = {
+        "task": task,
+        "target": target,
+        "model_type": model_type,
+        "model_label": label,
+        "device": "cpu",
+        "framework": "scikit-learn",
+        "epochs_total": effective_epochs,
+        "epochs_done": last_epoch,
+        "resumed_from": start_epoch,
+        "best_epoch": best_epoch,
+        "best": best_record,
+        "final": _py(final_result),
+        "rows": {"train": int(X_train.shape[0]), "val": int(X_val.shape[0])},
+        "features": int(len(preprocessor["feature_names"])),
+        "classes": classes,
+        "duration_sec": round(time.time() - t0, 1),
+    }
+    if task == "classification":
+        summary["report"] = _py(report)
+    (job_dir / "summary.json").write_text(
+        json.dumps(_py(summary), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    db_log_fn(f"训练完成，用时 {summary['duration_sec']}s")
+    return _py(summary)
+
+
+# ---------------------------------------------------------------------------
 # 入口（由 app.jobs.JobManager 在工作线程中调用）
 # ---------------------------------------------------------------------------
 
@@ -852,11 +1315,41 @@ def run_training(
             started_at=t0,
         )
 
+    # 传统机器学习模型（sklearn）：仅分类/回归，单节点 CPU 训练
+    model_type = str(params.get("model_type", "mlp") or "mlp")
+    if model_type != "mlp":
+        if parallel is not None:
+            raise ValueError("传统机器学习模型不支持联合训练，请使用单节点模式")
+        if task not in ("classification", "regression"):
+            raise ValueError(f"任务 {task} 仅支持 mlp 模型")
+        return _run_sklearn_training(
+            dataset_path=dataset_path,
+            target=target,
+            task=task,
+            params=params,
+            cancel_event=cancel_event,
+            db_log_fn=db_log_fn,
+            job_dir=job_dir,
+            pause_event=pause_event,
+            resume_state=resume_state,
+            on_epoch_end=on_epoch_end,
+            on_checkpoint=on_checkpoint,
+            started_at=t0,
+        )
+
     batch_size = int(params["batch_size"])
     lr = float(params["lr"])
     hidden_size = int(params["hidden_size"])
     hidden_layers = int(params["hidden_layers"])
     test_split = float(params["test_split"])
+    # 训练超参（仅 MLP）：优化器 / 调度 / 早停 / 正则；默认值与历史行为完全一致
+    optimizer_name = str(params.get("optimizer", "adamw") or "adamw")
+    scheduler_name = str(params.get("lr_scheduler", "none") or "none")
+    early_stopping = bool(params.get("early_stopping", False))
+    patience = int(params.get("patience", 5))
+    dropout = float(params.get("dropout", 0.15))
+    weight_decay = float(params.get("weight_decay", 0.01))
+    activation = str(params.get("activation", "relu") or "relu")
 
     # ---- 环境 ----
     device = parallel.device if parallel is not None else _pick_device(db_log_fn)
@@ -986,10 +1479,20 @@ def run_training(
         "out_dim": out_dim,
         "hidden_size": hidden_size,
         "hidden_layers": hidden_layers,
+        "dropout": dropout,
+        "activation": activation,
     }
-    model = _build_model(n_features, out_dim, hidden_size, hidden_layers, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    db_log_fn(f"模型: MLP({'+'.join(str(d) for d in [n_features] + [hidden_size] * hidden_layers + [out_dim])})")
+    model = _build_model(
+        n_features, out_dim, hidden_size, hidden_layers, device,
+        dropout=dropout, activation=activation,
+    )
+    optimizer = _build_optimizer(optimizer_name, model, lr, weight_decay)
+    scheduler = _build_scheduler(scheduler_name, optimizer, epochs)
+    db_log_fn(
+        f"模型: MLP({'+'.join(str(d) for d in [n_features] + [hidden_size] * hidden_layers + [out_dim])})"
+        f" / 优化器 {optimizer_name}"
+        + (f" / 调度 {scheduler_name}" if scheduler is not None else "")
+    )
 
     # ---- 恢复训练上下文（跨服务器/跨显卡续训） ----
     start_epoch = 0
@@ -1007,12 +1510,17 @@ def run_training(
         best_epoch = int(resume_state.get("best_epoch", 0))
         best_record = resume_state.get("best_record") or None
         saved_device = resume_state.get("meta", {}).get("saved_device", "未知")
+        # 调度器状态不落盘：按已完成的 epoch 数快进，恢复与不中断一致的学习率轨迹
+        if scheduler is not None:
+            for _ in range(start_epoch):
+                scheduler.step()
         db_log_fn(
             f"续训恢复: 从第 {start_epoch + 1} 个 epoch 继续（原设备 {saved_device}，"
             f"本机设备 {device}；优化器/随机数状态已还原）"
         )
         # 随机数状态恢复必须在模型构建之后：续训的数据 shuffle 序列与未中断时完全一致
         _rng_restore(resume_state.get("rng") or {}, db_log_fn)
+    last_epoch = start_epoch
 
     if parallel is not None:
         # 每个节点必须读取同一数据快照并生成相同的特征与标签映射。
@@ -1053,6 +1561,10 @@ def run_training(
                 "epochs": epochs, "batch_size": batch_size, "lr": lr,
                 "hidden_size": hidden_size, "hidden_layers": hidden_layers,
                 "test_split": test_split, "seed": seed,
+                "optimizer": optimizer_name, "lr_scheduler": scheduler_name,
+                "early_stopping": early_stopping, "patience": patience,
+                "dropout": dropout, "weight_decay": weight_decay,
+                "activation": activation,
             },
             epoch=finished_epoch,
             best_score=best_score,
@@ -1108,7 +1620,7 @@ def run_training(
             else:
                 parallel.step(optimizer, len(y_batch))
             # GPU 标量留在设备累计，轮次结束才同步；CPU 沿用原有精度与行为。
-            value = loss.item() if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64)
+            value = loss.item() if device.type == "cpu" else loss.detach().to(torch.float64)
             running = running + value * len(y_batch)
             seen += len(y_batch)
         running = float(running)
@@ -1164,9 +1676,20 @@ def run_training(
             performance.write(job_dir, int(seen), steps)
         if on_epoch_end is not None:
             on_epoch_end(record)
+        last_epoch = epoch
+        if scheduler is not None:
+            scheduler.step()
         if parallel is not None and parallel.control(cancel_event, pause_event, allow_pause=True):
             _persist_state(epoch)
             raise JobPaused(f"联合训练已在完整 epoch {epoch} 后暂停")
+        # 早停：验证指标连续 patience 轮无提升则提前结束（best_epoch 可跨续训推导）
+        if early_stopping and epoch - best_epoch >= patience:
+            db_log_fn(
+                f"早停触发：验证指标已 {epoch - best_epoch} 轮未提升（耐心值 {patience}），"
+                f"于第 {epoch} 轮提前结束训练"
+            )
+            _persist_state(epoch)
+            break
 
     # ---- 最终报告（用最佳权重）----
     if parallel is not None and not parallel.primary:
@@ -1189,8 +1712,14 @@ def run_training(
         "cuda_version": torch.version.cuda,
         "device_backend": backend_from_device(device),
         "epochs_total": epochs,
-        "epochs_done": epochs,
+        "epochs_done": last_epoch,
         "resumed_from": start_epoch,          # 本次运行起始 epoch（0 表示全新训练）
+        "optimizer": optimizer_name,
+        "lr_scheduler": scheduler_name,
+        "early_stopping": early_stopping,
+        "dropout": dropout,
+        "weight_decay": weight_decay,
+        "activation": activation,
         "best_epoch": best_epoch,
         "best": best_record,
         "final": _py(final_result),
@@ -1236,10 +1765,39 @@ def predict_row(
     device: str = "cpu",
 ) -> dict:
     """加载 best.pt，对单条表格记录、KMeans 样本或时间序列历史窗口进行预测。"""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    except Exception:
+        # sklearn 估计器不在 weights_only 白名单内；仅当文件声明 framework=sklearn
+        # （由本平台训练器写入）时才允许完整反序列化，其余文件维持严格模式报错。
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if ckpt.get("framework") != "sklearn":
+            raise
     pre: dict = ckpt["preprocessor"]
     task = ckpt["task"]
     target_device = torch.device(device)
+
+    if ckpt.get("framework") == "sklearn":
+        if target_device.type != "cpu":
+            raise ValueError("传统机器学习模型预测仅支持 CPU")
+        if row is None:
+            raise ValueError("表格预测需要提供 row 对象")
+        x = _featurize_row(row, pre)
+        estimator = ckpt["estimator"]
+        if task == "classification":
+            proba = estimator.predict_proba(x)[0]
+            classes = list(pre["classes"])
+            top = int(np.argmax(proba))
+            return {
+                "task": task,
+                "prediction": classes[top],
+                "probabilities": {str(c): float(p) for c, p in zip(classes, proba)},
+            }
+        value = float(np.asarray(estimator.predict(x)).ravel()[0])
+        scale = pre.get("target_scale")
+        if scale:
+            value = value * float(scale[1]) + float(scale[0])
+        return {"task": task, "prediction": value}
 
     if task == "clustering":
         if target_device.type != "cpu":

@@ -44,7 +44,7 @@ class InferenceService:
         backend = worker.get("device_backend") or gpu.get("backend") or "cpu"
         if worker.get("state") in {"degraded", "recovering"} or gpu.get("healthy") is False:
             raise ValueError("所选预测 Worker 设备异常")
-        if backend not in {"cpu", "cuda", "rocm", "xpu", "mps"}:
+        if backend not in {"cpu", "cuda", "rocm", "xpu"}:
             raise ValueError("所选预测 Worker 计算后端不支持")
         if task == "clustering" and backend != "cpu":
             raise ValueError("KMeans 聚类预测仅支持 CPU")

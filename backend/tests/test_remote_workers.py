@@ -1096,9 +1096,9 @@ def test_remote_build_selects_non_cuda_gpu_backend(backend):
     assert f"--build-arg WORKER_BACKEND={backend}" in args
 
 
-def test_remote_build_rejects_mps_docker_deployment():
-    """MPS 只能由 macOS 原生 Worker 使用，远程 Linux Docker 部署需明确拒绝。"""
-    with pytest.raises(remote_workers.RemoteWorkerError, match="macOS 原生 worker"):
+def test_remote_build_rejects_unknown_backend():
+    """未知的计算后端不能进入远程部署构建参数。"""
+    with pytest.raises(remote_workers.RemoteWorkerError, match="计算后端必须是 auto、cuda、rocm、xpu 或 cpu"):
         remote_workers._remote_build_args(_server(mode="gpu", device_backend="mps"))
 
 

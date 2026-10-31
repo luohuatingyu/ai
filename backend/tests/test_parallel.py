@@ -347,7 +347,6 @@ def test_member_validation_and_backend_selection(ls):
     [("cuda", "nvidia", "cuda:0", "nccl"),
      ("rocm", "amd", "cuda:0", "gloo"),
      ("xpu", "intel", "xpu:0", "gloo"),
-     ("mps", "apple", "mps", "gloo"),
      ("cpu", "cpu", "cpu", "gloo")],
 )
 def test_member_selection_supports_each_device_backend(
@@ -375,11 +374,10 @@ def test_member_selection_supports_each_device_backend(
 
 
 def test_mixed_accelerators_use_gloo(ls):
-    """AMD/Intel/Apple/CPU 混合計算组统一走 Gloo，不伪装为 CUDA/NCCL。"""
+    """AMD/Intel/CPU 混合計算组统一走 Gloo，不伪装为 CUDA/NCCL。"""
     requests = []
     for index, (backend, vendor, device) in enumerate([
-        ("rocm", "amd", "cuda:0"), ("xpu", "intel", "xpu:0"),
-        ("mps", "apple", "mps"), ("cpu", "cpu", "cpu"),
+        ("rocm", "amd", "cuda:0"), ("xpu", "intel", "xpu:0"), ("cpu", "cpu", "cpu"),
     ]):
         worker_id = f"mixed-{index}"
         caps = _caps(worker_id, _port())
@@ -396,7 +394,7 @@ def test_mixed_accelerators_use_gloo(ls):
     members = select_members(ls, requests)
     group = make_group("job-mixed", "token-mixed", members, 30, 42)
 
-    assert [member["device_backend"] for member in members] == ["rocm", "xpu", "mps", "cpu"]
+    assert [member["device_backend"] for member in members] == ["rocm", "xpu", "cpu"]
     assert group["backend"] == "gloo"
 
 
@@ -611,15 +609,14 @@ def test_cpu_slot_hides_inherited_gpu_visibility(monkeypatch):
 @pytest.mark.parametrize(
     ("backend", "index", "expected"),
     [("rocm", "1", ("1", "1", "1", "")),
-     ("xpu", "1", ("", "", "", "level_zero:1")),
-     ("mps", "0", ("", "", "", ""))],
+     ("xpu", "1", ("", "", "", "level_zero:1"))],
 )
 def test_supervisor_sets_backend_specific_device_visibility(monkeypatch, backend, index, expected):
     """子进程后端选择与每槽设备可见性变量保持一致。"""
     from types import SimpleNamespace
     from app.worker import WorkerSupervisor
 
-    count = 1 if backend == "mps" else 2
+    count = 2
     monkeypatch.setenv("WORKER_DEVICE", backend)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,1")
@@ -633,7 +630,7 @@ def test_supervisor_sets_backend_specific_device_visibility(monkeypatch, backend
     monkeypatch.setattr("app.worker.subprocess.Popen", lambda args, env: launched.append(env) or SimpleNamespace(pid=1))
 
     supervisor = WorkerSupervisor(None, None, None, log=lambda message: None, cpu_slots=0)
-    slot = "gpu0" if backend == "mps" else "gpu1"
+    slot = "gpu1"
     supervisor._spawn(slot, index)
 
     assert launched[0]["WORKER_DEVICE"] == backend

@@ -457,10 +457,9 @@
             <option value="cuda">NVIDIA CUDA</option>
             <option value="rocm">AMD ROCm</option>
             <option value="xpu">Intel XPU</option>
-            <option value="mps">Apple MPS</option>
             <option value="cpu">CPU</option>
           </select>
-          <div class="hint">MPS 需要 macOS 原生 worker；AMD/Intel 需安装对应 PyTorch 构建。</div>
+          <div class="hint">AMD/Intel 需安装对应 PyTorch 构建。</div>
         </div>
         <div class="field" id="minVramField" hidden>
           <label>最低显存（MiB，可选）</label>
@@ -2216,7 +2215,7 @@ function predictionWorkerIssue(worker, task) {
   if (!worker.enabled) return "未启用";
   const gpu = worker.gpu || {}, backend = worker.device_backend || gpu.backend || "cpu";
   if (["degraded", "recovering"].includes(worker.state) || gpu.healthy === false) return "设备异常";
-  if (!["cpu", "cuda", "rocm", "xpu", "mps"].includes(backend)) return "不支持的计算后端";
+  if (!["cpu", "cuda", "rocm", "xpu"].includes(backend)) return "不支持的计算后端";
   if (task === "clustering" && backend !== "cpu") return "聚类仅支持 CPU";
   if (backend !== "cpu" && !gpu.available) return "加速设备不可用";
   return "";
