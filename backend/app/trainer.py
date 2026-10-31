@@ -10,7 +10,7 @@
   * run_training 支持 resume_state 断点续训与 pause_event 优雅暂停。
 - **模型选择（分类/回归）**：model_type=mlp 为 PyTorch 多层感知机；其余为
   scikit-learn 传统模型（线性/逻辑回归、决策树、随机森林、梯度提升树、SVM、KNN），
-  仅支持单节点 CPU；随机森林/梯度提升树按 epoch 分阶段增量拟合并支持续训。
+  仅支持单节点 CPU；随机森林/梯度提升树按 epoch 累计预算从零重训并支持续训。
   sklearn 产物仍写入 best.pt（framework=sklearn 标记），predict_row 双格式兼容。
 - **MLP 可配置训练超参**：优化器（AdamW/Adam/SGD/RMSprop）、学习率调度
   （step/cosine）、早停（patience）、Dropout、权重衰减、激活函数；
@@ -825,10 +825,11 @@ _SKLEARN_MODEL_LABELS = {
     "svm": "支持向量机",
     "knn": "K 近邻",
 }
-# 随机森林 / 梯度提升树支持 warm_start 增量训练，可按 epoch 分阶段拟合并续训
+# 随机森林 / 梯度提升树：每轮以累计基学习器预算从零重训，支持按 epoch 分阶段与续训
 _SKLEARN_STAGED_MODELS = {"random_forest", "gradient_boosting"}
-# 分阶段模型的总量预算：per-epoch 增量 = ceil(budget / epochs)，保证跑满 epochs 时约达预算
-_SKLEARN_ESTIMATOR_BUDGET = 100
+# 分阶段模型的总量预算：每轮固定增量增长，达到预算后不再增长
+_SKLEARN_STAGED_STEP = 10
+_SKLEARN_ESTIMATOR_BUDGET = 200
 
 
 def _build_sklearn_estimator(model_type: str, task: str, seed: int):
@@ -855,10 +856,10 @@ def _build_sklearn_estimator(model_type: str, task: str, seed: int):
         return cls(random_state=seed)
     if model_type == "random_forest":
         cls = RandomForestClassifier if task == "classification" else RandomForestRegressor
-        return cls(n_estimators=10, warm_start=True, random_state=seed, n_jobs=-1)
+        return cls(n_estimators=10, random_state=seed, n_jobs=-1)
     if model_type == "gradient_boosting":
         cls = HistGradientBoostingClassifier if task == "classification" else HistGradientBoostingRegressor
-        return cls(max_iter=10, warm_start=True, random_state=seed)
+        return cls(max_iter=10, random_state=seed)
     if model_type == "svm":
         # probability=True 才能输出分类概率（内部 5 折交叉验证，小数据集开销可接受）
         return SVC(probability=True, random_state=seed) if task == "classification" else SVR()
@@ -1051,7 +1052,8 @@ def _run_sklearn_training(
 ) -> dict:
     """训练 sklearn 传统机器学习模型（分类/回归），产物与 torch 路径一致。
 
-    - 随机森林 / 梯度提升树：warm_start 按 epoch 分阶段增量拟合，支持断点续训；
+    - 随机森林 / 梯度提升树：每轮以累计基学习器预算从零重训（确定性），
+      支持 epoch 分阶段与断点续训，续训轮次与不中断训练完全等价；
     - 一次性模型（线性/逻辑回归、决策树、SVM、KNN）：第 1 个 epoch 拟合完成，
       后续 epoch 参数不适用（summary 中 epochs_total=1）。
     """
@@ -1126,12 +1128,14 @@ def _run_sklearn_training(
 
         fit_started = time.perf_counter()
         if staged:
-            # warm_start 增量：每轮追加固定数量的基学习器，直至达到预算
-            per_epoch = max(1, -(-_SKLEARN_ESTIMATOR_BUDGET // max(effective_epochs, 1)))
+            # 每轮以累计基学习器预算从零重训（随机森林/梯度提升）：
+            # 轮次序号决定模型规模（固定步长 + 预算封顶），固定 seed 下确定性强，
+            # 任意分段续训的轮次与不中断训练完全一致。
+            target_count = min(epoch * _SKLEARN_STAGED_STEP, _SKLEARN_ESTIMATOR_BUDGET)
             if model_type == "random_forest":
-                estimator.n_estimators = getattr(estimator, "n_estimators", 0) + per_epoch
+                estimator.n_estimators = target_count
             else:
-                estimator.max_iter = getattr(estimator, "max_iter", 0) + per_epoch
+                estimator.max_iter = target_count
         estimator.fit(X_train, y_train)
         performance.record["train_seconds"] = time.perf_counter() - fit_started
 
@@ -1295,6 +1299,11 @@ def run_training(
     if task not in ("classification", "regression", "clustering", "time_series_forecasting"):
         raise ValueError(f"未知任务类型: {task}")
 
+    # 传统机器学习模型（sklearn）：仅分类/回归；其他任务在进入各自分支前明确拒绝
+    model_type = str(params.get("model_type", "mlp") or "mlp")
+    if model_type != "mlp" and task not in ("classification", "regression"):
+        raise ValueError(f"任务 {task} 仅支持 mlp 模型")
+
     # ---- 超参 ----
     epochs = int(params.get("epochs", 20))
     seed = int(params.get("seed", 42))
@@ -1316,12 +1325,9 @@ def run_training(
         )
 
     # 传统机器学习模型（sklearn）：仅分类/回归，单节点 CPU 训练
-    model_type = str(params.get("model_type", "mlp") or "mlp")
     if model_type != "mlp":
         if parallel is not None:
             raise ValueError("传统机器学习模型不支持联合训练，请使用单节点模式")
-        if task not in ("classification", "regression"):
-            raise ValueError(f"任务 {task} 仅支持 mlp 模型")
         return _run_sklearn_training(
             dataset_path=dataset_path,
             target=target,
