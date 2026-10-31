@@ -32,6 +32,12 @@ class ArtifactStoreUnavailableError(OSError):
     """
 
 
+# S3 客户端网络超时上限：连接失败（含静默丢包场景）约数秒内判死，读多数为
+# 小对象（日志批次 ≤64KiB、指标 JSONL），超时上限只防无限挂起不抢带宽。
+_S3_CONNECT_TIMEOUT = 5.0
+_S3_READ_TIMEOUT = 30.0
+
+
 def _is_s3_object_missing(exc: BaseException) -> bool:
     """仅把 S3 的对象不存在响应归类为缺失，避免吞掉基础设施故障。"""
     return str(getattr(exc, "code", "")) in {
@@ -266,17 +272,34 @@ class S3ArtifactStore(ArtifactStore):
     ):
         # 惰性导入：保持 local 模式零依赖
         from minio import Minio  # noqa: WPS433
+        import urllib3  # noqa: WPS433
 
         resolved_endpoint = endpoint or config.S3_ENDPOINT
+        # 追加连接/读取超时：远端存储静默丢包、TLS 半开等情况会让 API 启动
+        # 或请求无限挂起，无法依赖 minio 默认（无）超时兜底。
+        http_client = urllib3.PoolManager(
+            timeout=urllib3.Timeout(connect=_S3_CONNECT_TIMEOUT, read=_S3_READ_TIMEOUT),
+            retries=urllib3.Retry(total=2, connect=2, read=2, backoff_factor=0.2),
+        )
         self._client = Minio(
             resolved_endpoint,
             access_key=access_key or config.S3_ACCESS_KEY,
             secret_key=secret_key or config.S3_SECRET_KEY,
             secure=config.S3_SECURE if secure is None else secure,
             region=_oss_region_from_endpoint(resolved_endpoint),
+            http_client=http_client,
         )
         self.bucket = bucket or config.S3_BUCKET
-        self._ensure_bucket()
+        try:
+            self._ensure_bucket()
+        except Exception as exc:  # 网络故障必须只在启动时降级为告警
+            # 对象存储不可达只告警不阻断：启动完成依赖本地文件，远端首次可用前
+            # 各具体请求会按 ArtifactStoreUnavailableError 映射为可重试 503。
+            print(
+                f"警告: 对象存储 bucket 检查失败（{type(exc).__name__}: {exc}），"
+                "继续启动；后续请求将按存储异常返回可重试错误",
+                flush=True,
+            )
 
     def _ensure_bucket(self) -> None:
         """启动时确保 bucket 存在（不存在则创建）。"""
@@ -371,11 +394,16 @@ class S3ArtifactStore(ArtifactStore):
 
     def list_keys(self, prefix: str) -> List[str]:
         validate_key(prefix)
-        keys: List[str] = []
-        for obj in self._client.list_objects(self.bucket, prefix=prefix, recursive=True):
-            if not obj.object_name.endswith("/"):
-                keys.append(obj.object_name)
-        return keys
+        try:
+            keys: List[str] = []
+            for obj in self._client.list_objects(self.bucket, prefix=prefix, recursive=True):
+                if not obj.object_name.endswith("/"):
+                    keys.append(obj.object_name)
+            return keys
+        except Exception as exc:
+            raise ArtifactStoreUnavailableError(
+                f"列出对象存储产物失败: {prefix}: {exc}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------

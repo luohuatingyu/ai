@@ -559,3 +559,17 @@ def test_s3_write_failure_is_reported_as_storage_unavailable():
 
     with pytest.raises(ArtifactStoreUnavailableError, match="写入对象存储产物失败"):
         st.write_bytes("jobs/test/job.json", b"{}")
+
+
+def test_s3_list_keys_outage_is_reported_as_storage_unavailable():
+    """S3 列表请求故障包装成可识别的存储异常，供 API 统一映射 503。"""
+    class FailingClient:
+        def list_objects(self, bucket, prefix="", recursive=False):
+            raise ConnectionError("TLS connection reset")
+
+    st = object.__new__(S3ArtifactStore)
+    st._client = FailingClient()
+    st.bucket = "test-bucket"
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="列出对象存储产物失败"):
+        st.list_keys("jobs/it-s3/")

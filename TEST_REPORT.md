@@ -1,3 +1,43 @@
+## 本次变更测试结果：存储故障分级 503 与启动降级（2026-10-31）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：5d40cf7（Map storage outages to retryable 503 and bound S3 timeouts）；CSS 表头修正为 `5d2085f`，报告自身提交不改变测试代码版本。
+- **测试日期 / 分支**：2026-10-31 / emdash/hot-boxes-clean-y9u6p。
+- **范围**：远端对象存储（阿里云 OSS + 远端 Redis 协调器）间歇性故障（TLS 半开/静默丢包）触发三类缺陷——训练指标读取阶段异常逃逸导致 `/api/jobs` 返回 500、`S3ArtifactStore.list_keys` 缺乏异常包装、`minio` 客户端无超时导致 API 启动永久挂起（`_recover_on_restart` 在导入链同步执行）。修复：任务列表逐条 `api_view` 纳入 try 映射 503、`list_keys` 故障包装、minio PoolManager 追加连接 5s/读取 30s 超时、启动 bucket 探活失败降级告警、恢复循环存储故障降级为告警；同时移除训练记录表头无效 `position: sticky`（Safari 合成层残影根因）并更新 CSS 版本参数。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| 任务列表逐条读取故障返回 503 | API；任务成功创建后指标读取连接故障 | `tests/test_api.py::test_job_list_metric_read_failure_returns_retryable_service_error`：修补丁前 500、修后 503 + 中文提示 + 不泄露 endpoint/secret | 异常、安全 |
+| S3 列表故障包装为存储异常 | 存储；list_objects 连接故障 | `tests/test_storage.py::test_s3_list_keys_outage_is_reported_as_storage_unavailable`：包装为 `ArtifactStoreUnavailableError("列出对象存储产物失败…")` | 异常 |
+| S3 客户端超时有界且启动降级 | 存储；远端不可达启动 | `tests/test_storage.py` 客户端构造 / `test_api.py::test_job_manager_startup_tolerates_storage_outage`：bucket 探活失败告警继续启动，恢复循环 list_job_ids / read_job 故障降级告警不中断初始化 | 异常、边界 |
+| 训练记录表头渲染稳定 | 前端；表头样式含 sticky 引发 Safari 残影 | `frontend/training-record-display.test.cjs`：断言无 `position: sticky` 且保留深色 700 背景 #f5f8fc；HTML 引用 `v=20261031-record-table-1` | 兼容、回归 |
+| 历史功能不回归 | Python 3.12 完整后端 | 全量 `backend/tests/`（两次运行）+ 全量前端 | 兼容、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 完整后端（两次运行） | 693 | 661 | 1 | 0 | 31 |
+| 完整前端 `node --test frontend/` | 185 | 185 | 0 | 0 | 0 |
+
+- 修复前先以失败测试复现 500 泄漏、list_keys 漏包、启动不可容错三类缺陷，再实施修复，全部转绿。
+- 后端首跑中 `test_running_job_logs_are_immediately_visible_and_uncacheable` 因并行时序偶发失败，单独复测通过，随后整包复跑稳定（661 通过 / 1 既有失败）。
+- `tests/test_remote_workers.py::test_worker_entrypoint_clears_removed_values_and_rejects_missing_file` 为既有问题（在 2026-10-30 基准点干净签出同环境复现），不在本次变更范围。
+- 实网复现：容器内对 `xyzc.s3.oss-cn-shanghai.aliyuncs.com:443` TLS 握手读超时（TCP 可连），恢复后自愈；合并远端不可达 + 本修复后 `docker restart` 实测 **health=200（48s）且 `/api/jobs` 返回 503**，前端提示"已保留列表，稍后自动重试"。
+- 线上 CSS 已引用 `v=20261031-record-table-1` 且无 sticky 表头规则。
+- 本环境无物理 GPU；31 项跳过与既有记录一致。
+
+实际执行命令：`docker compose up --build -d`；`docker exec -w /app mtp-trainer python -m pytest …`（定向）；`docker exec -w /repo/backend mtp-trainer python -m pytest tests/ -q`（全量两次）；`node --test frontend/`；`curl /api/health /api/jobs /app.css`；`docker restart mtp-trainer` 实网验证。
+
+### 已知限制、重测建议与回滚
+
+- REMOTE 设施（阿里云 OSS、47.101.33.133 Redis 协调器）间歇故障为环境问题，本修复保证 API 自身可用与 503 语义；远端数据可见性由网络恢复。
+- `test_worker_entrypoint` 既有失败建议将 `REDIS_PASSWORD=` 子串断言改为按行匹配。
+- 回滚：撤销本次功能提交并 `docker compose up --build -d`；无数据迁移。
+
 ## 本次变更测试结果：emdash/hot-boxes-clean-y9u6p 合并至 master（2026-10-30）
 
 ### Git 基准点与范围
@@ -24,6 +64,7 @@
 
 - 本合并未引入新代码差异，无需回滚；如需撤销整个合并，`git revert -m 1 06625a9`。
 - 后续 master 侧 `backend/app/` 变更时按常规触发重测并重建 Compose。
+
 
 ## 本次变更测试结果：日志游标分页、S3 故障可重试与训练记录展示修正（2026-10-30）
 

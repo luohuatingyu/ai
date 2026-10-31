@@ -22,3 +22,12 @@ test('训练记录表头使用高对比度文字', () => {
   assert.match(header, /color:\s*#26364d\s*!important/);
   assert.match(header, /font-weight:\s*700/);
 });
+
+test('训练记录表头不使用 sticky，避免 Safari 合成层残影', () => {
+  const header = /\.training-page \.training-record-table-wrap th \{([^}]+)\}/.exec(css)?.[1] || '';
+
+  assert.doesNotMatch(header, /position:\s*sticky/);
+  assert.match(header, /background:\s*#f5f8fc/);
+  assert.match(header, /color:\s*#26364d\s*!important/);
+  assert.match(header, /font-weight:\s*700/);
+});

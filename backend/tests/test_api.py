@@ -1752,7 +1752,7 @@ def test_training_page_resource_retry_and_chart_style_contract():
     assert "grid-column: 1 / -1" in css
     assert ".training-page #llmFields > .formgrid" in css
     assert "repeat(auto-fit, minmax(min(100%, 210px), 1fr))" in css
-    assert 'href="/app.css?v=20261030-training-record-2"' in html
+    assert 'href="/app.css?v=20261031-record-table-1"' in html
 
 
 def test_remote_server_feedback_toasts_render_above_add_modal():
@@ -2123,3 +2123,60 @@ def test_job_list_storage_failure_returns_retryable_service_error(selection_api,
     assert response.status_code == 503
     assert response.json()["detail"] == "对象存储暂不可用，无法读取任务列表，请稍后重试"
     assert "secret" not in response.text and "endpoint" not in response.text
+
+
+def test_job_list_metric_read_failure_returns_retryable_service_error(selection_api, make_dataset, monkeypatch):
+    """逐条读取训练指标时对象存储故障同样映射 503，不得伪装成 HTTP 500。"""
+    from app import jobstore
+    from app.storage import ArtifactStoreUnavailableError
+
+    client, manager, _ = selection_api
+    ds_id = make_dataset(n=40)
+    created = client.post("/api/train", json=_train_payload(ds_id))
+    assert created.status_code == 200, created.text
+
+    def fail_read_metrics(*args, **kwargs):
+        """列表条目已就位后，模拟指标对象读取时连接故障。"""
+        raise ArtifactStoreUnavailableError("TLS connection reset")
+
+    monkeypatch.setattr(jobstore, "read_metrics", fail_read_metrics)
+    response = client.get("/api/jobs")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "对象存储暂不可用，无法读取任务列表，请稍后重试"
+    assert "secret" not in response.text and "endpoint" not in response.text
+
+
+def test_job_manager_startup_tolerates_storage_outage(tmp_path, monkeypatch):
+    """对象存储不可达时，重启恢复降级为告警，控制面仍能完成初始化。"""
+    from app import jobstore
+    from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore
+    from app.jobs import JobManager
+    from app.storage import ArtifactStoreUnavailableError, LocalArtifactStore
+
+    store = LocalArtifactStore(tmp_path / "recover-state")
+
+    def fail_list_ids(store):
+        """模拟启动时任务列表读取连接故障。"""
+        raise ArtifactStoreUnavailableError("TLS connection reset")
+
+    monkeypatch.setattr(jobstore, "list_job_ids", fail_list_ids)
+    try:
+        manager = JobManager(store=store, queue=EmbeddedJobQueue(),
+                             lease=EmbeddedLeaseStore(), start_workers=False)
+    finally:
+        monkeypatch.undo()
+
+    def fail_read_job(store, job_id):
+        """模拟任务列表可读但单个任务文件读取故障。"""
+        raise ArtifactStoreUnavailableError("TLS connection reset")
+
+    jobstore.write_job(store, {"id": "stub-job", "status": "queued"})
+    monkeypatch.setattr(jobstore, "list_job_ids", lambda store: ["stub-job"])
+    monkeypatch.setattr(jobstore, "read_job", fail_read_job)
+    try:
+        manager = JobManager(store=store, queue=EmbeddedJobQueue(),
+                             lease=EmbeddedLeaseStore(), start_workers=False)
+    finally:
+        monkeypatch.undo()
+        manager.stop()

@@ -169,12 +169,12 @@ def start_training(req: TrainRequest) -> dict:
 def list_jobs() -> list[dict]:
     try:
         records = manager.list()
+        return [
+            api_view(record, include_metrics=True, store=manager.store)
+            for record in records
+        ]
     except ArtifactStoreUnavailableError as exc:
         raise HTTPException(503, "对象存储暂不可用，无法读取任务列表，请稍后重试") from exc
-    return [
-        api_view(record, include_metrics=True, store=manager.store)
-        for record in records
-    ]
 
 
 @router.get("/jobs/{job_id}")
