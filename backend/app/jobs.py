@@ -29,7 +29,7 @@ from app.jobstore import (
     QUEUED,
     RUNNING,
 )
-from app.storage import ArtifactStore, get_store, job_key
+from app.storage import ArtifactStore, ArtifactStoreUnavailableError, get_store, job_key
 from app.worker import TrainingWorker, detect_capabilities
 
 TERMINAL = {COMPLETED, FAILED, CANCELLED}
@@ -318,9 +318,16 @@ class JobManager:
         - running：watchdog 之后按租约状态自动重派（不在此处臆断失败）；
         - queued：后续 watchdog 检测缺失队列条目时补投；
         - paused/completed/failed/cancelled：保持原状。
+        对象存储暂时不可达时恢复降级为告警并跳过，任务状态由后续 watchdog
+        衔接（重派/补投），API 进程不能因远端设施抖动而拒绝启动。
         """
-        for job_id in jobstore.list_job_ids(self.store):
-            record = jobstore.read_job(self.store, job_id)
+        try:
+            job_ids = jobstore.list_job_ids(self.store)
+            records = [jobstore.read_job(self.store, job_id) for job_id in job_ids]
+        except ArtifactStoreUnavailableError as exc:
+            print(f"警告: 重启恢复跳过（对象存储不可达: {exc}）；由后续 watchdog 衔接任务状态", flush=True)
+            return
+        for job_id, record in zip(job_ids, records):
             if record is None:
                 continue
             if record.get("status") == FAILED and record.get("error") == "服务重启，任务中断":
