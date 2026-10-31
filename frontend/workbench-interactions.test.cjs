@@ -636,7 +636,7 @@ function predictionFixture() {
   f.state.jobId = 'predict-model';
   f.state.workerResourcesLoaded = true;
   f.state.workerSlots = [{ worker_id: 'chosen', hostname: 'cpu-host', active: true, enabled: true,
-    device_backend: 'cpu', device: 'cpu', state: 'idle', gpu: { healthy: true } }];
+    device_backend: 'cpu', device: 'cpu', state: 'idle', inference: true, gpu: { healthy: true } }];
   f.$('predictWorker').value = 'chosen';
   f.$('predictInput').value = '{"x":1}';
   f.context.setTimeout = fn => { fn(); return 1; };
@@ -715,13 +715,14 @@ test('切换模型后旧预测响应不能覆盖结果或解锁新请求', async
   assert.equal(f.$('btnPredict').disabled, false);
 });
 
-for (const issue of ['missing', 'offline', 'disabled', 'stale', 'unhealthy', 'clustering-gpu']) {
+for (const issue of ['missing', 'offline', 'disabled', 'stale', 'legacy', 'unhealthy', 'clustering-gpu']) {
   test('不可用预测资源阻止提交并保留原选择：' + issue, async () => {
     const f = predictionFixture(), worker = f.state.workerSlots[0];
     if (issue === 'missing') f.state.workerSlots = [];
     if (issue === 'offline') worker.active = false;
     if (issue === 'disabled') worker.enabled = false;
     if (issue === 'stale') f.state.workerResourcesError = '资源服务不可用';
+    if (issue === 'legacy') delete worker.inference;
     if (issue === 'unhealthy') worker.gpu.healthy = false;
     if (issue === 'clustering-gpu') {
       f.state.jobs[0].spec.task = 'clustering'; worker.device_backend = 'cuda'; worker.gpu.available = true;
@@ -734,6 +735,16 @@ for (const issue of ['missing', 'offline', 'disabled', 'stale', 'unhealthy', 'cl
     assert.match(f.$('predictOut').textContent, /不会自动回退/);
   });
 }
+
+test('旧镜像计算槽在预测下拉中禁选，选项与提示均指向重新部署', () => {
+  const f = predictionFixture();
+  delete f.state.workerSlots[0].inference;
+  f.context.renderPredictionResources();
+  const option = f.$('predictWorker').children.find(node => node.value === 'chosen');
+  assert.equal(option.disabled, true);
+  assert.match(option.textContent, /重新部署/);
+  assert.match(f.$('predictResourceHint').textContent, /重新部署/);
+});
 
 /* ---------- 模型选择与训练超参（模块 A/B/C） ---------- */
 

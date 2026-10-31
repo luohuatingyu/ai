@@ -47,7 +47,7 @@ def setup_inference(tmp_path):
     queue, lease = EmbeddedJobQueue(), EmbeddedLeaseStore()
     caps = {"worker_id": "chosen", "machine_id": "machine-a",
             "hostname": "host-a", "slot": "cpu0", "device_backend": "cpu",
-            "device": "cpu", "state": "idle",
+            "device": "cpu", "state": "idle", "inference": True,
             "gpu": {"available": False, "healthy": True}}
     lease.register_worker("chosen", caps, 60)
     return InferenceService(store, queue, lease), caps
@@ -61,6 +61,26 @@ def test_reject_unhealthy_worker(setup_inference, state):
     with pytest.raises(ValueError, match="设备异常"):
         service.submit("job-a", "classification", "chosen", {"row": {}})
     assert service.queue.inference_queue("chosen").snapshot() == []
+
+
+def test_reject_worker_without_inference_capability(setup_inference):
+    """旧镜像计算槽提交预测立即拒绝，不静默排队直至超时。"""
+    service, caps = setup_inference
+    service.lease.register_worker(
+        "chosen", {k: v for k, v in caps.items() if k != "inference"}, 60)
+    with pytest.raises(ValueError, match="重新部署"):
+        service.submit("job-a", "classification", "chosen", {"row": {}})
+    assert not service.store.list_keys("inferences/")
+    assert service.queue.inference_queue("chosen").snapshot() == []
+
+
+def test_workers_api_exposes_inference_capability(setup_inference, monkeypatch):
+    """/api/workers 透传能力标志，前端据此在提交前禁选旧镜像计算槽。"""
+    service, _ = setup_inference
+    client = api_client(service, monkeypatch)
+    workers = client.get("/api/workers").json()["workers"]
+    flagged = next(w for w in workers if w["worker_id"] == "chosen")
+    assert bool(flagged["inference"]) is True
 
 
 def test_recovery_skips_corrupt_record(setup_inference):
@@ -89,7 +109,7 @@ def test_prediction_recovery_failure_does_not_block_training(setup_inference, mo
     assert service.queue.snapshot() == ["job-a"]
 
 
-@pytest.mark.parametrize("mode", ["missing", "offline", "disabled", "unsupported", "gpu_missing", "gpu_unhealthy", "kmeans_gpu"])
+@pytest.mark.parametrize("mode", ["missing", "offline", "disabled", "stale", "unsupported", "gpu_missing", "gpu_unhealthy", "kmeans_gpu"])
 def test_resource_rejection_does_not_fallback(setup_inference, mode):
     """拒绝无效目标且不创建记录或改投其他机器。"""
     service, caps = setup_inference
@@ -100,6 +120,9 @@ def test_resource_rejection_does_not_fallback(setup_inference, mode):
         service.lease._workers["chosen"]["last_seen"] = 0
     elif mode == "disabled":
         service.lease.set_worker_enabled("chosen", False)
+    elif mode == "stale":
+        service.lease.register_worker(
+            "chosen", {k: v for k, v in caps.items() if k != "inference"}, 60)
     else:
         caps["device_backend"] = "unsupported" if mode == "unsupported" else "cuda"
         caps["gpu"] = {"available": mode != "gpu_missing", "healthy": mode != "gpu_unhealthy"}

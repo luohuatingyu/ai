@@ -48,6 +48,7 @@ def test_detect_capabilities_reports_cpu_and_stable_server_identity(monkeypatch)
 
     assert caps["machine_id"] == "worker-lab"
     assert caps["managed"] is True
+    assert caps["inference"] is True
     assert caps["cpu"]["cores"] >= 1
     assert caps["cpu"]["memory_mb"] is None or caps["cpu"]["memory_mb"] >= 1
 
