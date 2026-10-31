@@ -1,3 +1,29 @@
+## 本次变更测试结果：中文表头修复合并至 master（2026-10-31）
+
+### Git 基准点与范围
+
+- **Commit Hash**：ada4ea8（Merge branch 'emdash/hot-boxes-clean-y9u6p'，含 `55fa9c7` 中文表头与秒数精度 + `10dcfad` 报告）。
+- **测试日期 / 分支**：2026-10-31 / master。
+- **范围**：纯合并提交，合并为自动合并无冲突（`grep` 检查 TEST_REPORT.md 冲突标记为 0）。合并前分支侧已按 `10dcfad` 基准完成全量测试（见下节）；合并后 master 与 10dcfad 的 `backend/`、`frontend/` 业务代码 diff 为空，差异仅 TEST_REPORT.md（+96 行），测试结论直接适用。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 验证方式与输入 | 预期结果 | 场景 |
+|---|---|---|---|
+| 合并后业务代码与已测版本一致 | `git diff 10dcfad ada4ea8 -- backend/ frontend/` | 空输出（实测为空） | 兼容、回归 |
+| 合并冲突无遗漏标记 | `grep -c "^<<<<<<<\|^=======$\|^>>>>>>>" TEST_REPORT.md` | 0（实际 0） | 边界 |
+
+### 测试执行结果
+
+- 使用分支侧 10dcfad 基准的既有全量结果：前端 188/188，后端 693 收集（661 通过、1 既有失败、31 跳过）。
+
+实际执行命令：`git diff 10dcfad ada4ea8 -- backend/ frontend/`；冲突标记计数检查。
+
+### 已知限制、重测建议与回滚
+
+- 本次合并未引入新代码差异，无需回滚；撤销整个合并 `git revert -m 1 ada4ea8`。
+- 后续 master 侧 `backend/app/` 或 `backend/static/` 变更时按常规触发重测并重建 Compose。
+
 ## 本次变更测试结果：训练记录页头中文统一与秒数精度收敛（2026-10-31）
 
 ### Git 基准点与范围
