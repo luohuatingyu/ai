@@ -1,3 +1,40 @@
+## 本次变更测试结果：预测计算槽能力协商（旧镜像 Worker 提交即拒）（2026-10-31）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：`c46ff12`（Add inference capability flag and reject stale prediction workers）+ 测试提交 `b16b7e6`；报告更新为独立提交。
+- **测试日期 / 分支**：2026-10-31 / emdash/hot-boxes-clean-y9u6p。
+- **范围（事故修复）**：远程服务器 `Linux`（47.101.33.133）的 worker 镜像构建于预测特性提交 `01e8476` 之前，不消费按槽预测队列，指派其预测会静默排队 1 小时后被 watchdog 判超时（实测 3 条滞留 `mtp:queue:inference:<sha256(Linux-cpu0)>`）。本次增加能力协商：`worker.py detect_capabilities()` 上报 `inference` 标志（随注册写入 Redis/Embedded 协调面并经 `/api/workers` 透传）；`inference.py validate_worker()` 对无标志 Worker 提交预测立即 409 拒绝并提示重新部署；前端 `predictionWorkerIssue()` 同步禁选并提示。共 3 个业务文件 + 4 个测试文件，无新增依赖、无配置/数据迁移。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| A1 无标志 Worker 提交预测立即拒绝 | 服务层；注册无 `inference` 字段的 Worker | `test_inference.py::test_reject_worker_without_inference_capability`：`ValueError` 匹配"重新部署"，不创建记录、队列为空；参数化新增 `stale` 模式同样不落库不入队；线上实测对旧镜像 `Linux-cpu0` 返回 HTTP 409 | 异常、安全 |
+| A2 具备标志的 Worker 行为不变 | 服务层/API 层；fixture 补 `inference: True` 后既有全部预测用例回归 | 既有排队/隔离/超时/真实模型用例全部通过；线上实测对重建后本地 Worker 提交 → 202 → `completed`（prediction=否，probabilities 落盘） | 回归 |
+| A3 能力上报链路 | 单元/协调层/API 层 | `test_worker.py::test_detect_capabilities_reports_cpu_and_stable_server_identity` 断言 `caps["inference"] is True`；`test_inference.py::test_workers_api_exposes_inference_capability` 断言 `/api/workers` 透传；`test_coordination.py` Redis 往返断言 bool→"1"→真值（`MTP_TEST_REDIS` 门控） | 正常 |
+| A4 前端禁选与提示 | 前端；无 `inference` 的计算槽 | `workbench-interactions.test.cjs` 参数化新增 `legacy` 模式阻止提交；新增用例断言 option disabled、选项与提示均含"重新部署" | 异常、边界 |
+| A5 全量回归 | Python 3.12 容器全量后端 + 全量前端 | 全量 `backend/tests/` 与 `node --test frontend/` 0 失败（见下表） | 兼容、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 容器全量后端（`docker run -v "$(pwd):/repo" -w /repo/backend`，与历史基准同口径） | 750 | 719 | 0 | 0 | 31 |
+| 完整前端 `node --test frontend/` | 196 | 196 | 0 | 0 | 0 |
+| 宿主机 3.9 定向（3 个直接相关测试文件，仅作参考） | 115 | 106 | 9 | 0 | 27 |
+
+- 相对上一轮（688 用例）净增 31 个：本次新增 5 个（能力拒绝、API 透传、stale 参数模式、前端 legacy、前端禁选提示）及其余并行提交（模型选择）新增用例。
+- 端到端实测（重建后线上）：旧镜像 `Linux-cpu0` 提交预测 → HTTP 409"所选预测 Worker 镜像过旧…请重新部署该服务器（同步代码）后再试"；重建后本地 Worker（新镜像）`/api/workers` 返回 `inference=1`、`Linux-cpu0` 返回 `None`；对 `11e35b3fd296-cpu0` 提交预测 202 → 轮询至 `completed`，结果含 prediction/probabilities/device。
+- 既有滞留验证：事故中 3 条预测已被 watchdog 按设计标记 `failed`（"预测排队超时，请检查所选 Worker"），行为符合既有兜底设计。
+- `docker compose up --build -d` 重建成功；`/api/health` 200。
+
+### 已知限制、环境说明与回滚
+
+- 宿主机 3.9 的 9 个失败均与本改动无关：5 个为既有 API 测试 + 本次新增透传用例命中 pydantic 无法评估 `str | None` 注解（需 Python 3.10+，容器 3.12 全部通过）；4 个为 `test_worker.py` 既有的顺序依赖偶发（经 `git stash` 基线复跑确认改动前同样失败）。权威口径以容器 3.12 全量为准。
+- 重新部署远程服务器 `Linux` 之前，该机计算槽在预测面板为禁选状态（预期行为，提示"Worker 镜像过旧，请重新部署服务器"）；重新部署后即恢复。
+- 回滚方式：`git revert c46ff12 b16b7e6` 即可整体还原；新增字段为可选透传，无持久化格式变更。
+
 ## 本次变更测试结果：剔除 Apple MPS 后端支持（Linux 隔离部署收敛）（2026-10-31）
 
 ### Git 基准点与范围
