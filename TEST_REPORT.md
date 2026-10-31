@@ -1,3 +1,21 @@
+## 线上遗留问题：远程小规格计算节点预测执行租约丢失（2026-10-31 实测，待决策）
+
+### 现象与证据
+
+- **现象**：白名单修复并重新部署后，远程 `Linux-cpu0` 能正常领取预测队列（记录 `queued → running`、worker 状态 `predicting`），但 **3/3 次**预测均在 60～107 s 后失败，错误为 watchdog 写入的“预测执行租约丢失，请重新提交”。
+
+| 预测编号（前 16 位） | 创建 | 开始 | 结束 | 结果 |
+|---|---|---|---|---|
+| infer-5b7b3a93381043 | 21:53:10 | 21:53:11 | 21:54:29 | 租约丢失（79 s） |
+| infer-e5f9b108cfe046 | 22:17:24 | 22:17:28 | 22:18:33 | 租约丢失（69 s） |
+| infer-86e10d60b9cc42 | 22:21:29 | 22:21:30 | 22:23:16 | 租约丢失（107 s） |
+
+- **根因**：远程节点规格为 2 vCPU / 1735 MB，且 **Redis 与计算同机**。预测子进程（`python -m app.inference` → torch/sklearn/xgboost 导入 + 模型加载）压满 CPU/内存，同机 Redis 无法及时响应；worker 续租心跳（`WORKER_HEARTBEAT_INTERVAL=10s`、`WORKER_LEASE_TTL=30s`）连续失败超过 TTL 后由 `JobController._loop` 判定失租，父进程放弃写入，watchdog 兜底标记失败。
+- **实测证据**：预测执行期间平台侧 Redis 连接约 12 s 时读超时；对目标机的只读 SSH 采样会话挂起至 180 s 超时；`ping` 全程正常（排除网络问题）；空闲时目标机 `free -m` 可用内存仅约 287 MB。对照：本机资源充足时同一代码路径预测 2.8 s 成功。
+- **影响**：该远程槽当前无法稳定完成预测；训练任务与预测队列领取（本次修复目标）均正常。
+- **可选缓解（待用户决策）**：① 调大 `WORKER_LEASE_TTL` / `WORKER_HEARTBEAT_INTERVAL`（配置项，无需改代码，仅缓解）；② 限制预测子进程线程数并降低其优先级（`OMP_NUM_THREADS=1` / `torch.set_num_threads(1)`、nice，改代码）；③ 将 Redis 迁出计算节点或升级机型（根治，基础设施变更）；④ 预测改用资源充足的槽位或默认“API 服务进程”。
+- **未验证**：资源充足条件下的远程槽预测成功路径（本机已验证同路径）；远程槽 xgboost 任务（依赖下发问题见下节）。
+
 ## 本次变更测试结果：XGBoost 模型选项（GPU 可用时加速）与远程 Worker 启动崩溃修复（2026-10-31）
 
 ### Git 基准点与范围
@@ -38,6 +56,11 @@
 - **远程 Linux 槽暂无 xgboost 依赖**：故障修复部署打包自修复中的 trainer 容器，其 requirements-worker.txt 尚不含 xgboost；该槽执行 xgboost 任务会明确报错（不静默）。下次对该服务器"同步代码/更新"（本地镜像已含依赖）后即恢复完整能力。
 - **pip 加速源建议**：远程服务器（阿里云）未配置 pip 源，重建安装 torch+全依赖较慢；如需加速可在服务器管理中配置 `https://mirrors.aliyun.com/pypi/simple/`。
 - **部署白名单与运行代码的时序约束**：远程部署由运行中的 trainer 容器打包自身代码，平台代码更新后需先重建本地容器再触发部署，否则远程拿到旧代码（本次故障的放大因素之一）。
+- **新发现（2026-10-31 22:00 线上实测，C2 的补充更正）**：白名单修复部署后 `Linux-cpu0` 已能领取预测（`queued→running`、worker `predicting`），但 **3/3 次**预测均在 60～107 s 后失败，错误为 watchdog 的“预测执行租约丢失，请重新提交”，故 C2 的“正常接单预测”仅指领取，**不等于执行成功**。
+  - 根因：该机仅 2 vCPU / 1735 MB 且 **Redis 与计算同机**；预测子进程（`python -m app.inference` → torch/sklearn/xgboost 导入 + 模型加载）压满 CPU/内存，同机 Redis 无响应；续租心跳（`WORKER_HEARTBEAT_INTERVAL=10s`、`WORKER_LEASE_TTL=30s`）连续失败超过 TTL，`JobController._loop` 判定失租，父进程放弃写入，由 watchdog 兜底标记失败。
+  - 证据：执行期间平台侧 Redis 连接约 12 s 读超时；对目标机的只读 SSH 采样会话挂起至 180 s 超时；`ping` 全程正常（排除网络）；空闲时目标机可用内存仅约 287 MB。对照：本机资源充足时同一路径预测 2.8 s 成功（`infer-dee5b500…`，prediction=否/probabilities 正常）。
+  - 待决策的缓解选项：① 调大 `WORKER_LEASE_TTL`/`WORKER_HEARTBEAT_INTERVAL`（配置，无需改码，仅缓解）；② 限制预测子进程线程数并降低优先级（`OMP_NUM_THREADS=1`/`torch.set_num_threads(1)`、nice，改代码）；③ Redis 迁出计算节点或升级机型（根治，基础设施变更）；④ 预测改用资源充足的槽或默认“API 服务进程”。
+  - 未验证：资源充足条件下远程槽的预测成功路径；该结论当前仅限此台 2 vCPU/1.7 GB 机型。
 - 宿主机 3.9 无法运行 API/Schema 层测试（pydantic 注解求值，既有环境限制），以容器 3.12 为权威口径。
 - 回滚方式：XGBoost 特性 `git revert e26fba4 b54bd74 573513d`；白名单修复独立提交 `6d900f2` 可单独保留（建议保留，属崩溃修复）；无持久化格式变更。
 
