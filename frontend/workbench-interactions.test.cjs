@@ -868,3 +868,20 @@ test('提交载荷携带模型选择与训练超参，非分类回归任务固�
   await g.$('btnStart').onclick();
   assert.equal(JSON.parse(g.requests[0].options.body).model_type, 'mlp');
 });
+
+test('XGBoost 选项按任务出现，作为分阶段模型保留轮数并在载荷中透传', () => {
+  const f = fixture();
+  f.$('p_parallel').value = 'single';
+  f.$('taskSelect').value = 'regression';
+  f.$('p_model_type').value = 'xgboost';
+  f.context.updateTaskFields();
+  assert.equal(f.$('p_model_type').value, 'xgboost', '回归任务应保留 xgboost 选择');
+  assert.match(f.$('modelTypeHint').textContent, /CUDA 加速/);
+  assert.equal(f.$('epochField').hidden, false, 'xgboost 按轮增长树数，需要轮数');
+  assert.equal(f.$('mlpHyperFields').hidden, true);
+  f.context.updateStart();
+  return f.$('btnStart').onclick().then(() => {
+    const body = JSON.parse(f.requests[0].options.body);
+    assert.equal(body.model_type, 'xgboost');
+  });
+});

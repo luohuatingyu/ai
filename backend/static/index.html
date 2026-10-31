@@ -1144,7 +1144,7 @@ function getTrainingIssue() {
   const supervised = task === "classification" || task === "regression";
   const modelType = supervised ? ($("p_model_type").value || "mlp") : "mlp";
   const isMLP = modelType === "mlp";
-  const staged = modelType === "random_forest" || modelType === "gradient_boosting";
+  const staged = ["random_forest", "gradient_boosting", "xgboost"].includes(modelType);
   const fields = [];
   if (!cluster && (llm || isMLP || staged)) fields.push(["p_epochs", "轮数 / 迭代次数", 1, 500]);
   if (!cluster) fields.push(["p_test_split", "验证集比例", 0.05, 0.5, true]);
@@ -1314,6 +1314,7 @@ const MODEL_OPTIONS = {
     { value: "decision_tree", label: "决策树", desc: "规则直观、无需特征缩放；单棵树容易过拟合，仅 CPU。" },
     { value: "random_forest", label: "随机森林", desc: "多棵树投票，抗过拟合、效果稳定；每轮按固定步长增长树数，仅 CPU。" },
     { value: "gradient_boosting", label: "梯度提升树", desc: "表格数据通常效果最好的模型之一；每轮按固定步长增长迭代数，仅 CPU。" },
+    { value: "xgboost", label: "XGBoost（GPU 可用时加速）", desc: "优化的梯度提升实现；检测到 NVIDIA GPU 时自动使用 CUDA 加速，否则用 CPU。" },
     { value: "svm", label: "支持向量机", desc: "小样本、高维数据表现好；大样本训练较慢，仅 CPU。" },
     { value: "knn", label: "K 近邻", desc: "按最近邻样本投票，简单直观；样本量大时预测较慢，仅 CPU。" },
   ],
@@ -1323,6 +1324,7 @@ const MODEL_OPTIONS = {
     { value: "decision_tree", label: "决策树", desc: "规则直观、无需特征缩放；单棵树容易过拟合，仅 CPU。" },
     { value: "random_forest", label: "随机森林", desc: "多棵树平均，抗过拟合、效果稳定；每轮按固定步长增长树数，仅 CPU。" },
     { value: "gradient_boosting", label: "梯度提升树", desc: "表格数据通常效果最好的模型之一；每轮按固定步长增长迭代数，仅 CPU。" },
+    { value: "xgboost", label: "XGBoost（GPU 可用时加速）", desc: "优化的梯度提升实现；检测到 NVIDIA GPU 时自动使用 CUDA 加速，否则用 CPU。" },
     { value: "svm", label: "支持向量回归", desc: "小样本、高维数据表现好；大样本训练较慢，仅 CPU。" },
     { value: "knn", label: "K 近邻", desc: "按最近邻样本平均，简单直观；样本量大时预测较慢，仅 CPU。" },
   ],
@@ -1340,7 +1342,7 @@ function updateTaskFields() {
   const isSupervised = task === "classification" || task === "regression";
   const modelType = isSupervised ? ($("p_model_type").value || "mlp") : "mlp";
   const isMLP = modelType === "mlp";
-  const isStaged = modelType === "random_forest" || modelType === "gradient_boosting";
+  const isStaged = ["random_forest", "gradient_boosting", "xgboost"].includes(modelType);
   // sklearn 模型不支持梯度同步，切换时自动退出联合训练模式
   if (!isMLP && $("p_parallel").value === "parallel") $("p_parallel").value = "single";
   if (isClustering) $("p_parallel").value = "single";
