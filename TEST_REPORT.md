@@ -1,3 +1,60 @@
+## 本次变更测试结果：数据集导入限额 + checkpoint 结构校验 + 计算节点能力上报（2026-11-01，P1）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：`1c7534b`（Harden dataset import limits, checkpoint validation and worker capability reporting）；测试报告更新为独立提交。
+- **测试日期 / 分支**：2026-11-01 / emdash/hot-boxes-clean-y9u6p。
+- **范围（对应 2026-11-01 风险分析 P1 项 3/4/5）**：
+  1. **数据集上传与压缩包导入限额**：`config` 新增 `DATASET_MAX_FILE_SIZE`/`_ROWS`/`_COLUMNS`/`_UPLOAD_CHUNK_BYTES`/`_ARCHIVE_FILES`/`_ARCHIVE_MEMBER_BYTES`/`_ARCHIVE_EXPANDED_BYTES`/`_COMPRESSION_RATIO`/`_IMPORT_FILES`；`DatasetManager` 限额默认值统一取自配置。`dataset_importer` 上传改为**分块流式写入**（不再 `file.file.read()` 一次性读入内存），超限即删除半成品并返回 400；解压按**成员数/单成员/展开总量/压缩比**四重预算校验，并在写入时按**实际字节数**兜底（防伪造声明尺寸的压缩炸弹）；压缩包内数据文件数超限**明确拒绝**而非静默截断；新增 `_enforce_frame_limits` 统一行/列/列名约束（原先仅上传路径校验）。`routers/datasets.py::validate_dataset_file` 复用分块写入并在 `finally` 清理临时文件。
+  2. **checkpoint 结构校验与明确失败**：`trainer` 新增 `_required_state_keys`，按 kind（trainer_state/llm_trainer_state）与框架（sklearn/xgboost 用 estimator，torch 用 state_dict/optimizer）校验必需字段，缺字段报“缺少必要字段 [...]”；非字典负载不再触发 AttributeError；`load_torch_checkpoint` 对非字典产物报“格式无效”。`worker` 在**存在 checkpoint 但全部不可用**时明确失败（不再静默从第 0 轮重训、丢弃已完成进度）；读取 checkpoint 遇**存储故障**（`ArtifactStoreUnavailableError`）直接中止并按环境性错误自动重试，不再误判为损坏。
+  3. **计算节点代码版本与依赖能力上报**：新增轻量模块 `app/runtime_info.py`（运行文件白名单 + `code_fingerprint` + 框架版本探测），`remote_workers._worker_runtime_files` 复用同一白名单，消除打包/指纹口径漂移。`detect_capabilities()` 上报 `code_fingerprint`（12 位摘要）、`framework_versions`（torch/sklearn/xgboost/numpy）、`frameworks`，经 `/api/workers` 透传；新增 `required_framework()` 与 `MissingFrameworkError`：节点缺少任务所需依赖时**在下载产物前快速失败**，且归类为可重试（换节点即成功），替代导入阶段晦涩的 ImportError。
+  4. **配置透传**：`docker-compose.yml`、`docker-compose.cpu.yml`、`.env.example` 新增 8 个 `DATASET_*` 配置项。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| D1 上传超限按块拒绝且不残留 | API；`DATASET_MAX_FILE_SIZE=64` | `test_import_rejects_oversized_upload`：400 含“过大”、数据集数 0 | 边界 |
+| D2 校验接口同样受限并清理临时文件 | API；`DATASET_MAX_FILE_SIZE=32` | `test_validate_endpoint_rejects_oversized_upload_and_cleans_temp`：400 且临时目录为空 | 异常 |
+| D3 行/列上限任一导入路径生效 | API；行=1 / 列=1 | `test_import_rejects_row_limit`、`test_import_rejects_column_limit`：400 含“行数过多/列数过多” | 边界 |
+| D4 批量导入文件数上限 | API；上限=1，提交 2 个 | `test_batch_import_rejects_too_many_files`：400 含“文件过多” | 边界 |
+| D5 压缩包成员数上限 | API；上限=2，3 个成员 | `test_import_archive_rejects_too_many_members`：400 含“成员过多” | 安全 |
+| D6 解压总大小上限 | API；展开上限 1KB、放开压缩比 | `test_import_archive_rejects_expanded_size`：400 含“解压总大小” | 安全 |
+| D7 压缩比（压缩炸弹）识别 | API；压缩比上限=1 | `test_import_archive_rejects_compression_bomb_ratio`：400 含“压缩比” | 安全 |
+| D8 单成员大小上限 | API；成员上限 32B | `test_import_archive_rejects_oversized_member`：400 含“成员” | 安全 |
+| D9 压缩包内数据文件数上限 | API；上限=1，2 个 CSV | `test_import_archive_rejects_too_many_data_files`：400 含“数据文件过多” | 边界 |
+| D10 既有导入链路不回归 | API | ZIP/TAR 正常导入、路径穿越拒绝、JSON/批量/回滚用例全部保持通过 | 兼容、回归 |
+| C1 最新 checkpoint 损坏回退更早版本 | worker 集成；损坏最新一个 | `test_checkpoint_corrupt_falls_back_to_older`（既有）：日志含“回退更早版本”、曲线连续 | 回归 |
+| C2 全部 checkpoint 不可用则明确失败 | worker 集成；损坏全部 checkpoint | `test_all_checkpoints_corrupt_fails_with_clear_reason`：状态 failed、error 含“均无法加载”、已完成进度未被重置 | 异常 |
+| C3 读取 checkpoint 存储故障按环境性重试 | worker 集成；注入 `ArtifactStoreUnavailableError` 一次 | `test_checkpoint_read_outage_retries_instead_of_restarting`：retry_count=1、无“回退更早版本”、曲线连续补满 | 异常、兼容 |
+| C4 checkpoint 结构校验 | 单元；缺字段/非字典/sklearn 缺 estimator | `test_load_trainer_state_reports_missing_required_fields`、`..._requires_estimator_for_traditional_framework`、`..._rejects_non_dict_payload`（3 例参数化）、`test_load_torch_checkpoint_rejects_non_dict_payload`（2 例） | 异常 |
+| W1 能力上报含指纹与框架版本 | 单元 | `test_detect_capabilities_reports_code_fingerprint_and_frameworks`：指纹 12 位且非 unknown、版本键齐全、`frameworks` 含 torch/sklearn 无空值 | 正常 |
+| W2 指纹随内容变化且容忍缺文件 | 单元 | `test_code_fingerprint_tracks_content_and_survives_missing_files`：改内容指纹变化、缺文件返回 unknown | 边界 |
+| W3 框架需求判定 | 单元 | `test_required_framework_mapping`：xgboost/sklearn/mlp/空/聚类/时序分别映射正确 | 正常、边界 |
+| W4 缺依赖快速失败且可重试 | worker 集成；`frameworks=["torch","sklearn"]` 执行 xgboost 任务 | `test_missing_framework_fails_fast_and_is_retryable`：error 含“缺少 xgboost 依赖”、重试计数达上限、无训练产物、`classify_retryable` 为真 | 异常 |
+| W5 能力字段缺失时不拦截（兼容） | worker 集成；caps 无 `frameworks` | `test_capability_preflight_skips_check_when_frameworks_unknown`：任务正常完成 | 兼容 |
+| W6 能力字段经 API 透传 | API | `test_workers_api_reports_code_fingerprint_and_framework_capabilities`：每个槽位含指纹与 `frameworks` | 正常 |
+| R1 全量回归 | 容器 3.12 全量 + 前端 | 全量 `backend/tests/` 0 失败；`node --test frontend/` 0 失败 | 兼容、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 容器全量后端（`docker run -v "$(pwd):/repo" -w /repo/backend <trainer镜像> python -m pytest tests/ -q`，与历史基准同口径） | 799 | 768 | 0 | 0 | 31 |
+| 完整前端 `node --test frontend/` | 197 | 197 | 0 | 0 | 0 |
+
+- 较上一轮（743 passed / 774 收集）净增 25 个通过用例：API 限额与能力透传 11 个 + worker 能力/框架/checkpoint 7 个 + trainer 结构校验 7 个（含参数化展开）；31 个跳过与历史基准一致（无 GPU 硬件、Redis 门控等环境性跳过）。
+- 定向回归：`test_remote_workers.py` 158 通过（部署白名单与 `app.runtime_info` 口径一致）、数据集相关（`test_excel_import`/`test_hub_datasets`/`test_dataset_preview_pagination`/`test_llm_trainer`）92 通过。
+- `docker compose up --build -d` 重建成功，全部容器 Up/healthy。
+
+### 已知限制、环境说明与回滚
+
+- **压缩比阈值取舍**：默认 200 用于拦截“压缩炸弹”；合法但极端重复的数据（如大段常量列）可能被拒，可按需调大 `DATASET_MAX_COMPRESSION_RATIO`，错误信息已说明原因。
+- **行/列上限对 JSON 数值列名的行为变化**：导入路径现与上传路径一致地要求列名为非空字符串；历史仅上传路径校验，属一致性收敛。
+- **未实现派发前的能力过滤**：当前为“执行前快速失败 + 自动重试”，任务仍会先进入缺依赖节点一次再转派；如需零无效派发，需在调度层引入能力匹配（本次未纳入范围）。
+- **代码指纹仅用于展示与排查**：不作为功能开关；远程节点未同步时可在 `/api/workers` 直接比对指纹差异。
+- 回滚方式：`git revert 1c7534b` 即可整体还原；新增 `DATASET_*` 配置项均有默认值，无持久化格式变更；checkpoint 结构校验对既有合法产物无影响（旧 torch.save 传统模型仍自动识别）。
+
 ## 线上遗留问题：远程小规格计算节点预测执行租约丢失（2026-10-31 实测；缓解已于 2026-11-01 实施，见下节）
 
 ### 现象与证据
