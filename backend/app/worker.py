@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import app.config as config
-from app import jobstore
+from app import jobstore, runtime_info
 from app.coordination import JobQueue, LeaseStore, build_coordination
 from app.storage import (
     ArtifactStore,
@@ -43,7 +43,13 @@ from app.storage import (
     resolve_dataset_for_worker,
 )
 from app.performance import ResourceSampler, configure_torch_threads, thread_environment
-from app.trainer import JobCancelled, JobPaused, load_trainer_state, run_training
+from app.trainer import (
+    JobCancelled,
+    JobPaused,
+    load_trainer_state,
+    required_framework,
+    run_training,
+)
 from app.parallel_worker import make_group, run_rank_process, select_members, slot_key
 from app.device import device_info, probe_device
 
@@ -90,6 +96,7 @@ def detect_capabilities(
         parallel.update({"gloo": _torch.distributed.is_gloo_available(), "nccl": _torch.distributed.is_nccl_available()})
     except Exception:
         pass
+    framework_versions = runtime_info.framework_versions()
     return {
         "worker_id": worker_id or f"worker-{hostname}-{uuid.uuid4().hex[:6]}",
         "machine_id": machine_id or config.WORKER_MACHINE_ID or hostname,
@@ -109,6 +116,11 @@ def detect_capabilities(
         # 能力协商标志：仅内置预测队列消费/执行逻辑的代码版本才上报，
         # 服务端据此拒绝旧镜像 Worker 的预测指派，避免静默排队直至超时。
         "inference": True,
+        # 代码指纹与框架能力：平台可据此比对"远程是否运行同一份代码"，
+        # 并在派发前拒绝缺少依赖（如 XGBoost）的计算节点。
+        "code_fingerprint": runtime_info.code_fingerprint(config.APP_ROOT / "app"),
+        "framework_versions": framework_versions,
+        "frameworks": runtime_info.available_frameworks(framework_versions),
     }
 
 
@@ -233,12 +245,17 @@ def classify_retryable(exc: BaseException) -> bool:
     - 其余异常（RuntimeError/OSError/ConnectionError 等）按错误文本匹配
       环境性特征词（CUDA/OOM/网络瞬断/存储故障）判定可重试。
     """
-    if isinstance(exc, ArtifactStoreUnavailableError):
+    if isinstance(exc, (ArtifactStoreUnavailableError, MissingFrameworkError)):
+        # 存储瞬断与"本节点缺少依赖"都属于环境性错误：换节点/换机即可成功。
         return True
     if isinstance(exc, _FATAL_EXCEPTION_TYPES):
         return False
     text = f"{exc}".lower()
     return any(p in text for p in _RETRYABLE_PATTERNS)
+
+
+class MissingFrameworkError(RuntimeError):
+    """当前计算节点缺少任务所需依赖，应由具备该能力的节点接手执行。"""
 
 
 class JobLeaseLost(Exception):
@@ -856,6 +873,18 @@ class TrainingWorker:
             scratch.mkdir(parents=True, exist_ok=True)
             params = spec.get("params") or {}
 
+            # 能力预检：本节点缺少任务所需依赖时立即失败（可重试，换节点即成功），
+            # 避免下载产物并在导入阶段抛出晦涩的 ImportError。
+            required = required_framework(str(spec.get("task") or ""), params)
+            available = self.caps.get("frameworks")
+            if available is not None and required not in available:
+                versions = self.caps.get("framework_versions") or {}
+                raise MissingFrameworkError(
+                    f"当前计算节点缺少 {required} 依赖（{required} 版本："
+                    f"{versions.get(required) or '未安装'}），"
+                    "请对该服务器执行“同步代码/更新”后重试，或改派其它计算槽"
+                )
+
             def joblog(msg: str) -> None:
                 """统一任务日志通道：本地 scratch 追加 + 整文件同步到状态平面。
 
@@ -889,16 +918,28 @@ class TrainingWorker:
             resume_state = None
             resume_key = None
             resumed_epoch = 0
-            for epoch, key in _list_checkpoints(store, job_id):
+            candidates = _list_checkpoints(store, job_id)
+            for epoch, key in candidates:
                 try:
                     local_ckpt = store.read_file(key, scratch / "resume-ckpt.pt")
                     resume_state = load_trainer_state(local_ckpt)
                     resumed_epoch = epoch
                     resume_key = key
                     break
+                except ArtifactStoreUnavailableError:
+                    # 存储故障是环境性错误：直接中止并自动重试，
+                    # 不能把"读不到"当作"checkpoint 损坏"而从头重训、丢弃进度。
+                    raise
                 except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
                     joblog(f"checkpoint e{epoch} 加载失败，回退更早版本: {exc}")
                     resume_state = None
+            if candidates and resume_state is None:
+                # 存在 checkpoint 但全部不可用：明确失败并说明原因，
+                # 避免静默从第 0 轮重训、丢失已完成进度。
+                raise ValueError(
+                    f"{len(candidates)} 个 checkpoint 均无法加载，无法续训；"
+                    "请检查状态平面存储完整性，或清理损坏的 checkpoint 后重试"
+                )
             # checkpoint 是进度唯一权威：无条件把 metrics 回滚到 resume epoch
             # （resume_state 为空时回滚到 0——孤儿进度清空，重试曲线不会出现重复 epoch）
             truncated = jobstore.truncate_metrics_to_epoch(store, job_id, resumed_epoch)

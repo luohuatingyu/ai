@@ -447,8 +447,22 @@ def save_trainer_state(
     return state
 
 
+def _required_state_keys(state: dict) -> tuple[str, ...]:
+    """按状态种类与框架列出续训必需字段，加载后立即做结构校验。"""
+    if state.get("kind") == "llm_trainer_state":
+        return ("task", "signature", "state_dict", "optimizer")
+    if state.get("framework") in ("sklearn", "xgboost"):
+        # 传统模型状态保存的是完整估计器（无 state_dict/optimizer）。
+        return ("task", "model_type", "estimator", "preprocessor")
+    return ("task", "arch", "state_dict", "optimizer", "preprocessor")
+
+
 def load_trainer_state(path: Path) -> dict:
-    """加载训练上下文；文件缺失/损坏/不兼容时抛出带明确指引的异常。"""
+    """加载训练上下文；文件缺失/损坏/不兼容时抛出带明确指引的异常。
+
+    反序列化后立即做结构校验：缺字段的 checkpoint 明确报告缺少哪些字段，
+    而不是在续训中途抛 KeyError；调用方据此回退更早版本，全部不可用时明确失败。
+    """
     if not path.exists():
         raise FileNotFoundError(f"训练状态文件不存在: {path}")
     try:
@@ -460,10 +474,13 @@ def load_trainer_state(path: Path) -> dict:
             state = torch.load(path, map_location="cpu", weights_only=False)
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {exc}") from exc
-        if state.get("framework") not in ("sklearn", "xgboost"):
+        if not isinstance(state, dict) or state.get("framework") not in ("sklearn", "xgboost"):
             raise ValueError(f"训练状态文件损坏或由不兼容版本保存: {path}")
     if not isinstance(state, dict) or state.get("kind") not in {"trainer_state", "llm_trainer_state"}:
         raise ValueError(f"不是有效的训练状态文件（kind 不匹配）: {path}")
+    missing = [key for key in _required_state_keys(state) if key not in state]
+    if missing:
+        raise ValueError(f"训练状态文件缺少必要字段 {missing}: {path}")
     return state
 
 
@@ -822,6 +839,19 @@ def _estimator_framework(model_type: str) -> str:
     （estimator 对象无法进入 torch.load(weights_only=True) 白名单）。
     """
     return "xgboost" if model_type == "xgboost" else "sklearn"
+
+
+def required_framework(task: str, params: dict | None) -> str:
+    """判断任务所需的训练框架能力名（与 runtime_info 上报的能力名一致）。
+
+    worker 在下载产物前据此做能力预检：缺少依赖的节点快速失败并让具备该
+    能力的节点接手，而不是等到导入阶段抛出晦涩的 ImportError。
+    """
+    model_type = str((params or {}).get("model_type") or "mlp")
+    if model_type in _SKLEARN_MODEL_LABELS:
+        return _estimator_framework(model_type)
+    # MLP/聚类/时序/LLM 均基于 torch 实现。
+    return "torch"
 
 
 def _build_sklearn_estimator(model_type: str, task: str, seed: int):
@@ -1784,17 +1814,24 @@ def run_training(
 # ---------------------------------------------------------------------------
 
 def load_torch_checkpoint(path: Path) -> dict:
-    """读取 torch.save 产物；仅平台标记的传统模型允许非安全反序列化。"""
+    """读取 torch.save 产物；仅平台标记的传统模型允许非安全反序列化。
+
+    非字典负载（例如被替换成列表/标量）统一报"格式无效"，避免调用方拿到
+    不可用对象后在 `.get()` 处抛出难以理解的 AttributeError。
+    """
     try:
-        return torch.load(path, map_location="cpu", weights_only=True)
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
     except Exception:
         # sklearn/XGBoost 估计器不在 weights_only 白名单内；仅当文件声明
         # framework ∈ {sklearn, xgboost}（由本平台训练器写入）时才允许完整
         # 反序列化，其余文件维持严格模式报错。
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        if ckpt.get("framework") not in ("sklearn", "xgboost"):
+        if not isinstance(ckpt, dict) or ckpt.get("framework") not in ("sklearn", "xgboost"):
             raise
         return ckpt
+    if not isinstance(ckpt, dict):
+        raise ValueError(f"模型文件格式无效（应为字典负载）: {path}")
+    return ckpt
 
 
 def predict_torch_artifact(

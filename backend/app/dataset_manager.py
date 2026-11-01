@@ -15,22 +15,29 @@ import pandas as pd
 from fastapi import HTTPException, UploadFile
 import logging
 
+import app.config as config
+
 logger = logging.getLogger(__name__)
 
 class DatasetManager:
     """数据集管理器，负责数据集的存储、验证和管理"""
     
-    def __init__(self, datasets_dir: Path, max_file_size: int = 500 * 1024 * 1024, 
-                 max_rows: int = 2_000_000, max_columns: int = 100):
+    def __init__(self, datasets_dir: Path, max_file_size: int = None,
+                 max_rows: int = None, max_columns: int = None):
         """
         初始化数据集管理器
-        
+
+        限额默认取自 config（可由环境变量调整），显式传参时以传参为准。
+
         Args:
             datasets_dir: 数据集存储目录
             max_file_size: 最大文件大小（字节）
             max_rows: 最大行数
             max_columns: 最大列数
         """
+        max_file_size = config.DATASET_MAX_FILE_SIZE if max_file_size is None else max_file_size
+        max_rows = config.DATASET_MAX_ROWS if max_rows is None else max_rows
+        max_columns = config.DATASET_MAX_COLUMNS if max_columns is None else max_columns
         self.datasets_dir = datasets_dir
         self.max_file_size = max_file_size
         self.max_rows = max_rows

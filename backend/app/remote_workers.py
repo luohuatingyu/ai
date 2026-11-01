@@ -22,7 +22,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from cryptography.fernet import Fernet, InvalidToken
 
 import app.config as config
-from app import remote_config_repository
+from app import remote_config_repository, runtime_info
 from app.state import manager
 
 
@@ -547,18 +547,14 @@ def _canonical_docker_platform(platform: str) -> str:
 
 
 def _worker_runtime_files(app_root: Path) -> List[Path]:
-    """按白名单收集计算节点源码，拒绝缺失文件和符号链接，避免夹带管理端或秘密。"""
+    """按白名单收集计算节点源码，拒绝缺失文件和符号链接，避免夹带管理端或秘密。
+
+    白名单与代码指纹共用 ``app.runtime_info``：打包与指纹口径一致，
+    避免远程节点缺少新文件而启动即 ModuleNotFoundError。
+    """
     if app_root.is_symlink():
         raise RemoteWorkerError("worker 源码目录不能是符号链接")
-    names = [
-        "__init__.py", "config.py", "coordination.py", "storage.py", "jobstore.py",
-        "device.py", "performance.py", "trainer.py", "llm_trainer.py", "worker.py",
-        "inference.py", "predictor.py", "worker-entrypoint.sh",
-    ]
-    # 联合训练模块在支持该功能的版本中随 worker 一起部署，兼容未启用该功能的版本。
-    names.extend(name for name in ("parallel.py", "parallel_worker.py")
-                 if (app_root / name).exists() or (app_root / name).is_symlink())
-    files = [app_root / name for name in names]
+    files = [app_root / name for name in runtime_info.runtime_file_names(app_root)]
     for path in files:
         if path.is_symlink() or not path.is_file():
             raise RemoteWorkerError(f"worker 运行文件缺失或不是普通文件：{path.name}")

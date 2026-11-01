@@ -624,20 +624,16 @@ async def batch_import_datasets(
 @router.post("/datasets/validate")
 async def validate_dataset_file(file: UploadFile = File(...)) -> dict:
     """验证数据集文件"""
+    temp_file_path = dataset_importer.temp_dir / safe_filename(file.filename or "")
     try:
-        # 保存临时文件
-        temp_file_path = dataset_importer.temp_dir / safe_filename(file.filename or "")
-        with open(temp_file_path, "wb") as buffer:
-            buffer.write(file.file.read())
-
+        # 分块写入临时文件并强制大小上限（不整体读入内存）
+        dataset_importer.write_upload(file, temp_file_path)
         # 验证文件
-        result = dataset_importer.validate_file_structure(temp_file_path)
-
-        # 清理临时文件
-        temp_file_path.unlink()
-
-        return result
+        return dataset_importer.validate_file_structure(temp_file_path)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, f"验证数据集文件失败: {e}")
+    finally:
+        # 校验结束即清理临时文件，异常路径同样不残留
+        temp_file_path.unlink(missing_ok=True)

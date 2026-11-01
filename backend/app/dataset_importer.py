@@ -1,6 +1,5 @@
 """数据集导入工具，支持批量导入和多种数据源"""
 import json
-import shutil
 import stat
 import tempfile
 import time
@@ -12,6 +11,8 @@ from typing import Dict, List, Any
 import pandas as pd
 from fastapi import HTTPException, UploadFile
 import logging
+
+import app.config as config
 from app.dataset_manager import DatasetManager
 from app.utils import safe_filename, validate_csv_structure
 
@@ -26,6 +27,31 @@ class DatasetImporter:
         self.temp_dir = datasets_dir / "temp" / "import"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
     
+    def write_upload(self, file: UploadFile, target: Path) -> int:
+        """按块写入上传内容并强制大小上限，返回实际字节数。
+
+        分块写入避免一次性把整个上传读入内存；超限时删除半成品文件后抛 400。
+        """
+        limit = config.DATASET_MAX_FILE_SIZE
+        chunk_size = max(int(config.DATASET_UPLOAD_CHUNK_BYTES), 64 * 1024)
+        written = 0
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(target, "wb") as buffer:
+                while True:
+                    chunk = file.file.read(chunk_size)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > limit:
+                        raise HTTPException(
+                            400, f"文件过大（最大 {limit // 1024 // 1024}MB）")
+                    buffer.write(chunk)
+        except HTTPException:
+            target.unlink(missing_ok=True)
+            raise
+        return written
+
     def import_dataset(self, file: UploadFile, description: str = "", 
                       tags: List[str] = None, auto_validate: bool = True) -> Dict[str, Any]:
         """
@@ -51,8 +77,7 @@ class DatasetImporter:
             self.temp_dir.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix="upload-", dir=self.temp_dir) as work_dir:
                 temp_file_path = Path(work_dir) / safe_filename(filename)
-                with open(temp_file_path, "wb") as buffer:
-                    buffer.write(file.file.read())
+                self.write_upload(file, temp_file_path)
 
                 if file_ext in {".zip", ".tar", ".tar.gz", ".tgz"}:
                     return self._import_from_archive(
@@ -67,6 +92,16 @@ class DatasetImporter:
         except Exception as e:
             logger.error(f"导入数据集失败: {e}")
             raise HTTPException(500, f"导入数据集失败: {e}")
+
+    def _enforce_frame_limits(self, df: pd.DataFrame) -> None:
+        """统一执行数据规模限制，避免超宽/超长表进入存储和后续训练。"""
+        if len(df) > config.DATASET_MAX_ROWS:
+            raise HTTPException(400, f"数据集行数过多（最大 {config.DATASET_MAX_ROWS} 行）")
+        if len(df.columns) > config.DATASET_MAX_COLUMNS:
+            raise HTTPException(400, f"数据集列数过多（最大 {config.DATASET_MAX_COLUMNS} 列）")
+        for column in df.columns:
+            if not isinstance(column, str) or not column.strip():
+                raise HTTPException(400, "列名必须为非空字符串")
 
     def _file_extension(self, filename: str) -> str:
         """获取后缀并保留 .tar.gz 复合扩展名。"""
@@ -92,14 +127,57 @@ class DatasetImporter:
             raise HTTPException(400, f"压缩包包含危险路径: {member_name}") from exc
         return target
 
+    def _copy_member_with_budget(self, source, output, budget: Dict[str, int]) -> None:
+        """按块拷贝成员并在写入时累计实际字节数，声明的尺寸不可信时仍能兜底。
+
+        budget 携带本压缩包的全局预算（已展开字节数与剩余额度），任一超限立即中止。
+        """
+        chunk_size = 1024 * 1024
+        while True:
+            chunk = source.read(chunk_size)
+            if not chunk:
+                break
+            budget["expanded"] += len(chunk)
+            if len(chunk) > budget["member_remaining"]:
+                raise HTTPException(400, "压缩包成员解压后过大，已中止导入")
+            budget["member_remaining"] -= len(chunk)
+            if budget["expanded"] > budget["expanded_limit"]:
+                raise HTTPException(400, "压缩包解压总大小超出限制，已中止导入")
+            output.write(chunk)
+
     def _extract_archive_safely(self, archive_path: Path, destination: Path) -> None:
-        """只解出普通文件和目录，避免 ZIP/TAR 路径穿越及链接攻击。"""
+        """只解出普通文件和目录，避免 ZIP/TAR 路径穿越及链接攻击。
+
+        同时校验成员数、单成员大小、解压总大小与压缩比，防止压缩炸弹耗尽
+        磁盘和内存（声明的尺寸可能被伪造，写入时再按实际字节数兜底）。
+        """
         destination.mkdir(parents=True, exist_ok=True)
         file_ext = self._file_extension(archive_path.name)
+        file_limit = int(config.DATASET_MAX_ARCHIVE_FILES)
+        member_limit = int(config.DATASET_MAX_ARCHIVE_MEMBER_BYTES)
+        expanded_limit = int(config.DATASET_MAX_ARCHIVE_EXPANDED_BYTES)
+        ratio_limit = int(config.DATASET_MAX_COMPRESSION_RATIO)
+        archive_size = max(archive_path.stat().st_size, 1)
+        budget = {"expanded": 0, "member_remaining": member_limit,
+                  "expanded_limit": expanded_limit}
+
+        def check_declared(count: int, declared_total: int, declared_member: int) -> None:
+            """按压缩包声明的尺寸提前拒绝明显超限的成员。"""
+            if count > file_limit:
+                raise HTTPException(400, f"压缩包成员过多（最大 {file_limit} 个）")
+            if declared_member > member_limit:
+                raise HTTPException(400, "压缩包存在超大成员，已中止导入")
+            if declared_total > expanded_limit:
+                raise HTTPException(400, "压缩包解压总大小超出限制，已中止导入")
+            if declared_total > archive_size * ratio_limit:
+                raise HTTPException(400, "压缩包压缩比异常（疑似压缩炸弹），已中止导入")
 
         if file_ext == ".zip":
             with zipfile.ZipFile(archive_path, "r") as archive:
-                for item in archive.infolist():
+                members = archive.infolist()
+                check_declared(len(members), sum(item.file_size for item in members),
+                               max((item.file_size for item in members), default=0))
+                for item in members:
                     target = self._safe_member_path(destination, item.filename)
                     mode = (item.external_attr >> 16) & 0o170000
                     if mode == stat.S_IFLNK:
@@ -108,12 +186,16 @@ class DatasetImporter:
                         target.mkdir(parents=True, exist_ok=True)
                         continue
                     target.parent.mkdir(parents=True, exist_ok=True)
+                    budget["member_remaining"] = member_limit
                     with archive.open(item, "r") as source, open(target, "wb") as output:
-                        shutil.copyfileobj(source, output)
+                        self._copy_member_with_budget(source, output, budget)
             return
 
         with tarfile.open(archive_path, "r:*") as archive:
-            for item in archive.getmembers():
+            members = archive.getmembers()
+            check_declared(len(members), sum(item.size for item in members if item.isfile()),
+                           max((item.size for item in members if item.isfile()), default=0))
+            for item in members:
                 target = self._safe_member_path(destination, item.name)
                 if item.isdir():
                     target.mkdir(parents=True, exist_ok=True)
@@ -124,8 +206,9 @@ class DatasetImporter:
                 source = archive.extractfile(item)
                 if source is None:
                     raise HTTPException(400, f"压缩包成员无法读取: {item.name}")
+                budget["member_remaining"] = member_limit
                 with source, open(target, "wb") as output:
-                    shutil.copyfileobj(source, output)
+                    self._copy_member_with_budget(source, output, budget)
     
     def _import_from_archive(self, archive_path: Path, description: str, 
                            tags: List[str], auto_validate: bool) -> Dict[str, Any]:
@@ -143,9 +226,14 @@ class DatasetImporter:
             for file_path in sorted(extraction_dir.rglob("*")):
                 if file_path.is_file() and self._file_extension(file_path.name) in supported_data:
                     extracted_files.append(file_path)
-            
+
             if not extracted_files:
                 raise HTTPException(400, "压缩文件中未找到支持的数据文件")
+            if len(extracted_files) > config.DATASET_MAX_IMPORT_FILES:
+                # 明确拒绝而不是静默截断：用户能据此拆分压缩包或调大配置。
+                raise HTTPException(
+                    400, f"压缩包内数据文件过多（{len(extracted_files)} > "
+                         f"{config.DATASET_MAX_IMPORT_FILES}），请拆分后重试")
             
             # 导入每个数据文件
             for file_path in extracted_files:
@@ -200,6 +288,9 @@ class DatasetImporter:
         except (ValueError, ImportError, OSError) as exc:
             raise HTTPException(400, f"数据文件解析失败: {exc}") from exc
         
+        # 规模限制：任何导入路径都必须受行数/列数约束，避免超宽表进入存储
+        self._enforce_frame_limits(df)
+
         # 验证数据
         if auto_validate:
             validation_result = validate_csv_structure(df)
@@ -276,6 +367,11 @@ class DatasetImporter:
                     with tarfile.open(file_path, 'r:*') as tar_ref:
                         file_list = tar_ref.getnames()
                 
+                if len(file_list) > config.DATASET_MAX_ARCHIVE_FILES:
+                    return {
+                        "valid": False,
+                        "error": f"压缩包成员过多（最大 {config.DATASET_MAX_ARCHIVE_FILES} 个）"
+                    }
                 # 查找数据文件
                 data_files = [f for f in file_list if self._file_extension(f) in {".csv", ".xlsx", ".xls", ".json"}]
                 
@@ -323,6 +419,9 @@ class DatasetImporter:
     def batch_import(self, files: List[UploadFile], description: str = "", 
                     tags: List[str] = None) -> Dict[str, Any]:
         """批量导入数据集"""
+        if len(files) > config.DATASET_MAX_IMPORT_FILES:
+            raise HTTPException(
+                400, f"批量导入文件过多（{len(files)} > {config.DATASET_MAX_IMPORT_FILES}）")
         results = {
             "success": [],
             "failed": [],

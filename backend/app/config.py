@@ -70,6 +70,19 @@ INFERENCE_HEARTBEAT_INTERVAL = float(os.environ.get("INFERENCE_HEARTBEAT_INTERVA
 INFERENCE_MIN_FREE_MEMORY_MB = int(os.environ.get("INFERENCE_MIN_FREE_MEMORY_MB", "256"))
 INFERENCE_TORCH_MIN_FREE_MEMORY_MB = int(os.environ.get("INFERENCE_TORCH_MIN_FREE_MEMORY_MB", "640"))
 
+# 数据集导入限额：防止超大上传、压缩炸弹和超宽表耗尽内存与磁盘。
+# 上传按块写入（流式），不在内存中整体读取；压缩包解压前/解压中同时校验
+# 成员数、单成员大小、展开总大小、压缩比与实际写入字节数。
+DATASET_MAX_FILE_SIZE = int(os.environ.get("DATASET_MAX_FILE_SIZE", str(500 * 1024 * 1024)))          # 单个上传文件上限（字节）
+DATASET_MAX_ROWS = int(os.environ.get("DATASET_MAX_ROWS", "2000000"))                                # 数据集最大行数
+DATASET_MAX_COLUMNS = int(os.environ.get("DATASET_MAX_COLUMNS", "100"))                              # 数据集最大列数
+DATASET_UPLOAD_CHUNK_BYTES = int(os.environ.get("DATASET_UPLOAD_CHUNK_BYTES", str(1024 * 1024)))      # 上传分块大小（字节）
+DATASET_MAX_ARCHIVE_FILES = int(os.environ.get("DATASET_MAX_ARCHIVE_FILES", "10000"))                 # 压缩包成员数上限
+DATASET_MAX_ARCHIVE_MEMBER_BYTES = int(os.environ.get("DATASET_MAX_ARCHIVE_MEMBER_BYTES", str(500 * 1024 * 1024)))   # 单成员解压后上限（字节）
+DATASET_MAX_ARCHIVE_EXPANDED_BYTES = int(os.environ.get("DATASET_MAX_ARCHIVE_EXPANDED_BYTES", str(1024 * 1024 * 1024)))  # 解压总大小上限（字节）
+DATASET_MAX_COMPRESSION_RATIO = int(os.environ.get("DATASET_MAX_COMPRESSION_RATIO", "200"))          # 展开/压缩体积比上限（防压缩炸弹）
+DATASET_MAX_IMPORT_FILES = int(os.environ.get("DATASET_MAX_IMPORT_FILES", "1000"))                    # 单次批量/压缩包导入文件数上限
+
 # 多机多卡：一卡一进程的机器级守护（Supervisor）与卡健康自愈
 WORKER_SUPERVISOR_PROBE_INTERVAL = float(os.environ.get("WORKER_SUPERVISOR_PROBE_INTERVAL", "15"))  # 掉卡探测周期（秒）
 WORKER_GPU_PROBE = os.environ.get("WORKER_GPU_PROBE", "true").strip().lower() == "true"  # 心跳周期内是否做 GPU 软探测

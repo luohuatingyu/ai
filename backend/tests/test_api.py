@@ -86,6 +86,17 @@ def test_performance_detail_and_resource_heartbeat(client):
         jobstore.delete_job_artifacts(manager.store, job_id)
 
 
+def test_workers_api_reports_code_fingerprint_and_framework_capabilities(client):
+    """能力上报链路：/api/workers 透传代码指纹与框架能力，供页面比对与排查。"""
+    workers = client.get("/api/workers").json()["workers"]
+    assert workers, "嵌入式模式至少应有一个计算槽"
+    for worker in workers:
+        assert isinstance(worker.get("code_fingerprint"), str) and worker["code_fingerprint"]
+        versions = worker.get("framework_versions") or {}
+        assert "torch" in versions and "xgboost" in versions
+        assert "torch" in (worker.get("frameworks") or [])
+
+
 @pytest.mark.parametrize("state,active,occupied,expected", [
     ("idle", True, True, "reserved"),
     ("disabled", True, True, "reserved"),
@@ -1475,6 +1486,156 @@ def test_import_archive_rejects_unsafe_member_path(client, store):
     assert response.status_code == 400
     assert "路径" in response.json()["detail"]
     assert client.get("/api/datasets").json()["total"] == 0
+
+
+def test_import_rejects_oversized_upload(client, store, monkeypatch):
+    """边界场景：上传超过限额的文件按块写入时立即拒绝，不创建数据集。"""
+    monkeypatch.setattr(config, "DATASET_MAX_FILE_SIZE", 64)
+    content = b"feature,target\n" + b"1,a\n" * 64
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("big.csv", content, "text/csv")},
+    )
+
+    assert response.status_code == 400
+    assert "过大" in response.json()["detail"]
+    assert client.get("/api/datasets").json()["total"] == 0
+
+
+def test_validate_endpoint_rejects_oversized_upload_and_cleans_temp(client, store, monkeypatch):
+    """边界场景：校验接口同样受限，且不残留临时文件。"""
+    from app.state import dataset_importer
+
+    monkeypatch.setattr(config, "DATASET_MAX_FILE_SIZE", 32)
+    response = client.post(
+        "/api/datasets/validate",
+        files={"file": ("big.csv", b"feature,target\n" + b"1,a\n" * 32, "text/csv")},
+    )
+
+    assert response.status_code == 400
+    assert list(dataset_importer.temp_dir.glob("*")) == []
+
+
+def test_import_rejects_row_limit(client, store, monkeypatch):
+    """边界场景：超过行数上限的数据集拒绝入库。"""
+    monkeypatch.setattr(config, "DATASET_MAX_ROWS", 1)
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("rows.csv", b"feature,target\n1,a\n2,b\n", "text/csv")},
+    )
+
+    assert response.status_code == 400
+    assert "行数过多" in response.json()["detail"]
+    assert client.get("/api/datasets").json()["total"] == 0
+
+
+def test_import_rejects_column_limit(client, store, monkeypatch):
+    """边界场景：超过列数上限的数据集拒绝入库。"""
+    monkeypatch.setattr(config, "DATASET_MAX_COLUMNS", 1)
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("wide.csv", b"feature,target\n1,a\n", "text/csv")},
+    )
+
+    assert response.status_code == 400
+    assert "列数过多" in response.json()["detail"]
+
+
+def test_batch_import_rejects_too_many_files(client, store, monkeypatch):
+    """边界场景：批量导入文件数超过上限时整体拒绝。"""
+    monkeypatch.setattr(config, "DATASET_MAX_IMPORT_FILES", 1)
+    files = [
+        ("files", ("a.csv", b"feature,target\n1,a\n", "text/csv")),
+        ("files", ("b.csv", b"feature,target\n2,b\n", "text/csv")),
+    ]
+    response = client.post("/api/datasets/batch-import", files=files)
+
+    assert response.status_code == 400
+    assert "文件过多" in response.json()["detail"]
+
+
+def test_import_archive_rejects_too_many_members(client, store, monkeypatch):
+    """安全场景：压缩包成员数超过上限时拒绝解压（防解压炸弹）。"""
+    monkeypatch.setattr(config, "DATASET_MAX_ARCHIVE_FILES", 2)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        for index in range(3):
+            archive.writestr(f"f{index}.csv", "feature,target\n1,a\n")
+
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("many.zip", payload.getvalue(), "application/zip")},
+    )
+
+    assert response.status_code == 400
+    assert "成员过多" in response.json()["detail"]
+    assert client.get("/api/datasets").json()["total"] == 0
+
+
+def test_import_archive_rejects_expanded_size(client, store, monkeypatch):
+    """安全场景：解压总大小超过上限时拒绝（放开压缩比限制以单独验证）。"""
+    monkeypatch.setattr(config, "DATASET_MAX_ARCHIVE_EXPANDED_BYTES", 1024)
+    monkeypatch.setattr(config, "DATASET_MAX_COMPRESSION_RATIO", 100000)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("rows.csv", "feature,target\n" + "1,a\n" * 500)
+
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("expanded.zip", payload.getvalue(), "application/zip")},
+    )
+
+    assert response.status_code == 400
+    assert "解压总大小" in response.json()["detail"]
+
+
+def test_import_archive_rejects_compression_bomb_ratio(client, store, monkeypatch):
+    """安全场景：高压缩比（展开远大于压缩体积）被识别为压缩炸弹拒绝。"""
+    monkeypatch.setattr(config, "DATASET_MAX_COMPRESSION_RATIO", 1)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("rows.csv", "feature,target\n" + "1,a\n" * 500)
+
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("bomb.zip", payload.getvalue(), "application/zip")},
+    )
+
+    assert response.status_code == 400
+    assert "压缩比" in response.json()["detail"]
+
+
+def test_import_archive_rejects_oversized_member(client, store, monkeypatch):
+    """安全场景：单个成员解压后超过上限时拒绝。"""
+    monkeypatch.setattr(config, "DATASET_MAX_ARCHIVE_MEMBER_BYTES", 32)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("rows.csv", "feature,target\n" + "1,a\n" * 50)
+
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("member.zip", payload.getvalue(), "application/zip")},
+    )
+
+    assert response.status_code == 400
+    assert "成员" in response.json()["detail"]
+
+
+def test_import_archive_rejects_too_many_data_files(client, store, monkeypatch):
+    """边界场景：压缩包内数据文件数超过导入上限时拒绝，避免静默截断。"""
+    monkeypatch.setattr(config, "DATASET_MAX_IMPORT_FILES", 1)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("a.csv", "feature,target\n1,a\n")
+        archive.writestr("b.csv", "feature,target\n2,b\n")
+
+    response = client.post(
+        "/api/datasets/import",
+        files={"file": ("two.zip", payload.getvalue(), "application/zip")},
+    )
+
+    assert response.status_code == 400
+    assert "数据文件过多" in response.json()["detail"]
 
 
 def test_process_dataset_supports_legacy_flat_layout(client, store):
