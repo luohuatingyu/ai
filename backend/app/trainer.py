@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 import random
 import threading
 import time
@@ -44,6 +45,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import app.config as config
 from app.performance import EpochPerformance
+from app.predictor import PICKLE_FORMAT, featurize_row as _featurize_row, load_checkpoint
 from app.device import (
     backend_from_device,
     device_rng_state,
@@ -317,29 +319,8 @@ def _encode_target(y: pd.Series, task: str) -> tuple[np.ndarray, list[str] | Non
     return pd.to_numeric(y, errors="raise").to_numpy(dtype=np.float32), None
 
 
-def _featurize_row(row: dict, pre: dict) -> np.ndarray:
-    """单条 JSON 行 -> 模型输入向量（与训练期预处理一致，含标准化）。"""
-    numeric: dict[str, float] = {}
-    for c in pre["num_cols"]:
-        try:
-            v = float(row.get(c))
-        except (TypeError, ValueError):
-            v = float(pre["num_medians"].get(c, 0.0))
-        numeric[c] = v
-
-    onehot: set[str] = set()
-    for c in pre["cat_cols"]:
-        v = row.get(c)
-        onehot.add(f"{c}={pre['cat_modes'].get(c, '') if v is None else str(v)}")
-
-    x = np.zeros((1, len(pre["feature_names"])), dtype=np.float32)
-    for i, name in enumerate(pre["feature_names"]):
-        if name in numeric:
-            x[0, i] = numeric[name]
-        elif name in onehot:
-            x[0, i] = 1.0
-    x = (x - np.asarray(pre["mean"], dtype=np.float32)) / np.asarray(pre["std"], dtype=np.float32)
-    return x
+# _featurize_row 由 app.predictor 提供：预测子进程读取 pickle 传统模型时不应
+# 导入本模块（从而不加载 torch），所以纯 numpy 的特征处理下沉到那里。
 
 
 # ---------------------------------------------------------------------------
@@ -1015,21 +996,25 @@ def _save_sklearn_checkpoint(
 ) -> None:
     """保存 sklearn/XGBoost 模型到 best.pt/last.pt，字段结构与 torch checkpoint 对齐。
 
-    估计器对象无法进入 torch.load(weights_only=True) 白名单，
-    读取方（predict_row / load_trainer_state）依据 framework 标记切换加载方式。
+    使用标准 pickle（``format=pickle-v1``）而非 torch.save：预测子进程读取
+    传统模型时不需要导入 torch（导入常驻约 490 MB，小内存计算槽无法承受）。
+    历史 torch.save 产物仍由 ``app.predictor`` 自动识别并兼容。
     """
-    torch.save(
-        {
-            "framework": _estimator_framework(model_type),
-            "model_type": model_type,
-            "estimator": estimator,
-            "task": task,
-            "kind": kind,
-            "best_record": record or {},
-            "preprocessor": preprocessor,
-        },
-        path,
-    )
+    payload = {
+        "format": PICKLE_FORMAT,
+        "framework": _estimator_framework(model_type),
+        "model_type": model_type,
+        "estimator": estimator,
+        "task": task,
+        "kind": kind,
+        "best_record": record or {},
+        "preprocessor": preprocessor,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
 
 
 def _persist_sklearn_state(
@@ -1205,7 +1190,7 @@ def _run_sklearn_training(
     best_path = job_dir / "best.pt"
     if not best_path.exists():
         raise ValueError("缺少 best.pt 权重产物，无法生成最终报告")
-    ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+    ckpt = load_checkpoint(best_path)
     estimator = ckpt["estimator"]
     val_pred = estimator.predict(X_val)
     if y_scale:
@@ -1798,20 +1783,26 @@ def run_training(
 # 在线预测（加载 best.pt）
 # ---------------------------------------------------------------------------
 
-def predict_row(
-    ckpt_path: Path, row: dict | None = None, history: list[Any] | None = None,
-    device: str = "cpu",
-) -> dict:
-    """加载 best.pt，对单条表格记录、KMeans 样本或时间序列历史窗口进行预测。"""
+def load_torch_checkpoint(path: Path) -> dict:
+    """读取 torch.save 产物；仅平台标记的传统模型允许非安全反序列化。"""
     try:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        return torch.load(path, map_location="cpu", weights_only=True)
     except Exception:
         # sklearn/XGBoost 估计器不在 weights_only 白名单内；仅当文件声明
         # framework ∈ {sklearn, xgboost}（由本平台训练器写入）时才允许完整
         # 反序列化，其余文件维持严格模式报错。
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         if ckpt.get("framework") not in ("sklearn", "xgboost"):
             raise
+        return ckpt
+
+
+def predict_torch_artifact(
+    ckpt_path: Path, row: dict | None = None, history: list[Any] | None = None,
+    device: str = "cpu",
+) -> dict:
+    """加载 torch 产物，对表格记录、KMeans 样本或时间序列历史窗口进行预测。"""
+    ckpt = load_torch_checkpoint(ckpt_path)
     pre: dict = ckpt["preprocessor"]
     task = ckpt["task"]
     target_device = torch.device(device)
@@ -1896,3 +1887,13 @@ def predict_row(
     if scale:
         value = value * float(scale[1]) + float(scale[0])
     return {"task": task, "prediction": value}
+
+
+def predict_row(
+    ckpt_path: Path, row: dict | None = None, history: list[Any] | None = None,
+    device: str = "cpu",
+) -> dict:
+    """兼容入口：按产物格式分派，pickle 传统模型不会加载 torch。"""
+    from app.predictor import predict_row as _predict_by_format
+
+    return _predict_by_format(ckpt_path, row=row, history=history, device=device)

@@ -553,7 +553,7 @@ def _worker_runtime_files(app_root: Path) -> List[Path]:
     names = [
         "__init__.py", "config.py", "coordination.py", "storage.py", "jobstore.py",
         "device.py", "performance.py", "trainer.py", "llm_trainer.py", "worker.py",
-        "inference.py", "worker-entrypoint.sh",
+        "inference.py", "predictor.py", "worker-entrypoint.sh",
     ]
     # 联合训练模块在支持该功能的版本中随 worker 一起部署，兼容未启用该功能的版本。
     names.extend(name for name in ("parallel.py", "parallel_worker.py")

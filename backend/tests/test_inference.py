@@ -1,8 +1,10 @@
 """预测资源选择、租约隔离与真实模型推理回归测试。"""
+import os
 import threading
 import time
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -253,10 +255,10 @@ def test_prediction_subprocess_is_reaped(setup_inference, monkeypatch, tmp_path,
         children.append(process)
         return process
 
-    def ensure_owned():
-        """仅在失租分支模拟外部租约失效。"""
-        if reason == "lease":
-            raise JobLeaseLost("lost lease")
+    # 轮询循环只读本地租约标志（续租由心跳线程负责），失租分支通过置位模拟。
+    lease_lost = threading.Event()
+    if reason == "lease":
+        lease_lost.set()
 
     monkeypatch.setattr("app.inference.subprocess.Popen", slow_process)
     scratch = tmp_path / "scratch"
@@ -266,7 +268,7 @@ def test_prediction_subprocess_is_reaped(setup_inference, monkeypatch, tmp_path,
         shutdown.set()
     if reason == "pause":
         pause.set()
-    controller = SimpleNamespace(ensure_owned=ensure_owned, pause_event=pause)
+    controller = SimpleNamespace(ensure_owned=lambda: None, pause_event=pause, lease_lost=lease_lost)
     with pytest.raises((RuntimeError, TimeoutError, JobLeaseLost)):
         run_prediction_process({"timeout": 0.05}, caps, service.store, controller, shutdown)
     assert len(children) == 1 and children[0].poll() is not None
@@ -333,6 +335,73 @@ def test_device_failure_never_falls_back(setup_inference, monkeypatch, tmp_path)
     monkeypatch.setattr("app.device.device_info", lambda *a: {"healthy": False})
     with pytest.raises(RuntimeError, match="未切换计算资源"):
         predict_request({"caps": {"device_backend": "cuda", "device": "cuda:0"}}, tmp_path)
+
+
+def test_sklearn_artifact_prediction_avoids_torch(setup_inference, make_dataset, tmp_path):
+    """pickle 传统模型产物在独立子进程中预测，全程不加载 torch。"""
+    import json
+    import subprocess
+    from pathlib import Path
+
+    from app.predictor import is_torch_artifact
+    from tests.test_trainer import _run
+
+    service, caps = setup_inference
+    training_dir = tmp_path / "sklearn-out"
+    training_dir.mkdir()
+    dataset = make_dataset(kind="classification", n=80)
+    summary = _run(service.store, dataset, "classification", 2, training_dir,
+                   target="target", model_type="random_forest")
+    assert summary["framework"] == "scikit-learn"
+    best = training_dir / "best.pt"
+    assert not is_torch_artifact(best), "新传统模型产物应使用 pickle 序列化"
+
+    script = (
+        "import json, sys; sys.path.insert(0, '.');"
+        "from pathlib import Path;"
+        "import app.predictor as predictor;"
+        "result = predictor.predict_row(Path(sys.argv[1]), row=json.loads(sys.argv[2]));"
+        "print(json.dumps({'prediction': result['prediction'],"
+        " 'probabilities': result['probabilities'],"
+        " 'torch': 'torch' in sys.modules,"
+        " 'trainer': 'app.trainer' in sys.modules}))"
+    )
+    row = json.dumps({"f1": 0.5, "f2": -0.2, "f3": 1.0})
+    completed = subprocess.run([sys.executable, "-c", script, str(best), row],
+                               cwd=Path.cwd(), capture_output=True, text=True, timeout=120)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert payload["prediction"] in {"0", "1", "2"}
+    assert set(payload["probabilities"]) <= {"0", "1", "2"}
+    assert payload["torch"] is False and payload["trainer"] is False
+
+
+def test_legacy_torch_sklearn_artifact_still_predicts(setup_inference, make_dataset, tmp_path):
+    """历史 torch.save 传统模型产物自动回退 torch 加载，预测结果一致。"""
+    import pickle
+
+    import torch
+
+    from app import predictor
+    from tests.test_trainer import _run
+
+    service, caps = setup_inference
+    training_dir = tmp_path / "legacy-out"
+    training_dir.mkdir()
+    dataset = make_dataset(kind="classification", n=80)
+    _run(service.store, dataset, "classification", 2, training_dir,
+         target="target", model_type="random_forest")
+    best = training_dir / "best.pt"
+    row = {"f1": 0.5, "f2": -0.2, "f3": 1.0}
+    expected = predictor.predict_row(best, row=row)
+
+    payload = pickle.loads(best.read_bytes())
+    payload.pop("format", None)
+    legacy = training_dir / "legacy.pt"
+    torch.save(payload, legacy)
+    assert predictor.is_torch_artifact(legacy)
+
+    assert predictor.predict_row(legacy, row=row) == expected
 
 
 @pytest.mark.parametrize("task,kind", [
@@ -405,3 +474,182 @@ def test_real_llm_generation_on_selected_worker(setup_inference, monkeypatch, tm
         record = client.get(f"/api/jobs/job-a/inferences/{ident}").json()
         assert record["status"] == "completed", record
         assert record["result"] == expected and record["device"] == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# 预测稳定性（小规格计算槽）：线程限制、内存门槛、退出原因分类、独立租约
+# ---------------------------------------------------------------------------
+
+
+def test_prediction_environment_limits_thread_counts(monkeypatch):
+    """子进程环境必须压制 BLAS/OpenMP 线程，避免与同机协调平面抢 CPU。"""
+    from app.inference import prediction_environment
+
+    monkeypatch.setattr(config, "INFERENCE_NUM_THREADS", 1)
+    env = prediction_environment()
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        assert env[name] == "1", f"{name} 未被限制为 1"
+    assert env["TOKENIZERS_PARALLELISM"] == "false"
+    # 其余环境（PATH 等）原样透传，不能清空继承环境。
+    assert env.get("PATH") == os.environ.get("PATH")
+
+
+def test_low_free_memory_rejects_before_heavy_import(monkeypatch):
+    """可用内存低于阈值时，子进程在导入 torch 前给出可操作错误。"""
+    from app.inference import ensure_free_memory
+
+    monkeypatch.setattr("app.inference._host_available_mb", lambda: 100.0)
+    with pytest.raises(RuntimeError, match="内存不足"):
+        ensure_free_memory(256, "测试预测")
+    # 内存未知（无法读取 /proc/meminfo）时不阻断预测。
+    monkeypatch.setattr("app.inference._host_available_mb", lambda: None)
+    ensure_free_memory(256, "测试预测")
+    # 内存充足时放行。
+    monkeypatch.setattr("app.inference._host_available_mb", lambda: 4096.0)
+    ensure_free_memory(256, "测试预测")
+
+
+def test_submit_rejects_worker_with_low_reported_memory(setup_inference, monkeypatch):
+    """提交阶段按 Worker 心跳上报的可用内存拒绝明显不足的计算槽。"""
+    service, caps = setup_inference
+    scarce = {**caps, "resources": {"latest": {"host_available_mb": 128}}}
+    service.lease.register_worker("chosen", scarce, 60)
+    with pytest.raises(ValueError, match="可用内存不足"):
+        service.submit("job-a", "classification", "chosen", {"row": {}})
+    assert not service.store.list_keys("inferences/")
+    # 心跳未上报内存（旧镜像/无采样）时不拦截，保持向后兼容。
+    service.lease.register_worker("chosen", caps, 60)
+    record = service.submit("job-a", "classification", "chosen", {"row": {}})
+    assert record["status"] == "queued"
+
+
+@pytest.mark.parametrize("returncode,detail,expected", [
+    (-9, "", "OOM"),
+    (-11, "", "OOM"),
+    (-15, "", "信号"),
+    (1, "MemoryError: unable to allocate 665.0 MiB", "内存分配失败"),
+    (1, "ValueError: bad input", None),
+])
+def test_exit_reason_classification(returncode, detail, expected):
+    """子进程退出方式翻译为可操作原因；不确定的原因不做猜测。"""
+    from app.inference import _exit_reason
+
+    reason = _exit_reason(returncode, detail)
+    if expected is None:
+        assert reason == ""
+    else:
+        assert expected in reason
+
+
+def test_killed_subprocess_error_mentions_oom(setup_inference, monkeypatch, tmp_path):
+    """返回码 -9 的子进程失败信息包含 OOM 指引（真实子进程冒烟）。"""
+    from app.inference import run_prediction_process
+
+    service, caps = setup_inference
+    original_popen = subprocess.Popen
+
+    def killed_process(*args, **kwargs):
+        """真实子进程立即自杀，模拟被 OOM killer 杀死。"""
+        script = "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
+        return original_popen([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr("app.inference.subprocess.Popen", killed_process)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(config, "WORKER_SCRATCH_DIR", scratch)
+    controller = SimpleNamespace(ensure_owned=lambda: None, pause_event=threading.Event(),
+                                 lease_lost=threading.Event())
+    with pytest.raises(RuntimeError, match="OOM"):
+        run_prediction_process({"timeout": 5}, caps, service.store, controller, threading.Event())
+    assert list(scratch.iterdir()) == []
+
+
+def test_sklearn_prediction_never_imports_torch_or_device_layer(setup_inference, make_dataset, tmp_path):
+    """pickle 传统模型预测子进程全程不加载 torch 与设备层（省约 490MB 常驻）。"""
+    import json as _json
+
+    from app.predictor import is_torch_artifact
+    from tests.test_trainer import _run
+
+    service, caps = setup_inference
+    training_dir = tmp_path / "sklearn-stability"
+    training_dir.mkdir()
+    dataset = make_dataset(kind="classification", n=80)
+    _run(service.store, dataset, "classification", 2, training_dir,
+         target="target", model_type="random_forest")
+    best = training_dir / "best.pt"
+    assert not is_torch_artifact(best)
+    service.store.write_file(job_key("job-a", "best.pt"), best)
+
+    script = (
+        "import json, sys; sys.path.insert(0, '.');"
+        "from pathlib import Path;"
+        "from app.inference import predict_request;"
+        "request = json.loads(Path(sys.argv[1]).read_text());"
+        "result = predict_request(request, Path(sys.argv[1]).parent);"
+        "print(json.dumps({'device': result['device'],"
+        " 'torch': 'torch' in sys.modules,"
+        " 'device_module': 'app.device' in sys.modules,"
+        " 'trainer': 'app.trainer' in sys.modules}))"
+    )
+    request = {"job_id": "job-a", "task": "classification",
+               "local_store": str(service.store.root),
+               "caps": {"device_backend": "cpu", "device": "cpu", "gpu": {"available": False, "healthy": True}},
+               "payload": {"row": {"f1": 0.5, "f2": -0.2, "f3": 1.0}}}
+    request_path = tmp_path / "request.json"
+    request_path.write_text(_json.dumps(request), encoding="utf-8")
+    completed = subprocess.run([sys.executable, "-c", script, str(request_path)],
+                               cwd=Path.cwd(), capture_output=True, text=True, timeout=120)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    payload = _json.loads(completed.stdout.strip().splitlines()[-1])
+    assert payload["device"] == "cpu"
+    assert payload["torch"] is False
+    assert payload["device_module"] is False
+    assert payload["trainer"] is False
+
+
+def test_lease_loss_during_polling_terminates_subprocess(setup_inference, monkeypatch, tmp_path):
+    """运行中心跳线程判定失租后，轮询循环停止子进程且不写结果。"""
+    from app.inference import run_prediction_process
+
+    service, caps = setup_inference
+    original_popen = subprocess.Popen
+    children = []
+
+    def slow_process(*args, **kwargs):
+        """长耗时子进程模拟仍在运行的预测。"""
+        process = original_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        children.append(process)
+        return process
+
+    monkeypatch.setattr("app.inference.subprocess.Popen", slow_process)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(config, "WORKER_SCRATCH_DIR", scratch)
+    # 模拟心跳线程在子进程运行期间判定失租并置位本地标志。
+    lease_lost = threading.Event()
+    threading.Timer(1.0, lease_lost.set).start()
+    controller = SimpleNamespace(ensure_owned=lambda: None, pause_event=threading.Event(),
+                                 lease_lost=lease_lost)
+    with pytest.raises(JobLeaseLost):
+        run_prediction_process({"timeout": 30}, caps, service.store, controller, threading.Event())
+    assert len(children) == 1 and children[0].poll() is not None
+    assert list(scratch.iterdir()) == []
+
+
+def test_inference_lease_ttl_is_independent_of_training(monkeypatch):
+    """预测使用独立的（更长）租约 TTL，导入/加载慢不再触发误判失租。"""
+    assert config.INFERENCE_LEASE_TTL >= config.WORKER_LEASE_TTL
+    assert config.INFERENCE_HEARTBEAT_INTERVAL > 0
+    assert config.INFERENCE_LEASE_TTL / config.INFERENCE_HEARTBEAT_INTERVAL >= 3
+
+
+def test_recovery_error_includes_running_duration(setup_inference):
+    """失租失败信息包含已运行时长，帮助区分加载慢与真正失联。"""
+    service, caps = setup_inference
+    record = service.submit("job-a", "classification", "chosen", {"row": {}})
+    ident = record["id"]
+    service.store.write_json(inference_key(ident, "execution.json"),
+                             {"status": "running", "token": "old", "started_at": time.time() - 75})
+    service.recover()
+    failed = service.get(ident)
+    assert failed["status"] == "failed"
+    assert "运行 7" in failed["error"] and "租约丢失" in failed["error"]

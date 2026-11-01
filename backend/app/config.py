@@ -55,6 +55,21 @@ EMBEDDED_WORKERS = int(os.environ.get("EMBEDDED_WORKERS", "2"))                 
 WORKER_CHECKPOINT_INTERVAL = int(os.environ.get("WORKER_CHECKPOINT_INTERVAL", "5"))     # 每训练 N 个 epoch 存一次 checkpoint
 WORKER_CHECKPOINT_KEEP = int(os.environ.get("WORKER_CHECKPOINT_KEEP", "3"))             # 版本化 checkpoint 保留个数（可回退）
 
+# 预测（inference）资源与租约：小规格计算槽（如 2 vCPU / 1.7 GB 且与 Redis 同机）在
+# 预测子进程导入 torch/BLAS 时会把同机协调平面一起拖慢，导致续租心跳超时被误判失租。
+# 这里用独立的租约/心跳参数和资源阈值，把"模型加载慢"和"Worker 真的失联"区分开：
+# - INFERENCE_NUM_THREADS：预测子进程 BLAS/OpenMP 线程数（默认 1，避免抢占同机协调平面 CPU）；
+# - INFERENCE_NICE：预测子进程调度谦让值（>0 降低优先级，0 表示不调整）；
+# - INFERENCE_LEASE_TTL / INFERENCE_HEARTBEAT_INTERVAL：预测专用租约有效期与心跳周期（秒）；
+# - INFERENCE_MIN_FREE_MEMORY_MB：提交/执行前要求的最低可用内存（心跳上报数据，MB）；
+# - INFERENCE_TORCH_MIN_FREE_MEMORY_MB：torch 产物预测额外内存要求（torch 常驻约 490MB，MB）。
+INFERENCE_NUM_THREADS = int(os.environ.get("INFERENCE_NUM_THREADS", "1"))
+INFERENCE_NICE = int(os.environ.get("INFERENCE_NICE", "5"))
+INFERENCE_LEASE_TTL = float(os.environ.get("INFERENCE_LEASE_TTL", "90"))
+INFERENCE_HEARTBEAT_INTERVAL = float(os.environ.get("INFERENCE_HEARTBEAT_INTERVAL", "10"))
+INFERENCE_MIN_FREE_MEMORY_MB = int(os.environ.get("INFERENCE_MIN_FREE_MEMORY_MB", "256"))
+INFERENCE_TORCH_MIN_FREE_MEMORY_MB = int(os.environ.get("INFERENCE_TORCH_MIN_FREE_MEMORY_MB", "640"))
+
 # 多机多卡：一卡一进程的机器级守护（Supervisor）与卡健康自愈
 WORKER_SUPERVISOR_PROBE_INTERVAL = float(os.environ.get("WORKER_SUPERVISOR_PROBE_INTERVAL", "15"))  # 掉卡探测周期（秒）
 WORKER_GPU_PROBE = os.environ.get("WORKER_GPU_PROBE", "true").strip().lower() == "true"  # 心跳周期内是否做 GPU 软探测
