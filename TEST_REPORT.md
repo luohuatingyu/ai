@@ -46,6 +46,8 @@
 - 较上一轮（743 passed / 774 收集）净增 25 个通过用例：API 限额与能力透传 11 个 + worker 能力/框架/checkpoint 7 个 + trainer 结构校验 7 个（含参数化展开）；31 个跳过与历史基准一致（无 GPU 硬件、Redis 门控等环境性跳过）。
 - 定向回归：`test_remote_workers.py` 158 通过（部署白名单与 `app.runtime_info` 口径一致）、数据集相关（`test_excel_import`/`test_hub_datasets`/`test_dataset_preview_pagination`/`test_llm_trainer`）92 通过。
 - `docker compose up --build -d` 重建成功，全部容器 Up/healthy。
+- **线上端到端冒烟（重建后线上，4/4 通过）**：① `/api/workers` 显示本地两槽指纹 `d02fd197b6f7`、`frameworks=[torch, sklearn, xgboost]`、xgboost 2.1.4；② 高压缩比 ZIP（2 万行重复数据）导入被 400 拒绝并提示“压缩包压缩比异常（疑似压缩炸弹）”；③ 正常 CSV（200 行）导入 → 随机森林训练 completed → 预测 completed（`prediction='0'`，概率和≈1，device=cpu）；④ 任务与数据集已清理。
+- **冒烟副产物（有价值信号）**：`Linux-cpu0` 的 `code_fingerprint`/`frameworks` 为 `None`，即该远程节点仍运行旧代码（未重新部署）；指纹机制据此直接暴露“远程未同步”，无需人工比对文件。
 
 ### 已知限制、环境说明与回滚
 
