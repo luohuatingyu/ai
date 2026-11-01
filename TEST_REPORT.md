@@ -1,4 +1,4 @@
-## 线上遗留问题：远程小规格计算节点预测执行租约丢失（2026-10-31 实测，待决策）
+## 线上遗留问题：远程小规格计算节点预测执行租约丢失（2026-10-31 实测；缓解已于 2026-11-01 实施，见下节）
 
 ### 现象与证据
 
@@ -13,8 +13,59 @@
 - **根因**：远程节点规格为 2 vCPU / 1735 MB，且 **Redis 与计算同机**。预测子进程（`python -m app.inference` → torch/sklearn/xgboost 导入 + 模型加载）压满 CPU/内存，同机 Redis 无法及时响应；worker 续租心跳（`WORKER_HEARTBEAT_INTERVAL=10s`、`WORKER_LEASE_TTL=30s`）连续失败超过 TTL 后由 `JobController._loop` 判定失租，父进程放弃写入，watchdog 兜底标记失败。
 - **实测证据**：预测执行期间平台侧 Redis 连接约 12 s 时读超时；对目标机的只读 SSH 采样会话挂起至 180 s 超时；`ping` 全程正常（排除网络问题）；空闲时目标机 `free -m` 可用内存仅约 287 MB。对照：本机资源充足时同一代码路径预测 2.8 s 成功。
 - **影响**：该远程槽当前无法稳定完成预测；训练任务与预测队列领取（本次修复目标）均正常。
-- **可选缓解（待用户决策）**：① 调大 `WORKER_LEASE_TTL` / `WORKER_HEARTBEAT_INTERVAL`（配置项，无需改代码，仅缓解）；② 限制预测子进程线程数并降低其优先级（`OMP_NUM_THREADS=1` / `torch.set_num_threads(1)`、nice，改代码）；③ 将 Redis 迁出计算节点或升级机型（根治，基础设施变更）；④ 预测改用资源充足的槽位或默认“API 服务进程”。
+- **缓解状态（2026-11-01）**：已实施代码级缓解（详见“远程小规格计算槽预测稳定性”一节），核心为：预测子进程单线程 + 降低调度优先级、pickle 传统模型全程不加载 torch、预测独立租约 TTL 90s、轮询循环不再 50ms 忙等续租、提交/执行前内存门槛、退出原因分类。**远程槽实测仍待执行**（需重新部署远程服务器后连续 10 次预测验证）。
 - **未验证**：资源充足条件下的远程槽预测成功路径（本机已验证同路径）；远程槽 xgboost 任务（依赖下发问题见下节）。
+
+## 本次变更测试结果：远程小规格计算槽预测稳定性（pickle 免 torch 预测 + 独立租约 + 资源门槛）（2026-11-01）
+
+### Git 基准点与范围
+
+- **基准点 Commit Hash**：`1de26db`（Stabilize inference on small compute slots: thread caps, pickle-only path, dedicated lease TTL, memory guards）；测试报告更新为独立提交。
+- **测试日期 / 分支**：2026-11-01 / emdash/hot-boxes-clean-y9u6p。
+- **范围（稳定性修复，对应 2026-11-01 风险分析 P0 项）**：
+  1. **预测子进程资源限制**：`run_prediction_process` 启动子进程时注入 `OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS=1`、`TOKENIZERS_PARALLELISM=false`（新配置 `INFERENCE_NUM_THREADS`，默认 1）；子进程 `main()` 入口调用 `os.nice(INFERENCE_NICE)`（默认 5）降低调度优先级，避免压满同机协调平面 CPU。torch 产物路径同时 `torch.set_num_threads(1)`。
+  2. **传统模型预测不加载 torch**：新增 `app/predictor.py`（pickle-v1 产物读取 + numpy 特征处理 + 按格式分派预测），sklearn/xgboost 训练改用标准 pickle 保存 `best.pt/last.pt`（torch.save 产物自动识别并兼容）；`inference.predict_request` 先读产物再决定加载路径——pickle 传统模型全程不导入 torch 与 `app.device`（省约 490MB 常驻）；`trainer.predict_row` 改为兼容分派入口；worker 部署白名单补充 `predictor.py`。
+  3. **预测独立租约参数**：新增 `INFERENCE_LEASE_TTL=90`（原沿用训练的 30s，模型加载慢会被误判失租——3/3 次失败的直接判定点）与 `INFERENCE_HEARTBEAT_INTERVAL=10`；`execute`/`_recover_record` 全部改用预测专用 TTL。
+  4. **轮询循环去忙等**：`run_prediction_process` 轮询只读本地 `lease_lost` 标志（由心跳线程判定置位），不再每 50ms 调 `ensure_owned()` 续租；写结果前保留一次原子核对。一次瞬时 Redis 超时不再误杀预测。
+  5. **内存门槛与失败分类**：新增 `_host_available_mb()`（读 /proc/meminfo）；`ensure_free_memory` 在导入重依赖前检查（传统模型 256MB / torch 产物 640MB，`INFERENCE_MIN_FREE_MEMORY_MB`/`INFERENCE_TORCH_MIN_FREE_MEMORY_MB` 可配）；`validate_worker` 按 Worker 心跳上报的 `host_available_mb` 在提交阶段拒绝明显不足的槽位（未上报不拦截，保持兼容）；`_exit_reason` 把返回码 -9/-11、stderr 内存分配失败翻译为 OOM 指引；失租失败信息带已运行时长。
+  6. **配置透传**：`docker-compose.yml`、`docker-compose.cpu.yml`、`.env.example` 新增 6 个 `INFERENCE_*` 配置项。
+
+### 验收标准—测试用例映射
+
+| 验收标准 | 层级、前置条件与输入 | 可执行用例及预期业务结果 | 场景 |
+|---|---|---|---|
+| B1 子进程线程与优先级限制生效 | 单元；`prediction_environment()` | `test_prediction_environment_limits_thread_counts`：4 个 BLAS 环境变量=1、TOKENIZERS_PARALLELISM=false、PATH 原样透传 | 正常 |
+| B2 内存不足时提前失败且信息可操作 | 单元；mock `_host_available_mb` | `test_low_free_memory_rejects_before_heavy_import`（参数化 3 例）：低于阈值抛“内存不足”、未知不阻断、充足放行 | 边界、异常 |
+| B3 提交阶段拒绝内存不足 Worker | 服务层；心跳上报 128MB | `test_submit_rejects_worker_with_low_reported_memory`：拒绝且不落库；未上报内存不拦截 | 异常、兼容 |
+| B4 子进程退出原因分类 | 单元；参数化 5 种返回码/stderr | `test_exit_reason_classification`：-9/-11→OOM、-15→信号、MemoryError→内存分配失败、其它不猜测 | 异常 |
+| B5 OOM 子进程失败信息含指引 | 服务层；真实 SIGKILL 子进程 | `test_killed_subprocess_error_mentions_oom`：RuntimeError 匹配“OOM”，临时目录清空 | 异常 |
+| B6 传统模型预测不加载 torch/设备层 | 集成；真实训练产物 + 真实子进程 | `test_sklearn_prediction_never_imports_torch_or_device_layer`：sys.modules 无 torch/app.device/app.trainer，device=cpu | 正常、回归 |
+| B7 运行中失租终止子进程 | 服务层；异步置位 lease_lost | `test_lease_loss_during_polling_terminates_subprocess`：JobLeaseLost、子进程终止、临时目录清空 | 异常 |
+| B8 预测租约独立于训练 | 配置层 | `test_inference_lease_ttl_is_independent_of_training`：TTL≥训练 TTL、心跳>0、TTL/心跳≥3 | 边界 |
+| B9 失租失败信息带运行时长 | 服务层；伪造 running 记录 75s | `test_recovery_error_includes_running_duration`：failed 且 error 含“运行 7x 秒”与“租约丢失” | 异常 |
+| B10 超时/停机/暂停/失租仍终止子进程 | 服务层；真实子进程参数化 4 例 | `test_prediction_subprocess_is_reaped`（更新：失租改本地标志模拟）：子进程 poll 非 None、临时目录空 | 回归 |
+| B11 OOM stderr 带返回码 | 服务层；真实自杀子进程 | `test_prediction_failure_includes_subprocess_stderr`（既有）：MemoryError + “-9” 在失败信息中 | 回归 |
+| B12 全量回归 | 容器 3.12 全量 + 前端 | 全量 `backend/tests/` 0 失败；`node --test frontend/` 0 失败 | 兼容、回归 |
+
+### 测试执行结果
+
+| 阶段 | 总数 | 通过 | 失败 | 错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| Python 3.12 容器全量后端（`docker run -v "$(pwd):/repo" -w /repo/backend <trainer镜像> python -m pytest tests/ -q`，与历史基准同口径） | 774 | 743 | 0 | 0 | 31 |
+| 完整前端 `node --test frontend/` | 197 | 197 | 0 | 0 | 0 |
+
+- 较上一轮（727 passed / 758 收集）净增 16 个通过用例：本次新增 14 个（B1–B9 对应 11 个用例 + 参数化展开）+ 遗留 pickle 免 torch 用例 2 个 + 失租参数化更新 1 个；31 个跳过与历史基准一致（无 GPU 硬件、Redis 门控等环境性跳过）。
+- `docker compose up --build -d` 重建成功，全部容器 Up/healthy。
+- 线上端到端冒烟验证通过（随机森林训练 6s 完成 → 预测 138.61 万元成功，指定计算槽 `acf87b67eaa5-cpu0`）。
+
+### 已知限制、环境说明与回滚
+
+- **远程槽实测待执行**：缓解代码需重新部署远程 `Linux` 服务器（服务器管理 → 同步代码/更新，本地镜像须先重建）后才生效；建议按 B 系列验收标准连续提交 10 次预测验证不再出现租约丢失。
+- **根因中的架构因素未消除**：Redis 与计算同机、2 vCPU/1.7GB 机型本身仍不适合 torch 产物预测（640MB 门槛会明确拒绝而不是被 OOM 杀死）；根治仍需 Redis 迁出计算节点或升级机型。
+- **`os.nice` 仅 Unix 生效**：Windows 平台静默跳过（try/except 保护），不影响预测本身。
+- **内存门槛为保险丝非配额**：`/proc/meminfo` 不可读（极少数容器/平台）时不阻断预测，退回原有行为。
+- **torch 产物（MLP/KMeans/时序/LLM）预测仍需加载 torch**：这是算法依赖，无法规避；小内存槽执行此类预测会被 640MB 门槛提前拒绝并提示选择更大槽位。
+- 回滚方式：`git revert 1de26db` 即可整体还原；新增 `INFERENCE_*` 配置项均有默认值，无持久化格式变更；旧 torch.save 传统模型产物由 `predictor.is_torch_artifact` 自动识别兼容。
 
 ## 本次变更测试结果：XGBoost 模型选项（GPU 可用时加速）与远程 Worker 启动崩溃修复（2026-10-31）
 
