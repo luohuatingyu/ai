@@ -22,7 +22,7 @@
             </div>
           </div>
           <div v-if="stat.trend !== undefined" class="stat-trend" :class="stat.trend >= 0 ? 'positive' : 'negative'">
-            <el-icon><component :is="stat.trend >= 0 ? 'ArrowUp' : 'ArrowDown' /></el-icon>
+            <el-icon><component :is="stat.trend >= 0 ? 'ArrowUp' : 'ArrowDown'" /></el-icon>
             <span>{{ Math.abs(stat.trend) }}%</span>
             <span>较上周</span>
           </div>
@@ -45,13 +45,13 @@
             <el-table-column prop="id" label="任务ID" width="180" />
             <el-table-column prop="task" label="任务类型" width="120">
               <template #default="scope">
-                <el-tag :type="getTaskTypeTag(scope.row.task)">{{ scope.row.task }}</el-tag>
+                <el-tag :type="getTaskTypeTag(scope.row.task) as any">{{ scope.row.task }}</el-tag>
               </template>
             </el-table-column>
             <el-table-column prop="dataset_name" label="数据集" width="150" />
             <el-table-column prop="status" label="状态" width="100">
               <template #default="scope">
-                <el-tag :type="getStatusTag(scope.row.status)" effect="dark">
+                <el-tag :type="getStatusTag(scope.row.status) as any" effect="dark">
                   {{ getStatusText(scope.row.status) }}
                 </el-tag>
               </template>
@@ -93,8 +93,8 @@
                 </span>
               </div>
             </div>
-            <div v-else class="empty-state-mini">暂无模型</div>
           </div>
+          <div v-else class="empty-state-mini">暂无模型</div>
         </el-card>
       </el-col>
       
@@ -192,9 +192,8 @@ import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import {
   Refresh, ArrowUp, ArrowDown, Plus, Notebook, Connection, Upload,
-  Monitor, Cpu, Server, DataBoard, Box
+  Monitor, Cpu, DataBoard, Box
 } from '@element-plus/icons-vue'
-import { Math } from 'node:math'
 
 const router = useRouter()
 const appStore = useAppStore()
@@ -206,8 +205,8 @@ const stats = ref([
   { key: 'pipelines', label: 'Pipeline', value: '0', icon: 'Connection', iconClass: 'purple', trend: 0 },
 ])
 
-const recentJobs = ref([])
-const recentModels = ref([])
+const recentJobs = ref<any[]>([])
+const recentModels = ref<any[]>([])
 const resourceSummary = ref({ total: 0, gpu: 0, cpu: 0, idle: 0, running: 0, offline: 0 })
 const systemInfo = ref({ torch_version: '-', cuda_version: '-', gpu_count: 0, storage_backend: 'local' })
 

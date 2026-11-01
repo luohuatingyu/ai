@@ -16,8 +16,8 @@
         <el-button-group>
           <el-button :type="kernelStatus === 'running' ? 'success' : 'primary'" 
                      @click="toggleKernel" :loading="kernelLoading">
-            <el-icon v-if="kernelStatus === 'running'"><Stop /></el-icon>
-            <el-icon v-else><Play /></el-icon>
+            <el-icon v-if="kernelStatus === 'running'"><VideoPause /></el-icon>
+            <el-icon v-else><VideoPlay /></el-icon>
             {{ kernelStatus === 'running' ? '停止内核' : '启动内核' }}
           </el-button>
           <el-button @click="addCell('code')" :disabled="kernelStatus !== 'running'">
@@ -40,7 +40,7 @@
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item @click="saveNotebook">
-                <el-icon><Save /></el-icon>
+                <el-icon><DocumentChecked /></el-icon>
                 <span>保存 Notebook</span>
               </el-dropdown-item>
               <el-dropdown-item @click="exportNotebook">
@@ -114,11 +114,11 @@
               :disabled="kernelStatus !== 'running' || executingCells.includes(index)"
               :loading="executingCells.includes(index)"
             >
-              <el-icon><Play /></el-icon>
+              <el-icon><VideoPlay /></el-icon>
               运行
             </el-button>
             <el-button @click="interruptCell(index)" :disabled="!executingCells.includes(index)">
-              <el-icon><Stop /></el-icon>
+              <el-icon><VideoPause /></el-icon>
               中断
             </el-button>
           </div>
@@ -163,7 +163,7 @@
             <textarea v-model="cell.source" @blur="saveCell(index)" @keydown.esc="cancelEdit(index)" rows="10" spellcheck="false" />
             <div class="editor-actions">
               <el-button size="small" @click="saveCell(index)">保存</el-button>
-              <el-button size="small" type="secondary" @click="cancelEdit(index)">取消</el-button>
+              <el-button size="small" type="info" @click="cancelEdit(index)">取消</el-button>
             </div>
           </div>
           <div v-else class="markdown-preview" v-html="renderedMarkdown(cell.source)" @dblclick="startEdit(index)" />
@@ -176,6 +176,7 @@
         <span>添加代码单元格</span>
       </div>
     </div>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -185,8 +186,8 @@ import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { marked } from 'marked'
 import {
-  ArrowLeft, Play, Stop, Plus, Document, More, Save, Download, Delete,
-  ArrowUp, ArrowDown, DocumentCopy, Notebook, Server, PlayCircle, StopCircle
+  ArrowLeft, VideoPlay, VideoPause, Plus, Document, More, DocumentChecked, Download, Delete,
+  ArrowUp, ArrowDown, DocumentCopy, Notebook
 } from '@element-plus/icons-vue'
 
 // 动态导入 Monaco Editor
@@ -207,6 +208,23 @@ const loadMonaco = async () => {
     })
   }
   return monaco
+}
+
+
+const getStatusType = (status?: string) => {
+  const map: Record<string, string> = {
+    starting: 'info', running: 'success', idle: 'warning',
+    busy: 'primary', stopped: 'info', error: 'danger',
+  }
+  return (map[status || ''] || 'info') as any
+}
+
+const getStatusText = (status?: string) => {
+  const map: Record<string, string> = {
+    starting: '启动中', running: '运行中', idle: '空闲',
+    busy: '忙碌', stopped: '已停止', error: '错误',
+  }
+  return map[status || ''] || (status || '-')
 }
 
 const route = useRoute()

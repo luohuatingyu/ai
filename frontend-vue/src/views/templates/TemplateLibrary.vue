@@ -46,7 +46,7 @@
         </div>
         <div class="template-footer">
           <el-button size="small" type="primary" @click.stop="instantiateTemplate(template)">
-            <el-icon><Play /></el-icon>
+            <el-icon><VideoPlay /></el-icon>
             使用模板
           </el-button>
           <el-button size="small" @click.stop="viewTemplate(template.id)">
@@ -83,19 +83,19 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
-import { Plus, View, Play, Document, Folder } from '@element-plus/icons-vue'
+import { Plus, View, VideoPlay, Document, Folder } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const appStore = useAppStore()
 
-const templates = ref([])
+const templates = ref<any[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(12)
 const selectedCategory = ref('')
 const showBuiltin = ref('')
 const searchKeyword = ref('')
-const categories = ref([])
+const categories = ref<any[]>([])
 
 const fetchTemplates = async () => {
   try {

@@ -208,6 +208,20 @@ def instantiate_template(template_id: str, req: InstantiateTemplateRequest) -> d
             instantiated_type=req.instantiated_type,
             created_by=req.created_by,
         )
+        # 内置模板仅存在于代码（无 DB 行），实例化记录跳过外键表
+        template = _template_registry.get_template(template_id)
+        if template and not template.is_builtin:
+            with db_session() as db:
+                from app.db_utils import record_template_instantiation
+
+                record_template_instantiation(
+                    db=db,
+                    template_id=template_id,
+                    instantiated_type=req.instantiated_type,
+                    instantiated_id=result.get("instantiated_id", template_id),
+                    parameters=req.parameters,
+                    created_by=req.created_by,
+                )
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))

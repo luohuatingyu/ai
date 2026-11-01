@@ -58,6 +58,7 @@ def list_models(
                 "id": m.id,
                 "name": m.name,
                 "version": m.version,
+                "source_job_id": m.source_job_id,
                 "task": m.task,
                 "framework": m.framework,
                 "metrics": m.metrics,

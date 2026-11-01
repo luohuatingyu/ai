@@ -341,31 +341,21 @@ class TemplateRegistry:
         template = self.get_template(template_id)
         if not template:
             raise ValueError(f"模板不存在: {template_id}")
-        
+
         # 验证参数
         errors = template.validate_params(params)
         if errors:
             raise ValueError(f"参数验证失败: {', '.join(errors)}")
-        
+
         # 渲染模板
         rendered = template.render(params)
-        
-        # 记录实例化
-        with db_session() as db:
-            record_template_instantiation(
-                db=db,
-                template_id=template_id,
-                instantiated_type=instantiated_type,
-                instantiated_id=f"{instantiated_type}-{uuid.uuid4().hex[:8]}",
-                parameters=params,
-                created_by=created_by,
-            )
-        
+
         return {
             "template_id": template_id,
             "rendered_content": rendered,
             "parameters": params,
             "instantiated_type": instantiated_type,
+            "instantiated_id": f"{instantiated_type}-{uuid.uuid4().hex[:8]}",
         }
     
     def _db_to_template(self, db_template) -> Optional[ScriptTemplate]:

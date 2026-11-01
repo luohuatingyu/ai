@@ -290,11 +290,11 @@ def create_notebook_session(
     bound_workers: list[str] = None,
     kernel_type: str = "python",
     metadata: dict = None,
+    session_id: str = None,
 ) -> NotebookSession:
-    """创建 Notebook 会话"""
-    session_id = f"nb-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    """创建 Notebook 会话（session_id 缺省时自动生成）"""
     session = NotebookSession(
-        id=session_id,
+        id=session_id or f"nb-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
         name=name,
         owner=owner,
         dataset_id=dataset_id,

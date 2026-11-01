@@ -14,11 +14,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import torch
+
 import app.config as config
 from app import jobstore
 from app.coordination import JobQueue, LeaseStore, build_coordination
 from app.storage import ArtifactStore, get_store, resolve_dataset_for_worker
 from app.training.core import TrainingSpec, TrainingContext, run_training
+from app.training.checkpoint import find_latest_checkpoint_local, sync_checkpoints_to_oss
 from app.training.distributed import ParallelStrategy, create_strategy_from_config
 from app.worker import detect_capabilities, probe_visible_gpu
 from app.performance import ResourceSampler

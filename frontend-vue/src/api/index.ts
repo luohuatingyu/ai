@@ -57,35 +57,35 @@ request.interceptors.response.use(
 
 export default request
 
-// 封装常用方法
+// 封装常用方法（拦截器已解包 response.data，这里统一返回 Promise<any>）
 export const api = {
-  get: <T>(url: string, params?: any, config?: AxiosRequestConfig) =>
-    request.get<T>(url, { params, ...config }),
-  
-  post: <T>(url: string, data?: any, config?: AxiosRequestConfig) =>
-    request.post<T>(url, data, config),
-  
-  put: <T>(url: string, data?: any, config?: AxiosRequestConfig) =>
-    request.put<T>(url, data, config),
-  
-  patch: <T>(url: string, data?: any, config?: AxiosRequestConfig) =>
-    request.patch<T>(url, data, config),
-  
-  delete: <T>(url: string, config?: AxiosRequestConfig) =>
-    request.delete<T>(url, config),
-  
+  get: (url: string, params?: any, config?: AxiosRequestConfig): Promise<any> =>
+    request.get(url, { params, ...config }) as any,
+
+  post: (url: string, data?: any, config?: AxiosRequestConfig): Promise<any> =>
+    request.post(url, data, config) as any,
+
+  put: (url: string, data?: any, config?: AxiosRequestConfig): Promise<any> =>
+    request.put(url, data, config) as any,
+
+  patch: (url: string, data?: any, config?: AxiosRequestConfig): Promise<any> =>
+    request.patch(url, data, config) as any,
+
+  delete: (url: string, config?: AxiosRequestConfig): Promise<any> =>
+    request.delete(url, config) as any,
+
   // 文件上传
-  upload: <T>(url: string, file: File, onProgress?: (progress: number) => void) => {
+  upload: (url: string, file: File, onProgress?: (progress: number) => void): Promise<any> => {
     const formData = new FormData()
     formData.append('file', file)
-    return request.post<T>(url, formData, {
+    return request.post(url, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       onUploadProgress: (progressEvent) => {
         if (onProgress && progressEvent.total) {
           onProgress(Math.round((progressEvent.loaded * 100) / progressEvent.total))
         }
       },
-    })
+    }) as any
   },
 }
 

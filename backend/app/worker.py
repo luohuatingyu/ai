@@ -1079,6 +1079,18 @@ class TrainingWorker:
                 f"训练完成: 最佳 epoch {summary.get('best_epoch')}，"
                 f"用时 {summary.get('duration_sec')}s（worker {self.worker_id}）",
             )
+            # 模型自动注册（REQ-4：训练产物自动进入注册表；失败不阻断训练收尾）
+            try:
+                from app.registry.auto_register import try_auto_register
+
+                registered = try_auto_register(
+                    job_id=job_id, summary=summary, log_fn=lambda m: joblog(m)
+                )
+                if registered:
+                    joblog(f"模型已自动注册: {registered['name']} v{registered['version']}"
+                           f"（id={registered['id']}）")
+            except Exception as exc:  # noqa: BLE001
+                joblog(f"模型自动注册失败（不影响训练产物）: {exc}")
             jobstore.finish_current_attempt(
                 store, job_id,
                 attempt_status="completed",

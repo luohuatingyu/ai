@@ -43,6 +43,7 @@ import { Refresh, Loading, WarningFilled } from '@element-plus/icons-vue'
 
 const appStore = useAppStore()
 const items = ref<any[]>([])
+const columns: any[] = []
 const loading = ref(false)
 const error = ref('')
 

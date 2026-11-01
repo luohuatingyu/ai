@@ -40,7 +40,7 @@
         <el-table-column prop="name" label="名称" min-width="150" />
         <el-table-column prop="source" label="来源" width="100">
           <template #default="scope">
-            <el-tag :type="getSourceTag(scope.row.source)" size="small">
+            <el-tag :type="getSourceTag(scope.row.source) as any" size="small">
               {{ getSourceText(scope.row.source) }}
             </el-tag>
           </template>
@@ -136,7 +136,8 @@
           <el-input v-model="importForm.description" type="textarea" placeholder="数据集描述" />
         </el-form-item>
         <el-form-item label="标签" prop="tags">
-          <el-tag-input v-model="importForm.tags" placeholder="按回车添加标签" />
+          <el-select v-model="importForm.tags" multiple filterable allow-create default-first-option
+                     placeholder="输入标签后回车创建" style="width: 100%" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -245,7 +246,7 @@
           </el-select>
         </el-form-item>
         <el-form-item label="参数配置">
-          <el-input v-model="processForm.params_json" type="textarea" rows="8" placeholder="JSON 格式参数" />
+          <el-input v-model="processForm.params_json" type="textarea" :rows="8" placeholder="JSON 格式参数" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -253,6 +254,7 @@
         <el-button type="primary" :loading="processing" @click="submitProcess">执行</el-button>
       </template>
     </el-dialog>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -268,12 +270,12 @@ const appStore = useAppStore()
 
 // 状态
 const loading = ref(false)
-const datasets = ref([])
+const datasets = ref<any[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
 const searchForm = reactive({ search: '', tags: [] as string[] })
-const allTags = ref([])
+const allTags = ref<any[]>([])
 
 // 导入
 const showImportDialog = ref(false)
@@ -296,15 +298,15 @@ const hfFormRef = ref()
 
 // 预览
 const showPreviewDialog = ref(false)
-const previewData = ref(null)
+const previewData = ref<any>(null)
 const previewPage = ref(1)
 const previewPageSize = ref(50)
 
 // 统计
 const showStatsDialog = ref(false)
-const statsData = ref(null)
+const statsData = ref<any>(null)
 const statsTab = ref('overview')
-const columnStats = ref([])
+const columnStats = ref<any[]>([])
 
 // 预处理
 const showProcessDialog = ref(false)

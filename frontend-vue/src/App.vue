@@ -97,7 +97,7 @@
             
             <el-sub-menu index="/clusters">
               <template #title>
-                <el-icon><Server /></el-icon>
+                <el-icon><Cpu /></el-icon>
                 <span>计算集群</span>
               </template>
               <el-menu-item index="/clusters/workers">Worker 管理</el-menu-item>
@@ -135,7 +135,7 @@ import { useRoute } from 'vue-router'
 import { zhCn } from 'element-plus/es/locales.mjs'
 import {
   Monitor, User, ArrowDown, SwitchButton,
-  DataBoard, Folder, Notebook, Document, Cpu, Box, Connection, Server,
+  DataBoard, Folder, Notebook, Document, Cpu, Box, Connection,
   Loading
 } from '@element-plus/icons-vue'
 

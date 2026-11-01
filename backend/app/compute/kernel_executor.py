@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import traceback
+import types
 import uuid
 from contextlib import redirect_stdout, redirect_stderr
 from dataclasses import dataclass, field
@@ -70,9 +71,17 @@ class VariableStore:
             self.variables.clear()
     
     def _is_serializable(self, obj: Any) -> bool:
-        """检查对象是否可 JSON 序列化"""
+        """检查对象是否可 JSON 序列化。
+
+        模块/函数/类/方法等运行时对象一律拒绝（它们无法安全存入
+        JSON 列，且对"变量快照"而言没有值）；其余对象尝试 JSON 编码。
+        """
+        if isinstance(obj, (types.ModuleType, types.FunctionType,
+                            types.BuiltinFunctionType, types.MethodType,
+                            type)):
+            return False
         try:
-            json.dumps(obj, default=str)
+            json.dumps(obj)
             return True
         except (TypeError, ValueError):
             return False

@@ -137,18 +137,18 @@ services:
     restart: unless-stopped
 
   frontend:
-    # 前端容器（Vue 3 + Vite 构建产物，Nginx 托管 + /api 反向代理）
+    # 前端容器（Vue 3 + Vite 构建产物，零依赖 Node 服务托管 + /api 反向代理，无 nginx）
     build:
       context: ./frontend-vue
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
     container_name: mtp-frontend
     ports:
-      - "8000:80"   # 页面与 API 同源入口
+      - "8000:8000"   # 页面与 API 同源入口
     depends_on:
       - trainer
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -162,8 +162,10 @@ services:
         APT_MIRROR: ${APT_MIRROR:-}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: mtp-worker
-    # 计算平面：Worker 宿主进程（注册/心跳/领任务/启动内核与训练）
-    command: ["python", "-m", "app.compute.worker_host"]
+    # 计算平面：训练执行走经全生命周期验证的 TrainingWorker
+    # （领取→租约→训练→checkpoint→产物→自动注册→状态收尾）；
+    # compute.worker_host 保留为 Notebook 内核宿主的扩展入口。
+    command: ["python", "-m", "app.worker"]
     stop_grace_period: 45s
     extra_hosts:
       - "localhost:host-gateway"

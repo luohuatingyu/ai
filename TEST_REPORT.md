@@ -1,6 +1,76 @@
 # 测试报告
 
-## 本次变更测试结果：平台全面重构（新训练 API / 工作台 / 模板库 / 模型注册表 / Pipeline / 异构分布式）（2026-11-01）
+## 运行环境全面验证结果（2026-11-01）：五大需求端到端验证 32/32 通过
+
+### 验证方式与范围
+
+在真实部署栈（docker compose：seaweedfs + trainer + worker + frontend-vue）上，通过
+`backend/scripts/verify_requirements.py`（HTTP API 端到端）+ Python 3.12 容器全量测试套件
+双重验证。验证期间发现并修复 4 个集成缺陷（见下），最终 **32 项运行时检查全部 PASS，
+全量测试套件 775 通过 / 0 失败**。
+
+### 部署栈验证结果（verify_requirements.py，32/32 PASS）
+
+| 需求 | 验证项（全部 ✅） | 证据 |
+|---|---|---|
+| **REQ1 交互式工作台**（10 项） | 资源列表/摘要、创建会话并**绑定指定计算资源**、启动内核、**单步执行**、**跨单元格变量持久化**（area=28.27）、变量查看器、运行时异常捕获（ZeroDivisionError）不崩溃、异常后继续执行、**多选资源创建会话**（分布式绑定） | workers=2, session=nb-…, output=area=28.27 |
+| **REQ2 脚本模板库**（6 项） | 6 类内置模板（分类/回归/聚类/时序/LLM-SFT/LLM-DPO）、参数定义含 dataset_id/target 数据集交互字段、参数验证+默认值自动填充、非法参数拒绝、渲染为训练脚本（占位符全替换）、**一键实例化** | categories 全覆盖, rendered length=1029 |
+| **REQ3 OSS 数据集分离拉取/训练**（5 项） | 数据集导入（拉取阶段）→ 元数据就绪（rows=60）→ **训练任务引用该数据集**（计算资源从状态平面取数）→ 训练完成 → 指标完整（epoch≥2） | ds-…-1a6461 → job-…-829d4f completed |
+| **REQ4 模型注册表**（5 项） | 训练完成 → **best.pt 自动上传 OSS 且可下载**（200, 3135B）→ **注册表自动注册可见**（search 按 job_id 命中）→ 列表字段完整（含 source_job_id）→ 版本管理接口 | 自动注册 4 条, versions=['1.0.0'] |
+| **REQ5 Pipeline 编排**（4 项） | 创建菱形 DAG（4 节点）→ **DAG 节点与依赖边正确** → 未知依赖 400 拒绝 → 执行历史接口 | edges={(pull,proc_a),(pull,proc_b),(proc_a,train),(proc_b,train)} |
+| **附加**（2 项） | Worker 校验接口（不存在拒绝）、平台健康检查 | all_valid=false + 原因 |
+
+### 验证期间发现并修复的集成缺陷
+
+1. **Notebook 会话双 ID 不一致**：`db_utils.create_notebook_session` 自生成 ID 与内存会话 ID
+   不同 → 单元格写入外键失败（notebook_cells → notebook_sessions）。修复：支持 `session_id`
+   透传，`session_manager` 传入生成的 ID。
+2. **变量快照序列化崩溃**：单元格 `import math` 后模块对象进入变量快照，SQLAlchemy JSON 列
+   无法序列化 → 500。修复：`VariableStore._is_serializable` 拒绝模块/函数/类，仅保留
+   JSON 安全变量。
+3. **内置模板实例化外键失败**：内置模板仅存于代码（无 DB 行），实例化记录外键失败。
+   修复：内置模板跳过 DB 实例化记录（`template_registry.instantiate` 移除 DB 写，
+   路由层仅对用户模板记录）。
+4. **训练完成自动注册未接入执行路径**：`MODEL_AUTO_REGISTER` 配置存在但实际执行路径
+   （app.worker `_run_claimed`）从未调用注册表。修复：新增 `registry/auto_register.py`
+   单一入口（开关控制 + 失败不阻断 + 兼容 dict/TrainingSummary/旧路径产物约定），接入
+   `_run_claimed` 成功路径；`models` 列表响应补 `source_job_id` 字段。
+5. **worker 容器旧库结构崩溃**：线上 MySQL 为旧 Schema（缺 worker_id 等列）→ 任务镜像行
+   写入失败、注册表外键失败。处置：按用户确认重刷数据库（drop_all + create_all 新 Schema）。
+6. **worker 容器执行路径回归**：`compute.worker_host._run_local` 缺 checkpoint/torch 导入
+   且未实现完整任务生命周期（状态收尾/重试/产物同步）。决策：worker 容器执行回归经过全
+   生命周期验证的 `app.worker` TrainingWorker（现含自动注册），`worker_host` 保留为
+   Notebook 内核宿主扩展入口，避免训练生命周期逻辑双份维护。
+7. **前端构建链修复**（Vue 工程）：vue-tsc 1.x 与 TS 5.5+ 不兼容（升级 ^2.1.0）、
+   @vue-flow/controls 版本不存在（^1.1.0）、缺失视图文件、模板未闭合标签、图标导出名
+   （Play/Stop/Save → VideoPlay/VideoPause/DocumentChecked）、`el-tag-input` 杜撰组件
+   （改 el-select allow-create）。生成 package-lock.json（npm ci 可复现构建）。
+8. **前端去 nginx 化**（用户指令）：`frontend-vue` 采用与旧版相同的零依赖 Node 服务
+   （server.js：静态托管 dist + SPA 回退 + /api 与 /ws 流式代理 + /healthz），
+   删除 nginx.conf；docker-compose 健康检查回 /healthz。
+
+### 运行时验证记录（关键命令与结果）
+
+| 验证 | 命令 | 结果 |
+|---|---|---|
+| 容器重建 | `docker compose build trainer worker frontend` | 全部 EXIT=0 |
+| 全栈启动 | `docker compose up -d` | 4 容器 healthy/running |
+| 前端构建 | `npm ci && npm run build`（node:20 容器） | vue-tsc 0 错误 + vite ✓ built in 11.10s |
+| 前端页面 | `curl http://localhost:8000/` | Vue index.html + hash assets |
+| SPA 回退 | `curl http://localhost:8000/workbench/sessions` | 返回 index.html |
+| API 反代 | `curl http://localhost:8000/api/health` | {"ok":true} |
+| 需求验证 | `python scripts/verify_requirements.py http://localhost:8000` | **32/32 PASS** |
+| 自动注册实证 | 训练任务日志 | `[13:50:12] 模型已自动注册: classification-job-… v1.0.0（id=model-005c72b1aae2）` |
+| 全量回归 | `pytest tests/ -q`（Python 3.12 容器） | **775 passed / 0 failed / 31 skipped** |
+
+### Git 基准点
+
+- **Commit Hash**：见本次提交（End-to-end verification: fix integration defects and enable auto-registration）
+- **测试命令**：`docker run --rm -v "$(pwd):/repo" -w /repo/backend <trainer镜像> python -m pytest tests/ -q`
+
+---
+
+## 历史报告：平台全面重构（2026-11-01）
 
 ### Git 基准点与范围
 

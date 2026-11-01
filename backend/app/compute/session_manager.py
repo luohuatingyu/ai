@@ -159,7 +159,7 @@ class SessionManager:
             
             session_id = f"nb-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
             
-            # 保存到数据库
+            # 保存到数据库（传入生成的会话 ID，保证内存与 DB 行一致）
             with db_session() as db:
                 db_session_obj = create_notebook_session(
                     db=db,
@@ -169,6 +169,7 @@ class SessionManager:
                     bound_workers=bound_workers or [],
                     kernel_type=kernel_type,
                     metadata=metadata or {},
+                    session_id=session_id,
                 )
             
             session = NotebookSession(

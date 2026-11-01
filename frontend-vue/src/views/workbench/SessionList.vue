@@ -14,7 +14,7 @@
         <el-card class="session-card" :class="{ 'session-running': session.status === 'running' }">
           <div class="session-header">
             <h3 class="session-name">{{ session.name }}</h3>
-            <el-tag :type="getStatusType(session.status)" effect="dark" size="small">
+            <el-tag :type="getStatusType(session.status) as any" effect="dark" size="small">
               {{ getStatusText(session.status) }}
             </el-tag>
           </div>
@@ -35,8 +35,8 @@
               :loading="kernelLoading[session.id]"
               @click="toggleKernel(session)"
             >
-              <el-icon v-if="session.status === 'running'"><Stop /></el-icon>
-              <el-icon v-else><Play /></el-icon>
+              <el-icon v-if="session.status === 'running'"><VideoPause /></el-icon>
+              <el-icon v-else><VideoPlay /></el-icon>
               {{ session.status === 'running' ? '停止内核' : '启动内核' }}
             </el-button>
             <el-button size="small" @click="openSession(session.id)">
@@ -104,7 +104,7 @@
           </el-checkbox-group>
         </el-form-item>
         <el-form-item label="环境配置" prop="metadata">
-          <el-input v-model="createForm.metadata_json" type="textarea" rows="4" placeholder="JSON 格式环境变量/依赖配置" />
+          <el-input v-model="createForm.metadata_json" type="textarea" :rows="4" placeholder="JSON 格式环境变量/依赖配置" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -112,6 +112,7 @@
         <el-button type="primary" :loading="creating" @click="submitCreate">创建</el-button>
       </template>
     </el-dialog>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -120,18 +121,18 @@ import { useRouter } from 'vue-router'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import {
-  Plus, Play, Stop, Edit, More, Download, Delete,
-  DocumentCopy, Notebook, Server, ArrowRight
+  Plus, VideoPlay, VideoPause, Edit, More, Download, Delete,
+  DocumentCopy, Notebook, Cpu, ArrowRight
 } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const appStore = useAppStore()
 
-const sessions = ref([])
+const sessions = ref<any[]>([])
 const loading = ref(false)
 const kernelLoading = ref<Record<string, boolean>>({})
-const availableDatasets = ref([])
-const availableWorkers = ref([])
+const availableDatasets = ref<any[]>([])
+const availableWorkers = ref<any[]>([])
 
 // 新建对话框
 const showCreateDialog = ref(false)
@@ -290,7 +291,7 @@ const exportSession = async (session: any) => {
 
 const deleteSession = async (id: string) => {
   try {
-    await api.delete(`/workbench/sessions/${id}`, { force: true })
+    await api.delete(`/workbench/sessions/${id}`, { params: { force: "true" } })
     appStore.success('删除成功')
     fetchSessions()
   } catch (err) {
