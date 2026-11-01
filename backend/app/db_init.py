@@ -15,6 +15,16 @@ from app.models import (  # noqa: F401
     RemoteServerConfig,
     RemoteSSHCredentialStore,
     TrainingJob,
+    # 新增模型
+    NotebookSession,
+    NotebookCell,
+    ScriptTemplate,
+    TemplateInstantiation,
+    RegisteredModel,
+    ModelDeployment,
+    Pipeline,
+    PipelineRun,
+    PipelineStepRun,
 )
 
 

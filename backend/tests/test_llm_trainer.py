@@ -14,7 +14,7 @@ pytest.importorskip("transformers")
 pytest.importorskip("datasets")
 
 from app import llm_trainer
-from app.routers import jobs as jobs_router
+from app.routers import training_jobs as jobs_router
 from app.routers.schemas import TrainRequest
 from app.trainer import load_trainer_state
 
@@ -443,7 +443,7 @@ def test_llm_api_accepts_hub_task_and_forces_single_gpu_resource_hint(monkeypatc
         base_model="org/base-model",
         require_gpu=False,
     )
-    response = jobs_router.start_training(request)
+    response = jobs_router.create_training_job(request)
     assert response == {"job_id": "job-test-llm"}
     assert captured["resource_hint"]["require_gpu"] is True
     assert captured["params"]["dataset_source"] == "hub"

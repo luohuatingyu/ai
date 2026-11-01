@@ -30,15 +30,20 @@ def api_client(service, monkeypatch, task="classification"):
     """挂载真实路由及独立管理器，不启动应用后台线程。"""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-    from app.routers import jobs
+    from app.routers import training_jobs as jobs
+    from app.routers import clusters
 
     manager = JobManager(store=service.store, queue=service.queue, lease=service.lease,
                          start_workers=False, start_watchdog=False)
+    # clusters 路由同样引用模块级 manager，需一并补丁保证 Worker 状态一致
     monkeypatch.setattr(jobs, "manager", manager)
+    monkeypatch.setattr(clusters, "manager", manager)
     for ident in ("job-a", "job-b"):
         jobstore.write_job(service.store, {"id": ident, "status": "completed", "spec": {"task": task}})
+
     app = FastAPI()
     app.include_router(jobs.router)
+    app.include_router(clusters.router)
     return TestClient(app)
 
 
@@ -80,7 +85,7 @@ def test_workers_api_exposes_inference_capability(setup_inference, monkeypatch):
     """/api/workers 透传能力标志，前端据此在提交前禁选旧镜像计算槽。"""
     service, _ = setup_inference
     client = api_client(service, monkeypatch)
-    workers = client.get("/api/workers").json()["workers"]
+    workers = client.get("/api/clusters/workers").json()["workers"]
     flagged = next(w for w in workers if w["worker_id"] == "chosen")
     assert bool(flagged["inference"]) is True
 
@@ -309,23 +314,23 @@ def test_prediction_api_compatibility_privacy_and_ownership(setup_inference, mon
     service, _ = setup_inference
     client = api_client(service, monkeypatch)
     service.store.write_bytes(job_key("job-a", "best.pt"), b"mock-model-boundary")
-    monkeypatch.setattr("app.routers.jobs.predict_row", lambda *a, **k: {"prediction": 8})
-    legacy = client.post("/api/jobs/job-a/predict", json={"row": {}})
+    monkeypatch.setattr("app.routers.training_jobs.predict_row", lambda *a, **k: {"prediction": 8})
+    legacy = client.post("/api/training/jobs/job-a/predict", json={"row": {}})
     assert legacy.status_code == 200 and legacy.json() == {"prediction": 8}
-    accepted = client.post("/api/jobs/job-a/predict", json={"row": {"secret": 42}, "worker_id": "chosen"})
+    accepted = client.post("/api/training/jobs/job-a/predict", json={"row": {"secret": 42}, "worker_id": "chosen"})
     assert accepted.status_code == 202
     ident = accepted.json()["id"]
-    public = client.get(f"/api/jobs/job-a/inferences/{ident}")
+    public = client.get(f"/api/training/jobs/job-a/inferences/{ident}")
     assert public.status_code == 200 and public.json()["status"] == "queued"
     assert not {"payload", "token", "timeout"}.intersection(public.json())
     assert "secret" not in public.text
-    assert client.get(f"/api/jobs/job-b/inferences/{ident}").status_code == 404
-    assert client.get("/api/jobs/job-a/inferences/infer-" + "0" * 32).status_code == 404
-    assert client.get("/api/jobs/job-a/inferences/invalid").status_code == 400
+    assert client.get(f"/api/training/jobs/job-b/inferences/{ident}").status_code == 404
+    assert client.get("/api/training/jobs/job-a/inferences/infer-" + "0" * 32).status_code == 404
+    assert client.get("/api/training/jobs/job-a/inferences/invalid").status_code == 400
     for worker_id, status in [("", 422), ("x" * 161, 422), ("unknown", 409)]:
-        response = client.post("/api/jobs/job-a/predict", json={"row": {}, "worker_id": worker_id})
+        response = client.post("/api/training/jobs/job-a/predict", json={"row": {}, "worker_id": worker_id})
         assert response.status_code == status
-    assert client.post("/api/jobs/job-b/predict", json={"row": {}, "worker_id": "chosen"}).status_code == 400
+    assert client.post("/api/training/jobs/job-b/predict", json={"row": {}, "worker_id": "chosen"}).status_code == 400
 
 
 def test_device_failure_never_falls_back(setup_inference, monkeypatch, tmp_path):
@@ -432,12 +437,12 @@ def test_real_model_api_worker_predictions(setup_inference, make_dataset, monkey
     payload = {"history": list(range(8))} if task == "time_series_forecasting" else {"row": {"f1": "invalid"}}
     expected = json.loads(json.dumps(predict_row(training_dir / "best.pt", **payload)))
     for _ in range(2):
-        accepted = client.post("/api/jobs/job-a/predict", json={**payload, "worker_id": "chosen"})
+        accepted = client.post("/api/training/jobs/job-a/predict", json={**payload, "worker_id": "chosen"})
         assert accepted.status_code == 202, accepted.text
         ident = accepted.json()["id"]
         assert service.queue.inference_queue("chosen").pop(timeout=0) == ident
         service.execute(make_worker(service, caps), ident)
-        response = client.get(f"/api/jobs/job-a/inferences/{ident}")
+        response = client.get(f"/api/training/jobs/job-a/inferences/{ident}")
         assert response.status_code == 200
         record = response.json()
         assert record["status"] == "completed", record
@@ -463,15 +468,15 @@ def test_real_llm_generation_on_selected_worker(setup_inference, monkeypatch, tm
     client = api_client(service, monkeypatch, "llm_pretraining")
     payload = {"prompt": "machine learning", "max_new_tokens": 2, "temperature": 0.0, "top_p": 0.9}
     expected = {"prompt": payload["prompt"], "generated_text": generate_text(training_dir / "best_model.zip", device="cpu", **payload)}
-    legacy = client.post("/api/jobs/job-a/generate", json=payload)
+    legacy = client.post("/api/training/jobs/job-a/generate", json=payload)
     assert legacy.status_code == 200 and legacy.json() == expected
     for _ in range(2):
-        accepted = client.post("/api/jobs/job-a/generate", json={**payload, "worker_id": "chosen"})
+        accepted = client.post("/api/training/jobs/job-a/generate", json={**payload, "worker_id": "chosen"})
         assert accepted.status_code == 202, accepted.text
         ident = accepted.json()["id"]
         assert service.queue.inference_queue("chosen").pop(timeout=0) == ident
         service.execute(make_worker(service, caps), ident)
-        record = client.get(f"/api/jobs/job-a/inferences/{ident}").json()
+        record = client.get(f"/api/training/jobs/job-a/inferences/{ident}").json()
         assert record["status"] == "completed", record
         assert record["result"] == expected and record["device"] == "cpu"
 
