@@ -1,9 +1,9 @@
 import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios'
 
-// 创建 axios 实例
+// 创建 axios 实例（训练任务列表等接口可能读取大量任务指标，适当放宽超时）
 const request: AxiosInstance = axios.create({
   baseURL: '/api',
-  timeout: 30000,
+  timeout: 60000,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -22,35 +22,45 @@ request.interceptors.request.use(
   (error) => Promise.reject(error)
 )
 
-// 响应拦截器
+/** 从后端错误响应中提取可读的中文错误信息（FastAPI detail 字符串或列表）。 */
+const extractErrorMessage = (response?: { status?: number; data?: any }) => {
+  if (!response) return '网络错误或服务不可用，请检查后端服务是否启动'
+  const detail = response.data?.detail ?? response.data?.message
+  if (typeof detail === 'string' && detail) return detail
+  if (Array.isArray(detail) && detail.length > 0) {
+    // pydantic 校验错误列表：拼接字段位置与错误描述
+    const first = detail[0]
+    const path = Array.isArray(first.loc) ? first.loc.join('.') : ''
+    return `${path ? path + ': ' : ''}${first.msg || '请求参数校验失败'}`
+  }
+  const statusText: Record<number, string> = {
+    400: '请求参数无效',
+    401: '登录状态已失效',
+    403: '权限不足',
+    404: '资源不存在',
+    409: '资源状态冲突，请刷新后重试',
+    422: '请求参数校验失败',
+    500: '服务器内部错误',
+    502: '后端服务暂时不可达，请稍后重试',
+    503: '依赖服务暂不可用，请稍后重试',
+  }
+  return statusText[response.status || 0] || `请求失败 (${response.status})`
+}
+
+// 响应拦截器：统一解包 data 并把后端 detail 提取到 error.message
 request.interceptors.response.use(
-  (response: AxiosResponse) => {
-    return response.data
-  },
+  (response: AxiosResponse) => response.data,
   (error) => {
-    const { response } = error
-    if (response) {
-      switch (response.status) {
-        case 401:
-          // 未授权，跳转登录
-          localStorage.removeItem('token')
-          window.location.href = '/login'
-          break
-        case 403:
-          console.error('权限不足')
-          break
-        case 404:
-          console.error('资源不存在')
-          break
-        case 500:
-          console.error('服务器错误')
-          break
-        default:
-          console.error(`请求失败: ${response.status}`)
-      }
+    const response = error?.response
+    const message = extractErrorMessage(response)
+    if (response?.status === 401) {
+      // 未授权：清理凭证后回到入口页（当前部署为内网单用户，无独立登录页）
+      localStorage.removeItem('token')
     } else {
-      console.error('网络错误或服务不可用')
+      console.error(`[API] ${error?.config?.method?.toUpperCase() || ''} ${error?.config?.url || ''}: ${message}`)
     }
+    // 保持 axios 原始结构，同时让 err.message 直接可用于页面提示
+    error.message = message
     return Promise.reject(error)
   }
 )
@@ -74,10 +84,19 @@ export const api = {
   delete: (url: string, config?: AxiosRequestConfig): Promise<any> =>
     request.delete(url, config) as any,
 
-  // 文件上传
-  upload: (url: string, file: File, onProgress?: (progress: number) => void): Promise<any> => {
+  // 文件上传（支持同时附带描述/标签等普通表单字段）
+  upload: (
+    url: string,
+    file: File,
+    onProgress?: (progress: number) => void,
+    fields?: Record<string, any>
+  ): Promise<any> => {
     const formData = new FormData()
     formData.append('file', file)
+    for (const [key, value] of Object.entries(fields || {})) {
+      if (value === undefined || value === null) continue
+      formData.append(key, Array.isArray(value) ? JSON.stringify(value) : String(value))
+    }
     return request.post(url, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       onUploadProgress: (progressEvent) => {
