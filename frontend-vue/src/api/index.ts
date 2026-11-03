@@ -7,6 +7,21 @@ const request: AxiosInstance = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+  // 数组参数按重复键序列化（tags=a&tags=b），与 FastAPI 的 list 查询参数约定一致
+  paramsSerializer: {
+    serialize: (params: Record<string, any>) => {
+      const search = new URLSearchParams()
+      for (const [key, value] of Object.entries(params || {})) {
+        if (value === undefined || value === null || value === '') continue
+        if (Array.isArray(value)) {
+          for (const item of value) search.append(key, String(item))
+        } else {
+          search.append(key, String(value))
+        }
+      }
+      return search.toString()
+    },
+  },
 })
 
 // 请求拦截器
@@ -84,7 +99,7 @@ export const api = {
   delete: (url: string, config?: AxiosRequestConfig): Promise<any> =>
     request.delete(url, config) as any,
 
-  // 文件上传（支持同时附带描述/标签等普通表单字段）
+  // 文件上传（支持同时附带描述/标签等普通表单字段；数组按重复键追加）
   upload: (
     url: string,
     file: File,
@@ -95,7 +110,11 @@ export const api = {
     formData.append('file', file)
     for (const [key, value] of Object.entries(fields || {})) {
       if (value === undefined || value === null) continue
-      formData.append(key, Array.isArray(value) ? JSON.stringify(value) : String(value))
+      if (Array.isArray(value)) {
+        for (const item of value) formData.append(key, String(item))
+      } else {
+        formData.append(key, String(value))
+      }
     }
     return request.post(url, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },

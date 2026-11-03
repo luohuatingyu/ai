@@ -259,6 +259,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
+import { ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import {
@@ -321,7 +322,7 @@ const fetchDatasets = async () => {
       limit: pageSize.value,
       offset: (page.value - 1) * pageSize.value,
       search: searchForm.search || undefined,
-      tags: searchForm.tags.length > 0 ? searchForm.tags.join(',') : undefined,
+      tags: searchForm.tags.length > 0 ? searchForm.tags : undefined,
     })
     datasets.value = res.datasets || []
     total.value = res.total || 0
@@ -393,11 +394,11 @@ const submitImport = async () => {
   }
   importing.value = true
   try {
-    const formData = new FormData()
-    formData.append('file', importForm.file)
-    formData.append('description', importForm.description)
-    formData.append('tags', JSON.stringify(importForm.tags))
-    await api.upload('/datasets/import', importForm.file)
+    // 描述与标签随上传文件一起提交（此前构造的 FormData 未实际发送）
+    await api.upload('/datasets/import', importForm.file, undefined, {
+      description: importForm.description,
+      tags: importForm.tags,
+    })
     appStore.success('导入成功')
     showImportDialog.value = false
     importForm.file = null
@@ -427,7 +428,9 @@ const submitHuggingFace = async () => {
 }
 
 // 预览
+const previewDatasetId = ref('')
 const viewDataset = async (id: string) => {
+  previewDatasetId.value = id
   previewData.value = null
   previewPage.value = 1
   showPreviewDialog.value = true
@@ -435,8 +438,10 @@ const viewDataset = async (id: string) => {
 }
 
 const fetchPreview = async () => {
+  if (!previewDatasetId.value) return
   try {
-    const res = await api.get(`/datasets/${processForm.dataset_id || ''}`, {
+    // 使用当前预览的数据集 ID（此前误用预处理表单的 dataset_id 导致预览错乱）
+    const res = await api.get(`/datasets/${previewDatasetId.value}`, {
       rows: previewPageSize.value,
       offset: (previewPage.value - 1) * previewPageSize.value,
     })
@@ -486,8 +491,17 @@ const submitProcess = async () => {
   }
 }
 
-// 删除
+// 删除（需二次确认，防止误删）
 const deleteDataset = async (id: string) => {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除数据集 ${id}？删除后本地文件、对象存储副本与数据库镜像将一并清理，不可恢复。`,
+      '删除确认',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
   try {
     await api.delete(`/datasets/${id}`)
     appStore.success('删除成功')

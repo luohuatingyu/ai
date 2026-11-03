@@ -118,6 +118,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import {
@@ -225,9 +226,15 @@ const openSession = (id: string) => {
 const submitCreate = async () => {
   creating.value = true
   try {
-    const metadata = JSON.parse(createForm.metadata_json || '{}')
+    let metadata: Record<string, any> = {}
+    if (createForm.metadata_json.trim()) {
+      metadata = JSON.parse(createForm.metadata_json)
+    }
     await api.post('/workbench/sessions', {
-      ...createForm,
+      name: createForm.name,
+      dataset_id: createForm.dataset_id || null,
+      kernel_type: createForm.kernel_type,
+      bound_workers: createForm.bound_workers,
       metadata,
     })
     appStore.success('会话创建成功')
@@ -290,6 +297,15 @@ const exportSession = async (session: any) => {
 }
 
 const deleteSession = async (id: string) => {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除会话 ${id}？会话内的单元格与变量将一并清理。`,
+      '删除确认',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
   try {
     await api.delete(`/workbench/sessions/${id}`, { params: { force: "true" } })
     appStore.success('删除成功')
