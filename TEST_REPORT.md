@@ -1,5 +1,103 @@
 # 测试报告
 
+## 前端全面优化与训练任务列表 502 修复（2026-11-03）
+
+### 变更范围
+
+按用户确认的方案对 11 项页面与功能问题进行改造：远程服务器与凭证、Worker 管理、仪表盘、
+数据集维护、新建会话、脚本模板库、训练任务列表 502、训练任务创建、模型注册表、部署管理、
+Pipeline。模型删除采用**归档（软删除）**：`DELETE /api/models/{id}` 仅置 `status=archived`，
+不删记录与产物，前端默认筛选 `ready`、可切换查看已归档模型。
+
+**后端变更**（仅 `backend/app/routers/models.py`，+63 行）：
+- 新增 `GET /api/models/deployments`（全局部署列表，支持 model_id/status 过滤，注册在 `/{model_id}` 之前避免路由遮蔽）；
+- 新增 `DELETE /api/models/deployments/{deployment_id}`（停止部署，置 `status=stopped`）；
+- 修复 `download_model` 缺失 `import app.config` 导致本地存储模式 NameError；
+- 两个新端点在数据库不可用时返回受控 503（与 remote 路由既有模式一致）。
+
+**前端变更**（19 个文件）：
+- 502 根因修复：训练任务列表/仪表盘/任务详情此前请求不存在的 `/api/jobs`（后端实际为
+  `/api/training/jobs`），容器代理下表现为 502/404；创建任务页误拼 `/api/api/training/jobs`；
+  详情页 `.replace('{id}')` 模板字符串未替换。全部改为正确路径。
+- API 客户端：统一提取 FastAPI `detail` 到 `err.message`（含 422 字段校验信息）、超时 60s、
+  数组查询参数按重复键序列化（`tags=a&tags=b`）、upload 支持附带表单字段。
+- App.vue 渲染全局通知（此前 `appStore.success/error` 无任何 UI 呈现）+ 侧栏折叠。
+- 占位页重写为真实功能：NewSession（创建会话并跳转）、TemplateCreate/MyTemplates
+  （创建/编辑/删除用户模板）、DatasetImport（上传+示例+导入历史）、DatasetHuggingFace、
+  ModelRegistry/Deployments/ModelDetail、PipelineList/Create/Runs/RunDetail/Detail、
+  JobList/JobDetail/JobCreate（结构化表单+模板预填）、WorkerList（启停+状态）、
+  RemoteServers（登记+凭证管理+操作轮询）、TemplateDetail。
+- 存量缺陷修复：数据集预览误用预处理表单的 dataset_id、删除无二次确认（数据集/会话/
+  任务/Pipeline/凭证）、上传未携带描述与标签、会话创建把 `metadata_json` 误发后端、
+  `PipelineRunDetail` 路由改为 `/pipelines/run/:pipelineId/:runId`。
+
+### 测试执行结果（2026-11-03）
+
+| 验证 | 命令 | 结果 |
+|---|---|---|
+| 前端类型检查+构建 | `cd frontend-vue && npm run build`（vue-tsc + vite） | 类型检查 0 错误，✓ built in 7.14s |
+| 容器重建 | `docker compose up --build -d` | 4 镜像构建成功，trainer/worker/frontend 重建并启动，frontend healthy |
+| 全量回归（容器） | `docker run --rm -v "$(pwd):/repo" -w /repo/backend <trainer镜像> python -m pytest tests/ -q`（Python 3.12） | **775 passed / 0 failed / 31 skipped** |
+| API 修复验证 | `curl http://localhost:8000/api/training/jobs` | 200（修复前该页请求 `/api/jobs` → 404，代理下 502） |
+| 旧错误路径对照 | `curl http://localhost:8000/api/jobs` | 404（确认为 502 根因） |
+| 新增部署接口 | `curl .../api/models/deployments` | 200 `{"deployments":[],"total":0,...}`；删除不存在部署 → 404 `部署记录不存在` |
+| 无 DB 受控错误 | 本地 `USE_DATABASE=false` 启动后 curl | 部署接口 503 中文提示；`/api/models`、`/api/workbench/sessions` 为存量 DB 依赖 500（容器内正常） |
+| 其余接口抽查 | `/api/datasets` `/api/samples` `/api/datasets/import-history` `/api/clusters/workers` `/api/clusters/workers/summary` `/api/templates` `/api/remote-ssh-credentials` | 全部 200/503（受控） |
+| SPA 回退 | `curl http://localhost:8000/training/jobs` | 200 返回 index.html |
+| ESLint | `npx eslint .` | 不可用（项目无 ESLint 配置文件，存量情况）；类型门禁由 vue-tsc 覆盖 |
+
+**容器全量套件说明**：采用与上次基准相同的方式（trainer 镜像 + 挂载完整仓库）运行，
+结果 **775 passed / 0 failed / 31 skipped**，与基线完全一致，本次后端改动未引入失败。
+另注：曾尝试仅把 `backend/tests` 拷入运行中的 trainer 容器执行，出现 22 个失败——
+全部因仓库根目录夹具（`scripts/worker-node.sh`、launcher 等，测试以 `parents[2]` 相对解析）
+缺失所致，仓库挂载方式下不存在，非代码回归。
+
+**本机环境限制说明**：宿主机为 Python 3.9（容器为 3.12）。本机直跑 pytest 存在两类与代码
+无关的收集错误：① PEP 604 语法（已装 `eval_type_backport` 解决）；② 缺依赖
+（`openpyxl`/`datasets`/`cryptography`，共 4 个模块无法收集）。本机补装 cryptography 后
+对比基线 ca35ad5：全量跑失败集合与基线一致（watchdog/worker 类用例在全量负载下的时序抖动，
+单跑即过；`test_parallel` llm_pretraining 暂停恢复与 `test_performance` cpu quota 为可稳定
+复现的存量失败，基线同样失败），**本次变更无回归**。API 级验证以容器栈结果为准。
+
+### 关键模块测试结果
+
+- 数据层/API 层：容器全量套件 0 失败（含 storage、db_utils、trainer、API 契约）。
+- 前端：vue-tsc 全量类型检查通过；构建产物含全部 15 个重写页面 chunk。
+- 新增后端路由：200/404/503 三分支实测通过。
+
+### 重测触发条件
+
+与既有规则一致：`backend/app/`、`frontend-vue/src/` 业务代码变更、路由（`main.py`、
+`router/index.ts`）、核心配置（`config.py`、`vite.config.ts`、`docker-compose.yml`）变更后
+需重跑"前端构建 + 容器全量套件 + docker compose 重建"。
+
+### 已知问题
+
+1. 模型注册表 / 部署 / Pipeline / Notebook 会话接口依赖 MySQL（`USE_DATABASE=false` 时
+   返回 500），为既有架构行为；容器部署默认开启数据库，不受影响。
+2. `test_parallel`（llm_pretraining 暂停恢复）与 `test_performance`（cpu quota）存在存量
+   失败，与本次变更无关（基线 ca35ad5 同样失败）。
+3. ESLint 声明于 package.json 但项目无 ESLint 配置文件，`npm run lint` 不可执行。
+4. 部署"停止"仅置记录状态，推理服务实际下线依赖后续 Worker 执行器实现（后端注释中标注
+   TODO，本次未扩展）。
+
+### 下次测试建议
+
+- 为 `GET /api/models/deployments` 与 `DELETE .../deployments/{id}` 补充 pytest 契约用例
+  （当前以 curl 实测覆盖）。
+- 前端可引入 vitest 对 API 客户端的 paramsSerializer 与错误信息提取做单元测试。
+- 修复存量失败：`test_performance::test_cpu_quota_respected` 的 AttributeError、
+  `test_parallel` 的 llm_pretraining 暂停恢复。
+
+### Git 基准点
+
+- **Commit Hash**：c6d3524（Return controlled 503 for deployment endpoints when database is unavailable）
+- **分支**：emdash/hot-boxes-clean-y9u6p
+- **测试日期**：2026-11-03
+- **测试命令**：前端 `npm run build`；后端 `docker compose exec trainer python -m pytest tests/ -q`
+
+---
+
 ## 运行环境全面验证结果（2026-11-01）：五大需求端到端验证 32/32 通过
 
 ### 验证方式与范围
