@@ -89,7 +89,7 @@
               </div>
               <div class="model-mini-metrics">
                 <span v-for="(value, key) in model.metrics" :key="key" class="metric-mini">
-                  {{ key }}: {{ value.toFixed(4) }}
+                  {{ key }}: {{ Number(value).toFixed(4) }}
                 </span>
               </div>
             </div>
@@ -175,8 +175,8 @@
               <span>{{ systemInfo.gpu_count }}</span>
             </div>
             <div class="info-row">
-              <span>存储后端</span>
-              <span>{{ systemInfo.storage_backend }}</span>
+              <span>计算后端</span>
+              <span>{{ systemInfo.backend || '-' }}</span>
             </div>
           </div>
         </el-card>
@@ -208,44 +208,96 @@ const stats = ref([
 const recentJobs = ref<any[]>([])
 const recentModels = ref<any[]>([])
 const resourceSummary = ref({ total: 0, gpu: 0, cpu: 0, idle: 0, running: 0, offline: 0 })
-const systemInfo = ref({ torch_version: '-', cuda_version: '-', gpu_count: 0, storage_backend: 'local' })
+const systemInfo = ref({ torch_version: '-', cuda_version: '-', gpu_count: 0, backend: '-' })
 
+// 各接口独立请求：任一失败只影响对应区块，不拖垮整个仪表盘
 const refreshData = async () => {
   appStore.setGlobalLoading(true, '加载仪表盘数据...')
+  await Promise.allSettled([
+    loadJobStats(),
+    loadModelStats(),
+    loadDatasetStats(),
+    loadPipelineStats(),
+    loadWorkers(),
+    loadSystem(),
+  ])
+  appStore.setGlobalLoading(false)
+}
+
+// 训练任务统计与最近任务（正确路径为 /api/training/jobs，旧版误请求 /api/jobs）
+const loadJobStats = async () => {
   try {
-    const [jobsRes, modelsRes, datasetsRes, pipelinesRes, workersRes, systemRes] = await Promise.all([
-      api.get('/jobs'),
-      api.get('/models'),
-      api.get('/datasets'),
-      api.get('/pipelines'),
-      api.get('/clusters/workers/summary'),
-      api.get('/system'),
-    ])
-    
-    // 更新统计
-    stats.value[0].value = jobsRes.length?.toString() || '0'
-    stats.value[1].value = modelsRes.total?.toString() || modelsRes.models?.length?.toString() || '0'
-    stats.value[2].value = datasetsRes.total?.toString() || datasetsRes.datasets?.length?.toString() || '0'
-    stats.value[3].value = pipelinesRes.total?.toString() || pipelinesRes.pipelines?.length?.toString() || '0'
-    
-    // 最近任务
-    recentJobs.value = (jobsRes || []).slice(0, 5).map((job: any) => ({
+    const jobsRes: any = await api.get('/training/jobs')
+    const jobList = Array.isArray(jobsRes) ? jobsRes : (jobsRes.jobs || [])
+    stats.value[0].value = jobList.length.toString()
+    recentJobs.value = jobList.slice(0, 5).map((job: any) => ({
       ...job,
-      created_at: job.created_at * 1000,
+      dataset_name: job?.spec?.dataset_name || job?.spec?.dataset_id || '-',
+      task: job?.spec?.task || job.task,
+      created_at: (job.created_at || 0) * 1000,
     }))
-    
-    // 最近模型
+  } catch (err: any) {
+    appStore.warning('训练任务统计加载失败', err?.message)
+  }
+}
+
+const loadModelStats = async () => {
+  try {
+    const modelsRes: any = await api.get('/models', { limit: 8 })
+    stats.value[1].value = (modelsRes.total ?? modelsRes.models?.length ?? 0).toString()
     recentModels.value = (modelsRes.models || []).slice(0, 4)
-    
-    // 资源摘要
-    resourceSummary.value = workersRes || { total: 0, gpu: 0, cpu: 0, idle: 0, running: 0, offline: 0 }
-    
-    // 系统信息
-    systemInfo.value = systemRes || { torch_version: '-', cuda_version: '-', gpu_count: 0, storage_backend: 'local' }
-  } catch (err) {
-    appStore.error('加载失败', err.message)
-  } finally {
-    appStore.setGlobalLoading(false)
+  } catch (err: any) {
+    appStore.warning('模型统计加载失败', err?.message)
+  }
+}
+
+const loadDatasetStats = async () => {
+  try {
+    const datasetsRes: any = await api.get('/datasets', { limit: 1 })
+    stats.value[2].value = (datasetsRes.total ?? datasetsRes.datasets?.length ?? 0).toString()
+  } catch (err: any) {
+    appStore.warning('数据集统计加载失败', err?.message)
+  }
+}
+
+const loadPipelineStats = async () => {
+  try {
+    const pipelinesRes: any = await api.get('/pipelines', { limit: 1 })
+    stats.value[3].value = (pipelinesRes.total ?? pipelinesRes.pipelines?.length ?? 0).toString()
+  } catch (err: any) {
+    appStore.warning('Pipeline 统计加载失败', err?.message)
+  }
+}
+
+const loadWorkers = async () => {
+  try {
+    const workersRes: any = await api.get('/clusters/workers/summary')
+    const details = workersRes.details || []
+    resourceSummary.value = {
+      total: workersRes.total ?? details.length,
+      gpu: workersRes.gpu ?? details.filter((w: any) => w.device !== 'cpu').length,
+      cpu: workersRes.cpu ?? details.filter((w: any) => w.device === 'cpu').length,
+      idle: details.filter((w: any) => (w.state || 'idle') === 'idle' && !w.current_job).length,
+      running: details.filter((w: any) => w.current_job).length,
+      offline: 0,
+    }
+  } catch (err: any) {
+    resourceSummary.value = { total: 0, gpu: 0, cpu: 0, idle: 0, running: 0, offline: 0 }
+    appStore.warning('计算资源加载失败', err?.message)
+  }
+}
+
+const loadSystem = async () => {
+  try {
+    const systemRes: any = await api.get('/system')
+    systemInfo.value = {
+      torch_version: systemRes.torch_version || '-',
+      cuda_version: systemRes.cuda_version || '-',
+      gpu_count: systemRes.gpu_count ?? 0,
+      backend: systemRes.backend || '-',
+    }
+  } catch (err: any) {
+    appStore.warning('系统信息加载失败', err?.message)
   }
 }
 
