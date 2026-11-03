@@ -2,7 +2,7 @@
   <div class="page-view">
     <div class="page-header">
       <h1 class="page-title">执行历史</h1>
-      <el-button @click="refreshData" :loading="loading">
+      <el-button @click="fetchPipelines" :loading="pipelinesLoading">
         <el-icon><Refresh /></el-icon>
         刷新
       </el-button>

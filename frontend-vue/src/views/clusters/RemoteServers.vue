@@ -39,7 +39,7 @@
           </el-table-column>
           <el-table-column label="模式" width="90">
             <template #default="scope">
-              <el-tag size="small" :type="scope.row.mode === 'gpu' ? 'success' : 'info'">
+              <el-tag size="small" :type="(scope.row.mode === 'gpu' ? 'success' : 'info') as any">
                 {{ scope.row.mode === 'gpu' ? 'GPU' : 'CPU' }}
               </el-tag>
             </template>
@@ -177,7 +177,7 @@
     <!-- 远程操作进度对话框 -->
     <el-dialog v-model="showOperationDialog" :title="`远程操作：${operationAction}`" width="720px" :close-on-click-modal="false">
       <div class="op-status">
-        <el-tag :type="operationStatusTag" effect="dark">{{ operationStatusText }}</el-tag>
+        <el-tag :type="operationStatusTag as any" effect="dark">{{ operationStatusText }}</el-tag>
         <span v-if="operationMachine" class="op-machine">{{ operationMachine }}</span>
       </div>
       <div class="op-output" ref="outputRef">
