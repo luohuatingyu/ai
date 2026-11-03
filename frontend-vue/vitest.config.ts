@@ -13,6 +13,8 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      // monaco-editor 包缺少 main 字段，vite-node 无法解析；测试环境用轻量桩替代
+      'monaco-editor': path.resolve(__dirname, './src/test/monaco-stub.ts'),
     },
   },
   test: {

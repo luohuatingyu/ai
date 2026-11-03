@@ -42,6 +42,9 @@ export async function mountPage(
   const wrapper = mount(component, {
     global: { plugins: [ElementPlus, router, pinia] },
   })
+  // 多轮 flush：覆盖动态 import（如 monaco 桩）与接口响应的异步链路
+  await flushPromises()
+  await flushPromises()
   await flushPromises()
   return { wrapper, pinia, router }
 }

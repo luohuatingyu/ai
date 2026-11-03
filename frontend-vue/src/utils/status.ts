@@ -23,6 +23,16 @@ export const JOB_STATUS: Record<string, StatusMeta> = {
   cancelled: { label: '已取消', type: 'info' },
 }
 
+/** 交互式工作台会话状态 */
+export const SESSION_STATUS: Record<string, StatusMeta> = {
+  starting: { label: '启动中', type: 'info' },
+  running: { label: '运行中', type: 'success' },
+  idle: { label: '空闲', type: 'warning' },
+  busy: { label: '忙碌', type: 'primary' },
+  stopped: { label: '已停止', type: 'info' },
+  error: { label: '错误', type: 'danger' },
+}
+
 /** 数据集来源 */
 export const DATASET_SOURCE: Record<string, StatusMeta> = {
   local: { label: '本地上传', type: 'success' },

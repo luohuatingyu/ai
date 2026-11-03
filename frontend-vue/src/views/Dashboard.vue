@@ -41,7 +41,7 @@
           >
             <el-table-column prop="name" label="任务名称" min-width="160" show-overflow-tooltip>
               <template #default="{ row }">
-                <el-link type="primary" :underline="false" @click="viewJob(row.id)">
+                <el-link type="primary" underline="never" @click="viewJob(row.id)">
                   {{ row.name || row.id }}
                 </el-link>
               </template>

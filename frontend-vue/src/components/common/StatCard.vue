@@ -26,7 +26,7 @@
  * - clickable 时渲染为 button（键盘可达，回车触发 click）；
  * - tone 控制图标底色语义（蓝=任务、绿=成功、橙=资源、红=异常…）。
  */
-import type { Component } from 'vue'
+import { computed, type Component } from 'vue'
 
 const props = withDefaults(
   defineProps<{
@@ -53,6 +53,6 @@ const props = withDefaults(
 
 const emit = defineEmits<{ click: [] }>()
 
-/** 数值展示：数字直接展示，避免科学计数法 */
-const displayValue = props.value
+/** 数值展示：computed 保持响应（props.value 更新后文本同步刷新） */
+const displayValue = computed(() => props.value)
 </script>
