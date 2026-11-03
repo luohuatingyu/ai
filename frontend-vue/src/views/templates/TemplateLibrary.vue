@@ -94,7 +94,7 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
-import { Plus, View, VideoPlay, Document, Folder } from '@element-plus/icons-vue'
+import { Plus, View, VideoPlay, Document } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const appStore = useAppStore()

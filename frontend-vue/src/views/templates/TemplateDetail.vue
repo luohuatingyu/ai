@@ -66,15 +66,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api'
-import { useAppStore } from '@/stores/app'
 import { ArrowLeft, WarningFilled } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
-const appStore = useAppStore()
 const detail = ref<any>(null)
 const loading = ref(false)
 const error = ref('')

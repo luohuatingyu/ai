@@ -180,14 +180,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { marked } from 'marked'
 import {
   ArrowLeft, VideoPlay, VideoPause, Plus, Document, More, DocumentChecked, Download, Delete,
-  ArrowUp, ArrowDown, DocumentCopy, Notebook
+  ArrowUp, ArrowDown, DocumentCopy
 } from '@element-plus/icons-vue'
 
 // 动态导入 Monaco Editor
@@ -480,7 +480,7 @@ const clearCellOutput = async (index: number) => {
 const saveNotebook = async () => {
   try {
     await api.put(`/workbench/sessions/${sessionId}/notebook`, {
-      cells: cells.value.map((c, i) => ({
+      cells: cells.value.map((c) => ({
         cell_type: c.cell_type,
         source: c.source,
         outputs: c.outputs,

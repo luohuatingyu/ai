@@ -1,108 +1,146 @@
 <template>
-  <div class="dataset-list">
-    <div class="page-header">
-      <h1 class="page-title">数据集列表</h1>
-      <div class="header-actions">
-        <el-button type="primary" @click="showImportDialog = true">
-          <el-icon><Upload /></el-icon>
-          导入数据集
-        </el-button>
-        <el-button @click="showHuggingFaceDialog = true">
-          <el-icon><Link /></el-icon>
-          HuggingFace
-        </el-button>
-      </div>
-    </div>
-    
-    <!-- 搜索栏 -->
-    <el-card class="mb-20">
-      <el-form :model="searchForm" inline size="small">
-        <el-form-item label="搜索">
-          <el-input v-model="searchForm.search" placeholder="名称/描述/列名" clearable style="width: 250px" />
-        </el-form-item>
-        <el-form-item label="标签">
-          <el-select v-model="searchForm.tags" multiple placeholder="选择标签" style="width: 200px">
-            <el-option v-for="tag in allTags" :key="tag" :label="tag" :value="tag" />
-          </el-select>
-        </el-form-item>
-        <el-form-item>
-          <el-button type="primary" @click="fetchDatasets">搜索</el-button>
-          <el-button @click="resetSearch">重置</el-button>
-        </el-form-item>
-      </el-form>
-    </el-card>
-    
+  <PageShell title="数据集列表" module="数据集管理" description="统一浏览、检索与管理平台数据集，支持预览、统计与预处理">
+    <template #actions>
+      <el-button @click="fetchDatasets" :loading="loading">
+        <el-icon class="gap-8"><Refresh /></el-icon>
+        刷新
+      </el-button>
+      <el-button @click="router.push('/datasets/huggingface')">
+        <el-icon class="gap-8"><Link /></el-icon>
+        HuggingFace 导入
+      </el-button>
+      <el-button type="primary" @click="router.push('/datasets/import')">
+        <el-icon class="gap-8"><Upload /></el-icon>
+        导入数据集
+      </el-button>
+    </template>
+
+    <!-- 筛选区：搜索 + 标签；回车或点击搜索按钮触发查询 -->
+    <FilterBar>
+      <el-input
+        v-model="searchForm.search"
+        placeholder="搜索名称 / 描述 / 列名"
+        clearable
+        style="width: 240px"
+        :prefix-icon="Search"
+        @keyup.enter="onSearch"
+        @clear="onSearch"
+      />
+      <el-select
+        v-model="searchForm.tags"
+        multiple
+        collapse-tags
+        collapse-tags-tooltip
+        placeholder="按标签筛选"
+        style="width: 220px"
+      >
+        <el-option v-for="tag in allTags" :key="tag" :label="tag" :value="tag" />
+      </el-select>
+      <el-button type="primary" plain @click="onSearch">搜索</el-button>
+      <el-button @click="resetSearch">重置</el-button>
+      <template #actions>
+        <span class="text-xs text-secondary">共 {{ formatInteger(total) }} 个数据集</span>
+      </template>
+    </FilterBar>
+
     <!-- 数据集表格 -->
-    <el-card>
-      <el-table :data="datasets" border size="small" style="width: 100%" v-loading="loading">
-        <el-table-column type="selection" width="55" />
-        <el-table-column prop="id" label="ID" width="180" />
-        <el-table-column prop="name" label="名称" min-width="150" />
-        <el-table-column prop="source" label="来源" width="100">
-          <template #default="scope">
-            <el-tag :type="getSourceTag(scope.row.source) as any" size="small">
-              {{ getSourceText(scope.row.source) }}
-            </el-tag>
+    <SectionCard flush>
+      <el-table
+        v-loading="loading"
+        :data="datasets"
+        class="table-card"
+        :header-cell-style="{ background: 'var(--mtp-bg-subtle)' }"
+      >
+        <el-table-column prop="name" label="名称" min-width="200" show-overflow-tooltip>
+          <template #default="{ row }">
+            <div class="ds-name">
+              <span class="ds-name__title">{{ row.name }}</span>
+              <span class="ds-name__id">{{ row.id }}</span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column prop="rows" label="行数" width="80">
-          <template #default="scope">
-            {{ formatNumber(scope.row.rows) }}
+        <el-table-column prop="source" label="来源" width="120">
+          <template #default="{ row }">
+            <StatusTag :status="row.source" :map="DATASET_SOURCE" />
           </template>
         </el-table-column>
-        <el-table-column prop="columns" label="列数" width="80">
-          <template #default="scope">
-            {{ scope.row.columns?.length || 0 }}
+        <el-table-column label="规模" width="150">
+          <template #default="{ row }">
+            <span class="mono">{{ formatInteger(row.rows) }}</span> 行 ×
+            <span class="mono">{{ row.columns?.length || 0 }}</span> 列
           </template>
         </el-table-column>
-        <el-table-column label="标签" min-width="150">
-          <template #default="scope">
-            <el-tag v-for="tag in scope.row.tags" :key="tag" size="small" effect="light">{{ tag }}</el-tag>
+        <el-table-column label="标签" min-width="160">
+          <template #default="{ row }">
+            <template v-if="row.tags?.length">
+              <el-tag v-for="tag in row.tags" :key="tag" size="small" effect="plain" class="mr-4">{{ tag }}</el-tag>
+            </template>
+            <span v-else class="text-ink-400">-</span>
           </template>
         </el-table-column>
-        <el-table-column prop="created_at" label="创建时间" width="160">
-          <template #default="scope">
-            {{ formatDate(scope.row.created_at) }}
-          </template>
+        <el-table-column prop="created_at" label="创建时间" width="130">
+          <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right">
-          <template #default="scope">
-            <el-dropdown>
-              <el-button size="small" link>
-                操作
-                <el-icon><ArrowDown /></el-icon>
+        <el-table-column label="操作" width="210" fixed="right">
+          <template #default="{ row }">
+            <div class="row-actions">
+              <el-button link type="primary" size="small" @click="viewDataset(row)">
+                <el-icon><View /></el-icon>预览
               </el-button>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item @click="viewDataset(scope.row.id)">
-                    <el-icon><View /></el-icon>
-                    <span>预览</span>
-                  </el-dropdown-item>
-                  <el-dropdown-item @click="viewStats(scope.row.id)">
-                    <el-icon><DataAnalysis /></el-icon>
-                    <span>统计信息</span>
-                  </el-dropdown-item>
-                  <el-dropdown-item @click="processDataset(scope.row.id)">
-                    <el-icon><Setting /></el-icon>
-                    <span>预处理</span>
-                  </el-dropdown-item>
-                  <el-dropdown-item @click="materializeDataset(scope.row.id)" v-if="scope.row.source === 'huggingface'">
-                    <el-icon><Download /></el-icon>
-                    <span>下载到本地</span>
-                  </el-dropdown-item>
-                  <el-dropdown-item divided @click="deleteDataset(scope.row.id)">
-                    <el-icon><Delete /></el-icon>
-                    <span style="color: #f56c6c">删除</span>
-                  </el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
+              <el-button link type="primary" size="small" @click="viewStats(row)">
+                <el-icon><DataAnalysis /></el-icon>统计
+              </el-button>
+              <el-dropdown trigger="click" @command="(cmd: string) => onRowCommand(cmd, row)">
+                <el-button link size="small">
+                  更多<el-icon><ArrowDown /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="process">
+                      <el-icon><Setting /></el-icon>预处理
+                    </el-dropdown-item>
+                    <el-dropdown-item v-if="row.source === 'huggingface'" command="materialize">
+                      <el-icon><Download /></el-icon>下载到本地
+                    </el-dropdown-item>
+                    <el-dropdown-item command="delete" divided>
+                      <el-icon style="color: var(--mtp-danger)"><Delete /></el-icon>
+                      <span style="color: var(--mtp-danger)">删除</span>
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </div>
           </template>
         </el-table-column>
+        <template #empty>
+          <!-- 首次加载失败 → 可重试错误态；有筛选条件 → 无匹配；否则 → 引导导入 -->
+          <EmptyState
+            v-if="loadError"
+            type="error"
+            title="数据集加载失败"
+            :description="loadError"
+            retryable
+            @retry="fetchDatasets"
+          />
+          <EmptyState
+            v-else-if="hasFilter"
+            title="没有匹配的数据集"
+            description="调整搜索关键词或标签筛选后重试"
+          >
+            <template #actions>
+              <el-button size="small" @click="resetSearch">清除筛选</el-button>
+            </template>
+          </EmptyState>
+          <EmptyState v-else title="暂无数据集" description="导入本地文件或从 HuggingFace 拉取数据集开始使用">
+            <template #actions>
+              <el-button type="primary" size="small" @click="router.push('/datasets/import')">导入数据集</el-button>
+              <el-button size="small" @click="router.push('/datasets/huggingface')">HuggingFace 导入</el-button>
+            </template>
+          </EmptyState>
+        </template>
       </el-table>
-      
-      <!-- 分页 -->
-      <div class="pagination" v-if="total > 0">
+
+      <div class="table-pagination" v-if="total > 0">
         <el-pagination
           v-model:current-page="page"
           v-model:page-size="pageSize"
@@ -113,128 +151,83 @@
           @current-change="onPageChange"
         />
       </div>
-    </el-card>
-    
-    <!-- 导入对话框 -->
-    <el-dialog v-model="showImportDialog" title="导入数据集" width="600px">
-      <el-form :model="importForm" ref="importFormRef" label-width="100px">
-        <el-form-item label="文件" prop="file">
-          <el-upload
-            action="#"
-            :auto-upload="false"
-            :on-change="handleFileChange"
-            :show-file-list="true"
-            accept=".csv,.zip,.tar,.gz"
-          >
-            <el-button type="primary">选择文件</el-button>
-            <template #tip>
-              <div>支持 CSV、ZIP 压缩包，最大 500MB</div>
-            </template>
-          </el-upload>
-        </el-form-item>
-        <el-form-item label="描述" prop="description">
-          <el-input v-model="importForm.description" type="textarea" placeholder="数据集描述" />
-        </el-form-item>
-        <el-form-item label="标签" prop="tags">
-          <el-select v-model="importForm.tags" multiple filterable allow-create default-first-option
-                     placeholder="输入标签后回车创建" style="width: 100%" />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="showImportDialog = false">取消</el-button>
-        <el-button type="primary" :loading="importing" @click="submitImport">导入</el-button>
-      </template>
-    </el-dialog>
-    
-    <!-- HuggingFace 对话框 -->
-    <el-dialog v-model="showHuggingFaceDialog" title="从 HuggingFace 导入" width="600px">
-      <el-form :model="hfForm" ref="hfFormRef" label-width="100px">
-        <el-form-item label="仓库 ID" prop="repo_id">
-          <el-input v-model="hfForm.repo_id" placeholder="如: imdb, squad, glue" />
-        </el-form-item>
-        <el-form-item label="版本" prop="revision">
-          <el-input v-model="hfForm.revision" placeholder="main (默认)" />
-        </el-form-item>
-        <el-form-item label="子集" prop="subset">
-          <el-input v-model="hfForm.subset" placeholder="可选，如: en, zh" />
-        </el-form-item>
-        <el-form-item label="Split" prop="split">
-          <el-select v-model="hfForm.split" placeholder="选择 split">
-            <el-option label="train" value="train" />
-            <el-option label="test" value="test" />
-            <el-option label="validation" value="validation" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="存储模式" prop="storage_mode">
-          <el-radio-group v-model="hfForm.storage_mode">
-            <el-radio value="local">本地存储</el-radio>
-            <el-radio value="oss">对象存储 (OSS)</el-radio>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item label="描述" prop="description">
-          <el-input v-model="hfForm.description" type="textarea" placeholder="数据集描述" />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="showHuggingFaceDialog = false">取消</el-button>
-        <el-button type="primary" :loading="hfImporting" @click="submitHuggingFace">导入</el-button>
-      </template>
-    </el-dialog>
-    
-    <!-- 预览对话框 -->
-    <el-dialog v-model="showPreviewDialog" title="数据集预览" width="90%" fullscreen>
-      <div v-if="previewData">
-        <div class="preview-header">
-          <h3>{{ previewData.name }} ({{ previewData.rows }} 行 × {{ previewData.columns?.length || 0 }} 列)</h3>
-          <div class="preview-pagination">
+    </SectionCard>
+
+    <!-- 预览抽屉：数据抽样浏览 -->
+    <el-drawer v-model="showPreviewDrawer" :title="`数据预览 · ${previewDatasetName}`" size="72%" destroy-on-close>
+      <div v-loading="previewLoading" class="preview-body">
+        <template v-if="previewData">
+          <div class="preview-meta mb-12">
+            <el-tag effect="plain" size="small">{{ formatInteger(previewData.rows) }} 行</el-tag>
+            <el-tag effect="plain" size="small">{{ previewData.columns?.length || 0 }} 列</el-tag>
+            <el-tag effect="plain" size="small">第 {{ previewPage }} / {{ Math.max(1, Math.ceil(previewData.rows / previewPageSize)) }} 页</el-tag>
+          </div>
+          <el-table :data="previewData.preview" class="table-card" border size="small" max-height="560">
+            <el-table-column
+              v-for="col in previewData.columns"
+              :key="col"
+              :prop="col"
+              :label="col"
+              min-width="120"
+              show-overflow-tooltip
+            />
+          </el-table>
+          <div class="table-pagination">
             <el-pagination
               v-model:current-page="previewPage"
               :page-size="previewPageSize"
               :total="previewData.rows"
               layout="prev, pager, next, jumper"
               @current-change="fetchPreview"
-              size="small"
             />
           </div>
-        </div>
-        <el-table :data="previewData.preview" border size="small" style="width: 100%">
-          <el-table-column v-for="col in previewData.columns" :key="col" :prop="col" :label="col" />
-        </el-table>
+        </template>
+        <EmptyState v-else-if="previewError" type="error" title="预览加载失败" :description="previewError" retryable @retry="fetchPreview" />
       </div>
-    </el-dialog>
-    
-    <!-- 统计信息对话框 -->
-    <el-dialog v-model="showStatsDialog" title="统计信息" width="800px">
+    </el-drawer>
+
+    <!-- 统计抽屉：概览 + 列详情 -->
+    <el-drawer v-model="showStatsDrawer" :title="`统计信息 · ${statsDatasetName}`" size="62%" destroy-on-close>
       <div v-if="statsData">
         <el-tabs v-model="statsTab">
           <el-tab-pane label="概览" name="overview">
-            <el-descriptions :column="2" border>
-              <el-descriptions-item label="总行数">{{ statsData.total_rows }}</el-descriptions-item>
+            <el-descriptions :column="3" border>
+              <el-descriptions-item label="总行数">{{ formatInteger(statsData.total_rows) }}</el-descriptions-item>
               <el-descriptions-item label="总列数">{{ statsData.total_columns }}</el-descriptions-item>
               <el-descriptions-item label="内存占用">{{ (statsData.memory_usage_mb || 0).toFixed(2) }} MB</el-descriptions-item>
             </el-descriptions>
           </el-tab-pane>
           <el-tab-pane label="列详情" name="columns">
-            <el-table :data="columnStats" border size="small" style="width: 100%">
-              <el-table-column prop="column" label="列名" />
+            <el-table :data="columnStats" class="table-card" border size="small" max-height="520">
+              <el-table-column prop="column" label="列名" min-width="120" show-overflow-tooltip />
               <el-table-column prop="type" label="类型" width="100" />
-              <el-table-column prop="null_count" label="空值数" width="100" />
-              <el-table-column prop="unique_count" label="唯一值数" width="100" />
-              <el-table-column prop="min" label="最小值" width="100" />
-              <el-table-column prop="max" label="最大值" width="100" />
-              <el-table-column prop="mean" label="平均值" width="100" />
-              <el-table-column prop="std" label="标准差" width="100" />
+              <el-table-column prop="null_count" label="空值数" width="90" />
+              <el-table-column prop="unique_count" label="唯一值" width="90" />
+              <el-table-column prop="min" label="最小值" width="100" show-overflow-tooltip />
+              <el-table-column prop="max" label="最大值" width="100" show-overflow-tooltip />
+              <el-table-column prop="mean" label="平均值" width="100" show-overflow-tooltip />
+              <el-table-column prop="std" label="标准差" width="100" show-overflow-tooltip />
             </el-table>
           </el-tab-pane>
         </el-tabs>
       </div>
-    </el-dialog>
-    
-    <!-- 预处理对话框 -->
-    <el-dialog v-model="showProcessDialog" title="数据预处理" width="800px">
-      <el-form :model="processForm" label-width="120px">
-        <el-form-item label="操作类型">
-          <el-select v-model="processForm.operation_type" placeholder="选择预处理操作" style="width: 300px">
+      <EmptyState v-else-if="statsError" type="error" title="统计加载失败" :description="statsError" retryable @retry="retryStats" />
+      <div v-else v-loading="true" class="stats-loading" />
+    </el-drawer>
+
+    <!-- 预处理对话框：操作类型 + JSON 参数（带校验） -->
+    <el-dialog v-model="showProcessDialog" title="数据预处理" width="640px" destroy-on-close>
+      <el-alert
+        v-if="processForm.datasetName"
+        :title="`目标数据集：${processForm.datasetName}`"
+        type="info"
+        :closable="false"
+        class="mb-12"
+        show-icon
+      />
+      <el-form label-width="100px">
+        <el-form-item label="操作类型" required>
+          <el-select v-model="processForm.operation_type" placeholder="选择预处理操作" style="width: 100%">
             <el-option label="去除重复行" value="remove_duplicates" />
             <el-option label="填充缺失值" value="fill_missing" />
             <el-option label="数值归一化" value="normalize" />
@@ -245,8 +238,14 @@
             <el-option label="列转换" value="transform_column" />
           </el-select>
         </el-form-item>
-        <el-form-item label="参数配置">
-          <el-input v-model="processForm.params_json" type="textarea" :rows="8" placeholder="JSON 格式参数" />
+        <el-form-item label="参数配置" :error="processParamsError">
+          <el-input
+            v-model="processForm.params_json"
+            type="textarea"
+            :rows="6"
+            placeholder='JSON 格式参数，如 {"columns": ["age"]}'
+            class="mono"
+          />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -254,71 +253,80 @@
         <el-button type="primary" :loading="processing" @click="submitProcess">执行</el-button>
       </template>
     </el-dialog>
-  </div>
+  </PageShell>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+/**
+ * 数据集列表：筛选检索、规模总览、表格管理与快速操作。
+ * - 预览与统计使用抽屉（避免整页跳转），预处理保留对话框；
+ * - 导入入口统一跳转到独立页面（/datasets/import、/datasets/huggingface），
+ *   本页不再重复放置导入表单；
+ * - 空态区分"加载失败 / 筛选无结果 / 完全无数据"三种情形。
+ */
+import { ref, reactive, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
+import PageShell from '@/components/common/PageShell.vue'
+import FilterBar from '@/components/common/FilterBar.vue'
+import SectionCard from '@/components/common/SectionCard.vue'
+import StatusTag from '@/components/common/StatusTag.vue'
+import EmptyState from '@/components/common/EmptyState.vue'
+import { DATASET_SOURCE } from '@/utils/status'
+import { formatDateTime, formatInteger, tryParseJSON } from '@/utils/format'
 import {
-  Upload, Link, View, DataAnalysis, Setting, Download, Delete,
-  ArrowDown, Folder, DataBoard
+  Refresh, Upload, Link, View, DataAnalysis, Setting, Download, Delete, ArrowDown, Search,
 } from '@element-plus/icons-vue'
 
+const router = useRouter()
 const appStore = useAppStore()
 
-// 状态
+// ---- 列表状态 ----
 const loading = ref(false)
+const loadError = ref('')
 const datasets = ref<any[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
 const searchForm = reactive({ search: '', tags: [] as string[] })
-const allTags = ref<any[]>([])
+const allTags = ref<string[]>([])
 
-// 导入
-const showImportDialog = ref(false)
-const importing = ref(false)
-const importForm = reactive({ file: null as File | null, description: '', tags: [] as string[] })
-const importFormRef = ref()
+/** 是否处于筛选状态（决定空态文案） */
+const hasFilter = computed(() => Boolean(searchForm.search) || searchForm.tags.length > 0)
 
-// HuggingFace
-const showHuggingFaceDialog = ref(false)
-const hfImporting = ref(false)
-const hfForm = reactive({
-  repo_id: '',
-  revision: 'main',
-  subset: '',
-  split: 'train',
-  storage_mode: 'local',
-  description: '',
-})
-const hfFormRef = ref()
-
-// 预览
-const showPreviewDialog = ref(false)
+// ---- 预览 ----
+const showPreviewDrawer = ref(false)
+const previewLoading = ref(false)
+const previewError = ref('')
 const previewData = ref<any>(null)
+const previewDatasetName = ref('')
+const previewDatasetId = ref('')
 const previewPage = ref(1)
 const previewPageSize = ref(50)
 
-// 统计
-const showStatsDialog = ref(false)
+// ---- 统计 ----
+const showStatsDrawer = ref(false)
+const statsError = ref('')
 const statsData = ref<any>(null)
+const statsDatasetName = ref('')
+const statsDatasetId = ref('')
 const statsTab = ref('overview')
 const columnStats = ref<any[]>([])
 
-// 预处理
+// ---- 预处理 ----
 const showProcessDialog = ref(false)
 const processing = ref(false)
-const processForm = reactive({ dataset_id: '', operation_type: '', params_json: '{}' })
+const processParamsError = ref('')
+const processForm = reactive({ datasetId: '', datasetName: '', operation_type: '', params_json: '{}' })
 
-// 方法
+/** 拉取数据集列表（带筛选与分页） */
 const fetchDatasets = async () => {
   loading.value = true
+  loadError.value = ''
   try {
-    const res = await api.get('/datasets', {
+    const res: any = await api.get('/datasets', {
       limit: pageSize.value,
       offset: (page.value - 1) * pageSize.value,
       search: searchForm.search || undefined,
@@ -326,20 +334,35 @@ const fetchDatasets = async () => {
     })
     datasets.value = res.datasets || []
     total.value = res.total || 0
-  } catch (err) {
-    appStore.error('加载失败', err.message)
+  } catch (err: any) {
+    loadError.value = err?.message || '网络错误'
+    appStore.error('加载失败', err?.message)
   } finally {
     loading.value = false
   }
 }
 
+/** 拉取可选标签（失败静默：标签筛选退化为手工输入场景） */
 const fetchTags = async () => {
   try {
-    const res = await api.get('/datasets/tags')
+    const res: any = await api.get('/datasets/tags')
     allTags.value = res.tags || []
   } catch (err) {
     console.error('获取标签失败', err)
   }
+}
+
+/** 搜索：回到第一页再查询 */
+const onSearch = () => {
+  page.value = 1
+  fetchDatasets()
+}
+
+const resetSearch = () => {
+  searchForm.search = ''
+  searchForm.tags = []
+  page.value = 1
+  fetchDatasets()
 }
 
 const onPageChange = (p: number) => {
@@ -353,149 +376,113 @@ const onPageSizeChange = (size: number) => {
   fetchDatasets()
 }
 
-const resetSearch = () => {
-  searchForm.search = ''
-  searchForm.tags = []
-  page.value = 1
-  fetchDatasets()
+// ---- 行操作分发 ----
+const onRowCommand = (command: string, row: any) => {
+  if (command === 'process') openProcess(row)
+  else if (command === 'materialize') materializeDataset(row)
+  else if (command === 'delete') deleteDataset(row)
 }
 
-const getSourceTag = (source: string) => {
-  const map: Record<string, string> = { local: 'success', huggingface: 'info', oss: 'warning' }
-  return map[source] || 'info'
-}
-
-const getSourceText = (source: string) => {
-  const map: Record<string, string> = { local: '本地上传', huggingface: 'HuggingFace', oss: '对象存储' }
-  return map[source] || source
-}
-
-const formatDate = (ts: number) => {
-  if (!ts) return '-'
-  return new Date(ts * 1000).toLocaleString('zh-CN')
-}
-
-const formatNumber = (num: number) => {
-  if (!num) return '0'
-  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M'
-  if (num >= 1000) return (num / 1000).toFixed(1) + 'K'
-  return num.toString()
-}
-
-// 导入处理
-const handleFileChange = (file: any) => {
-  importForm.file = file.raw
-}
-
-const submitImport = async () => {
-  if (!importForm.file) {
-    appStore.warning('请选择文件')
-    return
-  }
-  importing.value = true
-  try {
-    // 描述与标签随上传文件一起提交（此前构造的 FormData 未实际发送）
-    await api.upload('/datasets/import', importForm.file, undefined, {
-      description: importForm.description,
-      tags: importForm.tags,
-    })
-    appStore.success('导入成功')
-    showImportDialog.value = false
-    importForm.file = null
-    importForm.description = ''
-    importForm.tags = []
-    fetchDatasets()
-  } catch (err) {
-    appStore.error('导入失败', err.message)
-  } finally {
-    importing.value = false
-  }
-}
-
-const submitHuggingFace = async () => {
-  hfImporting.value = true
-  try {
-    await api.post('/datasets/hub', hfForm)
-    appStore.success('HuggingFace 数据集导入成功')
-    showHuggingFaceDialog.value = false
-    Object.assign(hfForm, { repo_id: '', revision: 'main', subset: '', split: 'train', storage_mode: 'local', description: '' })
-    fetchDatasets()
-  } catch (err) {
-    appStore.error('导入失败', err.message)
-  } finally {
-    hfImporting.value = false
-  }
-}
-
-// 预览
-const previewDatasetId = ref('')
-const viewDataset = async (id: string) => {
-  previewDatasetId.value = id
+// ---- 预览 ----
+const viewDataset = (row: any) => {
+  previewDatasetId.value = row.id
+  previewDatasetName.value = row.name || row.id
   previewData.value = null
+  previewError.value = ''
   previewPage.value = 1
-  showPreviewDialog.value = true
-  await fetchPreview()
+  showPreviewDrawer.value = true
+  fetchPreview()
 }
 
 const fetchPreview = async () => {
   if (!previewDatasetId.value) return
+  previewLoading.value = true
+  previewError.value = ''
   try {
-    // 使用当前预览的数据集 ID（此前误用预处理表单的 dataset_id 导致预览错乱）
-    const res = await api.get(`/datasets/${previewDatasetId.value}`, {
+    const res: any = await api.get(`/datasets/${previewDatasetId.value}`, {
       rows: previewPageSize.value,
       offset: (previewPage.value - 1) * previewPageSize.value,
     })
     previewData.value = res
-  } catch (err) {
-    appStore.error('预览失败', err.message)
+  } catch (err: any) {
+    previewError.value = err?.message || '网络错误'
+    appStore.error('预览失败', err?.message)
+  } finally {
+    previewLoading.value = false
   }
 }
 
-// 统计
-const viewStats = async (id: string) => {
+// ---- 统计 ----
+const viewStats = async (row: any) => {
+  statsDatasetId.value = row.id
+  statsDatasetName.value = row.name || row.id
+  statsData.value = null
+  statsError.value = ''
+  statsTab.value = 'overview'
+  showStatsDrawer.value = true
+  await loadStats()
+}
+
+const loadStats = async () => {
+  if (!statsDatasetId.value) return
   try {
-    const res = await api.get(`/datasets/${id}/stats`)
+    const res: any = await api.get(`/datasets/${statsDatasetId.value}/stats`)
     statsData.value = res
     columnStats.value = Object.entries(res.column_stats || {}).map(([col, stat]: [string, any]) => ({
       column: col,
       ...stat,
     }))
-    showStatsDialog.value = true
-  } catch (err) {
-    appStore.error('获取统计失败', err.message)
+  } catch (err: any) {
+    statsError.value = err?.message || '网络错误'
+    appStore.error('获取统计失败', err?.message)
   }
 }
 
-// 预处理
-const processDataset = (id: string) => {
-  processForm.dataset_id = id
+const retryStats = () => loadStats()
+
+// ---- 预处理 ----
+const openProcess = (row: any) => {
+  processForm.datasetId = row.id
+  processForm.datasetName = row.name || row.id
   processForm.operation_type = ''
   processForm.params_json = '{}'
+  processParamsError.value = ''
   showProcessDialog.value = true
 }
 
 const submitProcess = async () => {
+  // 前置校验：操作类型必选、参数必须为合法 JSON 对象
+  if (!processForm.operation_type) {
+    appStore.warning('请选择预处理操作')
+    return
+  }
+  const params = tryParseJSON(processForm.params_json)
+  if (params === undefined) {
+    processParamsError.value = '参数必须是合法的 JSON 对象，如 {"columns": ["age"]}'
+    return
+  }
+  processParamsError.value = ''
   processing.value = true
   try {
-    const params = JSON.parse(processForm.params_json)
-    await api.post(`/datasets/${processForm.dataset_id}/process`, {
+    await api.post(`/datasets/${processForm.datasetId}/process`, {
       operations: [{ type: processForm.operation_type, ...params }],
     })
     appStore.success('预处理完成')
     showProcessDialog.value = false
     fetchDatasets()
-  } catch (err) {
-    appStore.error('预处理失败', err.message)
+  } catch (err: any) {
+    appStore.error('预处理失败', err?.message)
   } finally {
     processing.value = false
   }
 }
 
-// 删除（需二次确认，防止误删）
-const deleteDataset = async (id: string) => {
+// ---- 删除（二次确认展示数据集名称，防止误删） ----
+const deleteDataset = async (row: any) => {
+  const name = row.name || row.id
   try {
     await ElMessageBox.confirm(
-      `确认删除数据集 ${id}？删除后本地文件、对象存储副本与数据库镜像将一并清理，不可恢复。`,
+      `确认删除数据集「${name}」？删除后本地文件、对象存储副本与数据库镜像将一并清理，不可恢复。`,
       '删除确认',
       { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
     )
@@ -503,22 +490,22 @@ const deleteDataset = async (id: string) => {
     return
   }
   try {
-    await api.delete(`/datasets/${id}`)
-    appStore.success('删除成功')
+    await api.delete(`/datasets/${row.id}`)
+    appStore.success('删除成功', name)
     fetchDatasets()
-  } catch (err) {
-    appStore.error('删除失败', err.message)
+  } catch (err: any) {
+    appStore.error('删除失败', err?.message)
   }
 }
 
-// 下载到本地
-const materializeDataset = async (id: string) => {
+// ---- 下载到本地（仅 HuggingFace 来源） ----
+const materializeDataset = async (row: any) => {
   try {
-    await api.post(`/datasets/${id}/materialize`)
-    appStore.success('下载完成')
+    await api.post(`/datasets/${row.id}/materialize`)
+    appStore.success('下载完成', row.name || row.id)
     fetchDatasets()
-  } catch (err) {
-    appStore.error('下载失败', err.message)
+  } catch (err: any) {
+    appStore.error('下载失败', err?.message)
   }
 }
 
@@ -529,9 +516,41 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.dataset-list { padding: 0; }
-.preview-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-.preview-pagination { display: flex; justify-content: flex-end; }
-.mb-20 { margin-bottom: 20px; }
-.pagination { padding: 16px 0; display: flex; justify-content: flex-end; }
+.ds-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ds-name__title {
+  font-weight: 500;
+  color: var(--mtp-ink-900);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ds-name__id {
+  font-size: 11px;
+  color: var(--mtp-ink-400);
+  font-family: var(--mtp-font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mr-4 {
+  margin-right: 4px;
+  margin-bottom: 2px;
+}
+
+.preview-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.stats-loading {
+  min-height: 200px;
+}
 </style>

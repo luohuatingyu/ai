@@ -116,14 +116,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, computed } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import {
   Plus, VideoPlay, VideoPause, Edit, More, Download, Delete,
-  DocumentCopy, Notebook, Cpu, ArrowRight
+  DocumentCopy, Notebook
 } from '@element-plus/icons-vue'
 
 const router = useRouter()

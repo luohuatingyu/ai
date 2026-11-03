@@ -1,0 +1,54 @@
+/**
+ * 统一状态映射：把后端状态值转换为中文标签 + Element Plus tag 类型。
+ * 各页面共用，避免同一种状态在不同页面显示不一致。
+ * 后续阶段接入工作台 / 部署 / 集群页面时按实际后端枚举扩展。
+ */
+
+/** Element Plus tag 的语义类型 */
+export type TagType = 'primary' | 'success' | 'warning' | 'danger' | 'info'
+
+/** 一条状态的展示定义 */
+export interface StatusMeta {
+  label: string
+  type: TagType
+}
+
+/** 训练任务状态（backend job status） */
+export const JOB_STATUS: Record<string, StatusMeta> = {
+  queued: { label: '排队中', type: 'info' },
+  running: { label: '运行中', type: 'primary' },
+  paused: { label: '已暂停', type: 'warning' },
+  completed: { label: '已完成', type: 'success' },
+  failed: { label: '失败', type: 'danger' },
+  cancelled: { label: '已取消', type: 'info' },
+}
+
+/** 数据集来源 */
+export const DATASET_SOURCE: Record<string, StatusMeta> = {
+  local: { label: '本地上传', type: 'success' },
+  huggingface: { label: 'HuggingFace', type: 'primary' },
+  oss: { label: '对象存储', type: 'warning' },
+}
+
+/** 训练任务类型 */
+export const TASK_TYPE: Record<string, StatusMeta> = {
+  classification: { label: '分类', type: 'primary' },
+  regression: { label: '回归', type: 'success' },
+  clustering: { label: '聚类', type: 'warning' },
+  time_series_forecasting: { label: '时间序列', type: 'info' },
+  llm_pretraining: { label: 'LLM 预训练', type: 'danger' },
+  llm_sft: { label: 'LLM 微调', type: 'danger' },
+  llm_dpo: { label: 'LLM DPO', type: 'danger' },
+}
+
+/**
+ * 按映射键解析状态；未登记的状态原样展示并标记为 info，
+ * 保证后端新增枚举时前端不崩溃、不误标。
+ */
+export function resolveStatus(
+  map: Record<string, StatusMeta>,
+  status: string | null | undefined
+): StatusMeta {
+  if (!status) return { label: '-', type: 'info' }
+  return map[status] || { label: status, type: 'info' }
+}
