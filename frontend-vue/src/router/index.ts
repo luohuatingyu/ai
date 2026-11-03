@@ -179,7 +179,7 @@ const routes: RouteRecordRaw[] = [
         meta: { title: 'Pipeline 详情' },
       },
       {
-        path: 'run/:id',
+        path: 'run/:pipelineId/:runId',
         name: 'PipelineRunDetail',
         component: () => import('@/views/pipelines/PipelineRunDetail.vue'),
         meta: { title: '执行详情' },
