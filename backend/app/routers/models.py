@@ -6,6 +6,7 @@ from typing import Optional, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+import app.config as config
 from app.registry.model_registry import ModelRegistry, ModelVersionManager
 from app.storage import get_store
 
@@ -74,6 +75,60 @@ def list_models(
         "limit": limit,
         "offset": offset,
     }
+
+
+# ---------------------------------------------------------------------------
+# 部署管理（全局路由必须注册在 /{model_id} 之前，避免被参数路由遮蔽）
+# ---------------------------------------------------------------------------
+
+@router.get("/deployments")
+def list_all_deployments(
+    model_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """列出全部部署记录（可按模型和状态过滤），供部署管理页浏览。"""
+    deployments = _registry.list_deployments(model_id)
+    if status:
+        deployments = [d for d in deployments if d.status == status]
+    total = len(deployments)
+    deployments = deployments[offset:offset + limit]
+    # 附带模型名称，避免页面逐条查询
+    model_name_map: dict = {}
+    for d in deployments:
+        if d.model_id not in model_name_map:
+            model = _registry.get_model(d.model_id)
+            model_name_map[d.model_id] = model.name if model else d.model_id
+    return {
+        "deployments": [
+            {
+                "id": d.id,
+                "model_id": d.model_id,
+                "model_name": model_name_map.get(d.model_id, d.model_id),
+                "model_version": d.model_version,
+                "endpoint_name": d.endpoint_name,
+                "endpoint_url": d.endpoint_url,
+                "status": d.status,
+                "config": d.config,
+                "worker_ids": d.worker_ids,
+                "created_at": d.created_at,
+            }
+            for d in deployments
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.delete("/deployments/{deployment_id}")
+def stop_deployment(deployment_id: str) -> dict:
+    """停止（终止）一个部署记录；不删除历史，便于追溯。"""
+    deployment = _registry.update_deployment(deployment_id, status="stopped")
+    if not deployment:
+        raise HTTPException(404, "部署记录不存在")
+    return {"ok": True, "deployment_id": deployment_id, "status": deployment.status}
 
 
 @router.get("/{model_id}")
