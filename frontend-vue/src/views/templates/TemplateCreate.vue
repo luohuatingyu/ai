@@ -1,27 +1,29 @@
 <template>
-  <div class="page-view">
-    <div class="page-header">
-      <h1 class="page-title">{{ isEdit ? '编辑模板' : '创建模板' }}</h1>
-      <el-button @click="router.push('/templates/library')">返回模板库</el-button>
-    </div>
-    <el-card v-loading="loadingDetail">
-      <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
+  <PageShell :title="isEdit ? '编辑模板' : '创建模板'" module="脚本模板库" :loading="loadingDetail">
+    <template #actions>
+      <el-button @click="router.push('/templates/library')">
+        <el-icon class="gap-8"><Back /></el-icon>
+        返回模板库
+      </el-button>
+    </template>
+
+    <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
+      <!-- 基本信息 -->
+      <SectionCard title="基本信息">
         <el-row :gutter="16">
-          <el-col :span="12">
+          <el-col :xs="24" :sm="12">
             <el-form-item label="模板名称" prop="name">
-              <el-input v-model="form.name" placeholder="如：XGBoost 分类模板" maxlength="80" />
+              <el-input v-model="form.name" placeholder="如：XGBoost 分类模板" maxlength="80" show-word-limit />
             </el-form-item>
           </el-col>
-          <el-col :span="12">
+          <el-col :xs="24" :sm="12">
             <el-form-item label="分类" prop="category">
               <el-select v-model="form.category" placeholder="选择或输入分类" style="width: 100%" filterable allow-create default-first-option>
                 <el-option v-for="c in categoryOptions" :key="c" :label="c" :value="c" />
               </el-select>
             </el-form-item>
           </el-col>
-        </el-row>
-        <el-row :gutter="16">
-          <el-col :span="12">
+          <el-col :xs="24" :sm="12">
             <el-form-item label="任务类型" prop="task_type">
               <el-select v-model="form.task_type" style="width: 100%">
                 <el-option label="分类" value="classification" />
@@ -31,40 +33,68 @@
               </el-select>
             </el-form-item>
           </el-col>
-          <el-col :span="12">
+          <el-col :xs="24" :sm="12">
             <el-form-item label="描述">
-              <el-input v-model="form.description" placeholder="模板用途说明" maxlength="200" />
+              <el-input v-model="form.description" placeholder="模板用途说明" maxlength="200" show-word-limit />
             </el-form-item>
           </el-col>
         </el-row>
-        <el-form-item label="脚本内容" prop="content">
+      </SectionCard>
+
+      <!-- 脚本内容 -->
+      <SectionCard title="脚本内容" description="使用 {{参数}} 占位符引用参数，例如 {{epochs}}">
+        <el-form-item prop="content">
           <el-input
-            v-model="form.content" type="textarea" :rows="14"
-            placeholder="训练脚本，使用 {{param}} 占位符引用参数，例如 {{epochs}}" class="code-textarea"
+            v-model="form.content"
+            type="textarea"
+            :rows="14"
+            placeholder="训练脚本内容..."
+            class="code-textarea mono"
           />
         </el-form-item>
-        <el-form-item label="参数定义">
+      </SectionCard>
+
+      <!-- 参数定义 -->
+      <SectionCard title="参数定义" description="JSON 数组，每项含 name/type/label，可选 required/default/options/description">
+        <el-form-item>
           <el-input
-            v-model="parametersJson" type="textarea" :rows="6"
+            v-model="parametersJson"
+            type="textarea"
+            :rows="6"
+            class="mono"
             placeholder='[{"name": "epochs", "type": "number", "label": "训练轮数", "required": true, "default": 20}]'
           />
-          <div class="tip-text">JSON 数组，每项含 name/type/label，可选 required/default/options/description。</div>
         </el-form-item>
-        <el-form-item>
-          <el-button type="primary" :loading="submitting" @click="submit">{{ isEdit ? '保存修改' : '创建模板' }}</el-button>
-          <el-button @click="router.back()">取消</el-button>
-        </el-form-item>
-      </el-form>
-    </el-card>
-  </div>
+        <div v-if="paramsError" class="params-error">
+          <el-icon><WarningFilled /></el-icon>
+          {{ paramsError }}
+        </div>
+      </SectionCard>
+
+      <div class="submit-bar">
+        <el-button type="primary" size="large" :loading="submitting" @click="submit">
+          {{ isEdit ? '保存修改' : '创建模板' }}
+        </el-button>
+        <el-button size="large" @click="router.back()">取消</el-button>
+      </div>
+    </el-form>
+  </PageShell>
 </template>
 
 <script setup lang="ts">
+/**
+ * 创建 / 编辑模板：基本信息、脚本内容与参数定义分区组织。
+ * - 编辑模式通过 ?id= 加载模板详情预填；
+ * - 参数定义 JSON 前端校验（数组 + 必含 name/type/label），非法时阻止提交并内联提示。
+ */
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { FormInstance, FormRules } from 'element-plus'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
+import PageShell from '@/components/common/PageShell.vue'
+import SectionCard from '@/components/common/SectionCard.vue'
+import { Back, WarningFilled } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -79,6 +109,7 @@ const form = reactive({
   name: '', category: '', task_type: 'classification', description: '', content: '',
 })
 const parametersJson = ref('[]')
+const paramsError = ref('')
 
 const isEdit = computed(() => Boolean(route.query.id))
 
@@ -89,6 +120,7 @@ const rules: FormRules = {
   content: [{ required: true, message: '请输入脚本内容', trigger: 'blur' }],
 }
 
+/** 解析参数定义 JSON：非法或缺少必填字段返回 null */
 const parseParameters = (): any[] | null => {
   try {
     const parsed = JSON.parse(parametersJson.value || '[]')
@@ -130,21 +162,23 @@ const loadTemplate = async () => {
 }
 
 const submit = async () => {
-  await formRef.value?.validate().catch(() => Promise.reject())
+  const valid = await formRef.value?.validate().catch(() => false)
+  if (!valid) return
   const parameters = parseParameters()
   if (parameters === null) {
-    appStore.error('参数定义不是合法 JSON 或缺少 name/type/label 字段')
+    paramsError.value = '参数定义必须是 JSON 数组，且每项包含 name、type、label 字段'
     return
   }
+  paramsError.value = ''
   submitting.value = true
   try {
     const payload = { ...form, parameters, dataset_requirements: {} }
     if (isEdit.value) {
       await api.put(`/templates/${route.query.id}`, payload)
-      appStore.success('模板已更新')
+      appStore.success('模板已更新', form.name)
     } else {
       await api.post('/templates', payload)
-      appStore.success('模板创建成功')
+      appStore.success('模板创建成功', form.name)
     }
     router.push('/templates/library')
   } catch (err: any) {
@@ -158,7 +192,27 @@ onMounted(loadTemplate)
 </script>
 
 <style scoped>
-.page-view { padding: 0; }
-.tip-text { color: #909399; font-size: 12px; line-height: 1.6; margin-top: 4px; }
-.code-textarea :deep(textarea) { font-family: 'Monaco', 'Menlo', monospace; font-size: 12px; }
+.code-textarea :deep(textarea) {
+  font-family: var(--mtp-font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.params-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 8px 12px;
+  border-radius: var(--mtp-radius-sm);
+  background: var(--el-color-danger-light-9);
+  color: var(--mtp-danger);
+  font-size: 13px;
+}
+
+.submit-bar {
+  display: flex;
+  gap: 10px;
+  padding: 4px 0 20px;
+}
 </style>

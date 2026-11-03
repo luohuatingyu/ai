@@ -46,9 +46,11 @@ export const TASK_TYPE: Record<string, StatusMeta> = {
   regression: { label: '回归', type: 'success' },
   clustering: { label: '聚类', type: 'warning' },
   time_series_forecasting: { label: '时间序列', type: 'info' },
+  time_series: { label: '时间序列', type: 'info' },
   llm_pretraining: { label: 'LLM 预训练', type: 'danger' },
   llm_sft: { label: 'LLM 微调', type: 'danger' },
   llm_dpo: { label: 'LLM DPO', type: 'danger' },
+  llm_ppo: { label: 'LLM PPO', type: 'danger' },
 }
 
 /**

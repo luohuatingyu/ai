@@ -1,90 +1,131 @@
 <template>
-  <div class="page-view">
-    <div class="page-header">
-      <h1 class="page-title">训练任务列表</h1>
-      <div class="header-actions">
-        <el-select v-model="statusFilter" placeholder="全部状态" clearable style="width: 140px" @change="refreshData">
-          <el-option label="排队中" value="queued" />
-          <el-option label="运行中" value="running" />
-          <el-option label="已暂停" value="paused" />
-          <el-option label="已完成" value="completed" />
-          <el-option label="已失败" value="failed" />
-          <el-option label="已取消" value="cancelled" />
-        </el-select>
-        <el-button @click="refreshData" :loading="loading">
-          <el-icon><Refresh /></el-icon>
-          刷新
-        </el-button>
-        <el-button type="primary" @click="router.push('/training/create')">
-          <el-icon><Plus /></el-icon>
-          创建任务
-        </el-button>
-      </div>
+  <PageShell title="任务列表" module="训练任务" description="跟踪全部训练任务的状态、进度与结果">
+    <template #actions>
+      <el-button @click="refreshData" :loading="loading">
+        <el-icon class="gap-8"><Refresh /></el-icon>
+        刷新
+      </el-button>
+      <el-button type="primary" @click="router.push('/training/create')">
+        <el-icon class="gap-8"><Plus /></el-icon>
+        创建任务
+      </el-button>
+    </template>
+
+    <!-- 状态汇总（基于全部任务聚合） -->
+    <div class="stat-grid">
+      <StatCard label="全部任务" :value="String(jobs.length)" :icon="Monitor" tone="blue" hint="所有记录" />
+      <StatCard label="进行中" :value="String(statusCounts.running + statusCounts.queued)" :icon="Loading" tone="orange" hint="排队 + 运行" />
+      <StatCard label="已完成" :value="String(statusCounts.completed)" :icon="CircleCheck" tone="green" hint="训练成功" />
+      <StatCard label="失败/取消" :value="String(statusCounts.failed + statusCounts.cancelled)" :icon="CircleClose" tone="red" hint="需要关注" />
     </div>
-    <el-card>
-      <div v-if="loading" class="loading-placeholder">
-        <el-icon class="is-loading" :size="32"><Loading /></el-icon>
-        <p>加载中...</p>
-      </div>
-      <div v-else-if="error" class="empty-state">
-        <el-icon class="empty-state-icon" :size="48"><WarningFilled /></el-icon>
-        <p>{{ error }}</p>
-        <el-button type="primary" @click="refreshData">重试</el-button>
-      </div>
-      <template v-else>
-        <el-alert v-if="filteredJobs.length === 0" :title="jobs.length === 0 ? '暂无训练任务，点击右上角创建' : '当前筛选条件下没有任务'" type="info" :closable="false" center />
-        <el-table v-else :data="filteredJobs" border size="small" style="width: 100%">
-          <el-table-column prop="id" label="任务 ID" width="200" show-overflow-tooltip>
-            <template #default="scope">
-              <el-link type="primary" @click="viewJob(scope.row.id)">{{ scope.row.id }}</el-link>
-            </template>
-          </el-table-column>
-          <el-table-column label="任务类型" width="150">
-            <template #default="scope">
-              <el-tag size="small" :type="getTaskTypeTag(specOf(scope.row).task) as any">
-                {{ taskText(specOf(scope.row).task) }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="数据集" min-width="140" show-overflow-tooltip>
-            <template #default="scope">{{ specOf(scope.row).dataset_name || specOf(scope.row).dataset_id || '-' }}</template>
-          </el-table-column>
-          <el-table-column label="状态" width="110">
-            <template #default="scope">
-              <el-tag :type="getStatusTag(scope.row.status) as any" effect="dark" size="small">
-                {{ getStatusText(scope.row.status) }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="设备" width="110">
-            <template #default="scope">{{ scope.row.device || resourceText(scope.row) }}</template>
-          </el-table-column>
-          <el-table-column label="创建时间" width="160">
-            <template #default="scope">{{ formatDate(scope.row.created_at) }}</template>
-          </el-table-column>
-          <el-table-column label="操作" width="170" fixed="right">
-            <template #default="scope">
-              <el-button size="small" link type="primary" @click="viewJob(scope.row.id)">详情</el-button>
-              <el-button
-                v-if="scope.row.status === 'running' || scope.row.status === 'queued'"
-                size="small" link type="warning" @click="cancelJob(scope.row.id)">取消</el-button>
-              <el-button
-                v-if="scope.row.status === 'failed' || scope.row.status === 'cancelled' || scope.row.status === 'completed' || scope.row.status === 'paused'"
-                size="small" link type="danger" @click="deleteJob(scope.row.id)">删除</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+
+    <!-- 筛选 -->
+    <FilterBar>
+      <el-select v-model="statusFilter" placeholder="全部状态" clearable style="width: 160px" @change="refreshData">
+        <el-option label="排队中" value="queued" />
+        <el-option label="运行中" value="running" />
+        <el-option label="已暂停" value="paused" />
+        <el-option label="已完成" value="completed" />
+        <el-option label="已失败" value="failed" />
+        <el-option label="已取消" value="cancelled" />
+      </el-select>
+      <template #actions>
+        <span class="text-xs text-secondary">共 {{ formatInteger(jobs.length) }} 个任务{{ statusFilter ? `，当前筛选 ${filteredJobs.length} 个` : '' }}</span>
       </template>
-    </el-card>
-  </div>
+    </FilterBar>
+
+    <!-- 任务表格 -->
+    <SectionCard flush>
+      <el-table
+        v-if="filteredJobs.length > 0"
+        v-loading="loading"
+        :data="filteredJobs"
+        class="table-card"
+        :header-cell-style="{ background: 'var(--mtp-bg-subtle)' }"
+      >
+        <el-table-column prop="id" label="任务 ID" min-width="190" show-overflow-tooltip>
+          <template #default="{ row }">
+            <el-link type="primary" underline="never" class="mono text-sm" @click="viewJob(row.id)">{{ row.id }}</el-link>
+          </template>
+        </el-table-column>
+        <el-table-column label="任务类型" width="120">
+          <template #default="{ row }">
+            <StatusTag :status="specOf(row).task" :map="TASK_TYPE" />
+          </template>
+        </el-table-column>
+        <el-table-column label="数据集" min-width="140" show-overflow-tooltip>
+          <template #default="{ row }">{{ specOf(row).dataset_name || specOf(row).dataset_id || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <StatusTag :status="row.status" :map="JOB_STATUS" />
+          </template>
+        </el-table-column>
+        <el-table-column label="设备" width="130">
+          <template #default="{ row }">{{ row.device || resourceText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="创建时间" width="120">
+          <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="150" fixed="right">
+          <template #default="{ row }">
+            <div class="row-actions">
+              <el-button size="small" link type="primary" @click="viewJob(row.id)">详情</el-button>
+              <el-button
+                v-if="row.status === 'running' || row.status === 'queued'"
+                size="small" link type="warning" @click="cancelJob(row)">取消</el-button>
+              <el-button
+                v-if="['failed', 'cancelled', 'completed', 'paused'].includes(row.status)"
+                size="small" link type="danger" @click="deleteJob(row)">删除</el-button>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <EmptyState
+        v-else-if="error"
+        type="error"
+        title="任务加载失败"
+        :description="error"
+        retryable
+        @retry="refreshData"
+      />
+      <EmptyState v-else-if="statusFilter" title="当前筛选条件下没有任务" description="切换状态筛选或查看全部任务">
+        <template #actions>
+          <el-button size="small" @click="statusFilter = ''; refreshData()">查看全部</el-button>
+        </template>
+      </EmptyState>
+      <EmptyState v-else title="暂无训练任务" description="从模板创建或手动配置第一个训练任务">
+        <template #actions>
+          <el-button type="primary" size="small" @click="router.push('/training/create')">创建训练任务</el-button>
+          <el-button size="small" @click="router.push('/templates/library')">浏览模板库</el-button>
+        </template>
+      </EmptyState>
+    </SectionCard>
+  </PageShell>
 </template>
 
 <script setup lang="ts">
+/**
+ * 训练任务列表：状态汇总、筛选与任务表格。
+ * - 汇总卡片基于全部任务聚合，筛选仅影响表格展示；
+ * - 取消/删除带确认弹窗；失败展示可重试错误态；
+ * - 后端返回的任务视图把任务类型/数据集放在 spec 内，统一经 specOf 取出。
+ */
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
-import { Refresh, Loading, WarningFilled, Plus } from '@element-plus/icons-vue'
+import PageShell from '@/components/common/PageShell.vue'
+import StatCard from '@/components/common/StatCard.vue'
+import FilterBar from '@/components/common/FilterBar.vue'
+import SectionCard from '@/components/common/SectionCard.vue'
+import StatusTag from '@/components/common/StatusTag.vue'
+import EmptyState from '@/components/common/EmptyState.vue'
+import { JOB_STATUS, TASK_TYPE } from '@/utils/status'
+import { formatDateTime, formatInteger } from '@/utils/format'
+import { Refresh, Plus, Monitor, Loading, CircleCheck, CircleClose } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const appStore = useAppStore()
@@ -95,6 +136,15 @@ const statusFilter = ref('')
 
 // 后端返回的任务视图把任务类型/数据集放在 spec 内，这里统一取出
 const specOf = (row: any) => row?.spec || {}
+
+/** 按状态聚合数量（汇总卡片） */
+const statusCounts = computed(() => {
+  const counts: Record<string, number> = { running: 0, queued: 0, completed: 0, failed: 0, cancelled: 0 }
+  for (const job of jobs.value) {
+    if (job.status in counts) counts[job.status]++
+  }
+  return counts
+})
 
 const filteredJobs = computed(() => {
   if (!statusFilter.value) return jobs.value
@@ -110,6 +160,7 @@ const refreshData = async () => {
     jobs.value = Array.isArray(res) ? res : (res.jobs || [])
   } catch (err: any) {
     error.value = err?.message || '加载失败'
+    appStore.error('任务加载失败', err?.message)
   } finally {
     loading.value = false
   }
@@ -117,64 +168,42 @@ const refreshData = async () => {
 
 const viewJob = (id: string) => router.push(`/training/detail/${id}`)
 
-const cancelJob = async (id: string) => {
+const cancelJob = async (row: any) => {
   try {
-    await appStoreConfirm(`确认取消任务 ${id}？正在运行的任务会在当前批次结束后停止。`)
-    await api.post(`/training/jobs/${id}/cancel`)
-    appStore.success('任务已取消')
+    await ElMessageBox.confirm(
+      `确认取消任务 ${row.id}？正在运行的任务会在当前批次结束后停止。`,
+      '操作确认',
+      { confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.post(`/training/jobs/${row.id}/cancel`)
+    appStore.success('任务已取消', row.id)
     refreshData()
   } catch (err: any) {
-    if (err !== 'cancel') appStore.error('取消失败', err?.message)
+    appStore.error('取消失败', err?.message)
   }
 }
 
-const deleteJob = async (id: string) => {
+const deleteJob = async (row: any) => {
   try {
-    await appStoreConfirm(`确认删除任务 ${id}？删除后任务记录与日志不可恢复。`)
-    await api.delete(`/training/jobs/${id}`)
-    appStore.success('任务已删除')
+    await ElMessageBox.confirm(
+      `确认删除任务 ${row.id}？删除后任务记录与日志不可恢复。`,
+      '操作确认',
+      { confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.delete(`/training/jobs/${row.id}`)
+    appStore.success('任务已删除', row.id)
     refreshData()
   } catch (err: any) {
-    if (err !== 'cancel') appStore.error('删除失败', err?.message)
+    appStore.error('删除失败', err?.message)
   }
-}
-
-// 使用 Element Plus MessageBox 作为确认弹窗
-import { ElMessageBox } from 'element-plus'
-const appStoreConfirm = (message: string) =>
-  ElMessageBox.confirm(message, '操作确认', { confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning' })
-
-const TASK_TEXT: Record<string, string> = {
-  classification: '分类',
-  regression: '回归',
-  clustering: '聚类',
-  time_series_forecasting: '时间序列预测',
-  llm_pretraining: 'LLM 预训练',
-  llm_sft: 'LLM 微调',
-  llm_dpo: 'LLM DPO',
-  llm_ppo: 'LLM PPO',
-}
-const taskText = (task?: string) => TASK_TEXT[task || ''] || task || '-'
-const getTaskTypeTag = (task?: string) => {
-  const map: Record<string, string> = {
-    classification: 'primary', regression: 'success', clustering: 'warning',
-    time_series_forecasting: 'info', llm_pretraining: 'danger', llm_sft: 'danger',
-    llm_dpo: 'danger', llm_ppo: 'danger',
-  }
-  return map[task || ''] || 'info'
-}
-
-const STATUS_TEXT: Record<string, string> = {
-  queued: '排队中', running: '运行中', paused: '已暂停',
-  completed: '已完成', failed: '失败', cancelled: '已取消',
-}
-const getStatusText = (status?: string) => STATUS_TEXT[status || ''] || status || '-'
-const getStatusTag = (status?: string) => {
-  const map: Record<string, string> = {
-    queued: 'info', running: 'primary', paused: 'warning',
-    completed: 'success', failed: 'danger', cancelled: 'info',
-  }
-  return map[status || ''] || 'info'
 }
 
 const resourceText = (row: any) => {
@@ -183,16 +212,14 @@ const resourceText = (row: any) => {
   return hint.require_gpu ? 'GPU' : '自动'
 }
 
-const formatDate = (ts?: number) => {
-  if (!ts) return '-'
-  return new Date(ts * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
-
 onMounted(refreshData)
 </script>
 
 <style scoped>
-.page-view { padding: 0; }
-.header-actions { display: flex; align-items: center; gap: 12px; }
-.loading-placeholder { text-align: center; padding: 60px; color: #909399; }
+/* 汇总卡片在窄屏 2 列 */
+@media (max-width: 768px) {
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 </style>
