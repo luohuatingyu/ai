@@ -89,7 +89,10 @@ def list_all_deployments(
     offset: int = 0,
 ) -> dict:
     """列出全部部署记录（可按模型和状态过滤），供部署管理页浏览。"""
-    deployments = _registry.list_deployments(model_id)
+    try:
+        deployments = _registry.list_deployments(model_id)
+    except Exception as exc:  # noqa: BLE001  数据库不可用时返回受控错误而非裸 500
+        raise HTTPException(503, "数据库暂不可用，无法读取部署记录；请检查 MySQL 连接") from exc
     if status:
         deployments = [d for d in deployments if d.status == status]
     total = len(deployments)
@@ -125,7 +128,10 @@ def list_all_deployments(
 @router.delete("/deployments/{deployment_id}")
 def stop_deployment(deployment_id: str) -> dict:
     """停止（终止）一个部署记录；不删除历史，便于追溯。"""
-    deployment = _registry.update_deployment(deployment_id, status="stopped")
+    try:
+        deployment = _registry.update_deployment(deployment_id, status="stopped")
+    except Exception as exc:  # noqa: BLE001  数据库不可用时返回受控错误而非裸 500
+        raise HTTPException(503, "数据库暂不可用，无法更新部署状态；请检查 MySQL 连接") from exc
     if not deployment:
         raise HTTPException(404, "部署记录不存在")
     return {"ok": True, "deployment_id": deployment_id, "status": deployment.status}
