@@ -374,6 +374,87 @@ def test_model_versions_endpoint(client, store):
     assert "1.0.0" in versions["versions"]
 
 
+def _register_deployable_model(client, name: str) -> str:
+    """注册一个可部署模型的辅助函数（返回模型 ID）。"""
+    register = client.post("/api/models", json={
+        "name": name,
+        "version": "1.0.0",
+        "task": "classification",
+        "framework": "torch",
+        "metrics": {"val_accuracy": 0.9},
+        "artifacts": {"best": f"models/{name}/best.pt"},
+    })
+    assert register.status_code == 200, register.text
+    return register.json()["id"]
+
+
+def test_model_deployments_global_list_endpoint(client, store):
+    """AC（部署管理页）：全局部署列表支持状态/模型过滤，且不被 /{model_id} 路由遮蔽"""
+    model_id = _register_deployable_model(client, "deploy-list-model")
+    other_id = _register_deployable_model(client, "deploy-other-model")
+
+    deployed = client.post(f"/api/models/{model_id}/deploy", json={
+        "model_version": "1.0.0", "endpoint_name": "sales-api", "replicas": 2, "config": {},
+    })
+    assert deployed.status_code == 200, deployed.text
+    deployment_id = deployed.json()["deployment_id"]
+
+    # 全局列表：路径 /api/models/deployments 不应被 GET /{model_id} 当作模型 ID
+    listing = client.get("/api/models/deployments")
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+    assert body["total"] == 1
+    entry = body["deployments"][0]
+    assert entry["id"] == deployment_id
+    assert entry["model_id"] == model_id
+    assert entry["model_name"] == "deploy-list-model"
+    assert entry["model_version"] == "1.0.0"
+    assert entry["endpoint_name"] == "sales-api"
+    assert entry["status"] == "pending"
+
+    # 状态过滤：命中 pending、排除 running
+    by_status = client.get("/api/models/deployments", params={"status": "pending"}).json()
+    assert [d["id"] for d in by_status["deployments"]] == [deployment_id]
+    assert client.get(
+        "/api/models/deployments", params={"status": "running"}
+    ).json()["deployments"] == []
+
+    # 模型过滤：只返回所属模型的部署
+    by_model = client.get("/api/models/deployments", params={"model_id": other_id}).json()
+    assert by_model["deployments"] == []
+    by_model = client.get("/api/models/deployments", params={"model_id": model_id}).json()
+    assert [d["id"] for d in by_model["deployments"]] == [deployment_id]
+
+
+def test_model_deployment_stop_endpoint(client, store):
+    """AC（停止部署）：置 stopped；不存在返回 404；详情页部署记录同步可见"""
+    model_id = _register_deployable_model(client, "deploy-stop-model")
+    deployed = client.post(f"/api/models/{model_id}/deploy", json={
+        "model_version": "1.0.0", "replicas": 1, "config": {},
+    })
+    deployment_id = deployed.json()["deployment_id"]
+
+    stopped = client.delete(f"/api/models/deployments/{deployment_id}")
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json()["status"] == "stopped"
+
+    # 停止后全局列表状态同步，且可按状态过滤
+    listing = client.get("/api/models/deployments").json()
+    assert listing["deployments"][0]["status"] == "stopped"
+    running = client.get("/api/models/deployments", params={"status": "running"}).json()
+    assert running["deployments"] == []
+
+    # 不存在的部署 → 404
+    missing = client.delete("/api/models/deployments/deploy-not-exist")
+    assert missing.status_code == 404
+    assert "部署记录不存在" in missing.json()["detail"]
+
+    # 模型详情页包含该部署记录（状态 stopped）
+    detail = client.get(f"/api/models/{model_id}").json()
+    assert any(d["id"] == deployment_id and d["status"] == "stopped"
+               for d in detail["deployments"])
+
+
 # ---------------------------------------------------------------------------
 # Pipeline（AC：DAG 创建、拓扑序、执行记录）
 # ---------------------------------------------------------------------------
