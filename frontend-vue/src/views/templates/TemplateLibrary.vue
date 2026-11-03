@@ -45,7 +45,7 @@
           <el-tag v-if="template.parameters.length > 5" size="small" effect="dark">+{{ template.parameters.length - 5 }} 更多</el-tag>
         </div>
         <div class="template-footer">
-          <el-button size="small" type="primary" @click.stop="instantiateTemplate(template)">
+          <el-button size="small" type="primary" @click.stop="useTemplate(template)">
             <el-icon><VideoPlay /></el-icon>
             使用模板
           </el-button>
@@ -53,6 +53,17 @@
             <el-icon><View /></el-icon>
             查看详情
           </el-button>
+          <el-popconfirm
+            v-if="!template.is_builtin"
+            title="确认删除该模板？删除后不可恢复。"
+            confirm-button-text="删除"
+            cancel-button-text="取消"
+            @confirm="deleteTemplate(template.id)"
+          >
+            <template #reference>
+              <el-button size="small" type="danger" plain @click.stop>删除</el-button>
+            </template>
+          </el-popconfirm>
         </div>
       </el-card>
     </div>
@@ -127,16 +138,18 @@ const onPageSizeChange = (size: number) => { pageSize.value = size; page.value =
 
 const viewTemplate = (id: string) => { router.push(`/templates/detail/${id}`) }
 
-const instantiateTemplate = async (template: any) => {
+// 使用模板：携带模板 ID 跳转创建任务页，由创建页拉取模板并预填参数
+const useTemplate = (template: any) => {
+  router.push(`/training/create?template=${template.id}`)
+}
+
+const deleteTemplate = async (id: string) => {
   try {
-    const res = await api.post(`/templates/${template.id}/instantiate`, {
-      parameters: {},
-      instantiated_type: 'training_job',
-    })
-    appStore.success('已创建训练任务草稿')
-    router.push(`/training/create?template=${template.id}`)
-  } catch (err) {
-    appStore.error('实例化失败', err.message)
+    await api.delete(`/templates/${id}`)
+    appStore.success('模板已删除')
+    fetchTemplates()
+  } catch (err: any) {
+    appStore.error('删除失败', err?.message)
   }
 }
 
