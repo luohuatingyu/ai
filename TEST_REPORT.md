@@ -41,6 +41,7 @@ Pipeline。模型删除采用**归档（软删除）**：`DELETE /api/models/{id
 | API 修复验证 | `curl http://localhost:8000/api/training/jobs` | 200（修复前该页请求 `/api/jobs` → 404，代理下 502） |
 | 旧错误路径对照 | `curl http://localhost:8000/api/jobs` | 404（确认为 502 根因） |
 | 新增部署接口 | `curl .../api/models/deployments` | 200 `{"deployments":[],"total":0,...}`；删除不存在部署 → 404 `部署记录不存在` |
+| 部署接口契约测试 | `pytest tests/test_new_training_api.py -q`（Python 3.12 容器） | **21 passed**（含新增 2 个：全局列表过滤/路由遮蔽、停止部署/404/详情同步） |
 | 无 DB 受控错误 | 本地 `USE_DATABASE=false` 启动后 curl | 部署接口 503 中文提示；`/api/models`、`/api/workbench/sessions` 为存量 DB 依赖 500（容器内正常） |
 | 其余接口抽查 | `/api/datasets` `/api/samples` `/api/datasets/import-history` `/api/clusters/workers` `/api/clusters/workers/summary` `/api/templates` `/api/remote-ssh-credentials` | 全部 200/503（受控） |
 | SPA 回退 | `curl http://localhost:8000/training/jobs` | 200 返回 index.html |
@@ -83,11 +84,15 @@ Pipeline。模型删除采用**归档（软删除）**：`DELETE /api/models/{id
 
 ### 下次测试建议
 
-- 为 `GET /api/models/deployments` 与 `DELETE .../deployments/{id}` 补充 pytest 契约用例
-  （当前以 curl 实测覆盖）。
 - 前端可引入 vitest 对 API 客户端的 paramsSerializer 与错误信息提取做单元测试。
 - 修复存量失败：`test_performance::test_cpu_quota_respected` 的 AttributeError、
   `test_parallel` 的 llm_pretraining 暂停恢复。
+- 为远程服务器操作轮询（`/api/remote-operations/*`）补充 E2E 用例。
+
+**2026-11-03 补充**：部署接口契约测试已补齐
+（`test_model_deployments_global_list_endpoint`：全局列表/状态与模型过滤/路由遮蔽；
+`test_model_deployment_stop_endpoint`：停止置 stopped/404/模型详情同步），本机 2 passed、
+Python 3.12 容器模块级 21 passed。按重测触发规则，仅新增测试代码无需重跑全量套件。
 
 ### Git 基准点
 
