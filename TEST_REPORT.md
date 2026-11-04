@@ -1,5 +1,106 @@
 # 测试报告
 
+## 前端 24 页全量重设计（2026-11-04）
+
+### 变更范围
+
+按用户确认的六阶段方案完成 `frontend-vue/` 应用框架与全部 24 个业务页面的重新设计
+（后端接口与数据结构未改动，仅前端仓库与构建产物变更）：
+
+1. **设计与测试底座**：石墨蓝设计令牌体系（main.scss 重写）、App 框架重构（分组侧栏/
+   折叠持久化/移动端抽屉/通知中心）、路由 meta（面包屑/菜单归属/页面描述）、6 个公共
+   组件（PageShell/StatCard/StatusTag/EmptyState/FilterBar/SectionCard）、状态映射与格式
+   化工具；补齐 Vitest + Vue Test Utils + happy-dom + Playwright 测试底座与此前缺失的
+   ESLint 配置。
+2. **数据准备与工作台**：数据集导入/列表/HuggingFace、会话管理/新建/Notebook 详情。
+3. **模板与训练**：模板库/我的模板/创建编辑/详情、任务列表/创建/详情。
+4. **模型与集群**：模型注册表/部署管理/模型详情、Worker 管理/远程服务器。
+5. **Pipeline 全链路**：新增 `utils/dag.ts`（依赖校验/分层布局/图构建），Pipeline 五页全部
+   改造，创建/编辑采用 Vue Flow 可视化画布 + 属性面板。
+6. **全量交付验收**：容器重建、后端全量回归、24 页 × 4 视口浏览器走查、本报告更新。
+
+**修复的存量缺陷**（全部先有失败测试或走查用例复现，再修复）：
+
+| 缺陷 | 位置 | 影响 |
+|---|---|---|
+| Monaco ESM 入口无 default 导出，`mod.default` 为 undefined | 会话详情 | 打开任意 Notebook 会话即抛错，编辑器不可用 |
+| 编辑器容器用 `:nth-of-type` 定位，永远命中第一个单元格 | 会话详情 | 重排/新增单元格后编辑器错位 |
+| `onMounted(refreshData)` 遗漏 | 远程服务器 | 页面打开永不加载列表 |
+| `nextTick` 未导入，轮询回调首轮抛错被 catch 静默吞掉 | 远程服务器 | 操作进度永不更新、轮询不停止 |
+| 编辑 Pipeline 保存时固定覆盖 `resource_hint:{}`/`retry_policy:{}`/`timeout:3600`/`continue_on_failure:false` | Pipeline 创建 | 高级配置静默丢失 |
+| 4 处 `el-link :underline` 布尔用法（EP 2.14 已弃用） | 多页 | 控制台报错 |
+| `StatCard.displayValue` 非响应式 | 公共组件 | 指标更新后文本不刷新 |
+| 我的模板空列表渲染空白加载区（无空态） | 我的模板 | 空状态不可见 |
+| 数据集列表导入/HF 对话框与独立页面重复 | 数据集列表 | 双入口维护成本 |
+
+### 测试执行结果（2026-11-04）
+
+| 验证 | 命令 | 结果 |
+|---|---|---|
+| 单元/组件测试 | `cd frontend-vue && npm run test:unit` | **199 passed / 0 failed**（连续 3 轮稳定） |
+| 浏览器 e2e（交互回归） | `npm run test:e2e`（Chromium，冒烟 + 表单校验 + 侧栏导航） | **5 passed / 0 failed** |
+| 全路由视觉走查 | `E2E_BASE_URL=http://localhost:8000 npx playwright test tests/e2e/walkthrough.spec.ts` | **96/96 通过**（24 路由 × 4 视口：1440/1280/768/390；外壳渲染、页面标题、无未捕获渲染错误、逐页截图人工走查） |
+| 前端类型检查 | `npm run type-check`（vue-tsc） | 0 错误 |
+| 前端 Lint | `npm run lint`（本轮补齐配置后首次可用） | 0 错误 |
+| 前端构建 | `npm run build` | ✓ built in 8.6s |
+| 容器重建 | `docker compose up --build -d` | 4 镜像构建成功，trainer/worker/frontend 重建启动，frontend healthy |
+| 后端全量回归（容器） | `docker run --rm -v "$(pwd):/repo" -w /repo/backend <trainer镜像> python -m pytest tests/ -q`（Python 3.12.15） | **777 passed / 0 failed / 31 skipped**（较上轮基线 775 增加 2 个为 1b956ab 已提交的部署契约测试；后端代码本轮零改动，无回归） |
+| SPA 回退抽查 | `curl http://localhost:8000/training/jobs` | 200 返回 index.html |
+| API 抽查 | `curl http://localhost:8000/api/datasets` | 200，返回真实数据集 |
+
+**走查覆盖说明**：走查用例（`tests/e2e/walkthrough.spec.ts`）已入库，可重复执行；截图为
+临时产物（`/tmp/mtp-walkthrough`，约 7.8MB）已按规范清理，不纳入仓库。走查在容器化前端
+（mtp-frontend，构建产物 + 同源 /api 代理）上执行，数据为平台真实数据。
+
+### 关键模块测试结果
+
+| 模块 | 覆盖内容 | 结果 |
+|---|---|---|
+| 设计系统/框架 | 设计令牌、公共组件行为（键盘可达/事件）、路由 meta | 32 项通过 |
+| 数据链路 | 列表筛选参数、导入载荷、HF 物化降级、预览/统计抽屉、预处理 JSON 校验 | 22 项通过 |
+| 工作台 | 会话 CRUD/内核启停、创建摘要联动、Notebook 执行/全部运行/变量轮询清理 | 26 项通过 |
+| 模板与训练 | 模板 CRUD、四类任务提交载荷（target/n_clusters/time_column）、模板预填、指标图表数据、日志过滤 | 43 项通过 |
+| 模型与集群 | 注册表筛选/归档、部署停止、Worker 汇总聚合/心跳滞后/托管开关、服务器登记载荷/凭证/操作轮询生命周期 | 29 项通过 |
+| Pipeline | DAG 校验（重复/自依赖/缺失/循环/布局防呆）、字段保留往返、五页交互（图节点点击/执行历史/运行状态映射） | 48 项通过 |
+| 后端回归 | 全量套件（本轮前端改动不涉及后端代码） | 777 passed / 31 skipped |
+
+### 重测触发条件
+
+- 修改 `frontend-vue/src/` 下任意页面/组件/工具 → 重跑 `npm run test:unit` + `npm run build`；
+  涉及交互链路（表单提交/弹窗/轮询）时同步重跑 `npm run test:e2e`。
+- 修改 `frontend-vue/` 构建配置或依赖 → 重跑 `docker compose up --build -d` 并做走查抽查。
+- 修改 `backend/app/` → 按既有规则重跑容器全量套件。
+- DAG 工具（`utils/dag.ts`）被 Pipeline 画布与详情页共同消费，其改动必须重跑全部
+  Pipeline 相关测试（`npx vitest run src/utils/__tests__/dag.spec.ts src/views/pipelines`）。
+
+### 已知问题
+
+- Element Plus 2.14 表单校验在 happy-dom 下放行空必填值（真实浏览器行为正常，已用 e2e
+  在真实 Chromium 中覆盖：HuggingFace 导入、新建会话、登记服务器三个入口）。单元测试
+  因此不依赖 EP 校验语义，业务校验（JSON 参数、DAG 依赖）均为前端自实现逻辑，不受影响。
+- 生产构建依赖 unplugin-auto-import 注入 Vue API：本轮已将涉及运行时行为的页面全部改为
+  显式导入（该差异曾是远程服务器页轮询缺陷的根因之一）。
+- 后端 31 个 skipped 用例为存量基线（GPU/多机相关），非本轮引入。
+- Playwright 截图走查为人工视觉验收辅助，最终视觉标准以产品确认结果为准。
+
+### 下次测试建议
+
+- 为 Worker 管理的 30 秒自动刷新与任务详情/执行详情的 5 秒轮询补充真实浏览器长时运行
+  观测（当前以单元测试断言定时器生命周期）。
+- Pipeline 画布的拖拽连线（Vue Flow 交互）目前以“属性面板改依赖”路径测试，可在真实
+  浏览器补充拖拽建边的 e2e 用例。
+- 视觉回归可引入 Playwright 截图对比基线（`toHaveScreenshot`），在固定视口与数据集下
+  防止样式回归。
+
+### Git 基准点
+
+- **Commit Hash**: 2949a18（Fix Monaco ESM import in session detail; add full-route walkthrough spec）
+- **分支**: worktree（emdash-hot-boxes-clean-y9u6p）
+- **测试日期**: 2026-11-04
+- **本报告覆盖的前端改造提交**：81b65fc（底座+框架+仪表盘+数据集列表）→ 20479c1（数据准备+工作台）→ 0bcb3ca（模板+训练）→ c92ad42（模型+集群）→ 3112128（Pipeline）→ 2949a18（Monaco 修复+走查）
+
+---
+
 ## 前端全面优化与训练任务列表 502 修复（2026-11-03）
 
 ### 变更范围
