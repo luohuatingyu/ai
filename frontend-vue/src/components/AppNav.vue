@@ -15,7 +15,7 @@
 
     <el-sub-menu v-for="group in navGroups" :key="group.key" :index="group.key">
       <template #title>
-        <el-icon><component :is="group.icon" /></el-icon>
+        <el-icon :style="groupIconStyle(group.key)"><component :is="group.icon" /></el-icon>
         <span>{{ group.title }}</span>
       </template>
       <el-menu-item v-for="item in group.items" :key="item.path" :index="item.path">
@@ -36,6 +36,7 @@ import { useRoute } from 'vue-router'
 import {
   DataBoard, Folder, Notebook, Document, Cpu, Box, Connection, OfficeBuilding,
 } from '@element-plus/icons-vue'
+import { MODULES } from '@/utils/modules'
 
 /** 折叠态由父级（侧栏 / 抽屉）决定，仅影响菜单渲染形态 */
 defineProps<{ collapse?: boolean }>()
@@ -44,6 +45,15 @@ const route = useRoute()
 
 /** 当前激活菜单：详情页回退到所属列表项 */
 const activeMenu = computed(() => (route.meta.nav as string) || route.path)
+
+/**
+ * 分组图标着色：使用业务域强调色的暗背景变体（accentLight），
+ * 让 7 个业务域在深色侧栏中即具备一致的视觉识别。
+ */
+const groupIconStyle = (groupKey: string) => {
+  const meta = MODULES[groupKey]
+  return meta ? { color: meta.accentLight } : undefined
+}
 
 /** 导航分组（key 与路由前缀一致，用于子菜单展开标识） */
 const navGroups = [
