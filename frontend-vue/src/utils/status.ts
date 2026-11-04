@@ -33,6 +33,42 @@ export const SESSION_STATUS: Record<string, StatusMeta> = {
   error: { label: '错误', type: 'danger' },
 }
 
+/** 模型状态（注册表） */
+export const MODEL_STATUS: Record<string, StatusMeta> = {
+  ready: { label: '可用', type: 'success' },
+  archived: { label: '已归档', type: 'info' },
+}
+
+/** 部署实例状态 */
+export const DEPLOY_STATUS: Record<string, StatusMeta> = {
+  pending: { label: '排队中', type: 'info' },
+  running: { label: '运行中', type: 'success' },
+  stopped: { label: '已停止', type: 'warning' },
+  failed: { label: '失败', type: 'danger' },
+}
+
+/** Worker 状态（active=false 时由页面单独显示离线） */
+export const WORKER_STATE: Record<string, StatusMeta> = {
+  idle: { label: '空闲', type: 'success' },
+  reserved: { label: '已预约', type: 'warning' },
+  busy: { label: '忙碌中', type: 'primary' },
+  disabled: { label: '已禁用', type: 'info' },
+}
+
+/** 远程服务器生命周期状态 */
+export const SERVER_STATUS: Record<string, StatusMeta> = {
+  not_deployed: { label: '未部署', type: 'info' },
+  provisioning: { label: '装机中', type: 'warning' },
+  configuring: { label: '下发配置', type: 'warning' },
+  deploying: { label: '部署中', type: 'warning' },
+  starting: { label: '启动中', type: 'warning' },
+  stopping: { label: '停止中', type: 'warning' },
+  restarting: { label: '重启中', type: 'warning' },
+  online: { label: '在线', type: 'success' },
+  stopped: { label: '已停止', type: 'info' },
+  error: { label: '异常', type: 'danger' },
+}
+
 /** 数据集来源 */
 export const DATASET_SOURCE: Record<string, StatusMeta> = {
   local: { label: '本地上传', type: 'success' },

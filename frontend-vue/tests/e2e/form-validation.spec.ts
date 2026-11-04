@@ -22,3 +22,14 @@ test('新建会话：名称为空时校验拦截，不发起创建', async ({ pa
   await page.waitForTimeout(300)
   expect(page.url()).toContain('/workbench/new')
 })
+
+test('登记远程服务器：必填项为空时校验拦截，不发起登记', async ({ page }) => {
+  await page.goto('/clusters/remote')
+  await page.locator('button', { hasText: '登记服务器' }).click()
+  // 对话框内直接点击登记（未填写任何字段）
+  await page.locator('.el-dialog button', { hasText: '登记' }).last().click()
+  await expect(page.locator('.el-form-item__error').first()).toContainText('请输入机器 ID')
+  await page.waitForTimeout(300)
+  // 对话框仍打开（未提交关闭）
+  await expect(page.locator('.el-dialog')).toBeVisible()
+})

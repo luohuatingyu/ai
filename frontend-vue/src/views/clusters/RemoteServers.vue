@@ -1,80 +1,107 @@
 <template>
-  <div class="page-view">
-    <div class="page-header">
-      <h1 class="page-title">远程服务器</h1>
-      <div class="header-actions">
-        <el-button @click="openCredentials">
-          <el-icon><Key /></el-icon>
-          SSH 凭证
-        </el-button>
-        <el-button type="primary" @click="openCreate">
-          <el-icon><Plus /></el-icon>
-          登记服务器
-        </el-button>
-        <el-button @click="refreshData" :loading="loading">
-          <el-icon><Refresh /></el-icon>
-          刷新
-        </el-button>
-      </div>
-    </div>
-    <el-card>
-      <div v-if="loading" class="loading-placeholder">
-        <el-icon class="is-loading" :size="32"><Loading /></el-icon>
-        <p>加载中...</p>
-      </div>
-      <div v-else-if="error" class="empty-state">
-        <el-icon class="empty-state-icon" :size="48"><WarningFilled /></el-icon>
-        <p>{{ error }}</p>
-        <el-button type="primary" @click="refreshData">重试</el-button>
-      </div>
-      <template v-else>
-        <el-alert v-if="servers.length === 0" title="暂无远程服务器，点击右上角登记" type="info" :closable="false" center />
-        <el-table v-else :data="servers" border size="small" style="width: 100%">
-          <el-table-column prop="machine_id" label="机器 ID" min-width="150" show-overflow-tooltip />
-          <el-table-column label="主机" min-width="160" show-overflow-tooltip>
-            <template #default="scope">{{ scope.row.host }}:{{ scope.row.port }}</template>
-          </el-table-column>
-          <el-table-column label="登录用户" width="110">
-            <template #default="scope">{{ scope.row.username || '-' }}</template>
-          </el-table-column>
-          <el-table-column label="模式" width="90">
-            <template #default="scope">
-              <el-tag size="small" :type="(scope.row.mode === 'gpu' ? 'success' : 'info') as any">
-                {{ scope.row.mode === 'gpu' ? 'GPU' : 'CPU' }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column prop="cpu_slots" label="CPU 槽" width="80" />
-          <el-table-column label="部署状态" width="100">
-            <template #default="scope">
-              <el-tag size="small" :type="scope.row.deployed ? 'success' : 'info'">
-                {{ scope.row.deployed ? '已部署' : '未部署' }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="状态" width="110">
-            <template #default="scope">
-              <el-tag size="small" :type="statusTag(scope.row.status) as any" effect="dark">
-                {{ statusText(scope.row.status) }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="230" fixed="right">
-            <template #default="scope">
-              <el-button size="small" link type="primary" @click="runAction(scope.row, scope.row.deployed ? 'deploy' : 'install')">
-                {{ scope.row.deployed ? '同步代码' : '部署' }}
+  <PageShell title="远程服务器" module="计算集群" description="管理远程训练服务器、SSH 凭证与远程操作">
+    <template #actions>
+      <el-button @click="openCredentials">
+        <el-icon class="gap-8"><Key /></el-icon>
+        SSH 凭证
+      </el-button>
+      <el-button type="primary" @click="openCreate">
+        <el-icon class="gap-8"><Plus /></el-icon>
+        登记服务器
+      </el-button>
+      <el-button @click="refreshData" :loading="loading">
+        <el-icon class="gap-8"><Refresh /></el-icon>
+        刷新
+      </el-button>
+    </template>
+
+    <!-- 服务器表格 -->
+    <SectionCard flush>
+      <el-table
+        v-if="servers.length > 0"
+        v-loading="loading"
+        :data="servers"
+        class="table-card"
+        :header-cell-style="{ background: 'var(--mtp-bg-subtle)' }"
+      >
+        <el-table-column prop="machine_id" label="机器 ID" min-width="140" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span class="mono text-sm">{{ row.machine_id }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="主机" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span class="mono text-sm">{{ row.host }}:{{ row.port }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="登录用户" width="110">
+          <template #default="{ row }">{{ row.username || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="模式" width="80">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.mode === 'gpu' ? 'success' : 'info'" disable-transitions>
+              {{ row.mode === 'gpu' ? 'GPU' : 'CPU' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="cpu_slots" label="CPU 槽" width="80" />
+        <el-table-column label="部署" width="90">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.deployed ? 'success' : 'info'" effect="plain" disable-transitions>
+              {{ row.deployed ? '已部署' : '未部署' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <StatusTag :status="row.status" :map="SERVER_STATUS" />
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="170" fixed="right">
+          <template #default="{ row }">
+            <div class="row-actions">
+              <el-button size="small" link type="primary" @click="runAction(row, row.deployed ? 'deploy' : 'install')">
+                {{ row.deployed ? '同步代码' : '部署' }}
               </el-button>
-              <el-button size="small" link type="success" @click="runAction(scope.row, 'start')">启动</el-button>
-              <el-button size="small" link type="warning" @click="runAction(scope.row, 'stop')">停止</el-button>
-              <el-button size="small" link type="info" @click="runAction(scope.row, 'restart')">重启</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-      </template>
-    </el-card>
+              <el-dropdown trigger="click" @command="(cmd: string) => runAction(row, cmd)">
+                <el-button size="small" link :aria-label="`服务器 ${row.machine_id} 的更多操作`">
+                  生命周期<el-icon><ArrowDown /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="start">启动</el-dropdown-item>
+                    <el-dropdown-item command="stop">停止</el-dropdown-item>
+                    <el-dropdown-item command="restart">重启</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <EmptyState
+        v-else-if="error"
+        type="error"
+        title="服务器加载失败"
+        :description="error"
+        retryable
+        @retry="refreshData"
+      />
+      <EmptyState
+        v-else-if="!loading"
+        title="暂无远程服务器"
+        description="登记远程机器并部署训练环境，扩展平台算力"
+      >
+        <template #actions>
+          <el-button type="primary" size="small" @click="openCreate">登记第一台服务器</el-button>
+        </template>
+      </EmptyState>
+      <div v-else v-loading="true" class="loading-placeholder" />
+    </SectionCard>
 
     <!-- 登记服务器对话框 -->
-    <el-dialog v-model="showCreateDialog" title="登记远程服务器" width="560px">
+    <el-dialog v-model="showCreateDialog" title="登记远程服务器" width="560px" destroy-on-close>
       <el-form ref="serverFormRef" :model="serverForm" :rules="serverRules" label-width="110px">
         <el-form-item label="机器 ID" prop="machine_id">
           <el-input v-model="serverForm.machine_id" placeholder="唯一标识，如 gpu-node-01" />
@@ -111,27 +138,28 @@
     </el-dialog>
 
     <!-- SSH 凭证管理对话框 -->
-    <el-dialog v-model="showCredentialsDialog" title="SSH 凭证管理" width="640px">
+    <el-dialog v-model="showCredentialsDialog" title="SSH 凭证管理" width="640px" destroy-on-close>
       <div class="cred-toolbar">
         <el-button size="small" type="primary" @click="resetCredentialForm(); showCredentialForm = true">
           <el-icon><Plus /></el-icon>
           新建凭证
         </el-button>
       </div>
-      <el-table :data="credentials" border size="small" v-loading="credentialsLoading">
+      <el-table v-if="credentials.length > 0" :data="credentials" class="table-card" v-loading="credentialsLoading" :header-cell-style="{ background: 'var(--mtp-bg-subtle)' }">
         <el-table-column prop="name" label="名称" min-width="120" />
         <el-table-column prop="username" label="用户名" width="120" />
         <el-table-column label="认证方式" width="110">
-          <template #default="scope">{{ authMethodText(scope.row.auth_method) }}</template>
+          <template #default="{ row }">{{ authMethodText(row.auth_method) }}</template>
         </el-table-column>
         <el-table-column label="默认" width="70">
-          <template #default="scope">
-            <el-tag v-if="scope.row.is_default" size="small" type="success">默认</el-tag>
+          <template #default="{ row }">
+            <el-tag v-if="row.is_default" size="small" type="success">默认</el-tag>
+            <span v-else class="text-ink-400">-</span>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="80">
-          <template #default="scope">
-            <el-popconfirm title="确认删除该凭证？仍被服务器引用的凭证无法删除。" @confirm="deleteCredential(scope.row.id)">
+          <template #default="{ row }">
+            <el-popconfirm title="确认删除该凭证？仍被服务器引用的凭证无法删除。" @confirm="deleteCredential(row.id)">
               <template #reference>
                 <el-button size="small" link type="danger">删除</el-button>
               </template>
@@ -139,10 +167,15 @@
           </template>
         </el-table-column>
       </el-table>
-      <el-empty v-if="!credentialsLoading && credentials.length === 0" description="暂无凭证" :image-size="60" />
+      <EmptyState
+        v-else-if="!credentialsLoading"
+        title="暂无凭证"
+        description="创建 SSH 凭证后可登记远程服务器"
+      />
+      <div v-else v-loading="true" class="cred-loading" />
 
       <!-- 新建凭证表单 -->
-      <el-dialog v-model="showCredentialForm" title="新建 SSH 凭证" width="480px" append-to-body>
+      <el-dialog v-model="showCredentialForm" title="新建 SSH 凭证" width="480px" append-to-body destroy-on-close>
         <el-form ref="credFormRef" :model="credForm" :rules="credRules" label-width="100px">
           <el-form-item label="名称" prop="name">
             <el-input v-model="credForm.name" placeholder="如 prod-cluster" />
@@ -158,13 +191,13 @@
             </el-radio-group>
           </el-form-item>
           <el-form-item v-if="credForm.auth_method === 'password'" label="密码" prop="password">
-            <el-input v-model="credForm.password" type="password" show-password />
+            <el-input v-model="credForm.password" type="password" show-password autocomplete="new-password" />
           </el-form-item>
           <el-form-item v-if="credForm.auth_method !== 'password'" label="私钥" prop="private_key">
             <el-input v-model="credForm.private_key" type="textarea" :rows="6" placeholder="粘贴完整 OpenSSH / PEM 私钥" />
           </el-form-item>
           <el-form-item v-if="credForm.auth_method === 'key_password'" label="私钥口令" prop="passphrase">
-            <el-input v-model="credForm.passphrase" type="password" show-password />
+            <el-input v-model="credForm.passphrase" type="password" show-password autocomplete="new-password" />
           </el-form-item>
         </el-form>
         <template #footer>
@@ -177,25 +210,37 @@
     <!-- 远程操作进度对话框 -->
     <el-dialog v-model="showOperationDialog" :title="`远程操作：${operationAction}`" width="720px" :close-on-click-modal="false">
       <div class="op-status">
-        <el-tag :type="operationStatusTag as any" effect="dark">{{ operationStatusText }}</el-tag>
-        <span v-if="operationMachine" class="op-machine">{{ operationMachine }}</span>
+        <StatusTag :status="operationStatus" :map="OPERATION_STATUS" size="large" />
+        <span v-if="operationMachine" class="op-machine mono">{{ operationMachine }}</span>
       </div>
-      <div class="op-output" ref="outputRef">
+      <div ref="outputRef" class="op-output">
         <pre>{{ operationOutput || '等待输出...' }}</pre>
       </div>
       <template #footer>
         <el-button @click="showOperationDialog = false">关闭</el-button>
       </template>
     </el-dialog>
-  </div>
+  </PageShell>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, nextTick, onUnmounted } from 'vue'
+/**
+ * 远程服务器：服务器登记、SSH 凭证管理与远程生命周期操作。
+ * - 生命周期操作（部署/启动/停止/重启）下发后弹窗轮询进度（2 秒间隔），
+ *   完成后刷新列表并按结果提示；轮询定时器在卸载时清理；
+ * - 凭证输入使用 type=password + autocomplete=new-password，避免浏览器持久化；
+ * - 单次轮询失败不终止弹窗，等待下一轮。
+ */
+import { ref, reactive, nextTick, onMounted, onUnmounted } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
-import { Refresh, Loading, WarningFilled, Plus, Key } from '@element-plus/icons-vue'
+import PageShell from '@/components/common/PageShell.vue'
+import SectionCard from '@/components/common/SectionCard.vue'
+import StatusTag from '@/components/common/StatusTag.vue'
+import EmptyState from '@/components/common/EmptyState.vue'
+import { SERVER_STATUS, type StatusMeta } from '@/utils/status'
+import { Refresh, Plus, Key, ArrowDown } from '@element-plus/icons-vue'
 
 const appStore = useAppStore()
 const servers = ref<any[]>([])
@@ -250,6 +295,15 @@ const operationMachine = ref('')
 const outputRef = ref<HTMLElement>()
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
+/** 操作状态映射（StatusTag 消费） */
+const OPERATION_STATUS: Record<string, StatusMeta> = {
+  queued: { label: '排队中', type: 'info' },
+  running: { label: '执行中', type: 'warning' },
+  completed: { label: '已完成', type: 'success' },
+  failed: { label: '失败', type: 'danger' },
+  cancelled: { label: '已中断', type: 'info' },
+}
+
 const refreshData = async () => {
   loading.value = servers.value.length === 0
   error.value = ''
@@ -258,6 +312,7 @@ const refreshData = async () => {
     servers.value = res.servers || []
   } catch (err: any) {
     error.value = err?.message || '加载失败'
+    appStore.error('服务器加载失败', err?.message)
   } finally {
     loading.value = false
   }
@@ -301,7 +356,8 @@ const resetCredentialForm = () => {
 }
 
 const submitCreate = async () => {
-  await serverFormRef.value?.validate().catch(() => Promise.reject())
+  const valid = await serverFormRef.value?.validate().catch(() => false)
+  if (!valid) return
   creating.value = true
   try {
     const payload: Record<string, any> = {
@@ -312,6 +368,7 @@ const submitCreate = async () => {
       mode: serverForm.mode,
       cpu_slots: serverForm.cpu_slots,
     }
+    // 用户名仅在填写时提交，未填写由后端回落到凭证中的用户名
     if (serverForm.username) payload.username = serverForm.username
     await api.post('/remote-servers', payload)
     appStore.success('服务器已登记', '可执行「部署」接入该机器')
@@ -325,7 +382,8 @@ const submitCreate = async () => {
 }
 
 const submitCredential = async () => {
-  await credFormRef.value?.validate().catch(() => Promise.reject())
+  const valid = await credFormRef.value?.validate().catch(() => false)
+  if (!valid) return
   savingCredential.value = true
   try {
     const payload: Record<string, any> = {
@@ -333,6 +391,7 @@ const submitCredential = async () => {
       username: credForm.username,
       auth_method: credForm.auth_method,
     }
+    // 按认证方式组装敏感字段（密码 / 私钥 / 私钥+口令）
     if (credForm.auth_method === 'password') payload.password = credForm.password
     else {
       payload.private_key = credForm.private_key
@@ -341,7 +400,7 @@ const submitCredential = async () => {
     const res: any = await api.post('/remote-ssh-credentials', payload)
     credentials.value = res.credentials || []
     showCredentialForm.value = false
-    appStore.success('凭证已保存')
+    appStore.success('凭证已保存', credForm.name)
   } catch (err: any) {
     appStore.error('凭证保存失败', err?.message)
   } finally {
@@ -405,55 +464,68 @@ const startPolling = (operationId: string) => {
 }
 
 const stopPolling = () => {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
 }
 
 // 组件卸载时停止操作轮询，避免泄漏定时器
 onUnmounted(stopPolling)
 
-const STATUS_TEXT: Record<string, string> = {
-  not_deployed: '未部署', provisioning: '装机中', configuring: '下发配置', deploying: '部署中',
-  starting: '启动中', stopping: '停止中', restarting: '重启中', online: '在线',
-  stopped: '已停止', error: '异常',
-}
-const statusText = (status?: string) => STATUS_TEXT[status || ''] || status || '-'
-const statusTag = (status?: string) => {
-  const map: Record<string, string> = {
-    not_deployed: 'info', online: 'success', stopped: 'info', error: 'danger',
-  }
-  if (map[status || '']) return map[status || '']
-  return ['provisioning', 'configuring', 'deploying', 'starting', 'stopping', 'restarting'].includes(status || '')
-    ? 'warning' : 'info'
-}
-
-const operationStatusText = computed(() => {
-  const map: Record<string, string> = {
-    queued: '排队中', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已中断',
-  }
-  return map[operationStatus.value] || operationStatus.value || '-'
-})
-const operationStatusTag = computed(() => {
-  const map: Record<string, string> = {
-    queued: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: 'info',
-  }
-  return map[operationStatus.value] || 'info'
-})
+// 页面加载时拉取服务器列表
+onMounted(refreshData)
 </script>
 
 <style scoped>
-.page-view { padding: 0; }
-.header-actions { display: flex; align-items: center; gap: 12px; }
-.tip-text { color: #909399; font-size: 12px; line-height: 1.4; margin-top: 4px; }
-.cred-toolbar { margin-bottom: 12px; display: flex; justify-content: flex-end; }
-.loading-placeholder { text-align: center; padding: 60px; color: #909399; }
-.op-status { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.op-machine { color: #909399; font-size: 13px; }
-.op-output {
-  background: #1e1e1e; border-radius: 6px; max-height: 320px; overflow: auto;
+.tip-text {
+  color: var(--mtp-ink-400);
+  font-size: 12px;
+  line-height: 1.4;
+  margin-top: 4px;
 }
+
+.cred-toolbar {
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.cred-loading {
+  min-height: 120px;
+}
+
+.loading-placeholder {
+  min-height: 200px;
+}
+
+.op-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.op-machine {
+  color: var(--mtp-ink-500);
+  font-size: 13px;
+}
+
+.op-output {
+  background: #1e1e2a;
+  border-radius: var(--mtp-radius-md);
+  max-height: 320px;
+  overflow: auto;
+}
+
 .op-output pre {
-  margin: 0; padding: 12px; color: #d4d4d4;
-  font-family: 'Monaco', 'Menlo', monospace; font-size: 12px; line-height: 1.6;
-  white-space: pre-wrap; word-break: break-word;
+  margin: 0;
+  padding: 12px;
+  color: #d4d4d4;
+  font-family: var(--mtp-font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>
