@@ -240,12 +240,12 @@ import {
   ArrowUp, ArrowDown, DocumentCopy,
 } from '@element-plus/icons-vue'
 
-// Monaco Editor 动态导入（测试环境通过 vi.mock 打桩）
+// Monaco Editor 动态导入（monaco-editor 的 ESM 入口无 default 导出，需回退到命名空间本身）
 let monaco: any = null
 const loadMonaco = async () => {
   if (!monaco) {
-    const mod = await import('monaco-editor')
-    monaco = mod.default
+    const mod: any = await import('monaco-editor')
+    monaco = mod.default ?? mod
     monaco.editor.defineTheme('mtp-dark', {
       base: 'vs-dark',
       inherit: true,

@@ -229,3 +229,4 @@ frontend-vue/src/auto-imports.d.ts
 frontend-vue/src/components.d.ts
 frontend-vue/test-results/
 frontend-vue/playwright-report/
+frontend-vue/walkthrough-shots/
