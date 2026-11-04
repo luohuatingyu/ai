@@ -1,3 +1,21 @@
+## 本次变更测试结果：分支追加提交合并至 master（2026-11-04）
+
+### Git 基准点与范围
+
+- **Commit Hash**：5f512da（Merge commit '23ae6c1'，父提交 master=bda1fb3、分支=23ae6c1）。
+- **测试日期 / 分支**：2026-11-04 / master。
+- **范围**：合并分支紧随上一次合并后新增的 2 个提交：`c2a61fd`（模块色彩识别体系：分域 identity chips / status dots / stat 数值色调）、`23ae6c1`（关键页首屏重排：attention strip、任务/模型 hero、运行节点状态配色），共 frontend-vue 21 文件 +905/−76（含 `utils/modules.ts` 及 7 个配套单测），**backend / TEST_REPORT.md 均未改动**。
+
+### 合并与冲突处理
+
+- `git merge 23ae6c1 --no-edit` 以 'ort' 策略自动合并，**零冲突**（master 侧自上次合并仅动 TEST_REPORT.md，与 frontend-vue 无交集）。
+- 等效性：合并后 `frontend-vue/` 与分支侧 23ae6c1 已测基线逐字一致，既有测试结论直接适用。
+
+### 已知限制、重测建议与回滚
+
+- 本会话未本地执行 `npm run test:unit`（主工作区 frontend-vue 无 node_modules），未新增容器回归；分支侧配套自动化流程将按其报告惯例补记本轮结果，建议后续顺手复核。
+- 回滚：`git revert -m 1 5f512da`。
+
 ## 本次变更测试结果：emdash/hot-boxes-clean-y9u6p 合并至 master（2026-11-04）
 
 ### Git 基准点与范围
