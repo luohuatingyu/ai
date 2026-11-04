@@ -69,6 +69,36 @@ export const SERVER_STATUS: Record<string, StatusMeta> = {
   error: { label: '异常', type: 'danger' },
 }
 
+/** Pipeline 状态 */
+export const PIPELINE_STATUS: Record<string, StatusMeta> = {
+  draft: { label: '草稿', type: 'info' },
+  active: { label: '已激活', type: 'success' },
+  paused: { label: '已暂停', type: 'warning' },
+  archived: { label: '已归档', type: 'info' },
+}
+
+/** Pipeline 执行状态（整体与单步骤通用） */
+export const PIPELINE_RUN_STATUS: Record<string, StatusMeta> = {
+  pending: { label: '等待中', type: 'info' },
+  running: { label: '运行中', type: 'primary' },
+  completed: { label: '已完成', type: 'success' },
+  failed: { label: '失败', type: 'danger' },
+  cancelled: { label: '已取消', type: 'info' },
+  skipped: { label: '已跳过', type: 'info' },
+}
+
+/** Pipeline 步骤类型 */
+export const PIPELINE_STEP_TYPE: Record<string, StatusMeta> = {
+  dataset_pull: { label: '数据集拉取', type: 'primary' },
+  dataset_process: { label: '数据预处理', type: 'success' },
+  training: { label: '模型训练', type: 'warning' },
+  model_upload: { label: '模型注册', type: 'info' },
+  model_deploy: { label: '模型部署', type: 'danger' },
+  custom_script: { label: '自定义脚本', type: 'info' },
+  notebook_run: { label: 'Notebook 执行', type: 'info' },
+  inference: { label: '批量推理', type: 'info' },
+}
+
 /** 数据集来源 */
 export const DATASET_SOURCE: Record<string, StatusMeta> = {
   local: { label: '本地上传', type: 'success' },
