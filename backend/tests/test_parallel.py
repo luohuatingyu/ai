@@ -262,7 +262,7 @@ def test_workers_complete_one_joint_job(store, q, ls, make_dataset, monkeypatch,
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from app.jobs import JobManager
-    from app.routers import jobs as routes
+    from app.routers import training_jobs as routes
 
     manager = JobManager(store=store, queue=q, lease=ls, start_workers=False, start_watchdog=False)
     monkeypatch.setattr(routes, "manager", manager)
@@ -281,13 +281,13 @@ def test_workers_complete_one_joint_job(store, q, ls, make_dataset, monkeypatch,
             (config.DATASETS_DIR / "processed").mkdir(exist_ok=True)
             (config.DATASETS_DIR / f"{dataset}.csv").rename(config.DATASETS_DIR / "processed" / f"{dataset}.csv")
             (config.DATASETS_DIR / f"{dataset}.meta.json").rename(config.DATASETS_DIR / "metadata" / f"{dataset}.json")
-        response = client.post("/api/train", json={"dataset_id": dataset, "target": "target", "task": task,
+        response = client.post("/api/training/jobs", json={"dataset_id": dataset, "target": "target", "task": task,
             "epochs": 2, "hidden_layers": 0, "parallel_timeout": 15, "parallel_workers": [
                 {"worker_id": worker.worker_id, "batch_size": size} for worker, size in zip(workers, [3, 2])]})
         assert response.status_code == 200, response.text
         job_id = response.json()["job_id"]
-        assert wait_until(lambda: client.get(f"/api/jobs/{job_id}").json()["status"] in {"completed", "failed"}, 45)
-        result = client.get(f"/api/jobs/{job_id}").json()
+        assert wait_until(lambda: client.get(f"/api/training/jobs/{job_id}").json()["status"] in {"completed", "failed"}, 45)
+        result = client.get(f"/api/training/jobs/{job_id}").json()
         assert result["status"] == "completed", result
         assert len(result["segments"]) == 1
         assert len(result["segments"][0]["members"]) == 2
@@ -300,16 +300,16 @@ def test_workers_complete_one_joint_job(store, q, ls, make_dataset, monkeypatch,
             assert 0 <= final["val_accuracy"] <= 1
         else:
             assert np.isfinite(final["val_r2"]) and np.isfinite(final["val_rmse"])
-        logs = client.get(f"/api/jobs/{job_id}/logs").json()
+        logs = client.get(f"/api/training/jobs/{job_id}/logs").json()
         assert any("联合训练启动" in line for line in logs["lines"])
         for row in [{"f1": 0.3, "f2": 0.1, "f3": -0.1}, {}, {"f1": "invalid"}]:
-            first = client.post(f"/api/jobs/{job_id}/predict", json={"row": row})
+            first = client.post(f"/api/training/jobs/{job_id}/predict", json={"row": row})
             assert first.status_code == 200, first.text
-            assert first.json() == client.post(f"/api/jobs/{job_id}/predict", json={"row": row}).json()
+            assert first.json() == client.post(f"/api/training/jobs/{job_id}/predict", json={"row": row}).json()
             if not row or row.get("f1") == "invalid":
                 checkpoint = store.read_file(f"jobs/{job_id}/best.pt", config.WORKER_SCRATCH_DIR / "verify.pt")
                 medians = torch.load(checkpoint, weights_only=True)["preprocessor"]["num_medians"]
-                assert first.json() == client.post(f"/api/jobs/{job_id}/predict", json={"row": medians}).json()
+                assert first.json() == client.post(f"/api/training/jobs/{job_id}/predict", json={"row": medians}).json()
         assert wait_until(lambda: all(ls.peek_holder(slot_key(worker.worker_id)) is None for worker in workers), 5)
     finally:
         client.close()
@@ -347,7 +347,6 @@ def test_member_validation_and_backend_selection(ls):
     [("cuda", "nvidia", "cuda:0", "nccl"),
      ("rocm", "amd", "cuda:0", "gloo"),
      ("xpu", "intel", "xpu:0", "gloo"),
-     ("mps", "apple", "mps", "gloo"),
      ("cpu", "cpu", "cpu", "gloo")],
 )
 def test_member_selection_supports_each_device_backend(
@@ -375,11 +374,10 @@ def test_member_selection_supports_each_device_backend(
 
 
 def test_mixed_accelerators_use_gloo(ls):
-    """AMD/Intel/Apple/CPU 混合計算组统一走 Gloo，不伪装为 CUDA/NCCL。"""
+    """AMD/Intel/CPU 混合計算组统一走 Gloo，不伪装为 CUDA/NCCL。"""
     requests = []
     for index, (backend, vendor, device) in enumerate([
-        ("rocm", "amd", "cuda:0"), ("xpu", "intel", "xpu:0"),
-        ("mps", "apple", "mps"), ("cpu", "cpu", "cpu"),
+        ("rocm", "amd", "cuda:0"), ("xpu", "intel", "xpu:0"), ("cpu", "cpu", "cpu"),
     ]):
         worker_id = f"mixed-{index}"
         caps = _caps(worker_id, _port())
@@ -396,7 +394,7 @@ def test_mixed_accelerators_use_gloo(ls):
     members = select_members(ls, requests)
     group = make_group("job-mixed", "token-mixed", members, 30, 42)
 
-    assert [member["device_backend"] for member in members] == ["rocm", "xpu", "mps", "cpu"]
+    assert [member["device_backend"] for member in members] == ["rocm", "xpu", "cpu"]
     assert group["backend"] == "gloo"
 
 
@@ -487,17 +485,17 @@ def test_member_does_not_renew_or_overwrite_replaced_leader(ls):
 
 def test_api_allows_cpu_llm_parallel_but_preserves_single_gpu_default(monkeypatch, ls):
     """API 兼容：显式联合训练可使用 CPU，旧 LLM 请求仍要求 GPU。"""
-    from app.routers import jobs as routes
+    from app.routers import training_jobs as routes
     selected = [{"worker_id": f"api-{i}", "batch_size": 1} for i in range(2)]
     for item in selected:
         ls.register_worker(item["worker_id"], _caps(item["worker_id"], _port()), 30)
     captured = []
     monkeypatch.setattr(routes.manager, "lease", ls)
     monkeypatch.setattr(routes.manager, "submit", lambda spec: captured.append(spec) or {"id": "test-job"})
-    routes.start_training(TrainRequest(dataset_id="example/corpus", dataset_source="hub", task="llm_pretraining", parallel_workers=selected))
+    routes.create_training_job(TrainRequest(dataset_id="example/corpus", dataset_source="hub", task="llm_pretraining", parallel_workers=selected))
     assert captured[-1]["resource_hint"]["require_gpu"] is False
     assert captured[-1]["resource_hint"]["parallel_workers"] == selected
-    routes.start_training(TrainRequest(dataset_id="example/corpus", dataset_source="hub", task="llm_pretraining"))
+    routes.create_training_job(TrainRequest(dataset_id="example/corpus", dataset_source="hub", task="llm_pretraining"))
     assert captured[-1]["resource_hint"]["require_gpu"] is True
 
 
@@ -559,13 +557,13 @@ def test_incompatible_members_are_rejected(ls, condition, match):
 def test_api_rejects_cpu_members_with_gpu_restrictions(monkeypatch, ls, restriction):
     """API 异常：显式 GPU 限制与 CPU 成员冲突时不创建任务。"""
     from fastapi import HTTPException
-    from app.routers import jobs as routes
+    from app.routers import training_jobs as routes
     selected = [{"worker_id": f"api-{i}", "batch_size": 1} for i in range(2)]
     for item in selected:
         ls.register_worker(item["worker_id"], _caps(item["worker_id"], _port()), 30)
     monkeypatch.setattr(routes.manager, "lease", ls)
     with pytest.raises(HTTPException) as error:
-        routes.start_training(TrainRequest(dataset_id="example/corpus", dataset_source="hub",
+        routes.create_training_job(TrainRequest(dataset_id="example/corpus", dataset_source="hub",
             task="llm_pretraining", parallel_workers=selected, **restriction))
     assert error.value.status_code == 400
 
@@ -611,15 +609,14 @@ def test_cpu_slot_hides_inherited_gpu_visibility(monkeypatch):
 @pytest.mark.parametrize(
     ("backend", "index", "expected"),
     [("rocm", "1", ("1", "1", "1", "")),
-     ("xpu", "1", ("", "", "", "level_zero:1")),
-     ("mps", "0", ("", "", "", ""))],
+     ("xpu", "1", ("", "", "", "level_zero:1"))],
 )
 def test_supervisor_sets_backend_specific_device_visibility(monkeypatch, backend, index, expected):
     """子进程后端选择与每槽设备可见性变量保持一致。"""
     from types import SimpleNamespace
     from app.worker import WorkerSupervisor
 
-    count = 1 if backend == "mps" else 2
+    count = 2
     monkeypatch.setenv("WORKER_DEVICE", backend)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,1")
@@ -633,7 +630,7 @@ def test_supervisor_sets_backend_specific_device_visibility(monkeypatch, backend
     monkeypatch.setattr("app.worker.subprocess.Popen", lambda args, env: launched.append(env) or SimpleNamespace(pid=1))
 
     supervisor = WorkerSupervisor(None, None, None, log=lambda message: None, cpu_slots=0)
-    slot = "gpu0" if backend == "mps" else "gpu1"
+    slot = "gpu1"
     supervisor._spawn(slot, index)
 
     assert launched[0]["WORKER_DEVICE"] == backend

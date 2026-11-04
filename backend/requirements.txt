@@ -4,6 +4,8 @@ python-multipart>=0.0.9
 pandas>=2.2
 numpy>=2.0
 scikit-learn>=1.5
+# XGBoost：GPU 可用时为树模型提供 CUDA 加速（device="cuda" 需 2.x API）
+xgboost>=2.0,<3
 # MySQL 数据库支持
 sqlalchemy>=2.0
 mysql-connector-python>=8.0

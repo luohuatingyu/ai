@@ -94,6 +94,7 @@
   @media (max-width: 560px) { .formgrid { grid-template-columns: 1fr; } }
   .field label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
   .hint { color: var(--muted); font-size: 12px; }
+  .field .hint { font-size: 11px; margin-top: 3px; line-height: 1.4; }
   .stack { display: flex; flex-direction: column; gap: 10px; }
   .empty { color: var(--muted); text-align: center; padding: 24px 8px;
            border: 1px dashed var(--border-strong); border-radius: 10px; font-size: 13px;
@@ -368,23 +369,34 @@
             <option value="llm_dpo">LLM DPO</option>
             <option value="llm_ppo">LLM PPO / RLHF</option>
           </select>
+          <small class="hint">分类预测离散标签，回归预测连续数值；聚类自动分组；LLM 任务面向文本生成。</small>
+        </div>
+        <div class="field" id="modelTypeField" hidden>
+          <label>模型选择</label>
+          <select id="p_model_type"></select>
+          <small class="hint" id="modelTypeHint"></small>
         </div>
         <div class="field" id="targetField">
           <label>目标列（要预测的列）</label>
           <select id="targetSelect"></select>
+          <small class="hint">模型学习的答案列；分类要求离散标签，回归要求连续数值。</small>
         </div>
         <div class="field" id="timeColumnField" hidden>
           <label>时间列（用于排序）</label>
           <select id="timeColumnSelect"></select>
+          <small class="hint">按该列的先后顺序切分训练/验证窗口，需与目标列不同。</small>
         </div>
         <div class="field" id="nClustersField" hidden>
           <label>聚类数</label><input id="p_n_clusters" type="number" value="3" min="2" max="64">
+          <small class="hint">希望分成的组数 K；可结合业务含义或肘部法选择。</small>
         </div>
         <div class="field" id="lookbackField" hidden>
           <label>历史窗口长度</label><input id="p_lookback" type="number" value="12" min="2" max="512">
+          <small class="hint">用最近 N 个时间步的取值预测未来；至少覆盖一个完整周期。</small>
         </div>
         <div class="field" id="forecastHorizonField" hidden>
           <label>预测步数</label><input id="p_forecast_horizon" type="number" value="1" min="1" max="64">
+          <small class="hint">预测未来第 1～N 步的值；步数越大难度越高。</small>
         </div>
         <div class="field wide" id="llmFields" hidden>
           <div class="formgrid">
@@ -433,16 +445,70 @@
           </div>
           <div class="hint">Hub 模型和数据集均按公共仓库加载，禁用自定义远程代码。单节点 LLM 使用 GPU；联合训练可选择 GPU、CPU 或混合节点，每个节点都需容纳完整模型。</div>
         </div>
-        <div class="field"><label id="epochLabel">轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"></div>
-        <div class="field" id="batchSizeField"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"></div>
+        <div class="field" id="epochField"><label id="epochLabel">轮数 epochs</label><input id="p_epochs" type="number" value="30" min="1" max="500"><small class="hint">完整遍历训练集的次数；过大易过拟合，通常 10～100。</small></div>
+        <div class="field" id="batchSizeField"><label>批大小 batch_size</label><input id="p_batch_size" type="number" value="64" min="1" max="4096"><small class="hint">每次权重更新使用的样本数；显存不足时调小，常见 32～256。</small></div>
       </div>
       <details id="trainingAdvanced" class="training-advanced">
-        <summary>高级参数 <span>学习率、网络结构与资源要求</span></summary>
+        <summary>高级参数 <span>学习率、网络结构、优化器与资源要求</span></summary>
         <div class="formgrid">
-        <div class="field" id="learningRateField"><label>学习率 lr</label><input id="p_lr" type="number" value="0.001" step="0.0001" min="0.0001"></div>
-        <div class="field" id="hiddenLayersField"><label>隐藏层数</label><input id="p_hidden_layers" type="number" value="3" min="0" max="8"></div>
-        <div class="field" id="hiddenSizeField"><label>每层神经元</label><input id="p_hidden_size" type="number" value="128" min="1" max="2048"></div>
-        <div class="field" id="testSplitField"><label>验证集比例</label><input id="p_test_split" type="number" value="0.2" step="0.05" min="0.05" max="0.5"></div>
+        <div class="field" id="learningRateField"><label>学习率 lr</label><input id="p_lr" type="number" value="0.001" step="0.0001" min="0.0001"><small class="hint">每次权重更新的步长；过大震荡不收敛，过小收敛慢，常用 0.0001～0.01。</small></div>
+        <div class="field" id="hiddenLayersField"><label>隐藏层数</label><input id="p_hidden_layers" type="number" value="3" min="0" max="8"><small class="hint">MLP 隐藏层层数；表格数据 1～3 层通常足够，层数越多越难训练。</small></div>
+        <div class="field" id="hiddenSizeField"><label>每层神经元</label><input id="p_hidden_size" type="number" value="128" min="1" max="2048"><small class="hint">每个隐藏层的神经元数量；越大表达能力越强，也更容易过拟合。</small></div>
+        <div class="wide" id="mlpHyperFields" hidden>
+          <div class="formgrid">
+            <div class="field" id="optimizerField">
+              <label>优化器</label>
+              <select id="p_optimizer">
+                <option value="adamw">AdamW（推荐）</option>
+                <option value="adam">Adam</option>
+                <option value="sgd">SGD</option>
+                <option value="rmsprop">RMSprop</option>
+              </select>
+              <small class="hint">AdamW 带解耦权重衰减，多数场景首选；SGD 需要更大学习率。</small>
+            </div>
+            <div class="field" id="lrSchedulerField">
+              <label>学习率调度</label>
+              <select id="p_lr_scheduler">
+                <option value="none">不调度</option>
+                <option value="step">Step（每 10 轮减半）</option>
+                <option value="cosine">Cosine 余弦退火</option>
+              </select>
+              <small class="hint">训练中按策略降低学习率，通常让后期更平稳、精度更高。</small>
+            </div>
+            <div class="field" id="activationField">
+              <label>激活函数</label>
+              <select id="p_activation">
+                <option value="relu">ReLU（默认）</option>
+                <option value="gelu">GELU</option>
+                <option value="tanh">Tanh</option>
+                <option value="silu">SiLU</option>
+              </select>
+              <small class="hint">隐藏层的非线性变换；ReLU 通用，GELU/SiLU 更平滑。</small>
+            </div>
+            <div class="field" id="dropoutField">
+              <label>Dropout 比例</label>
+              <input id="p_dropout" type="number" value="0.15" step="0.05" min="0" max="0.9">
+              <small class="hint">训练时随机丢弃神经元的比例，用于抗过拟合；0 表示关闭。</small>
+            </div>
+            <div class="field" id="weightDecayField">
+              <label>权重衰减</label>
+              <input id="p_weight_decay" type="number" value="0.01" step="0.001" min="0" max="0.5">
+              <small class="hint">L2 正则强度，抑制过大的权重；AdamW 默认 0.01，设 0 关闭。</small>
+            </div>
+            <div class="field" id="earlyStoppingField">
+              <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-top:4px; color:var(--text);">
+                <input id="p_early_stopping" type="checkbox" style="width:auto;"> 启用早停
+              </label>
+              <small class="hint">验证指标连续 N 轮无提升时提前结束，省时并防止过拟合。</small>
+            </div>
+            <div class="field" id="patienceField">
+              <label>早停耐心值</label>
+              <input id="p_patience" type="number" value="5" min="1" max="100">
+              <small class="hint">验证指标多少轮无提升后停止；太小可能错过后期提升。</small>
+            </div>
+          </div>
+        </div>
+        <div class="field" id="testSplitField"><label>验证集比例</label><input id="p_test_split" type="number" value="0.2" step="0.05" min="0.05" max="0.5"><small class="hint">留作验证的数据比例，用于指标评估与早停；过小则评估不稳定。</small></div>
         <div class="field" id="resourceHintField">
           <label>资源提示</label>
           <label style="display:flex; gap:6px; align-items:center; font-size:13px; margin-top:4px; color:var(--text);">
@@ -457,10 +523,9 @@
             <option value="cuda">NVIDIA CUDA</option>
             <option value="rocm">AMD ROCm</option>
             <option value="xpu">Intel XPU</option>
-            <option value="mps">Apple MPS</option>
             <option value="cpu">CPU</option>
           </select>
-          <div class="hint">MPS 需要 macOS 原生 worker；AMD/Intel 需安装对应 PyTorch 构建。</div>
+          <div class="hint">AMD/Intel 需安装对应 PyTorch 构建。</div>
         </div>
         <div class="field" id="minVramField" hidden>
           <label>最低显存（MiB，可选）</label>
@@ -1075,11 +1140,21 @@ function getTrainingIssue() {
   if (llm && task !== "llm_pretraining" && !$("p_base_model").value.trim()) return missing("p_base_model", "请填写基座模型 Hub ID。");
   if (task === "llm_ppo" && !$("p_reward_model").value.trim()) return missing("p_reward_model", "请填写 PPO 奖励模型 Hub ID。");
   // 数值边界与 API 请求模型一致；浮点参数不受输入框步长限制。
-  const fields = [["p_epochs", "轮数 / 迭代次数", 1, 500]];
+  // 分类/回归按所选模型裁剪校验：一次性 sklearn 模型无轮数/批大小/网络结构。
+  const supervised = task === "classification" || task === "regression";
+  const modelType = supervised ? ($("p_model_type").value || "mlp") : "mlp";
+  const isMLP = modelType === "mlp";
+  const staged = ["random_forest", "gradient_boosting", "xgboost"].includes(modelType);
+  const fields = [];
+  if (!cluster && (llm || isMLP || staged)) fields.push(["p_epochs", "轮数 / 迭代次数", 1, 500]);
   if (!cluster) fields.push(["p_test_split", "验证集比例", 0.05, 0.5, true]);
-  if (!cluster && $("p_parallel").value !== "parallel") fields.push(["p_batch_size", "批大小", 1, 4096]);
-  if (!cluster && (!llm || task === "llm_pretraining")) fields.push(["p_lr", "学习率", Number.MIN_VALUE, 1, true]);
-  if (!cluster && !llm) fields.push(["p_hidden_layers", "隐藏层数", 0, 8], ["p_hidden_size", "每层神经元", 1, 2048]);
+  if (!cluster && (llm || isMLP) && $("p_parallel").value !== "parallel") fields.push(["p_batch_size", "批大小", 1, 4096]);
+  if (!cluster && isMLP && (!llm || task === "llm_pretraining")) fields.push(["p_lr", "学习率", Number.MIN_VALUE, 1, true]);
+  if (!cluster && !llm && isMLP) fields.push(["p_hidden_layers", "隐藏层数", 0, 8], ["p_hidden_size", "每层神经元", 1, 2048]);
+  if (!cluster && !llm && isMLP) {
+    fields.push(["p_dropout", "Dropout 比例", 0, 0.9, true], ["p_weight_decay", "权重衰减", 0, 0.5, true]);
+    if ($("p_early_stopping").checked) fields.push(["p_patience", "早停耐心值", 1, 100]);
+  }
   if (cluster) fields.push(["p_n_clusters", "聚类数", 2, 64]);
   if (task === "time_series_forecasting") fields.push(["p_lookback", "历史窗口长度", 2, 512], ["p_forecast_horizon", "预测步数", 1, 64]);
   if (llm) fields.push(["p_max_samples", "最大样本数", 1, 1000000], ["p_max_seq_len", "最大序列长度", 2, 8192]);
@@ -1228,6 +1303,33 @@ function renderTrainingResources() {
   }
 }
 
+// 模型选项只在任务切换时重建，避免无关输入事件打断下拉交互
+let modelOptionsTask = null;
+
+// 分类/回归的模型选项与说明文案；按任务类型生成下拉项，默认 mlp 保持历史行为
+const MODEL_OPTIONS = {
+  classification: [
+    { value: "mlp", label: "MLP 神经网络", desc: "多层感知机，适合学习非线性关系；GPU/CPU 均可，支持全部高级超参与联合训练。" },
+    { value: "logistic_regression", label: "逻辑回归", desc: "线性分类基线，训练快、可解释性好；适合线性可分数据，仅 CPU。" },
+    { value: "decision_tree", label: "决策树", desc: "规则直观、无需特征缩放；单棵树容易过拟合，仅 CPU。" },
+    { value: "random_forest", label: "随机森林", desc: "多棵树投票，抗过拟合、效果稳定；每轮按固定步长增长树数，仅 CPU。" },
+    { value: "gradient_boosting", label: "梯度提升树", desc: "表格数据通常效果最好的模型之一；每轮按固定步长增长迭代数，仅 CPU。" },
+    { value: "xgboost", label: "XGBoost（GPU 可用时加速）", desc: "优化的梯度提升实现；检测到 NVIDIA GPU 时自动使用 CUDA 加速，否则用 CPU。" },
+    { value: "svm", label: "支持向量机", desc: "小样本、高维数据表现好；大样本训练较慢，仅 CPU。" },
+    { value: "knn", label: "K 近邻", desc: "按最近邻样本投票，简单直观；样本量大时预测较慢，仅 CPU。" },
+  ],
+  regression: [
+    { value: "mlp", label: "MLP 神经网络", desc: "多层感知机，适合学习非线性关系；GPU/CPU 均可，支持全部高级超参与联合训练。" },
+    { value: "linear_regression", label: "线性回归", desc: "线性拟合基线，训练快、可解释性好；适合线性关系数据，仅 CPU。" },
+    { value: "decision_tree", label: "决策树", desc: "规则直观、无需特征缩放；单棵树容易过拟合，仅 CPU。" },
+    { value: "random_forest", label: "随机森林", desc: "多棵树平均，抗过拟合、效果稳定；每轮按固定步长增长树数，仅 CPU。" },
+    { value: "gradient_boosting", label: "梯度提升树", desc: "表格数据通常效果最好的模型之一；每轮按固定步长增长迭代数，仅 CPU。" },
+    { value: "xgboost", label: "XGBoost（GPU 可用时加速）", desc: "优化的梯度提升实现；检测到 NVIDIA GPU 时自动使用 CUDA 加速，否则用 CPU。" },
+    { value: "svm", label: "支持向量回归", desc: "小样本、高维数据表现好；大样本训练较慢，仅 CPU。" },
+    { value: "knn", label: "K 近邻", desc: "按最近邻样本平均，简单直观；样本量大时预测较慢，仅 CPU。" },
+  ],
+};
+
 function updateTaskFields() {
   const task = taskSelect.value;
   const isClustering = task === "clustering";
@@ -1236,10 +1338,30 @@ function updateTaskFields() {
   const isPretraining = task === "llm_pretraining";
   const isDpo = task === "llm_dpo";
   const isPpo = task === "llm_ppo";
+  // 分类/回归提供模型选择；其余任务固定走 mlp 路径
+  const isSupervised = task === "classification" || task === "regression";
+  const modelType = isSupervised ? ($("p_model_type").value || "mlp") : "mlp";
+  const isMLP = modelType === "mlp";
+  const isStaged = ["random_forest", "gradient_boosting", "xgboost"].includes(modelType);
+  // sklearn 模型不支持梯度同步，切换时自动退出联合训练模式
+  if (!isMLP && $("p_parallel").value === "parallel") $("p_parallel").value = "single";
   if (isClustering) $("p_parallel").value = "single";
   const isParallel = $("p_parallel").value === "parallel";
   $("parallelModeField").hidden = isClustering;
   $("parallelPanel").hidden = !isParallel;
+  // 模型选择：按任务重建选项，保留仍有效的当前选择，同步说明文案
+  $("modelTypeField").hidden = !isSupervised;
+  if (isSupervised) {
+    const options = MODEL_OPTIONS[task];
+    if (modelOptionsTask !== task) {
+      modelOptionsTask = task;
+      const current = $("p_model_type").value || "mlp";
+      $("p_model_type").innerHTML = options.map(o => `<option value="${o.value}">${o.label}</option>`).join("");
+      $("p_model_type").value = options.some(o => o.value === current) ? current : "mlp";
+    }
+    const chosen = options.find(o => o.value === ($("p_model_type").value || "mlp"));
+    $("modelTypeHint").textContent = chosen ? chosen.desc : "";
+  }
   $("targetField").hidden = isClustering || isLLM;
   $("timeColumnField").hidden = !isForecasting;
   $("nClustersField").hidden = !isClustering;
@@ -1260,14 +1382,19 @@ function updateTaskFields() {
   $("vocabSizeField").hidden = !isPretraining;
   ["modelHiddenSizeField", "modelLayersField", "modelHeadsField"].forEach((id) => { $(id).hidden = !isPretraining; });
   $("ppoUpdatesField").hidden = !isPpo;
-  $("batchSizeField").hidden = isClustering || isParallel;
+  $("batchSizeField").hidden = isClustering || isParallel || (!isLLM && !isMLP);
   $("testSplitField").hidden = isClustering;
-  $("learningRateField").hidden = isClustering || (isLLM && !isPretraining);
+  // 一次性 sklearn 模型（决策树/SVM/KNN/线性模型）不按轮训练，隐藏轮数与批大小
+  $("epochField").hidden = !isClustering && !isLLM && !isMLP && !isStaged;
+  $("learningRateField").hidden = isClustering || (isLLM && !isPretraining) || (!isLLM && !isMLP);
   $("llmLearningRateField").hidden = !isLLM || isPretraining;
-  ["hiddenLayersField", "hiddenSizeField"].forEach((id) => { $(id).hidden = isClustering || isLLM; });
-  $("resourceHintField").hidden = isClustering || isLLM || isParallel;
-  $("p_require_gpu").disabled = isLLM;
-  $("p_require_gpu").checked = isLLM || $("p_require_gpu").checked;
+  ["hiddenLayersField", "hiddenSizeField"].forEach((id) => { $(id).hidden = isClustering || isLLM || (!isLLM && !isMLP); });
+  $("mlpHyperFields").hidden = isClustering || isLLM || !isMLP;
+  $("patienceField").hidden = !$("p_early_stopping").checked;
+  $("resourceHintField").hidden = isClustering || isLLM || isParallel || (!isLLM && !isMLP);
+  $("p_require_gpu").disabled = isLLM || (!isLLM && !isMLP);
+  if (!isMLP) $("p_require_gpu").checked = false;
+  else $("p_require_gpu").checked = isLLM || $("p_require_gpu").checked;
   $("minVramField").hidden = isLLM ? false : (isClustering || !$("p_require_gpu").checked);
   if (isParallel) $("minVramField").hidden = true;
   $("trainingAdvanced").hidden = isClustering;
@@ -1275,7 +1402,8 @@ function updateTaskFields() {
     $("p_require_gpu").checked = false;
     $("minVramField").hidden = true;
   }
-  $("epochLabel").textContent = isClustering ? "最大迭代次数" : "轮数 epochs";
+  $("epochLabel").textContent = isClustering ? "最大迭代次数"
+    : (!isClustering && !isLLM && !isMLP && !isStaged) ? "拟合轮次（该模型一次完成）" : "轮数 epochs";
   $("taskHint").textContent = isClustering
     ? "KMeans 根据所有特征自动分组，不需要目标列，当前使用 CPU。"
     : isForecasting
@@ -1288,7 +1416,9 @@ function updateTaskFields() {
             : isPpo
               ? "基于奖励模型执行 PPO 式 RLHF；需要输出标量分数的奖励模型。"
               : "对 Hugging Face CausalLM 执行全参数监督微调（SFT）。"
-        : "分类适用于离散标签，回归适用于连续数值目标。";
+        : isSupervised
+          ? "分类适用于离散标签，回归适用于连续数值目标；可在“模型选择”中切换算法，选项下方附适用场景说明。"
+          : "分类适用于离散标签，回归适用于连续数值目标。";
   renderParallelWorkers();
   renderTrainingResources();
   updateStart();
@@ -1323,6 +1453,9 @@ document.addEventListener("keydown", (event) => {
 const taskSelect = $("taskSelect");
 taskSelect.addEventListener("change", updateTaskFields);
 $("p_dataset_source").addEventListener("change", updateTaskFields);
+// 模型选择切换与早停开关都会改变字段可见性，统一走 updateTaskFields
+$("p_model_type").addEventListener("change", updateTaskFields);
+$("p_early_stopping").addEventListener("change", updateTaskFields);
 [
   "p_hub_dataset", "p_base_model", "p_reward_model", "p_completion_column",
 ].forEach((id) => $(id).addEventListener("input", () => { updateTaskFields(); updateStart(); }));
@@ -1357,6 +1490,17 @@ $("btnStart").onclick = async () => {
     min_vram_mb: $("p_require_gpu").checked ? Math.max(Number($("p_min_vram").value) || 0, 0) : 0,
     device_backend: $("p_device_backend").value,
   };
+  // 分类/回归携带所选模型；其余任务固定 mlp 保持历史语义
+  payload.model_type = (task === "classification" || task === "regression")
+    ? ($("p_model_type").value || "mlp") : "mlp";
+  // MLP 训练超参（sklearn 模型与 LLM 后端按默认值忽略）
+  payload.optimizer = $("p_optimizer").value;
+  payload.lr_scheduler = $("p_lr_scheduler").value;
+  payload.early_stopping = $("p_early_stopping").checked;
+  payload.patience = Number($("p_patience").value) || 5;
+  payload.dropout = Number($("p_dropout").value);
+  payload.weight_decay = Number($("p_weight_decay").value);
+  payload.activation = $("p_activation").value;
   if (task === "clustering") payload.n_clusters = Number($("p_n_clusters").value);
   if (task === "time_series_forecasting") {
     payload.time_column = $("timeColumnSelect").value;
@@ -2214,9 +2358,10 @@ async function fillPredictTemplate() {
 function predictionWorkerIssue(worker, task) {
   if (!worker || !worker.active) return "已离线";
   if (!worker.enabled) return "未启用";
+  if (!worker.inference) return "Worker 镜像过旧，请重新部署服务器";
   const gpu = worker.gpu || {}, backend = worker.device_backend || gpu.backend || "cpu";
   if (["degraded", "recovering"].includes(worker.state) || gpu.healthy === false) return "设备异常";
-  if (!["cpu", "cuda", "rocm", "xpu", "mps"].includes(backend)) return "不支持的计算后端";
+  if (!["cpu", "cuda", "rocm", "xpu"].includes(backend)) return "不支持的计算后端";
   if (task === "clustering" && backend !== "cpu") return "聚类仅支持 CPU";
   if (backend !== "cpu" && !gpu.available) return "加速设备不可用";
   return "";

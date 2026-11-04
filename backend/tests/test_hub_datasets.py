@@ -26,16 +26,19 @@ def client():
     from app.main import app
     from app.coordination import EmbeddedJobQueue, EmbeddedLeaseStore
     from app.jobs import JobManager
-    import app.routers.jobs as jobs
+    from app.routers import training_jobs, clusters
 
     manager = JobManager(queue=EmbeddedJobQueue(), lease=EmbeddedLeaseStore(),
                          start_workers=True, start_watchdog=False)
+    original_tj, original_cl = training_jobs.manager, clusters.manager
+    training_jobs.manager = manager
+    clusters.manager = manager
     try:
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(jobs, "manager", manager)
-            with TestClient(app) as api:
-                yield api
+        with TestClient(app) as api:
+            yield api
     finally:
+        training_jobs.manager = original_tj
+        clusters.manager = original_cl
         manager.stop()
 
 
@@ -324,19 +327,19 @@ def test_hub_reference_trains_reproducibly_and_predicts(client, hub):
                "epochs": 2, "batch_size": 32, "hidden_size": 8, "hidden_layers": 1, "seed": 42}
     summaries = []
     for _ in range(2):
-        response = client.post("/api/train", json=payload)
+        response = client.post("/api/training/jobs", json=payload)
         assert response.status_code == 200, response.text
         job_id = response.json()["job_id"]
         assert wait_until(lambda: job_status(get_store(), job_id) in {"completed", "failed"}, 30)
-        detail = client.get(f"/api/jobs/{job_id}").json()
+        detail = client.get(f"/api/training/jobs/{job_id}").json()
         assert detail["status"] == "completed", detail
         assert len(detail["metrics"]) == 2 and detail["summary"]["final"]["val_accuracy"] is not None
         assert get_store().exists(job_key(job_id, "best.pt"))
-        assert client.get(f"/api/jobs/{job_id}/logs").json()["lines"]
+        assert client.get(f"/api/training/jobs/{job_id}/logs").json()["lines"]
         summaries.append(detail["summary"]["final"]["val_accuracy"])
         for row in ({"feature": 1}, {}, {"feature": "invalid"}):
-            first = client.post(f"/api/jobs/{job_id}/predict", json={"row": row})
-            second = client.post(f"/api/jobs/{job_id}/predict", json={"row": row})
+            first = client.post(f"/api/training/jobs/{job_id}/predict", json={"row": row})
+            second = client.post(f"/api/training/jobs/{job_id}/predict", json={"row": row})
             assert first.status_code == second.status_code == 200
             assert first.json()["prediction"] == second.json()["prediction"]
     assert summaries[0] == summaries[1] and len(hub["loads"]) == 1

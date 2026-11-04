@@ -9,21 +9,27 @@ from fastapi.staticfiles import StaticFiles
 
 import app.config as config
 from app.device import available_backends, device_info
-from app.routers import datasets, jobs
+from app.routers import datasets, training_jobs, notebook, templates, models, pipelines, clusters, remote
 from app.state import manager  # noqa: F401  (对外保留引用，兼容测试/调用方)
 
-app = FastAPI(title="可视化模型训练平台", version="1.0.0")
+app = FastAPI(title="可视化模型训练平台", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.CORS_ALLOW_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # 领域路由
 app.include_router(datasets.router)
-app.include_router(jobs.router)
+app.include_router(training_jobs.router)
+app.include_router(notebook.router)
+app.include_router(templates.router)
+app.include_router(models.router)
+app.include_router(pipelines.router)
+app.include_router(clusters.router)
+app.include_router(remote.router)
 
 
 # ---------------------------------------------------------------------------

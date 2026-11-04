@@ -55,6 +55,22 @@ x-backend-env: &backend-env
   WORKER_CPU_SLOTS: ${WORKER_CPU_SLOTS:-2}
   WORKER_CHECKPOINT_INTERVAL: ${WORKER_CHECKPOINT_INTERVAL:-5}
   WORKER_CHECKPOINT_KEEP: ${WORKER_CHECKPOINT_KEEP:-3}
+  # ---- 数据集导入限额：防超大上传 / 压缩炸弹 / 超宽表 ----
+  DATASET_MAX_FILE_SIZE: ${DATASET_MAX_FILE_SIZE:-524288000}
+  DATASET_MAX_ROWS: ${DATASET_MAX_ROWS:-2000000}
+  DATASET_MAX_COLUMNS: ${DATASET_MAX_COLUMNS:-100}
+  DATASET_MAX_ARCHIVE_FILES: ${DATASET_MAX_ARCHIVE_FILES:-10000}
+  DATASET_MAX_ARCHIVE_MEMBER_BYTES: ${DATASET_MAX_ARCHIVE_MEMBER_BYTES:-524288000}
+  DATASET_MAX_ARCHIVE_EXPANDED_BYTES: ${DATASET_MAX_ARCHIVE_EXPANDED_BYTES:-1073741824}
+  DATASET_MAX_COMPRESSION_RATIO: ${DATASET_MAX_COMPRESSION_RATIO:-200}
+  DATASET_MAX_IMPORT_FILES: ${DATASET_MAX_IMPORT_FILES:-1000}
+  # ---- 预测（inference）稳定性：小规格槽位防 OOM / 防心跳误杀 ----
+  INFERENCE_NUM_THREADS: ${INFERENCE_NUM_THREADS:-1}
+  INFERENCE_NICE: ${INFERENCE_NICE:-5}
+  INFERENCE_LEASE_TTL: ${INFERENCE_LEASE_TTL:-90}
+  INFERENCE_HEARTBEAT_INTERVAL: ${INFERENCE_HEARTBEAT_INTERVAL:-10}
+  INFERENCE_MIN_FREE_MEMORY_MB: ${INFERENCE_MIN_FREE_MEMORY_MB:-256}
+  INFERENCE_TORCH_MIN_FREE_MEMORY_MB: ${INFERENCE_TORCH_MIN_FREE_MEMORY_MB:-640}
   WORKER_IMAGE: ${WORKER_IMAGE:-mtp-worker:local}
   WORKER_REMOTE_IMAGE: ${WORKER_IMAGE:-mtp-worker:local}
 
@@ -105,24 +121,30 @@ services:
       WORKER_REMOTE_REDIS_PASSWORD: ${WORKER_REMOTE_REDIS_PASSWORD:-}
       WORKER_REMOTE_S3_ENDPOINT: ${WORKER_REMOTE_S3_ENDPOINT:-}
       WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY: ${WORKER_SSH_CREDENTIAL_ENCRYPTION_KEY:-}
+      # 新增：Notebook / 模板 / 模型注册表 / Pipeline / 分布式训练
+      NOTEBOOK_MAX_SESSIONS: ${NOTEBOOK_MAX_SESSIONS:-20}
+      NOTEBOOK_SESSION_TTL: ${NOTEBOOK_SESSION_TTL:-7200}
+      NOTEBOOK_CELL_TIMEOUT: ${NOTEBOOK_CELL_TIMEOUT:-300}
+      MODEL_AUTO_REGISTER: ${MODEL_AUTO_REGISTER:-true}
+      MODEL_REGISTRY_OSS_PREFIX: ${MODEL_REGISTRY_OSS_PREFIX:-models/}
+      PIPELINE_MAX_CONCURRENT_RUNS: ${PIPELINE_MAX_CONCURRENT_RUNS:-5}
+      DISTRIBUTED_BACKEND: ${DISTRIBUTED_BACKEND:-nccl}
+      HETERO_PLACEMENT_STRATEGY: ${HETERO_PLACEMENT_STRATEGY:-memory_aware}
+      RESOURCE_SELECTOR_DEFAULT_STRATEGY: ${RESOURCE_SELECTOR_DEFAULT_STRATEGY:-auto}
     depends_on:
       seaweedfs:
         condition: service_healthy
     restart: unless-stopped
 
   frontend:
-    # 前端容器（Node 零依赖静态服务 + /api 反向代理，按语言与后端 Python 分离）
+    # 前端容器（Vue 3 + Vite 构建产物，零依赖 Node 服务托管 + /api 反向代理，无 nginx）
     build:
-      context: .
-      dockerfile: frontend/Dockerfile
+      context: ./frontend-vue
       args:
-        NODE_BASE: ${NODE_BASE_IMAGE:-node:20-alpine}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
     container_name: mtp-frontend
     ports:
       - "8000:8000"   # 页面与 API 同源入口
-    environment:
-      API_PROXY_HOST: trainer
-      API_PROXY_PORT: 8000
     depends_on:
       - trainer
     healthcheck:
@@ -140,7 +162,9 @@ services:
         APT_MIRROR: ${APT_MIRROR:-}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: mtp-worker
-    # 计算平面：supervisor 按 WORKER_CPU_SLOTS 拉起 CPU 执行槽（一卡一进程的 CPU 版）
+    # 计算平面：训练执行走经全生命周期验证的 TrainingWorker
+    # （领取→租约→训练→checkpoint→产物→自动注册→状态收尾）；
+    # compute.worker_host 保留为 Notebook 内核宿主的扩展入口。
     command: ["python", "-m", "app.worker"]
     stop_grace_period: 45s
     extra_hosts:
@@ -155,10 +179,35 @@ services:
       WORKER_MANAGED: ${WORKER_MANAGED:-false}
       # 同一 Compose 网络内的 CPU/GPU 槽使用服务名互联；跨机器部署请显式配置训练网地址并使用受管 worker。
       WORKER_DISTRIBUTED_HOST: ${WORKER_DISTRIBUTED_HOST:-worker}
+      # 分布式训练（异构感知）
+      DISTRIBUTED_BACKEND: ${DISTRIBUTED_BACKEND:-nccl}
+      HETERO_PLACEMENT_STRATEGY: ${HETERO_PLACEMENT_STRATEGY:-memory_aware}
+      HETERO_ALLOW_CPU_FALLBACK: ${HETERO_ALLOW_CPU_FALLBACK:-true}
     depends_on:
       seaweedfs:
         condition: service_healthy
     restart: unless-stopped
+
+  scheduler:
+    # Pipeline 定时调度器（独立进程，控制平面扩展）
+    build:
+      context: ./backend
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    container_name: mtp-scheduler
+    command: ["python", "-m", "app.orchestration.scheduler_service"]
+    extra_hosts:
+      - "localhost:host-gateway"
+    volumes:
+      - ./data:/app/data
+    environment:
+      <<: *backend-env
+      USE_DATABASE: ${USE_DATABASE:-false}
+    depends_on:
+      - trainer
+    restart: unless-stopped
+    profiles: ["scheduler"]   # 按需启动：docker compose --profile scheduler up
 
 volumes:
   seaweedfs-data:

@@ -21,7 +21,7 @@ def test_cpu_device_info_is_healthy_and_describes_gloo():
 @pytest.mark.parametrize(
     ("backend", "vendor", "device_type"),
     [("cuda", "nvidia", "cuda"), ("rocm", "amd", "cuda"),
-     ("xpu", "intel", "xpu"), ("mps", "apple", "mps"), ("cpu", "cpu", "cpu")],
+     ("xpu", "intel", "xpu"), ("cpu", "cpu", "cpu")],
 )
 def test_backend_mapping_is_cross_platform(backend, vendor, device_type):
     """公开后端名称映射到稳定厂商名和 PyTorch 设备类型。"""
@@ -45,13 +45,13 @@ def test_select_device_auto_falls_back_to_cpu(monkeypatch):
 @pytest.mark.parametrize(
     ("backend", "expected_device"),
     [("cuda", "cuda:0"), ("rocm", "cuda:0"), ("xpu", "xpu:0"),
-     ("mps", "mps"), ("cpu", "cpu")],
+     ("cpu", "cpu")],
 )
 def test_device_info_reports_simulated_cross_platform_backends(monkeypatch, backend, expected_device):
     """无对应硬件的测试机也能验证各平台设备协议映射。"""
     availability = {
         "cuda": backend == "cuda", "rocm": backend == "rocm",
-        "xpu": backend == "xpu", "mps": backend == "mps",
+        "xpu": backend == "xpu",
     }
     for name, enabled in availability.items():
         monkeypatch.setattr(device, f"_{name}_available", lambda enabled=enabled: enabled)
@@ -70,10 +70,15 @@ def test_device_info_reports_simulated_cross_platform_backends(monkeypatch, back
     assert ("nccl" in info["distributed_backends"]) is (backend == "cuda")
 
 
-@pytest.mark.parametrize(("backend", "index"), [("cpu", -1), ("mps", -1), ("mps", 1)])
-def test_device_info_rejects_invalid_single_device_indices(monkeypatch, backend, index):
-    """CPU/MPS 的固定设备和负索引在张量探测前明确拒绝。"""
-    monkeypatch.setattr(device, "_mps_available", lambda: True)
-    monkeypatch.setattr(device, "_backend_count", lambda _backend: 1)
+@pytest.mark.parametrize(("backend", "index"), [("cpu", -1)])
+def test_device_info_rejects_invalid_single_device_indices(backend, index):
+    """CPU 单设备的负索引在张量探测前明确拒绝。"""
     with pytest.raises(ValueError, match="设备索引"):
         device.device_info(backend, index=index)
+
+
+def test_seed_device_cpu_and_unavailable_cuda_paths_do_not_raise():
+    """CPU 与无 CUDA 环境的既有 seed 行为保持不变（回归保护）。"""
+    device.seed_device(42, "cpu")
+    device.seed_device(42, "cuda")
+    device.seed_device(42)

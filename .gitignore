@@ -221,3 +221,12 @@ __marimo__/
 # 可视化训练平台运行时数据（数据集/任务/模型产物）
 data/
 backend/.venv/
+
+# Vue 前端构建产物与依赖
+frontend-vue/node_modules/
+frontend-vue/dist/
+frontend-vue/src/auto-imports.d.ts
+frontend-vue/src/components.d.ts
+frontend-vue/test-results/
+frontend-vue/playwright-report/
+frontend-vue/walkthrough-shots/

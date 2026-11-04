@@ -412,6 +412,7 @@ def test_redis_worker_registry_roundtrip_nested_caps():
                                   "count": 1, "vram_mb": 8192},
         "torch_version": "2.8.0", "cuda_version": None,
         "python_version": "3", "started_at": 1700000000.5,
+        "inference": True,
     }
     ls.register_worker("w-nested", caps, ttl=30)
     ls.heartbeat_worker("w-nested", {"state": "running", "current_job": "job-x", "epoch": 42}, ttl=30)
@@ -425,6 +426,8 @@ def test_redis_worker_registry_roundtrip_nested_caps():
     assert w["current_job"] == "job-x" and w["state"] == "running"
     assert w["started_at"] == 1700000000.5
     assert w["active"] is True
+    # bool 经 jsonable("1") 往返后为真值；预测提交校验依赖该真值。
+    assert bool(w["inference"]) is True
     ls.deregister_worker("w-nested")
 
 

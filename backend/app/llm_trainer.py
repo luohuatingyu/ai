@@ -686,7 +686,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
                     optimizer.step()
                 else:
                     parallel.step(optimizer, weight, max_norm=1.0)
-                losses.append(float(loss.detach()) if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64))
+                losses.append(float(loss.detach()) if device.type == "cpu" else loss.detach().to(torch.float64))
                 weights.append(weight)
             elif task == "llm_dpo":
                 loss, preference_accuracy = _dpo_loss(model, reference, batch, tokenizer, beta, device)
@@ -697,7 +697,7 @@ def run_llm_training(task: str, dataset_path: Path | None, params: dict,
                     optimizer.step()
                 else:
                     parallel.step(optimizer, len(batch), max_norm=1.0)
-                losses.append(float(loss.detach()) if device.type == "cpu" else loss.detach().to(torch.float32 if device.type == "mps" else torch.float64))
+                losses.append(float(loss.detach()) if device.type == "cpu" else loss.detach().to(torch.float64))
                 extra_metrics.append(float(preference_accuracy.detach()) if device.type == "cpu" else preference_accuracy.detach())
                 weights.append(len(batch))
             else:

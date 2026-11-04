@@ -44,18 +44,33 @@ class TrainRequest(BaseModel):
     n_clusters: int = Field(4, ge=2, le=64)
     lookback: int = Field(12, ge=2, le=512)
     forecast_horizon: int = Field(1, ge=1, le=64)
+    # 分类/回归的模型选择：mlp 为 PyTorch 神经网络，xgboost 支持 GPU 加速，
+    # 其余为 sklearn 传统机器学习模型（仅 CPU）
+    model_type: Literal[
+        "mlp", "logistic_regression", "linear_regression", "decision_tree",
+        "random_forest", "gradient_boosting", "svm", "knn", "xgboost",
+    ] = "mlp"
     epochs: int = Field(20, ge=1, le=500)
     batch_size: int = Field(32, ge=1, le=4096)
     lr: float = Field(1e-3, gt=0, le=1.0)
     hidden_layers: int = Field(2, ge=0, le=8)
     hidden_size: int = Field(64, ge=1, le=2048)
+    # 以下训练超参仅对 MLP 生效；其他模型类型提交时忽略
+    optimizer: Literal["adamw", "adam", "sgd", "rmsprop"] = "adamw"
+    lr_scheduler: Literal["none", "step", "cosine"] = "none"
+    early_stopping: bool = False
+    patience: int = Field(5, ge=1, le=100)
+    dropout: float = Field(0.15, ge=0.0, le=0.9)
+    # AdamW 的 PyTorch 默认 weight_decay 即 0.01，保持历史任务行为完全一致
+    weight_decay: float = Field(0.01, ge=0.0, le=0.5)
+    activation: Literal["relu", "gelu", "tanh", "silu"] = "relu"
     test_split: float = Field(0.2, ge=0.05, le=0.5)
     seed: int = 42
     # 资源提示（任务分发匹配到卡级）：要求在 GPU 卡上训练 / 显存下限
     worker_id: str | None = Field(default=None, min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.-]+$")
     require_gpu: bool = False
     min_vram_mb: int = Field(0, ge=0, le=1024 * 1024)
-    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] = "auto"
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "cpu"] = "auto"
     parallel_workers: list[ParallelMember] = Field(default_factory=list, max_length=32)
     parallel_timeout: int = Field(default=300, ge=10, le=3600)
 
@@ -71,6 +86,28 @@ class TrainRequest(BaseModel):
     def validate_task_fields(self) -> "TrainRequest":
         """按任务类型校验数据源、模型标识、目标列和资源参数。"""
         llm_tasks = {"llm_pretraining", "llm_sft", "llm_dpo", "llm_ppo"}
+        # 各任务类型允许的 model_type；sklearn 模型仅支持分类/回归且只能 CPU 计算
+        sklearn_classification = {
+            "logistic_regression", "decision_tree", "random_forest",
+            "gradient_boosting", "svm", "knn",
+        }
+        sklearn_regression = sklearn_classification - {"logistic_regression"} | {"linear_regression"}
+        if self.task == "classification":
+            allowed_models = {"mlp", "xgboost"} | sklearn_classification
+        elif self.task == "regression":
+            allowed_models = {"mlp", "xgboost"} | sklearn_regression
+        else:
+            allowed_models = {"mlp"}
+        if self.model_type not in allowed_models:
+            raise ValueError(f"任务 {self.task} 不支持模型 {self.model_type}")
+        if self.model_type != "mlp":
+            if self.parallel_workers:
+                raise ValueError("传统机器学习模型不支持联合训练，请使用单节点模式")
+            # xgboost 在 GPU 可用时使用 CUDA 加速，允许 GPU 资源要求；纯 sklearn 仅 CPU
+            if self.model_type != "xgboost" and (
+                self.require_gpu or self.device_backend not in {"auto", "cpu"}
+            ):
+                raise ValueError("传统机器学习模型基于 scikit-learn，仅支持 CPU 计算")
         if self.parallel_workers:
             identifiers = [item.worker_id for item in self.parallel_workers]
             if len(identifiers) < 2 or len(set(identifiers)) != len(identifiers):
@@ -191,7 +228,7 @@ class RemoteServerRequest(BaseModel):
     )
     port: int = Field(default=22, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] = "gpu"
-    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] = "auto"
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "cpu"] = "auto"
     cpu_slots: int = Field(default=2, ge=0, le=256)
     distributed_host: str = Field(default="", max_length=253, pattern=r"^[A-Za-z0-9.:-]*$")
     remote_redis_url: str | None = Field(default=None, max_length=4096)
@@ -229,7 +266,7 @@ class RemoteServerUpdateRequest(BaseModel):
     ssh_credential_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     port: int | None = Field(default=None, ge=1, le=65535)
     mode: Literal["cpu", "gpu"] | None = None
-    device_backend: Literal["auto", "cuda", "rocm", "xpu", "mps", "cpu"] | None = None
+    device_backend: Literal["auto", "cuda", "rocm", "xpu", "cpu"] | None = None
     cpu_slots: int | None = Field(default=None, ge=0, le=256)
     distributed_host: str | None = Field(default=None, max_length=253, pattern=r"^[A-Za-z0-9.:-]*$")
     remote_redis_url: str | None = Field(default=None, max_length=4096)

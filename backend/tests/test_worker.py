@@ -48,8 +48,105 @@ def test_detect_capabilities_reports_cpu_and_stable_server_identity(monkeypatch)
 
     assert caps["machine_id"] == "worker-lab"
     assert caps["managed"] is True
+    assert caps["inference"] is True
     assert caps["cpu"]["cores"] >= 1
     assert caps["cpu"]["memory_mb"] is None or caps["cpu"]["memory_mb"] >= 1
+
+
+def test_detect_capabilities_reports_code_fingerprint_and_frameworks():
+    """能力上报包含代码指纹与框架能力，平台可据此比对远程是否同步、依赖是否齐全。"""
+    caps = detect_capabilities("worker-fp")
+
+    fingerprint = caps["code_fingerprint"]
+    assert isinstance(fingerprint, str) and len(fingerprint) == 12
+    assert fingerprint != "unknown", "运行文件应可读并生成稳定指纹"
+
+    versions = caps["framework_versions"]
+    assert set(versions) >= {"torch", "sklearn", "xgboost", "numpy"}
+    assert versions["torch"], "容器内 torch 版本应可探测"
+
+    frameworks = caps["frameworks"]
+    assert "torch" in frameworks and "sklearn" in frameworks
+    assert all(frameworks), "能力列表不得包含空值"
+
+
+def test_code_fingerprint_tracks_content_and_survives_missing_files(tmp_path):
+    """指纹随源码内容变化；文件缺失时返回 unknown 而不阻断启动。"""
+    import app.runtime_info as runtime_info
+
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    for name in runtime_info.RUNTIME_MODULE_FILES:
+        (app_dir / name).write_text(f"# {name}\n", encoding="utf-8")
+    baseline = runtime_info.code_fingerprint(app_dir)
+    assert len(baseline) == 12
+
+    (app_dir / "worker.py").write_text("# changed\n", encoding="utf-8")
+    assert runtime_info.code_fingerprint(app_dir) != baseline
+
+    (app_dir / "__init__.py").unlink()
+    assert runtime_info.code_fingerprint(app_dir) == "unknown"
+
+
+def test_required_framework_mapping():
+    """任务所需框架判定：XGBoost/传统模型/torch 分别上报对应能力名。"""
+    from app.trainer import required_framework
+
+    assert required_framework("classification", {"model_type": "xgboost"}) == "xgboost"
+    assert required_framework("regression", {"model_type": "random_forest"}) == "sklearn"
+    assert required_framework("classification", {"model_type": "mlp"}) == "torch"
+    assert required_framework("classification", {}) == "torch"
+    assert required_framework("clustering", {"n_clusters": 3}) == "torch"
+    assert required_framework("time_series_forecasting", None) == "torch"
+
+
+def test_missing_framework_fails_fast_and_is_retryable(store, make_dataset, make_job, q, ls):
+    """环境性场景：节点缺少 XGBoost 时快速失败，归类为可重试（换节点即成功）。"""
+    from app.worker import MissingFrameworkError, TrainingWorker, classify_retryable
+
+    ds = make_dataset()
+    job = make_job(ds, epochs=2, model_type="xgboost")
+    caps = detect_capabilities("worker-no-xgb")
+    caps["frameworks"] = ["torch", "sklearn"]  # 模拟未安装 xgboost 的旧远程节点
+    caps["framework_versions"] = {**caps["framework_versions"], "xgboost": ""}
+
+    w = TrainingWorker(store=store, queue=q, lease_store=ls, capabilities=caps,
+                       idle_poll=0.05, gpu_probe_enabled=False)
+    t = threading.Thread(target=w.run_forever, daemon=True)
+    t.start()
+    try:
+        q.push(job)
+        assert wait_until(lambda: job_status(store, job) == "failed", 60)
+        rec = jobstore.read_job(store, job)
+        assert "缺少 xgboost 依赖" in str(rec.get("error"))
+        assert rec["retry_count"] == int(config.JOB_MAX_AUTO_RETRY), "能力不足应逐个节点重试"
+        assert not store.exists(job_key(job, "best.pt")), "预检失败不得产生训练产物"
+    finally:
+        w.request_shutdown()
+        t.join(timeout=5)
+
+    assert classify_retryable(MissingFrameworkError("缺少 xgboost 依赖")) is True
+
+
+def test_capability_preflight_skips_check_when_frameworks_unknown(store, make_dataset, make_job, q, ls):
+    """兼容场景：能力字段缺失（旧记录/手工能力字典）时不拦截，保持既有行为。"""
+    from app.worker import TrainingWorker
+
+    ds = make_dataset()
+    job = make_job(ds, epochs=2, model_type="random_forest")
+    caps = detect_capabilities("worker-legacy")
+    caps.pop("frameworks", None)  # 老版本上报不含该字段
+
+    w = TrainingWorker(store=store, queue=q, lease_store=ls, capabilities=caps,
+                       idle_poll=0.05, gpu_probe_enabled=False)
+    t = threading.Thread(target=w.run_forever, daemon=True)
+    t.start()
+    try:
+        q.push(job)
+        assert wait_until(lambda: job_status(store, job) == "completed", 90)
+    finally:
+        w.request_shutdown()
+        t.join(timeout=5)
 
 
 def test_detect_capabilities_reports_configured_parallel_host(monkeypatch):
@@ -254,6 +351,89 @@ def test_checkpoint_corrupt_falls_back_to_older(store, make_dataset, make_job, q
     assert eps == sorted(set(eps)), f"回退续训后曲线仍应无重复 epoch: {eps}"
     assert eps == list(range(1, 41)), "回退续训后应补满全部 epoch"
     wb.stop()
+
+
+def test_all_checkpoints_corrupt_fails_with_clear_reason(store, make_dataset, make_job, q, ls, spawn_worker):
+    """异常场景：所有 checkpoint 都损坏时明确失败，不从第 0 轮静默重训。"""
+    ds = make_dataset(n=1000)
+    job = make_job(ds, epochs=40)
+    q.push(job)
+    wa = spawn_worker("srv-a")
+    assert wait_until(lambda: len(job_epochs(store, job)) >= 4, 40)
+    ls.set_signal(job, "pause")
+    assert wait_until(lambda: job_status(store, job) == "paused", 25)
+    wa.stop()
+
+    keys = [key for key in store.list_keys(f"jobs/{job}/checkpoints/") if key.endswith(".pt")]
+    assert keys, "暂停后应存在版本化 checkpoint"
+    for key in keys:
+        store.write_bytes(key, b"corrupted-not-torch")
+
+    jobstore.update_job(store, job, status=jobstore.QUEUED)
+    q.push(job)
+    wb = spawn_worker("srv-b")
+    assert wait_until(lambda: job_status(store, job) == "failed", 60)
+    rec = jobstore.read_job(store, job)
+    assert "均无法加载" in str(rec.get("error"))
+    assert "回退更早版本" in jobstore.read_job_log(store, job)
+    # 失败前已完成进度不得被静默丢弃（曲线不从第 0 轮重来）。
+    assert max(job_epochs(store, job)) >= 4
+    wb.stop()
+
+
+class CheckpointReadOutageStore:
+    """包装 store：前 fail_times 次读取 checkpoint 抛环境性存储故障。"""
+
+    def __init__(self, inner, fail_times=1):
+        self.inner = inner
+        self.fail_times = fail_times
+        self.raised = 0
+
+    def read_file(self, key, path):
+        if "checkpoints/ckpt-" in key and self.raised < self.fail_times:
+            self.raised += 1
+            raise ArtifactStoreUnavailableError("读取对象存储产物失败: 存储瞬断")
+        return self.inner.read_file(key, path)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def test_checkpoint_read_outage_retries_instead_of_restarting(
+    store, make_dataset, make_job, q, ls, spawn_worker
+):
+    """环境性场景：读取 checkpoint 时存储瞬断 → 中止并自动重试，不从头重训。"""
+    ds = make_dataset(n=1000)
+    job = make_job(ds, epochs=40)
+    q.push(job)
+    wa = spawn_worker("srv-a")
+    assert wait_until(lambda: len(job_epochs(store, job)) >= 4, 40)
+    ls.set_signal(job, "pause")
+    assert wait_until(lambda: job_status(store, job) == "paused", 25)
+    wa.stop()
+
+    jobstore.update_job(store, job, status=jobstore.QUEUED)
+    q.push(job)
+    from app.worker import TrainingWorker
+
+    epoch_count_before_retry = len(job_epochs(store, job))
+    wb = TrainingWorker(store=CheckpointReadOutageStore(store, fail_times=1), queue=q,
+                        lease_store=ls, capabilities=detect_capabilities("srv-outage"),
+                        idle_poll=0.05, gpu_probe_enabled=False)
+    t = threading.Thread(target=wb.run_forever, daemon=True)
+    t.start()
+    try:
+        assert wait_until(lambda: job_status(store, job) == "completed", 120)
+        rec = jobstore.read_job(store, job)
+        assert rec["retry_count"] == 1
+        assert rec["error"] is None
+        # 存储瞬断被正确归类为环境性错误，而不是"checkpoint 损坏"回退。
+        assert "回退更早版本" not in jobstore.read_job_log(store, job)
+        assert len(job_epochs(store, job)) >= epoch_count_before_retry
+        assert job_epochs(store, job) == list(range(1, 41)), "重试后曲线应连续补满"
+    finally:
+        wb.request_shutdown()
+        t.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------

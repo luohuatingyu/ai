@@ -379,3 +379,49 @@ def test_resume_rejects_corrupt_file(store, tmp_path):
     bad.write_bytes(b"not-a-torch-file")
     with pytest.raises(ValueError):
         load_trainer_state(bad)
+
+
+def test_load_trainer_state_reports_missing_required_fields(tmp_path):
+    """异常场景：缺字段的 checkpoint 明确报告缺少哪些字段，而不是续训中途 KeyError。"""
+    import torch as _torch
+
+    bad = tmp_path / "missing-fields.pt"
+    _torch.save({"kind": "trainer_state", "task": "classification"}, bad)
+    with pytest.raises(ValueError, match="缺少必要字段"):
+        load_trainer_state(bad)
+
+
+def test_load_trainer_state_requires_estimator_for_traditional_framework(tmp_path):
+    """异常场景：sklearn/xgboost 状态缺少 estimator 时按结构不合法拒绝。"""
+    import torch as _torch
+
+    bad = tmp_path / "sklearn-missing-estimator.pt"
+    _torch.save({"kind": "trainer_state", "framework": "sklearn",
+                 "task": "classification", "model_type": "random_forest",
+                 "preprocessor": {}}, bad)
+    with pytest.raises(ValueError, match="缺少必要字段"):
+        load_trainer_state(bad)
+
+
+@pytest.mark.parametrize("payload", [[1, 2, 3], 42, "text"])
+def test_load_trainer_state_rejects_non_dict_payload(tmp_path, payload):
+    """异常场景：非字典负载按 kind 不匹配拒绝，不抛 AttributeError。"""
+    import torch as _torch
+
+    bad = tmp_path / "non-dict.pt"
+    _torch.save(payload, bad)
+    with pytest.raises(ValueError, match="kind"):
+        load_trainer_state(bad)
+
+
+@pytest.mark.parametrize("payload", [42, "text"])
+def test_load_torch_checkpoint_rejects_non_dict_payload(tmp_path, payload):
+    """异常场景：预测产物为非字典负载时报"格式无效"，便于上游给出可读失败原因。"""
+    import torch as _torch
+
+    from app.trainer import load_torch_checkpoint
+
+    bad = tmp_path / "non-dict-model.pt"
+    _torch.save(payload, bad)
+    with pytest.raises(ValueError, match="格式无效"):
+        load_torch_checkpoint(bad)

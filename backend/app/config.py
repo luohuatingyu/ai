@@ -55,6 +55,34 @@ EMBEDDED_WORKERS = int(os.environ.get("EMBEDDED_WORKERS", "2"))                 
 WORKER_CHECKPOINT_INTERVAL = int(os.environ.get("WORKER_CHECKPOINT_INTERVAL", "5"))     # 每训练 N 个 epoch 存一次 checkpoint
 WORKER_CHECKPOINT_KEEP = int(os.environ.get("WORKER_CHECKPOINT_KEEP", "3"))             # 版本化 checkpoint 保留个数（可回退）
 
+# 预测（inference）资源与租约：小规格计算槽（如 2 vCPU / 1.7 GB 且与 Redis 同机）在
+# 预测子进程导入 torch/BLAS 时会把同机协调平面一起拖慢，导致续租心跳超时被误判失租。
+# 这里用独立的租约/心跳参数和资源阈值，把"模型加载慢"和"Worker 真的失联"区分开：
+# - INFERENCE_NUM_THREADS：预测子进程 BLAS/OpenMP 线程数（默认 1，避免抢占同机协调平面 CPU）；
+# - INFERENCE_NICE：预测子进程调度谦让值（>0 降低优先级，0 表示不调整）；
+# - INFERENCE_LEASE_TTL / INFERENCE_HEARTBEAT_INTERVAL：预测专用租约有效期与心跳周期（秒）；
+# - INFERENCE_MIN_FREE_MEMORY_MB：提交/执行前要求的最低可用内存（心跳上报数据，MB）；
+# - INFERENCE_TORCH_MIN_FREE_MEMORY_MB：torch 产物预测额外内存要求（torch 常驻约 490MB，MB）。
+INFERENCE_NUM_THREADS = int(os.environ.get("INFERENCE_NUM_THREADS", "1"))
+INFERENCE_NICE = int(os.environ.get("INFERENCE_NICE", "5"))
+INFERENCE_LEASE_TTL = float(os.environ.get("INFERENCE_LEASE_TTL", "90"))
+INFERENCE_HEARTBEAT_INTERVAL = float(os.environ.get("INFERENCE_HEARTBEAT_INTERVAL", "10"))
+INFERENCE_MIN_FREE_MEMORY_MB = int(os.environ.get("INFERENCE_MIN_FREE_MEMORY_MB", "256"))
+INFERENCE_TORCH_MIN_FREE_MEMORY_MB = int(os.environ.get("INFERENCE_TORCH_MIN_FREE_MEMORY_MB", "640"))
+
+# 数据集导入限额：防止超大上传、压缩炸弹和超宽表耗尽内存与磁盘。
+# 上传按块写入（流式），不在内存中整体读取；压缩包解压前/解压中同时校验
+# 成员数、单成员大小、展开总大小、压缩比与实际写入字节数。
+DATASET_MAX_FILE_SIZE = int(os.environ.get("DATASET_MAX_FILE_SIZE", str(500 * 1024 * 1024)))          # 单个上传文件上限（字节）
+DATASET_MAX_ROWS = int(os.environ.get("DATASET_MAX_ROWS", "2000000"))                                # 数据集最大行数
+DATASET_MAX_COLUMNS = int(os.environ.get("DATASET_MAX_COLUMNS", "100"))                              # 数据集最大列数
+DATASET_UPLOAD_CHUNK_BYTES = int(os.environ.get("DATASET_UPLOAD_CHUNK_BYTES", str(1024 * 1024)))      # 上传分块大小（字节）
+DATASET_MAX_ARCHIVE_FILES = int(os.environ.get("DATASET_MAX_ARCHIVE_FILES", "10000"))                 # 压缩包成员数上限
+DATASET_MAX_ARCHIVE_MEMBER_BYTES = int(os.environ.get("DATASET_MAX_ARCHIVE_MEMBER_BYTES", str(500 * 1024 * 1024)))   # 单成员解压后上限（字节）
+DATASET_MAX_ARCHIVE_EXPANDED_BYTES = int(os.environ.get("DATASET_MAX_ARCHIVE_EXPANDED_BYTES", str(1024 * 1024 * 1024)))  # 解压总大小上限（字节）
+DATASET_MAX_COMPRESSION_RATIO = int(os.environ.get("DATASET_MAX_COMPRESSION_RATIO", "200"))          # 展开/压缩体积比上限（防压缩炸弹）
+DATASET_MAX_IMPORT_FILES = int(os.environ.get("DATASET_MAX_IMPORT_FILES", "1000"))                    # 单次批量/压缩包导入文件数上限
+
 # 多机多卡：一卡一进程的机器级守护（Supervisor）与卡健康自愈
 WORKER_SUPERVISOR_PROBE_INTERVAL = float(os.environ.get("WORKER_SUPERVISOR_PROBE_INTERVAL", "15"))  # 掉卡探测周期（秒）
 WORKER_GPU_PROBE = os.environ.get("WORKER_GPU_PROBE", "true").strip().lower() == "true"  # 心跳周期内是否做 GPU 软探测
@@ -88,6 +116,57 @@ WORKER_STALE_CLEANUP_AGE = int(os.environ.get("WORKER_STALE_CLEANUP_AGE", "300")
 # 运行期目录统一创建（幂等）
 for _d in (DATA_DIR, DATASETS_DIR, JOBS_DIR, WORKER_SCRATCH_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# 新增：Notebook / 模板 / 模型注册表 / Pipeline / 分布式训练 配置
+# ---------------------------------------------------------------------------
+
+# Notebook 会话配置
+NOTEBOOK_MAX_SESSIONS = int(os.environ.get("NOTEBOOK_MAX_SESSIONS", "20"))           # 最大并发会话数
+NOTEBOOK_SESSION_TTL = int(os.environ.get("NOTEBOOK_SESSION_TTL", "7200"))             # 会话空闲 TTL（秒）
+NOTEBOOK_CELL_TIMEOUT = int(os.environ.get("NOTEBOOK_CELL_TIMEOUT", "300"))            # 单元格执行超时（秒）
+NOTEBOOK_MAX_VARIABLES_SIZE = int(os.environ.get("NOTEBOOK_MAX_VARIABLES_SIZE", "10485760"))  # 变量快照最大字节（10MB）
+NOTEBOOK_KERNEL_POOL_SIZE = int(os.environ.get("NOTEBOOK_KERNEL_POOL_SIZE", "4"))      # 内核进程池大小
+
+# 脚本模板配置
+TEMPLATE_BUILTIN_DIR = APP_ROOT / "templates" / "builtin"                               # 内置模板目录
+TEMPLATE_USER_DIR = DATA_DIR / "templates" / "user"                                     # 用户模板目录
+TEMPLATE_MAX_CONTENT_SIZE = int(os.environ.get("TEMPLATE_MAX_CONTENT_SIZE", "1048576")) # 模板内容最大字节（1MB）
+
+# 模型注册表配置
+MODEL_REGISTRY_OSS_PREFIX = os.environ.get("MODEL_REGISTRY_OSS_PREFIX", "models/")     # OSS 中模型注册表前缀
+MODEL_VERSION_SCHEME = os.environ.get("MODEL_VERSION_SCHEME", "semver")                # 版本方案：semver/auto_increment/timestamp
+MODEL_AUTO_REGISTER = os.environ.get("MODEL_AUTO_REGISTER", "true").lower() == "true"  # 训练完成自动注册
+MODEL_DEPLOY_DEFAULT_REPLICAS = int(os.environ.get("MODEL_DEPLOY_DEFAULT_REPLICAS", "1"))  # 默认部署副本数
+
+# Pipeline 配置
+PIPELINE_MAX_CONCURRENT_RUNS = int(os.environ.get("PIPELINE_MAX_CONCURRENT_RUNS", "5"))  # 最大并发执行数
+PIPELINE_STEP_TIMEOUT = int(os.environ.get("PIPELINE_STEP_TIMEOUT", "3600"))             # 单步超时（秒）
+PIPELINE_MAX_RETRIES = int(os.environ.get("PIPELINE_MAX_RETRIES", "3"))                  # 步骤最大重试次数
+PIPELINE_RETRY_BACKOFF = float(os.environ.get("PIPELINE_RETRY_BACKOFF", "5"))            # 重试退避（秒）
+
+# 分布式训练配置
+DISTRIBUTED_BACKEND = os.environ.get("DISTRIBUTED_BACKEND", "nccl").strip().lower()      # 通信后端：nccl/gloo/mpi
+DISTRIBUTED_INIT_METHOD = os.environ.get("DISTRIBUTED_INIT_METHOD", "env://").strip()    # 初始化方式
+DISTRIBUTED_MASTER_PORT_BASE = int(os.environ.get("DISTRIBUTED_MASTER_PORT_BASE", "29500"))  # 主节点端口基数
+DISTRIBUTED_TIMEOUT = int(os.environ.get("DISTRIBUTED_TIMEOUT", "1800"))                 # 分布式训练超时（秒）
+# 异构感知放置策略
+HETERO_PLACEMENT_STRATEGY = os.environ.get("HETERO_PLACEMENT_STRATEGY", "memory_aware").strip()  # memory_aware/compute_aware/balanced
+HETERO_MIN_VRAM_MB = int(os.environ.get("HETERO_MIN_VRAM_MB", "4096"))                   # 参与分布式训练的最小显存（MB）
+HETERO_ALLOW_CPU_FALLBACK = os.environ.get("HETERO_ALLOW_CPU_FALLBACK", "true").lower() == "true"  # 允许 CPU 回退
+# 流水线并行配置
+PIPELINE_PARALLEL_CHUNKS = int(os.environ.get("PIPELINE_PARALLEL_CHUNKS", "4"))          # 微批次分块数
+PIPELINE_PARALLEL_SCHEDULE = os.environ.get("PIPELINE_PARALLEL_SCHEDULE", "1f1b").strip()  # 调度：1f1b/gpipe
+# 张量并行配置
+TENSOR_PARALLEL_MIN_GPUS = int(os.environ.get("TENSOR_PARALLEL_MIN_GPUS", "2"))          # TP 最少 GPU 数
+
+# 计算资源选择器配置
+RESOURCE_SELECTOR_DEFAULT_STRATEGY = os.environ.get("RESOURCE_SELECTOR_DEFAULT_STRATEGY", "auto").strip()  # auto/manual/hetero_aware
+RESOURCE_SELECTOR_MAX_WORKERS_PER_JOB = int(os.environ.get("RESOURCE_SELECTOR_MAX_WORKERS_PER_JOB", "8"))  # 单任务最大 Worker 数
+
+# 前端代理配置（nginx 反向代理用）
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").strip()
+CORS_ALLOW_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()]
 
 # ---------------------------------------------------------------------------
 # 数据库（MySQL 可选镜像）配置：全项目唯一的 DB 配置来源

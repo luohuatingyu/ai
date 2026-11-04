@@ -22,7 +22,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from cryptography.fernet import Fernet, InvalidToken
 
 import app.config as config
-from app import remote_config_repository
+from app import remote_config_repository, runtime_info
 from app.state import manager
 
 
@@ -547,17 +547,14 @@ def _canonical_docker_platform(platform: str) -> str:
 
 
 def _worker_runtime_files(app_root: Path) -> List[Path]:
-    """按白名单收集计算节点源码，拒绝缺失文件和符号链接，避免夹带管理端或秘密。"""
+    """按白名单收集计算节点源码，拒绝缺失文件和符号链接，避免夹带管理端或秘密。
+
+    白名单与代码指纹共用 ``app.runtime_info``：打包与指纹口径一致，
+    避免远程节点缺少新文件而启动即 ModuleNotFoundError。
+    """
     if app_root.is_symlink():
         raise RemoteWorkerError("worker 源码目录不能是符号链接")
-    names = [
-        "__init__.py", "config.py", "coordination.py", "storage.py", "jobstore.py",
-        "device.py", "performance.py", "trainer.py", "llm_trainer.py", "worker.py", "worker-entrypoint.sh",
-    ]
-    # 联合训练模块在支持该功能的版本中随 worker 一起部署，兼容未启用该功能的版本。
-    names.extend(name for name in ("parallel.py", "parallel_worker.py")
-                 if (app_root / name).exists() or (app_root / name).is_symlink())
-    files = [app_root / name for name in names]
+    files = [app_root / name for name in runtime_info.runtime_file_names(app_root)]
     for path in files:
         if path.is_symlink() or not path.is_file():
             raise RemoteWorkerError(f"worker 运行文件缺失或不是普通文件：{path.name}")
@@ -666,14 +663,12 @@ def _remote_build_args(server: Dict[str, object]) -> str:
     if mode not in {"cpu", "gpu"}:
         raise RemoteWorkerError("资源类型必须是 cpu 或 gpu")
     backend = str(server.get("device_backend", "auto") or "auto").lower()
-    if backend not in {"auto", "cuda", "rocm", "xpu", "mps", "cpu"}:
-        raise RemoteWorkerError("计算后端必须是 auto、cuda、rocm、xpu、mps 或 cpu")
+    if backend not in {"auto", "cuda", "rocm", "xpu", "cpu"}:
+        raise RemoteWorkerError("计算后端必须是 auto、cuda、rocm、xpu 或 cpu")
     if mode == "cpu" and backend not in {"auto", "cpu"}:
         raise RemoteWorkerError("CPU 资源类型不能选择 GPU 后端")
     if mode == "gpu" and backend == "cpu":
         raise RemoteWorkerError("GPU 资源类型不能选择 CPU 后端")
-    if backend == "mps":
-        raise RemoteWorkerError("Apple MPS 需要 macOS 原生 worker，不能通过 Linux Docker 部署")
     args: List[str] = [f"--build-arg WORKER_MODE={mode}"]
     if backend != "auto":
         args.append(f"--build-arg WORKER_BACKEND={backend}")
@@ -1824,7 +1819,7 @@ def validate_server_record(server: Dict[str, object]) -> None:
     if not 1 <= port <= 65535:
         raise RemoteWorkerError("SSH 端口必须在 1 到 65535 之间")
     backend = str(server.get("device_backend", "auto") or "auto").lower()
-    if backend not in {"auto", "cuda", "rocm", "xpu", "mps", "cpu"}:
+    if backend not in {"auto", "cuda", "rocm", "xpu", "cpu"}:
         raise RemoteWorkerError("计算后端配置无效")
     mode = str(server.get("mode", "cpu"))
     if mode == "cpu" and backend not in {"auto", "cpu"}:
@@ -1888,8 +1883,6 @@ def render_remote_script(
     if mode not in {"cpu", "gpu"}:
         raise RemoteWorkerError("计算类型必须是 cpu 或 gpu")
     device_backend = str(server.get("device_backend", "auto") or "auto").lower()
-    if device_backend == "mps":
-        raise RemoteWorkerError("Apple MPS 需要 macOS 原生 worker；Linux Docker 远程部署不支持 MPS")
     try:
         cpu_slots = int(server.get("cpu_slots", 2))
     except (TypeError, ValueError) as exc:
