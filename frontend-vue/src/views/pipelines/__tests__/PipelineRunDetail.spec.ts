@@ -138,4 +138,27 @@ describe('PipelineRunDetail', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('已完成')
   })
+
+  it('图节点按执行状态携带状态 class，并渲染状态图例', async () => {
+    mockApiSuccess({
+      run: {
+        ...RUN,
+        status: 'running',
+        steps: [
+          { ...RUN.steps[0], status: 'completed' },
+          { ...RUN.steps[1], status: 'running' },
+        ],
+      },
+    })
+    const { wrapper } = await mountPage(PipelineRunDetail, { routes, path: '/pipelines/run/p-1/run-1' })
+
+    // 节点 class 编码执行状态（供 CSS 着色：完成绿 / 运行中蓝）
+    const nodes = wrapper.findComponent({ name: 'VueFlow' }).props('nodes') as any[]
+    expect(nodes[0].class).toContain('run-node--completed')
+    expect(nodes[1].class).toContain('run-node--running')
+
+    // 图例说明状态颜色含义
+    expect(wrapper.find('.run-legend').exists()).toBe(true)
+    expect(wrapper.find('.run-legend').text()).toContain('失败')
+  })
 })

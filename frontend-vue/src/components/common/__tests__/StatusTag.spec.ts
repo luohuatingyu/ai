@@ -30,4 +30,28 @@ describe('StatusTag', () => {
     })
     expect(wrapper.text()).toBe('-')
   })
+
+  it('所有状态渲染语义圆点', () => {
+    const wrapper = mount(StatusTag, {
+      ...mountOptions,
+      props: { status: 'completed', map: JOB_STATUS },
+    })
+    expect(wrapper.find('.status-tag__dot').exists()).toBe(true)
+    // 静态状态无呼吸动画 class
+    expect(wrapper.find('.status-tag').classes()).not.toContain('is-active')
+  })
+
+  it('进行中状态圆点带呼吸动画 class', () => {
+    const running = mount(StatusTag, {
+      ...mountOptions,
+      props: { status: 'running', map: JOB_STATUS },
+    })
+    expect(running.find('.status-tag').classes()).toContain('is-active')
+
+    const starting = mount(StatusTag, {
+      ...mountOptions,
+      props: { status: 'starting', map: JOB_STATUS },
+    })
+    expect(starting.find('.status-tag').classes()).toContain('is-active')
+  })
 })

@@ -34,4 +34,25 @@ describe('StatCard', () => {
     await wrapper.trigger('click')
     expect(wrapper.emitted('click')).toHaveLength(1)
   })
+
+  it('valueTone 渲染数值语义强调 class', () => {
+    const danger = mount(StatCard, {
+      ...mountOptions,
+      props: { label: '失败', value: 3, valueTone: 'danger' },
+    })
+    expect(danger.find('.stat-card__value').classes()).toContain('stat-card__value--danger')
+
+    const accent = mount(StatCard, {
+      ...mountOptions,
+      props: { label: '任务', value: 5, valueTone: 'accent' },
+    })
+    expect(accent.find('.stat-card__value').classes()).toContain('stat-card__value--accent')
+
+    // 默认不添加强调 class
+    const normal = mount(StatCard, {
+      ...mountOptions,
+      props: { label: '任务', value: 5 },
+    })
+    expect(normal.find('.stat-card__value').classes()).not.toContain('stat-card__value--danger')
+  })
 })

@@ -34,23 +34,74 @@
         class="mb-16"
       />
 
-      <!-- 状态摘要与进度 -->
-      <SectionCard v-loading="loading && !detail" title="状态与进度">
-        <div v-if="detail" class="status-row">
-          <StatusTag :status="detail.status" :map="JOB_STATUS" size="large" />
-          <span class="text-secondary text-sm">{{ statusHint }}</span>
-        </div>
-        <el-progress
-          class="mt-12"
-          :percentage="progressPercent"
-          :status="detail?.status === 'failed' ? 'exception' : (progressPercent >= 100 ? 'success' : undefined)"
-        />
-        <div v-if="detail" class="progress-meta">
-          <span>Epoch {{ progress.epoch }} / {{ progress.epochs_total }}</span>
-          <span>任务 ID：<span class="mono">{{ detail.id }}</span></span>
-        </div>
+      <!-- 任务 Hero：状态、进度、关键指标与日志入口一屏呈现 -->
+      <div v-loading="loading && !detail" class="job-hero">
+        <template v-if="detail">
+          <div class="job-hero__main">
+            <div class="job-hero__status">
+              <StatusTag :status="detail.status" :map="JOB_STATUS" size="large" />
+              <span class="job-hero__hint">{{ statusHint }}</span>
+            </div>
+            <el-progress
+              class="job-hero__progress"
+              :percentage="progressPercent"
+              :status="detail.status === 'failed' ? 'exception' : (progressPercent >= 100 ? 'success' : undefined)"
+            />
+            <div class="progress-meta">
+              <span>Epoch {{ progress.epoch }} / {{ progress.epochs_total }}</span>
+              <span>任务 ID：<span class="mono">{{ detail.id }}</span></span>
+            </div>
+          </div>
+          <div class="job-hero__side">
+            <div v-if="heroMetrics.length" class="hero-metrics">
+              <div v-for="m in heroMetrics" :key="m.key" class="hero-metric">
+                <span class="hero-metric__key">{{ m.key }}</span>
+                <span class="hero-metric__value">{{ m.value }}</span>
+              </div>
+            </div>
+            <el-button size="small" @click="scrollToLogs">
+              <el-icon><Document /></el-icon>
+              查看日志
+            </el-button>
+          </div>
+        </template>
         <div v-else class="loading-placeholder" />
+      </div>
+
+      <!-- 指标趋势（真实指标数据） -->
+      <SectionCard v-if="detail && metrics.length > 0" title="指标趋势" description="按 Epoch 展示训练指标变化" flush>
+        <div class="chart-box">
+          <VChart class="chart" :option="metricChartOption" autoresize />
+        </div>
       </SectionCard>
+
+      <!-- 训练日志 -->
+      <div ref="logSection">
+        <SectionCard v-if="detail" title="训练日志">
+          <template #extra>
+            <div class="log-toolbar">
+              <el-input
+                v-model="logFilter"
+                placeholder="过滤日志关键词"
+                clearable
+                size="small"
+                style="width: 200px"
+                :prefix-icon="Search"
+              />
+              <el-button size="small" :loading="logsLoading" @click="fetchLogs">
+                <el-icon><Refresh /></el-icon>
+                刷新日志
+              </el-button>
+            </div>
+          </template>
+          <div v-loading="logsLoading" class="log-panel">
+            <div v-if="displayLogs.length === 0" class="log-empty">
+              {{ logs.length === 0 ? '暂无日志，训练启动后自动产出' : '没有匹配过滤条件的日志' }}
+            </div>
+            <pre v-else class="log-content">{{ displayLogs.join('\n') }}</pre>
+          </div>
+        </SectionCard>
+      </div>
 
       <!-- 基本信息 -->
       <SectionCard v-if="detail" title="基本信息">
@@ -68,13 +119,6 @@
         </el-descriptions>
       </SectionCard>
 
-      <!-- 指标趋势（真实指标数据） -->
-      <SectionCard v-if="detail && metrics.length > 0" title="指标趋势" description="按 Epoch 展示训练指标变化" flush>
-        <div class="chart-box">
-          <VChart class="chart" :option="metricChartOption" autoresize />
-        </div>
-      </SectionCard>
-
       <!-- 指标明细 -->
       <SectionCard v-if="detail && metrics.length > 0" title="指标明细" flush>
         <el-table :data="metrics" class="table-card" max-height="320" :header-cell-style="{ background: 'var(--mtp-bg-subtle)' }">
@@ -83,32 +127,6 @@
             <template #default="{ row }">{{ formatMetric(row[key]) }}</template>
           </el-table-column>
         </el-table>
-      </SectionCard>
-
-      <!-- 训练日志 -->
-      <SectionCard v-if="detail" title="训练日志">
-        <template #extra>
-          <div class="log-toolbar">
-            <el-input
-              v-model="logFilter"
-              placeholder="过滤日志关键词"
-              clearable
-              size="small"
-              style="width: 200px"
-              :prefix-icon="Search"
-            />
-            <el-button size="small" :loading="logsLoading" @click="fetchLogs">
-              <el-icon><Refresh /></el-icon>
-              刷新日志
-            </el-button>
-          </div>
-        </template>
-        <div v-loading="logsLoading" class="log-panel">
-          <div v-if="displayLogs.length === 0" class="log-empty">
-            {{ logs.length === 0 ? '暂无日志，训练启动后自动产出' : '没有匹配过滤条件的日志' }}
-          </div>
-          <pre v-else class="log-content">{{ displayLogs.join('\n') }}</pre>
-        </div>
       </SectionCard>
     </template>
   </PageShell>
@@ -136,7 +154,7 @@ import StatusTag from '@/components/common/StatusTag.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
 import { JOB_STATUS, TASK_TYPE } from '@/utils/status'
 import { formatFullDateTime } from '@/utils/format'
-import { Refresh, Download, Search } from '@element-plus/icons-vue'
+import { Refresh, Download, Search, Document } from '@element-plus/icons-vue'
 
 /** 任务类型中文标签 */
 const taskText = (task?: string) => TASK_TYPE[task || '']?.label || task || '-'
@@ -193,6 +211,22 @@ const formatMetric = (value: any) => {
   if (value === null || value === undefined) return '-'
   const num = Number(value)
   return Number.isNaN(num) ? String(value) : num.toFixed(4)
+}
+
+/** Hero 关键指标：取最新一个 Epoch 的指标（epoch 键除外，最多 4 项） */
+const heroMetrics = computed(() => {
+  const last = metrics.value[metrics.value.length - 1]
+  if (!last) return []
+  return Object.entries(last)
+    .filter(([key]) => key !== 'epoch')
+    .slice(0, 4)
+    .map(([key, value]) => ({ key, value: formatMetric(value) }))
+})
+
+/** 日志区块锚点：Hero「查看日志」平滑滚动定位 */
+const logSection = ref<HTMLElement | null>(null)
+const scrollToLogs = () => {
+  logSection.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 /** 指标趋势折线图配置（每条线对应一个指标键） */
@@ -294,6 +328,97 @@ onUnmounted(stopPolling)
 </script>
 
 <style scoped>
+/* 任务 Hero：首屏状态与关键指标，替代原"状态与进度"卡片 */
+.job-hero {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 20px;
+  background: var(--mtp-bg-card);
+  border: 1px solid var(--mtp-ink-100);
+  border-left: 4px solid var(--mtp-module-accent, var(--mtp-brand-600));
+  border-radius: var(--mtp-radius-lg);
+  box-shadow: var(--mtp-shadow-card);
+  padding: 18px 20px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.job-hero__main {
+  flex: 1;
+  min-width: 260px;
+}
+
+.job-hero__status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.job-hero__hint {
+  font-size: 13px;
+  color: var(--mtp-ink-500);
+}
+
+.job-hero__progress {
+  margin-top: 12px;
+}
+
+.job-hero__side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.hero-metrics {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.hero-metric {
+  min-width: 86px;
+  padding: 8px 14px;
+  background: var(--mtp-bg-subtle);
+  border: 1px solid var(--mtp-ink-100);
+  border-radius: var(--mtp-radius-md);
+  text-align: center;
+}
+
+.hero-metric__key {
+  display: block;
+  font-size: 11.5px;
+  color: var(--mtp-ink-400);
+  margin-bottom: 2px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hero-metric__value {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--mtp-ink-900);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 768px) {
+  .job-hero__side {
+    align-items: stretch;
+    width: 100%;
+  }
+
+  .hero-metrics {
+    justify-content: flex-start;
+  }
+}
+
 .status-row {
   display: flex;
   align-items: center;

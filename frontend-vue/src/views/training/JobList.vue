@@ -112,8 +112,8 @@
  * - 取消/删除带确认弹窗；失败展示可重试错误态；
  * - 后端返回的任务视图把任务类型/数据集放在 spec 内，统一经 specOf 取出。
  */
-import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
@@ -128,11 +128,20 @@ import { formatDateTime, formatInteger } from '@/utils/format'
 import { Refresh, Plus, Monitor, Loading, CircleCheck, CircleClose } from '@element-plus/icons-vue'
 
 const router = useRouter()
+const route = useRoute()
 const appStore = useAppStore()
 const jobs = ref<any[]>([])
 const loading = ref(false)
 const error = ref('')
 const statusFilter = ref('')
+
+// 支持从仪表盘「需要关注」条直达：/training/jobs?status=failed
+statusFilter.value = String(route.query.status || '')
+
+// 状态筛选变化时同步到 URL（可分享 / 可回退）
+watch(statusFilter, (value) => {
+  router.replace({ query: value ? { status: value } : {} })
+})
 
 // 后端返回的任务视图把任务类型/数据集放在 spec 内，这里统一取出
 const specOf = (row: any) => row?.spec || {}

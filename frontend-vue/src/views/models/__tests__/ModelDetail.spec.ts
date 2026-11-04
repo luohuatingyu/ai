@@ -126,4 +126,16 @@ describe('ModelDetail', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('iris-rf')
   })
+
+  it('模型 Hero 前置展示版本、关键指标与部署动作', async () => {
+    apiGet.mockResolvedValue(MODEL)
+    const { wrapper } = await mountPage(ModelDetail, { routes, path: '/models/detail/m-1' })
+    const hero = wrapper.find('.model-hero')
+    expect(hero.exists()).toBe(true)
+    expect(hero.text()).toContain('v1') // 版本前置
+    expect(hero.text()).toContain('0.9555') // 指标 chips
+    // Hero 内提供部署与下载动作
+    expect(hero.findAll('button').some((b) => b.text().includes('部署服务'))).toBe(true)
+    expect(hero.findAll('button').some((b) => b.text().includes('下载产物'))).toBe(true)
+  })
 })

@@ -24,6 +24,38 @@
     </SectionCard>
 
     <template v-else>
+      <!-- 模型 Hero：状态、版本、关键指标与部署动作一屏呈现 -->
+      <div v-if="detail" class="model-hero">
+        <div class="model-hero__main">
+          <div class="model-hero__row">
+            <StatusTag :status="detail.status" :map="MODEL_STATUS" size="large" />
+            <span class="model-hero__version">{{ detail.version }}</span>
+            <StatusTag :status="detail.task" :map="TASK_TYPE" />
+            <span class="model-hero__framework">{{ detail.framework || '-' }}</span>
+          </div>
+          <div v-if="heroMetrics.length" class="model-hero__metrics">
+            <div v-for="m in heroMetrics" :key="m.key" class="hero-metric">
+              <span class="hero-metric__key">{{ m.key }}</span>
+              <span class="hero-metric__value">{{ m.value }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="model-hero__actions">
+          <el-button
+            v-if="detail.status !== 'archived'"
+            type="primary"
+            @click="openDeployDialog"
+          >
+            <el-icon class="gap-8"><Promotion /></el-icon>
+            部署服务
+          </el-button>
+          <el-button type="success" plain @click="downloadModel">
+            <el-icon class="gap-8"><Download /></el-icon>
+            下载产物
+          </el-button>
+        </div>
+      </div>
+
       <!-- 基本信息 -->
       <SectionCard v-loading="loading && !detail" title="基本信息">
         <template #extra>
@@ -161,6 +193,13 @@ const openDeployDialog = () => {
   showDeployDialog.value = true
 }
 
+/** Hero 关键指标：取前 4 项指标强调展示（最新训练结果） */
+const heroMetrics = computed(() =>
+  metricEntries.value
+    .slice(0, 4)
+    .map(([key, value]) => ({ key, value: Number(value).toFixed(4) }))
+)
+
 // 后端实际路径为 /api/models/{id}（旧版模板字符串未替换导致 404）
 const fetchDetail = async () => {
   loading.value = true
@@ -229,6 +268,95 @@ onMounted(fetchDetail)
 </script>
 
 <style scoped>
+/* 模型 Hero：状态 + 版本 + 关键指标 + 部署动作 */
+.model-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  background: var(--mtp-bg-card);
+  border: 1px solid var(--mtp-ink-100);
+  border-left: 4px solid var(--mtp-module-accent, var(--mtp-brand-600));
+  border-radius: var(--mtp-radius-lg);
+  box-shadow: var(--mtp-shadow-card);
+  padding: 18px 20px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.model-hero__main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.model-hero__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.model-hero__version {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--mtp-ink-900);
+  font-family: var(--mtp-font-mono);
+}
+
+.model-hero__framework {
+  font-size: 12.5px;
+  color: var(--mtp-ink-500);
+}
+
+.model-hero__metrics {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.model-hero__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.hero-metric {
+  min-width: 86px;
+  padding: 8px 14px;
+  background: var(--mtp-bg-subtle);
+  border: 1px solid var(--mtp-ink-100);
+  border-radius: var(--mtp-radius-md);
+  text-align: center;
+}
+
+.hero-metric__key {
+  display: block;
+  font-size: 11.5px;
+  color: var(--mtp-ink-400);
+  margin-bottom: 2px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hero-metric__value {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--mtp-ink-900);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 768px) {
+  .model-hero__actions {
+    width: 100%;
+  }
+}
+
 .loading-placeholder {
   min-height: 160px;
 }

@@ -124,6 +124,20 @@ describe('JobDetail', () => {
     expect(wrapper.find('.log-content').text()).toBe('ERROR x')
   })
 
+  it('任务 Hero 展示最新指标与日志入口', async () => {
+    mockApiSuccess()
+    const { wrapper } = await mountPage(JobDetail, { routes, path: '/training/detail/j-1' })
+    const hero = wrapper.find('.job-hero')
+    expect(hero.exists()).toBe(true)
+    // Hero 提供日志入口按钮
+    expect(hero.findAll('button').some((b) => b.text().includes('查看日志'))).toBe(true)
+    // 关键指标 chips 取最新 epoch（epoch 2: accuracy 0.85 / loss 0.6）
+    expect(hero.text()).toContain('accuracy')
+    expect(hero.text()).toContain('0.8500')
+    expect(hero.text()).toContain('loss')
+    expect(hero.text()).toContain('0.6000')
+  })
+
   it('详情加载失败展示可重试错误态', async () => {
     apiGet.mockRejectedValue(new Error('任务不存在'))
     const { wrapper } = await mountPage(JobDetail, { routes, path: '/training/detail/j-1' })

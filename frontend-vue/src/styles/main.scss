@@ -40,6 +40,10 @@
   --mtp-purple: #7c5cd6;
   --mtp-cyan: #0e9db5;
 
+  // 模块强调色（页面级由 PageShell 按业务域注入覆盖，未注入时回退品牌蓝）
+  --mtp-module-accent: var(--mtp-brand-600);
+  --mtp-module-accent-soft: var(--mtp-brand-100);
+
   // 布局与圆角
   --mtp-header-h: 56px;
   --mtp-sidebar-w: 232px;
@@ -261,7 +265,10 @@ pre,
   min-width: 0;
   overflow-y: auto;
   padding: 20px 24px 32px;
-  background: var(--mtp-bg-page);
+  // 页面背景层次：顶部轻微品牌色晕染 + 纵向渐变，弱化大面积同质白卡片
+  background:
+    radial-gradient(1100px 260px at 18% -60px, rgba(48, 86, 211, 0.05), transparent 65%),
+    linear-gradient(180deg, #f5f7fc 0%, var(--mtp-bg-page) 320px);
 }
 
 // 深色侧栏菜单（Element Plus 菜单变量注入）
@@ -369,6 +376,22 @@ pre,
   font-weight: 600;
   color: var(--mtp-ink-900);
   line-height: 1.3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+// 页面标题左侧模块章：图标 + 业务域强调色底，建立模块视觉识别
+.page-title__chip {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: var(--mtp-module-accent-soft, var(--mtp-brand-100));
+  color: var(--mtp-module-accent, var(--mtp-brand-600));
 }
 
 .page-desc {
@@ -487,7 +510,8 @@ pre,
   width: 3px;
   height: 14px;
   border-radius: 2px;
-  background: var(--mtp-brand-600);
+  // 跟随所在业务域的强调色（PageShell 注入），未注入时回退品牌蓝
+  background: var(--mtp-module-accent, var(--mtp-brand-600));
 }
 
 .section-card__desc {
@@ -582,12 +606,19 @@ pre,
 }
 
 .stat-card__value {
-  font-size: 26px;
-  font-weight: 600;
+  font-size: 28px;
+  font-weight: 700;
   color: var(--mtp-ink-900);
   line-height: 1.1;
+  letter-spacing: -0.3px;
   font-variant-numeric: tabular-nums;
 }
+
+// 数值语义强调：需要关注的指标（异常红 / 注意橙 / 达标绿 / 模块色）
+.stat-card__value--danger  { color: var(--mtp-danger); }
+.stat-card__value--warning { color: var(--mtp-warning); }
+.stat-card__value--success { color: var(--mtp-success); }
+.stat-card__value--accent  { color: var(--mtp-module-accent, var(--mtp-brand-600)); }
 
 .stat-card__hint {
   font-size: 12px;
@@ -611,6 +642,29 @@ pre,
 .tone-purple { background: #f1ecfb; color: var(--mtp-purple); }
 .tone-cyan   { background: #e5f5f8; color: var(--mtp-cyan); }
 .tone-gray   { background: #f0f2f6; color: var(--mtp-info); }
+
+// ---------------------------------------------------------------------------
+// 状态标签圆点（StatusTag）：进行中状态带呼吸动画，静态状态为实心圆点
+// ---------------------------------------------------------------------------
+.status-tag__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+  margin-right: 5px;
+  vertical-align: 1px;
+  flex-shrink: 0;
+}
+
+.status-tag.is-active .status-tag__dot {
+  animation: mtp-dot-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes mtp-dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.35; transform: scale(0.72); }
+}
 
 // ---------------------------------------------------------------------------
 // 7. 工具类

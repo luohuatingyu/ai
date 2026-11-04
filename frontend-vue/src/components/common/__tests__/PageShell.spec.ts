@@ -34,4 +34,25 @@ describe('PageShell', () => {
     })
     expect(wrapper.find('.el-loading-mask').exists()).toBe(true)
   })
+
+  it('传入 moduleKey 时渲染模块章并注入模块强调色 CSS 变量', () => {
+    const wrapper = mount(PageShell, {
+      ...mountOptions,
+      props: { title: '任务列表', moduleKey: 'training' },
+    })
+    expect(wrapper.find('.page-title__chip').exists()).toBe(true)
+    const style = (wrapper.find('.page-view').element as HTMLElement).style
+    expect(style.getPropertyValue('--mtp-module-accent')).toBe('#3056d3')
+    expect(style.getPropertyValue('--mtp-module-accent-soft')).toBe('#e8eefc')
+  })
+
+  it('未传 moduleKey（无路由上下文）时不渲染模块章，样式变量缺省', () => {
+    const wrapper = mount(PageShell, {
+      ...mountOptions,
+      props: { title: 'T' },
+    })
+    expect(wrapper.find('.page-title__chip').exists()).toBe(false)
+    const style = (wrapper.find('.page-view').element as HTMLElement).style
+    expect(style.getPropertyValue('--mtp-module-accent')).toBe('')
+  })
 })

@@ -12,7 +12,7 @@
         <el-icon><component :is="icon" /></el-icon>
       </span>
     </div>
-    <div class="stat-card__value">{{ displayValue }}</div>
+    <div class="stat-card__value" :class="valueToneClass">{{ displayValue }}</div>
     <div v-if="hint" class="stat-card__hint">{{ hint }}</div>
     <div v-if="$slots.footer" class="stat-card__footer">
       <slot name="footer" />
@@ -42,12 +42,15 @@ const props = withDefaults(
     hint?: string
     /** 是否可点击跳转 */
     clickable?: boolean
+    /** 数值强调色：danger 异常红 / warning 注意橙 / success 达标绿 / accent 模块色 / default 墨色 */
+    valueTone?: 'default' | 'danger' | 'warning' | 'success' | 'accent'
   }>(),
   {
     icon: undefined,
     tone: 'blue',
     hint: '',
     clickable: false,
+    valueTone: 'default',
   }
 )
 
@@ -55,4 +58,9 @@ const emit = defineEmits<{ click: [] }>()
 
 /** 数值展示：computed 保持响应（props.value 更新后文本同步刷新） */
 const displayValue = computed(() => props.value)
+
+/** 数值语义强调 class（default 不加类，保持墨色） */
+const valueToneClass = computed(() =>
+  props.valueTone === 'default' ? '' : `stat-card__value--${props.valueTone}`
+)
 </script>

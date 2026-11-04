@@ -126,4 +126,31 @@ describe('Dashboard', () => {
     expect(calledUrls).toContain('/clusters/workers/summary')
     expect(calledUrls).toContain('/system')
   })
+
+  it('存在失败任务时展示红色关注条，点击直达筛选后的任务列表', async () => {
+    mockApiSuccess()
+    const { wrapper, router } = await mountPage(Dashboard)
+    const strip = wrapper.find('.attention-strip')
+    expect(strip.exists()).toBe(true)
+    // 1 个失败（j2）+ 1 个运行中（j3），无排队
+    expect(strip.classes()).toContain('is-alert')
+    expect(strip.text()).toContain('失败 1')
+    expect(strip.text()).toContain('运行中 1')
+
+    const failedChip = strip.findAll('button').find((b) => b.text().includes('失败'))
+    await failedChip!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/training/jobs?status=failed')
+  })
+
+  it('全部任务完成时展示绿色提示条（仅排队/运行时）或不展示', async () => {
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/training/jobs')
+        return Promise.resolve({ jobs: [{ id: 'j1', status: 'completed', spec: {}, created_at: 1 }] })
+      return Promise.resolve({})
+    })
+    const { wrapper } = await mountPage(Dashboard)
+    // 无失败、无排队、无运行 → 不渲染关注条
+    expect(wrapper.find('.attention-strip').exists()).toBe(false)
+  })
 })
