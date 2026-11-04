@@ -106,4 +106,14 @@ describe('JobList', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('j-1')
   })
+
+  it('支持 ?status= 查询参数直达筛选（仪表盘关注条入口）', async () => {
+    mockApiSuccess()
+    const { wrapper } = await mountPage(JobList, { path: '/training/jobs?status=failed' })
+    await flushPromises()
+    const rows = wrapper.findAll('.el-table__row')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].text()).toContain('j-3')
+    expect(wrapper.text()).toContain('当前筛选 1 个')
+  })
 })

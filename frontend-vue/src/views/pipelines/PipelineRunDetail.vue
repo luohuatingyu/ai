@@ -51,6 +51,12 @@
         description="节点状态即本次执行的步骤状态，点击节点查看该步骤日志"
         flush
       >
+        <div class="run-legend">
+          <span v-for="item in RUN_LEGEND" :key="item.status" class="run-legend__item">
+            <span class="run-legend__dot" :class="`run-legend__dot--${item.status}`" />
+            {{ item.label }}
+          </span>
+        </div>
         <div class="run-graph-layout">
           <div class="run-graph-canvas">
             <VueFlow
@@ -258,6 +264,15 @@ const stepLogs = (step: any): string[] => (step.logs || []).filter(Boolean)
 
 const stepTypeText = (type?: string) => PIPELINE_STEP_TYPE[type || '']?.label || type || '-'
 
+/** 状态图例（与节点视觉编码一一对应） */
+const RUN_LEGEND = [
+  { status: 'completed', label: '已完成' },
+  { status: 'running', label: '运行中' },
+  { status: 'failed', label: '失败' },
+  { status: 'pending', label: '等待中' },
+  { status: 'cancelled', label: '已取消 / 跳过' },
+]
+
 // 路由携带 pipelineId + runId：/pipelines/run/{pipelineId}/{runId}
 const fetchDetail = async () => {
   loading.value = true
@@ -359,6 +374,77 @@ onUnmounted(stopPolling)
 .run-flow {
   width: 100%;
   height: 100%;
+}
+
+/* 状态图例 */
+.run-legend {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--mtp-ink-100);
+  font-size: 12px;
+  color: var(--mtp-ink-500);
+}
+
+.run-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.run-legend__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+}
+
+.run-legend__dot--completed { background: #e7f6ef; border-color: var(--mtp-success); }
+.run-legend__dot--running   { background: var(--mtp-brand-100); border-color: var(--mtp-brand-600); }
+.run-legend__dot--failed    { background: #fbeaeb; border-color: var(--mtp-danger); }
+.run-legend__dot--pending   { background: #fff; border-color: var(--mtp-ink-300); }
+.run-legend__dot--cancelled { background: #f0f2f6; border-color: var(--mtp-ink-300); }
+
+/* 节点状态视觉编码：背景与边框随步骤执行状态变化 */
+.run-flow :deep(.vue-flow__node-default) {
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.run-flow :deep(.run-node--completed) {
+  background: #e7f6ef;
+  border-color: var(--mtp-success);
+  color: #14573b;
+}
+
+.run-flow :deep(.run-node--running) {
+  background: var(--mtp-brand-100);
+  border-color: var(--mtp-brand-600);
+  color: var(--mtp-brand-700);
+  box-shadow: 0 0 0 3px rgba(48, 86, 211, 0.15);
+}
+
+.run-flow :deep(.run-node--failed) {
+  background: #fbeaeb;
+  border-color: var(--mtp-danger);
+  color: #8f2830;
+  box-shadow: 0 0 0 3px rgba(214, 69, 80, 0.12);
+}
+
+.run-flow :deep(.run-node--pending) {
+  background: #fff;
+  border-color: var(--mtp-ink-300);
+  color: var(--mtp-ink-500);
+}
+
+.run-flow :deep(.run-node--cancelled),
+.run-flow :deep(.run-node--skipped) {
+  background: #f0f2f6;
+  border-color: var(--mtp-ink-300);
+  color: var(--mtp-ink-500);
+  opacity: 0.75;
 }
 
 .run-graph-side {

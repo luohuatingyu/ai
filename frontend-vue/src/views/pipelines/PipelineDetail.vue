@@ -21,20 +21,7 @@
     </SectionCard>
 
     <template v-else>
-      <!-- 基本信息 -->
-      <SectionCard v-loading="loading && !detail" title="基本信息">
-        <template #extra>
-          <StatusTag v-if="detail" :status="detail.status" :map="PIPELINE_STATUS" size="large" />
-        </template>
-        <el-descriptions v-if="detail" :column="2" border>
-          <el-descriptions-item label="描述" :span="2">{{ detail.description || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="调度">{{ detail.schedule || '手动触发' }}</el-descriptions-item>
-          <el-descriptions-item label="创建时间">{{ formatFullDateTime(detail.created_at) }}</el-descriptions-item>
-        </el-descriptions>
-        <div v-else class="loading-placeholder" />
-      </SectionCard>
-
-      <!-- 步骤编排图 -->
+      <!-- 步骤编排图（首屏优先展示依赖结构） -->
       <SectionCard v-if="detail && steps.length > 0" title="步骤编排" :description="`共 ${steps.length} 步，点击节点查看配置`" flush>
         <div class="graph-layout">
           <div class="graph-canvas">
@@ -71,6 +58,19 @@
             </div>
           </div>
         </div>
+      </SectionCard>
+
+      <!-- 基本信息 -->
+      <SectionCard v-loading="loading && !detail" title="基本信息">
+        <template #extra>
+          <StatusTag v-if="detail" :status="detail.status" :map="PIPELINE_STATUS" size="large" />
+        </template>
+        <el-descriptions v-if="detail" :column="2" border>
+          <el-descriptions-item label="描述" :span="2">{{ detail.description || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="调度">{{ detail.schedule || '手动触发' }}</el-descriptions-item>
+          <el-descriptions-item label="创建时间">{{ formatFullDateTime(detail.created_at) }}</el-descriptions-item>
+        </el-descriptions>
+        <div v-else class="loading-placeholder" />
       </SectionCard>
 
       <!-- 步骤明细表 -->

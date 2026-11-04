@@ -11,6 +11,26 @@
       </el-button>
     </template>
 
+    <!-- 需要关注：失败 / 排队任务置顶直达，点击跳转到筛选后的任务列表 -->
+    <div
+      v-if="attentionFailed > 0 || attentionQueued > 0"
+      class="attention-strip"
+      :class="{ 'is-alert': attentionFailed > 0 }"
+      role="status"
+    >
+      <el-icon class="attention-strip__icon"><WarningFilled v-if="attentionFailed > 0" /><InfoFilled v-else /></el-icon>
+      <span class="attention-strip__label">{{ attentionFailed > 0 ? '存在异常任务，需要处理' : '有任务正在等待' }}</span>
+      <button v-if="attentionFailed > 0" type="button" class="attention-chip is-danger" @click="goJobs('failed')">
+        失败 {{ attentionFailed }}
+      </button>
+      <button v-if="attentionQueued > 0" type="button" class="attention-chip is-warning" @click="goJobs('queued')">
+        排队中 {{ attentionQueued }}
+      </button>
+      <button v-if="attentionRunning > 0" type="button" class="attention-chip is-info" @click="goJobs('running')">
+        运行中 {{ attentionRunning }}
+      </button>
+    </div>
+
     <!-- 关键指标（点击进入对应模块） -->
     <div class="stat-grid">
       <StatCard
@@ -218,7 +238,7 @@ import { JOB_STATUS, TASK_TYPE } from '@/utils/status'
 import { formatDateTime } from '@/utils/format'
 import {
   Refresh, Plus, Notebook, Connection, Upload, Document,
-  Monitor, Folder, Box,
+  Monitor, Folder, Box, WarningFilled, InfoFilled,
 } from '@element-plus/icons-vue'
 
 // 按需注册 ECharts 模块（树摇打包）
@@ -406,12 +426,68 @@ const loadSystem = async () => {
 const viewJob = (id: string) => router.push(`/training/detail/${id}`)
 const viewModel = (id: string) => router.push(`/models/detail/${id}`)
 
+/** 需要关注的任务数量（失败 / 排队 / 运行，来自任务状态聚合） */
+const attentionFailed = computed(() => statusCounts.value.failed || 0)
+const attentionQueued = computed(() => statusCounts.value.queued || 0)
+const attentionRunning = computed(() => statusCounts.value.running || 0)
+
+/** 点击关注条跳转到按状态筛选后的任务列表 */
+const goJobs = (status: string) => router.push(`/training/jobs?status=${status}`)
+
 onMounted(() => {
   refreshData()
 })
 </script>
 
 <style scoped>
+/* 需要关注条：有失败任务时红色告警底，仅排队时品牌色提示底 */
+.attention-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  margin-bottom: 16px;
+  border-radius: var(--mtp-radius-lg);
+  border: 1px solid var(--mtp-brand-100);
+  background: var(--mtp-brand-50);
+  color: var(--mtp-brand-700);
+  font-size: 13px;
+}
+
+.attention-strip.is-alert {
+  border-color: #f5c6cb;
+  background: #fdf1f2;
+  color: var(--mtp-danger);
+}
+
+.attention-strip__icon {
+  flex-shrink: 0;
+}
+
+.attention-strip__label {
+  font-weight: 600;
+}
+
+.attention-chip {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 2px 12px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+
+.attention-chip:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--mtp-shadow-card);
+}
+
+.attention-chip.is-danger  { background: var(--mtp-danger); color: #fff; }
+.attention-chip.is-warning { background: var(--mtp-warning); color: #fff; }
+.attention-chip.is-info    { background: var(--mtp-brand-600); color: #fff; }
+
 /* 双列布局：主列自适应 + 侧列固定，窄屏单列 */
 .dash-grid {
   display: grid;
